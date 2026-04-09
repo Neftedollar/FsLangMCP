@@ -33,16 +33,24 @@ LSP positions (`line`, `character`) are **0-based**.
 - `fcs_project_symbol_uses`
 - `fcs_type_at_position` — inferred F# type and symbol info at cursor (works without LSP workspace)
 - `fcs_signature_help` — method overloads and parameter info at cursor
+- `fcs_get_project_options` — get `OtherOptions` for a `.fsproj` via `proj-info`; use the result as `projectOptions` in other FCS tools
 
 ## Prerequisites
 
 - .NET SDK 10+
 - `fsautocomplete` installed
+- `ionide.projinfo.tool` (required for `fcs_get_project_options`)
 
 Install `fsautocomplete`:
 
 ```bash
 dotnet tool install -g fsautocomplete
+```
+
+Install `ionide.projinfo.tool`:
+
+```bash
+dotnet tool install -g ionide.projinfo.tool
 ```
 
 ## Install As Dotnet Tool

@@ -124,6 +124,9 @@ type RenameArgs =
       newName: string
       text: string option }
 
+[<CLIMutable>]
+type FcsGetProjectOptionsArgs = { projectPath: string }
+
 // ─── Helper: find nearest .fsproj ──────────────────────────────────────────────
 
 let private findNearestFsproj (filePath: string) : string option =
@@ -1339,6 +1342,66 @@ let private runProcess (fileName: string) (args: string list) =
     proc.WaitForExit()
     proc.ExitCode, stdout, stderr
 
+let private parseProjInfoOutput (path: string) (exitCode: int) (stdout: string) (stderr: string) : JToken =
+    if exitCode <> 0 then
+        JObject(
+            JProperty("error", $"proj-info failed (exit {exitCode})"),
+            JProperty("stderr", stderr)
+        ) :> JToken
+    elif String.IsNullOrWhiteSpace(stdout) then
+        JObject(JProperty("error", "proj-info produced no output")) :> JToken
+    else
+        let token = JToken.Parse(stdout)
+        let json =
+            match token with
+            | :? JArray as arr when arr.Count > 0 ->
+                match arr.[0] with
+                | :? JObject as obj -> obj
+                | other -> JObject(JProperty("warning", sprintf "unexpected element type: %s" (other.Type.ToString())))
+            | :? JObject as obj -> obj
+            | _ -> JObject()
+        let otherOptions =
+            json["OtherOptions"]
+            |> Option.ofObj
+            |> Option.map (fun t -> t.ToObject<string[]>())
+            |> Option.defaultValue [||]
+        JObject(
+            JProperty("projectPath", path),
+            JProperty("otherOptions", JArray(otherOptions)),
+            JProperty("optionsCount", otherOptions.Length)
+        ) :> JToken
+
+let private runProjInfoAsync (path: string) : Task<JToken> = task {
+    let psi = ProcessStartInfo()
+    psi.FileName <- "proj-info"
+    psi.UseShellExecute <- false
+    psi.RedirectStandardOutput <- true
+    psi.RedirectStandardError <- true
+    psi.CreateNoWindow <- true
+    psi.ArgumentList.Add("--project")
+    psi.ArgumentList.Add(path)
+    psi.ArgumentList.Add("--fcs")
+    psi.ArgumentList.Add("--serialize")
+
+    use proc = new Process(StartInfo = psi)
+    let started =
+        try
+            proc.Start()
+        with
+        | :? System.ComponentModel.Win32Exception
+        | :? System.IO.IOException ->
+            raise (FileNotFoundException "proj-info not found on PATH. Install with: dotnet tool install -g ionide.projinfo.tool")
+    if not started then
+        raise (InvalidOperationException "Unable to start proj-info process")
+
+    let stdoutTask = proc.StandardOutput.ReadToEndAsync()
+    let stderrTask  = proc.StandardError.ReadToEndAsync()
+    let! stdout = stdoutTask
+    let! stderr = stderrTask
+    do! proc.WaitForExitAsync()
+    return parseProjInfoOutput path proc.ExitCode stdout stderr
+}
+
 let private ensureDotnetGlobalTool (toolId: string) =
     let updateCode, _, updateErr = runProcess "dotnet" [ "tool"; "update"; "-g"; toolId ]
 
@@ -1540,6 +1603,19 @@ let main argv =
                         "textDocument_rename"
                         "Renames a symbol at a position via fsautocomplete. line/character are 0-based. Requires set_project to be called first (or --project at startup). Pass 'text' to analyze unsaved source content without writing to disk."
                         (fun args -> toolResult (bridge.Rename args))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsGetProjectOptionsArgs>
+                        "fcs_get_project_options"
+                        "Get FSharp compiler project options (OtherOptions) for a .fsproj file using proj-info. Returns the options list to use as `projectOptions` in FCS tools."
+                        (fun args ->
+                            let path = args.projectPath
+                            if String.IsNullOrWhiteSpace(path) then
+                                toolResult (Task.FromException<JToken>(ArgumentException "projectPath is required"))
+                            else
+                                toolResult (runProjInfoAsync path))
                     |> unwrapResult
                 )
 
