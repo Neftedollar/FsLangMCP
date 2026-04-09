@@ -840,20 +840,25 @@ type private FcsBridge() =
             |> Option.defaultValue ""
         $"{pp}::{po}"
 
-    member private _.LoadProjectOptionsFromFsproj(fsprojPath: string) : FSharpProjectOptions option =
-        try
-            let projectDir = Path.GetDirectoryName(fsprojPath)
-            let toolsPath = Init.init (DirectoryInfo(projectDir)) None
-            let loader = WorkspaceLoader.Create(toolsPath, [])
-            let projects = loader.LoadProjects([ fsprojPath ]) |> Seq.toList
-            match projects with
-            | proj :: _ ->
-                let fcsOpts = FCS.mapToFSharpProjectOptions proj (projects |> Seq.map id)
-                Some fcsOpts
-            | [] -> None
-        with ex ->
-            Console.Error.WriteLine($"[proj-info] Failed to load {fsprojPath}: {ex.Message}")
-            None
+    member private _.LoadProjectOptionsFromFsproj(fsprojPath: string) : Task<FSharpProjectOptions option> =
+        // Offload to thread pool — MSBuild/SDK probing is CPU+IO bound.
+        // Assumption: Init.init and WorkspaceLoader do not rely on thread-local or
+        // SynchronizationContext state (safe for file-system-based SDK resolution).
+        Task.Run(fun () ->
+            try
+                let projectDir = Path.GetDirectoryName(fsprojPath)
+                let toolsPath = Init.init (DirectoryInfo(projectDir)) None
+                let loader = WorkspaceLoader.Create(toolsPath, [])
+                let projects = loader.LoadProjects([ fsprojPath ]) |> Seq.toList
+                match projects with
+                | proj :: _ ->
+                    let fcsOpts = FCS.mapToFSharpProjectOptions proj (projects |> Seq.map id)
+                    Some fcsOpts
+                | [] -> None
+            with ex ->
+                Console.Error.WriteLine($"[proj-info] Failed to load {fsprojPath}: {ex.Message}")
+                None
+        )
 
     member private this.ResolveProjectOptions
         (path: string, text: string, projectPath: string option, projectOptions: string list option)
@@ -888,7 +893,8 @@ type private FcsBridge() =
                         return cached, "auto-discovered"
                     | None ->
                         // Try real MSBuild loading via Ionide.ProjInfo.FCS
-                        match this.LoadProjectOptionsFromFsproj(fsprojPath) with
+                        let! projInfoResult = this.LoadProjectOptionsFromFsproj(fsprojPath)
+                        match projInfoResult with
                         | Some projOpts ->
                             optionsCache.Set(fsprojKey, projOpts)
                             return projOpts, "ionide-proj-info"
