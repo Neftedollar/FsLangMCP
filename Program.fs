@@ -152,6 +152,7 @@ type private FsAutoCompleteBridge() =
     let diagnostics = ConcurrentDictionary<string, JToken>()
     [<VolatileField>]
     let mutable rpc: JsonRpc option = None
+    [<VolatileField>]
     let mutable lspProcess: Process option = None
     [<VolatileField>]
     let mutable runtimeProjectPath: string option = None
@@ -160,6 +161,7 @@ type private FsAutoCompleteBridge() =
     let workspaceReadyEvent = new ManualResetEventSlim(false)
     [<VolatileField>]
     let mutable workspaceReady = false
+    [<VolatileField>]
     let mutable stderrPump: Task option = None
 
     let parseArgs (raw: string option) =
