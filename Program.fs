@@ -1313,6 +1313,9 @@ let private toolResult (work: Task<JToken>) : Task<Result<Content list, McpError
         | :? ArgumentException as ex ->
             let err = InvalidArgs ex.Message
             return Error(McpError.TransportError (toolErrorToJson err))
+        // Guard for external process exceptions that surface "not ready" text.
+        // Note: current not-ready paths return via NotReadyResponse() (no exception),
+        // so this arm is defensive — it would fire if a future external dep raises.
         | ex when ex.Message.IndexOf("not ready", StringComparison.OrdinalIgnoreCase) >= 0
                || ex.Message.IndexOf("NotReady", StringComparison.Ordinal) >= 0 ->
             let err = NotReady ex.Message
