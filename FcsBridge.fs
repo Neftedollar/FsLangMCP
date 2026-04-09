@@ -28,7 +28,7 @@ let private findNearestFsproj (filePath: string) : string option =
 
 // ─── FcsBridge ─────────────────────────────────────────────────────────────────
 
-type FcsBridge() =
+type internal FcsBridge() =
     let checker =
         FSharpChecker.Create(
             keepAssemblyContents = true,

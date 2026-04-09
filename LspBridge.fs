@@ -40,7 +40,7 @@ type private WorkspaceLoadTarget(setReady: unit -> unit) =
 
 // ─── FsAutoCompleteBridge ──────────────────────────────────────────────────────
 
-type FsAutoCompleteBridge() =
+type internal FsAutoCompleteBridge() =
     let gate = new SemaphoreSlim(1, 1)
     let documents = ConcurrentDictionary<string, LspDocumentState>()
     let diagnostics = ConcurrentDictionary<string, JToken>()

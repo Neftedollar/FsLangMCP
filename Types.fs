@@ -106,7 +106,7 @@ type FcsGetProjectOptionsArgs = { projectPath: string }
 
 // ─── CLI parse result ──────────────────────────────────────────────────────────
 
-type CliParseResult =
+type internal CliParseResult =
     | Start
     | BootstrapTools
     | ShowHelp of string
@@ -123,7 +123,6 @@ let jobj (props: (string * JToken) list) =
 let jstr (value: string) = JValue(value) :> JToken
 let jint (value: int) = JValue(value) :> JToken
 let jbool (value: bool) = JValue(value) :> JToken
-let jarray (items: JToken seq) = JArray(items) :> JToken
 
 let toFileUri (path: string) =
     let fullPath = Path.GetFullPath(path)
