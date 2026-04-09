@@ -848,6 +848,9 @@ type private FcsBridge() =
         $"{pp}::{po}"
 
     member private _.LoadProjectOptionsFromFsproj(fsprojPath: string) : Task<FSharpProjectOptions option> =
+        // Offload to thread pool — MSBuild/SDK probing is CPU+IO bound.
+        // Assumption: Init.init and WorkspaceLoader do not rely on thread-local or
+        // SynchronizationContext state (safe for file-system-based SDK resolution).
         Task.Run(fun () ->
             try
                 let projectDir = Path.GetDirectoryName(fsprojPath)
