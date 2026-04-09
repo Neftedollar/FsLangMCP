@@ -10,6 +10,7 @@
     <Compile Include="../../BoundedCache.fs" Link="BoundedCache.fs" />
     <Compile Include="../../Types.fs" Link="Types.fs" />
     <Compile Include="../../Tools.fs" Link="Tools.fs" />
+    <Compile Include="TypesToolsTests.fs" />
     <Compile Include="BoundedCacheTests.fs" />
     <Compile Include="FcsBridgeTests.fs" />
   </ItemGroup>
