@@ -1578,10 +1578,16 @@ let main argv =
                                     ) :> JToken
                                 else
                                     // proj-info --fcs --serialize outputs a JSON array; take first element
+                                    if String.IsNullOrWhiteSpace(stdout) then
+                                        return JObject(JProperty("error", "proj-info produced no output")) :> JToken
+                                    else
                                     let token = JToken.Parse(stdout)
                                     let json =
                                         match token with
-                                        | :? JArray as arr when arr.Count > 0 -> arr.[0] :?> JObject
+                                        | :? JArray as arr when arr.Count > 0 ->
+                                            match arr.[0] with
+                                            | :? JObject as obj -> obj
+                                            | other -> JObject(JProperty("warning", sprintf "unexpected element type: %s" (other.Type.ToString())))
                                         | :? JObject as obj -> obj
                                         | _ -> JObject()
                                     let otherOptions =
