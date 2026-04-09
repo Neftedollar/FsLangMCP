@@ -5,23 +5,32 @@ open System.Threading.Tasks
 open FsLangMcp.Types
 open FsMcp.Core
 open FsMcp.Server
-open Newtonsoft.Json
-open Newtonsoft.Json.Linq
+open System.Text.Encodings.Web
+open System.Text.Json
+open System.Text.Json.Nodes
 
 // ─── MCP helpers ───────────────────────────────────────────────────────────────
 
+let private serializeOpts =
+    JsonSerializerOptions(Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping)
+
+let private renderOpts =
+    JsonSerializerOptions(
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        WriteIndented = true)
+
 let toolErrorToJson (err: ToolError) : string =
     match err with
-    | InvalidArgs msg  -> sprintf """{"errorKind":"InvalidArgs","message":%s}"""   (JsonConvert.SerializeObject msg)
-    | NotReady msg     -> sprintf """{"errorKind":"NotReady","message":%s}"""      (JsonConvert.SerializeObject msg)
-    | InfraFailure ex  -> sprintf """{"errorKind":"InfraFailure","message":%s}"""  (JsonConvert.SerializeObject ex.Message)
-    | FcsAborted msg   -> sprintf """{"errorKind":"FcsAborted","message":%s}"""    (JsonConvert.SerializeObject msg)
-    | FileNotFound msg -> sprintf """{"errorKind":"FileNotFound","message":%s}"""  (JsonConvert.SerializeObject msg)
+    | InvalidArgs msg  -> sprintf """{"errorKind":"InvalidArgs","message":%s}"""   (JsonSerializer.Serialize(msg, serializeOpts))
+    | NotReady msg     -> sprintf """{"errorKind":"NotReady","message":%s}"""      (JsonSerializer.Serialize(msg, serializeOpts))
+    | InfraFailure ex  -> sprintf """{"errorKind":"InfraFailure","message":%s}"""  (JsonSerializer.Serialize(ex.Message, serializeOpts))
+    | FcsAborted msg   -> sprintf """{"errorKind":"FcsAborted","message":%s}"""    (JsonSerializer.Serialize(msg, serializeOpts))
+    | FileNotFound msg -> sprintf """{"errorKind":"FileNotFound","message":%s}"""  (JsonSerializer.Serialize(msg, serializeOpts))
 
-let renderToken (token: JToken) =
-    token.ToString(Formatting.Indented)
+let renderToken (token: JsonNode) =
+    JsonSerializer.Serialize(token, renderOpts)
 
-let toolResult (work: Task<JToken>) : Task<Result<Content list, McpError>> =
+let toolResult (work: Task<JsonNode>) : Task<Result<Content list, McpError>> =
     task {
         try
             let! payload = work

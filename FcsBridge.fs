@@ -11,7 +11,8 @@ open FSharp.Compiler.Diagnostics
 open FSharp.Compiler.Symbols
 open FSharp.Compiler.Text
 open FSharp.Compiler.EditorServices
-open Newtonsoft.Json.Linq
+open System.Text.Json
+open System.Text.Json.Nodes
 open Ionide.ProjInfo
 open Ionide.ProjInfo.Types
 
@@ -43,62 +44,58 @@ type internal FcsBridge() =
     let asTask (workflow: Async<'T>) : Task<'T> =
         Async.StartAsTask(workflow, cancellationToken = CancellationToken.None)
 
-    let jstrOrNull (value: string) =
-        if String.IsNullOrWhiteSpace(value) then JValue.CreateNull() :> JToken else JValue(value) :> JToken
+    let jstrOrNull (value: string) : JsonNode =
+        if String.IsNullOrWhiteSpace(value) then null else JsonValue.Create(value)
 
-    let rangeToJson (r: range) =
-        JObject(
-            JProperty("file", normalizePath r.FileName),
-            JProperty("startLine", r.StartLine),
-            JProperty("startColumn", r.StartColumn),
-            JProperty("endLine", r.EndLine),
-            JProperty("endColumn", r.EndColumn)
-        )
-        :> JToken
+    let rangeToJson (r: range) : JsonNode =
+        jobj
+            [ "file", jstr (normalizePath r.FileName)
+              "startLine", jint r.StartLine
+              "startColumn", jint r.StartColumn
+              "endLine", jint r.EndLine
+              "endColumn", jint r.EndColumn ]
+        :> JsonNode
 
-    let positionToJson (p: Position) =
-        JObject(JProperty("line", p.Line), JProperty("column", p.Column)) :> JToken
+    let positionToJson (p: Position) : JsonNode =
+        jobj [ "line", jint p.Line; "column", jint p.Column ] :> JsonNode
 
-    let diagnosticToJson (d: FSharpDiagnostic) =
-        JObject(
-            JProperty("file", normalizePath d.FileName),
-            JProperty("message", d.Message),
-            JProperty("severity", d.Severity.ToString()),
-            JProperty("errorNumber", d.ErrorNumber),
-            JProperty("errorNumberText", d.ErrorNumberText),
-            JProperty("subcategory", d.Subcategory),
-            JProperty("range", rangeToJson d.Range),
-            JProperty("start", positionToJson d.Start),
-            JProperty("end", positionToJson d.End)
-        )
-        :> JToken
+    let diagnosticToJson (d: FSharpDiagnostic) : JsonNode =
+        jobj
+            [ "file", jstr (normalizePath d.FileName)
+              "message", jstr d.Message
+              "severity", jstr (d.Severity.ToString())
+              "errorNumber", jint d.ErrorNumber
+              "errorNumberText", jstr d.ErrorNumberText
+              "subcategory", jstr d.Subcategory
+              "range", rangeToJson d.Range
+              "start", positionToJson d.Start
+              "end", positionToJson d.End ]
+        :> JsonNode
 
-    let symbolToJson (symbol: FSharpSymbol) =
+    let symbolToJson (symbol: FSharpSymbol) : JsonNode =
         let declarationLocation =
             match symbol.DeclarationLocation with
             | Some r -> rangeToJson r
-            | None -> JValue.CreateNull() :> JToken
+            | None -> null
 
-        JObject(
-            JProperty("displayName", symbol.DisplayName),
-            JProperty("fullName", jstrOrNull symbol.FullName),
-            JProperty("assembly", symbol.Assembly.SimpleName),
-            JProperty("declarationLocation", declarationLocation),
-            JProperty("isExplicitlySuppressed", symbol.IsExplicitlySuppressed)
-        )
-        :> JToken
+        jobj
+            [ "displayName", jstr symbol.DisplayName
+              "fullName", jstrOrNull symbol.FullName
+              "assembly", jstr symbol.Assembly.SimpleName
+              "declarationLocation", declarationLocation
+              "isExplicitlySuppressed", jbool symbol.IsExplicitlySuppressed ]
+        :> JsonNode
 
-    let symbolUseToJson (symbolUse: FSharpSymbolUse) =
-        JObject(
-            JProperty("file", normalizePath symbolUse.FileName),
-            JProperty("range", rangeToJson symbolUse.Range),
-            JProperty("isFromDefinition", symbolUse.IsFromDefinition),
-            JProperty("isFromUse", symbolUse.IsFromUse),
-            JProperty("isFromPattern", symbolUse.IsFromPattern),
-            JProperty("isFromAttribute", symbolUse.IsFromAttribute),
-            JProperty("symbol", symbolToJson symbolUse.Symbol)
-        )
-        :> JToken
+    let symbolUseToJson (symbolUse: FSharpSymbolUse) : JsonNode =
+        jobj
+            [ "file", jstr (normalizePath symbolUse.FileName)
+              "range", rangeToJson symbolUse.Range
+              "isFromDefinition", jbool symbolUse.IsFromDefinition
+              "isFromUse", jbool symbolUse.IsFromUse
+              "isFromPattern", jbool symbolUse.IsFromPattern
+              "isFromAttribute", jbool symbolUse.IsFromAttribute
+              "symbol", symbolToJson symbolUse.Symbol ]
+        :> JsonNode
 
     // Build a stable cache key from projectPath and projectOptions list
     let makeCacheKey (projectPath: string option) (projectOptions: string list option) =
@@ -213,7 +210,7 @@ type internal FcsBridge() =
             return fullPath, source, optionsSource, options, parseResults, checkedResults
         }
 
-    member this.ParseAndCheckFile(args: FcsParseAndCheckArgs) : Task<JToken> =
+    member this.ParseAndCheckFile(args: FcsParseAndCheckArgs) : Task<JsonNode> =
         task {
             let! path, _, optionsSource, projectOptions, parseResults, checkedResults =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
@@ -228,21 +225,21 @@ type internal FcsBridge() =
             let status = if checkedResults.IsSome then "succeeded" else "aborted"
 
             return
-                JObject(
-                    JProperty("status", status),
-                    JProperty("file", path),
-                    JProperty("optionsSource", optionsSource),
-                    JProperty("projectFileName", projectOptions.ProjectFileName),
-                    JProperty("projectSourceFiles", JArray(projectOptions.SourceFiles)),
-                    JProperty("parseHadErrors", parseResults.ParseHadErrors),
-                    JProperty("hasFullTypeCheckInfo", hasTypeCheckInfo),
-                    JProperty("parseDiagnostics", JArray(parseDiagnostics)),
-                    JProperty("checkDiagnostics", JArray(checkDiagnostics))
-                )
-                :> JToken
+                jobj
+                    [ "status", jstr status
+                      "file", jstr path
+                      "optionsSource", jstr optionsSource
+                      "projectFileName", jstr projectOptions.ProjectFileName
+                      "projectSourceFiles",
+                      JsonArray(projectOptions.SourceFiles |> Array.map jstr) :> JsonNode
+                      "parseHadErrors", jbool parseResults.ParseHadErrors
+                      "hasFullTypeCheckInfo", jbool hasTypeCheckInfo
+                      "parseDiagnostics", JsonArray(parseDiagnostics) :> JsonNode
+                      "checkDiagnostics", JsonArray(checkDiagnostics) :> JsonNode ]
+                :> JsonNode
         }
 
-    member this.FileSymbols(args: FcsFileSymbolsArgs) : Task<JToken> =
+    member this.FileSymbols(args: FcsFileSymbolsArgs) : Task<JsonNode> =
         task {
             let! path, _, optionsSource, _, parseResults, checkedResults =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
@@ -250,15 +247,15 @@ type internal FcsBridge() =
             match checkedResults with
             | None ->
                 return
-                    JObject(
-                        JProperty("status", "aborted"),
-                        JProperty("file", path),
-                        JProperty("optionsSource", optionsSource),
-                        JProperty("parseHadErrors", parseResults.ParseHadErrors),
-                        JProperty("message", "Type checking was aborted. Symbols are unavailable."),
-                        JProperty("parseDiagnostics", JArray(parseResults.Diagnostics |> Array.map diagnosticToJson))
-                    )
-                    :> JToken
+                    jobj
+                        [ "status", jstr "aborted"
+                          "file", jstr path
+                          "optionsSource", jstr optionsSource
+                          "parseHadErrors", jbool parseResults.ParseHadErrors
+                          "message", jstr "Type checking was aborted. Symbols are unavailable."
+                          "parseDiagnostics",
+                          JsonArray(parseResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ]
+                    :> JsonNode
             | Some checkResults ->
                 let includeAllUses = args.includeAllUses |> Option.defaultValue false
                 let maxResults = args.maxResults |> Option.defaultValue 200
@@ -277,20 +274,21 @@ type internal FcsBridge() =
                     |> Seq.toArray
 
                 return
-                    JObject(
-                        JProperty("status", "succeeded"),
-                        JProperty("file", path),
-                        JProperty("optionsSource", optionsSource),
-                        JProperty("includeAllUses", includeAllUses),
-                        JProperty("count", symbols.Length),
-                        JProperty("symbols", JArray(symbols)),
-                        JProperty("parseDiagnostics", JArray(parseResults.Diagnostics |> Array.map diagnosticToJson)),
-                        JProperty("checkDiagnostics", JArray(checkResults.Diagnostics |> Array.map diagnosticToJson))
-                    )
-                    :> JToken
+                    jobj
+                        [ "status", jstr "succeeded"
+                          "file", jstr path
+                          "optionsSource", jstr optionsSource
+                          "includeAllUses", jbool includeAllUses
+                          "count", jint symbols.Length
+                          "symbols", JsonArray(symbols) :> JsonNode
+                          "parseDiagnostics",
+                          JsonArray(parseResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode
+                          "checkDiagnostics",
+                          JsonArray(checkResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ]
+                    :> JsonNode
         }
 
-    member this.ProjectSymbolUses(args: FcsProjectSymbolUsesArgs) : Task<JToken> =
+    member this.ProjectSymbolUses(args: FcsProjectSymbolUsesArgs) : Task<JsonNode> =
         task {
             let query = args.symbolQuery.Trim()
 
@@ -341,22 +339,22 @@ type internal FcsBridge() =
                 |> Seq.toArray
 
             return
-                JObject(
-                    JProperty("status", "succeeded"),
-                    JProperty("optionsSource", optionsSource),
-                    JProperty("projectFileName", projectOptions.ProjectFileName),
-                    JProperty("query", query),
-                    JProperty("exact", exact),
-                    JProperty("cached", cached),
-                    JProperty("totalProjectSymbolUses", allUses.Length),
-                    JProperty("matchedCount", matchedUses.Length),
-                    JProperty("uses", JArray(matchedUses)),
-                    JProperty("projectDiagnostics", JArray(projectResults.Diagnostics |> Array.map diagnosticToJson))
-                )
-                :> JToken
+                jobj
+                    [ "status", jstr "succeeded"
+                      "optionsSource", jstr optionsSource
+                      "projectFileName", jstr projectOptions.ProjectFileName
+                      "query", jstr query
+                      "exact", jbool exact
+                      "cached", jbool cached
+                      "totalProjectSymbolUses", jint allUses.Length
+                      "matchedCount", jint matchedUses.Length
+                      "uses", JsonArray(matchedUses) :> JsonNode
+                      "projectDiagnostics",
+                      JsonArray(projectResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ]
+                :> JsonNode
         }
 
-    member this.TypeAtPosition(args: FcsTypeAtPositionArgs) : Task<JToken> =
+    member this.TypeAtPosition(args: FcsTypeAtPositionArgs) : Task<JsonNode> =
         task {
             let! path, source, optionsSource, _, _, checkedResults =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
@@ -364,11 +362,8 @@ type internal FcsBridge() =
             match checkedResults with
             | None ->
                 return
-                    JObject(
-                        JProperty("status", "aborted"),
-                        JProperty("message", "Type checking was aborted.")
-                    )
-                    :> JToken
+                    jobj [ "status", jstr "aborted"; "message", jstr "Type checking was aborted." ]
+                    :> JsonNode
             | Some checkResults ->
                 // FCS uses 1-based lines; assume input is 0-based (LSP convention)
                 let fcsLine = args.line + 1
@@ -424,29 +419,27 @@ type internal FcsBridge() =
                 match symbolUse with
                 | None ->
                     return
-                        JObject(
-                            JProperty("status", "no_symbol"),
-                            JProperty("message", "No symbol at this position"),
-                            JProperty("file", path),
-                            JProperty("line", args.line),
-                            JProperty("character", args.character),
-                            JProperty("typeString", typeString)
-                        )
-                        :> JToken
+                        jobj
+                            [ "status", jstr "no_symbol"
+                              "message", jstr "No symbol at this position"
+                              "file", jstr path
+                              "line", jint args.line
+                              "character", jint args.character
+                              "typeString", jstr typeString ]
+                        :> JsonNode
                 | Some su ->
                     return
-                        JObject(
-                            JProperty("status", "ok"),
-                            JProperty("file", path),
-                            JProperty("line", args.line),
-                            JProperty("character", args.character),
-                            JProperty("optionsSource", optionsSource),
-                            JProperty("symbolName", su.Symbol.DisplayName),
-                            JProperty("fullName", jstrOrNull su.Symbol.FullName),
-                            JProperty("typeString", typeString),
-                            JProperty("xmlDoc", xmlDoc)
-                        )
-                        :> JToken
+                        jobj
+                            [ "status", jstr "ok"
+                              "file", jstr path
+                              "line", jint args.line
+                              "character", jint args.character
+                              "optionsSource", jstr optionsSource
+                              "symbolName", jstr su.Symbol.DisplayName
+                              "fullName", jstrOrNull su.Symbol.FullName
+                              "typeString", jstr typeString
+                              "xmlDoc", jstr xmlDoc ]
+                        :> JsonNode
         }
 
     member _.ClearCaches() =
@@ -455,14 +448,11 @@ type internal FcsBridge() =
 
     member private _.BuildSignatureHelpResult
         (path: string, source: string, optionsSource: string, args: FcsSignatureHelpArgs, checkedResults: FSharpCheckFileResults option)
-        : JToken =
+        : JsonNode =
         match checkedResults with
         | None ->
-            JObject(
-                JProperty("status", "aborted"),
-                JProperty("message", "Type checking was aborted.")
-            )
-            :> JToken
+            jobj [ "status", jstr "aborted"; "message", jstr "Type checking was aborted." ]
+            :> JsonNode
         | Some checkResults ->
             // FCS uses 1-based lines; assume input is 0-based (LSP convention)
             let fcsLine = args.line + 1
@@ -489,11 +479,10 @@ type internal FcsBridge() =
                                 paramGroups
                                 |> Seq.collect id
                                 |> Seq.map (fun p ->
-                                    JObject(
-                                        JProperty("name", p.Name |> Option.defaultValue ""),
-                                        JProperty("type", p.Type.BasicQualifiedName)
-                                    )
-                                    :> JToken)
+                                    jobj
+                                        [ "name", jstr (p.Name |> Option.defaultValue "")
+                                          "type", jstr p.Type.BasicQualifiedName ]
+                                    :> JsonNode)
                                 |> Seq.toArray
 
                             let returnType =
@@ -506,41 +495,38 @@ type internal FcsBridge() =
                                 let paramStr =
                                     parameters
                                     |> Array.map (fun p ->
-                                        let pName = p["name"].Value<string>()
-                                        let pType = p["type"].Value<string>()
+                                        let pName = p["name"].GetValue<string>()
+                                        let pType = p["type"].GetValue<string>()
                                         $"{pName}: {pType}")
                                     |> String.concat ", "
                                 $"{m.DisplayName}({paramStr}) -> {returnType}"
 
-                            Some (JObject(
-                                JProperty("signature", signature),
-                                JProperty("parameters", JArray(parameters)),
-                                JProperty("returnType", returnType)
-                            )
-                            :> JToken)
+                            Some (jobj
+                                [ "signature", jstr signature
+                                  "parameters", JsonArray(parameters) :> JsonNode
+                                  "returnType", jstr returnType ]
+                            :> JsonNode)
                         | _ -> None)
                     |> List.toArray
 
             if overloads.Length = 0 then
-                JObject(
-                    JProperty("status", "no_overloads"),
-                    JProperty("file", path),
-                    JProperty("line", args.line),
-                    JProperty("character", args.character)
-                )
-                :> JToken
+                jobj
+                    [ "status", jstr "no_overloads"
+                      "file", jstr path
+                      "line", jint args.line
+                      "character", jint args.character ]
+                :> JsonNode
             else
-                JObject(
-                    JProperty("status", "ok"),
-                    JProperty("file", path),
-                    JProperty("line", args.line),
-                    JProperty("character", args.character),
-                    JProperty("optionsSource", optionsSource),
-                    JProperty("overloads", JArray(overloads))
-                )
-                :> JToken
+                jobj
+                    [ "status", jstr "ok"
+                      "file", jstr path
+                      "line", jint args.line
+                      "character", jint args.character
+                      "optionsSource", jstr optionsSource
+                      "overloads", JsonArray(overloads) :> JsonNode ]
+                :> JsonNode
 
-    member this.SignatureHelp(args: FcsSignatureHelpArgs) : Task<JToken> =
+    member this.SignatureHelp(args: FcsSignatureHelpArgs) : Task<JsonNode> =
         task {
             let! path, source, optionsSource, _, _, checkedResults =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)

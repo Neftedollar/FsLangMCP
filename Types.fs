@@ -2,7 +2,8 @@ module FsLangMcp.Types
 
 open System
 open System.IO
-open Newtonsoft.Json.Linq
+open System.Text.Json
+open System.Text.Json.Nodes
 
 // ─── Tool error DU ─────────────────────────────────────────────────────────────
 
@@ -114,15 +115,15 @@ type internal CliParseResult =
 
 // ─── Helper utility functions ──────────────────────────────────────────────────
 
-let jobj (props: (string * JToken) list) =
-    let result = JObject()
+let jobj (props: (string * JsonNode) list) =
+    let result = JsonObject()
     for (key, value) in props do
         result[key] <- value
     result
 
-let jstr (value: string) = JValue(value) :> JToken
-let jint (value: int) = JValue(value) :> JToken
-let jbool (value: bool) = JValue(value) :> JToken
+let jstr (value: string) : JsonNode = JsonValue.Create(value)
+let jint (value: int) : JsonNode = JsonValue.Create(value)
+let jbool (value: bool) : JsonNode = JsonValue.Create(value)
 
 let toFileUri (path: string) =
     let fullPath = Path.GetFullPath(path)

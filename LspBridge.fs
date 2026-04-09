@@ -7,8 +7,9 @@ open System.Diagnostics
 open System.Threading
 open System.Threading.Tasks
 open FsLangMcp.Types
-open Newtonsoft.Json
-open Newtonsoft.Json.Linq
+open System.Text.Json
+open System.Text.Json.Nodes
+open System.Text.Json.Serialization
 open StreamJsonRpc
 
 // ─── LSP types ─────────────────────────────────────────────────────────────────
@@ -17,24 +18,24 @@ type private LspDocumentState =
     { mutable Version: int
       mutable Text: string }
 
-type private DiagnosticsTarget(store: ConcurrentDictionary<string, JToken>) =
+type private DiagnosticsTarget(store: ConcurrentDictionary<string, JsonNode>) =
     [<JsonRpcMethod("textDocument/publishDiagnostics")>]
-    member _.PublishDiagnostics(payload: JObject) =
+    member _.PublishDiagnostics(payload: JsonObject) =
         let uriToken = payload["uri"]
 
         if not (isNull uriToken) then
-            let uri = uriToken.Value<string>()
+            let uri = uriToken.GetValue<string>()
             let diagnostics = payload["diagnostics"]
-            store[uri] <- if isNull diagnostics then JArray() :> JToken else diagnostics.DeepClone()
+            store[uri] <- if isNull diagnostics then JsonArray() :> JsonNode else diagnostics.DeepClone()
 
 // ─── WorkspaceLoadTarget: tracks fsharp/workspaceLoad notification ─────────────
 
 type private WorkspaceLoadTarget(setReady: unit -> unit) =
     [<JsonRpcMethod("fsharp/workspaceLoad")>]
-    member _.WorkspaceLoad(payload: JObject) =
+    member _.WorkspaceLoad(payload: JsonObject) =
         let statusToken = payload["status"]
         if not (isNull statusToken) then
-            let status = statusToken.Value<string>()
+            let status = statusToken.GetValue<string>()
             if String.Equals(status, "finished", StringComparison.OrdinalIgnoreCase) then
                 setReady ()
 
@@ -43,7 +44,7 @@ type private WorkspaceLoadTarget(setReady: unit -> unit) =
 type internal FsAutoCompleteBridge() =
     let gate = new SemaphoreSlim(1, 1)
     let documents = ConcurrentDictionary<string, LspDocumentState>()
-    let diagnostics = ConcurrentDictionary<string, JToken>()
+    let diagnostics = ConcurrentDictionary<string, JsonNode>()
     [<VolatileField>]
     let mutable rpc: JsonRpc option = None
     [<VolatileField>]
@@ -144,14 +145,13 @@ type internal FsAutoCompleteBridge() =
         }
 
     // Return not-ready JSON if workspace not loaded yet
-    member _.NotReadyResponse() : JToken =
-        JObject(
-            JProperty("status", "not_ready"),
-            JProperty("message", "fsautocomplete is still loading the project. Try again in a moment.")
-        )
-        :> JToken
+    member _.NotReadyResponse() : JsonNode =
+        jobj
+            [ "status", jstr "not_ready"
+              "message", jstr "fsautocomplete is still loading the project. Try again in a moment." ]
+        :> JsonNode
 
-    member this.SetProject(args: SetProjectArgs) : Task<JToken> =
+    member this.SetProject(args: SetProjectArgs) : Task<JsonNode> =
         task {
             let projectPath = Path.GetFullPath(args.projectPath)
 
@@ -211,32 +211,32 @@ type internal FsAutoCompleteBridge() =
                 let loadStatus = if ready then "ready" else "timeout"
 
                 return
-                    JObject(
-                        JProperty("status", "ok"),
-                        JProperty("result", JObject(
-                            JProperty("projectPath",
-                                capturedProjectPath |> Option.map JValue |> Option.defaultValue (JValue.CreateNull()) :> JToken),
-                            JProperty("workspaceRoot", capturedWorkspaceRoot),
-                            JProperty("lspRestarted", restartLsp),
-                            JProperty("solutionMode", isSolution),
-                            JProperty("workspaceLoadStatus", loadStatus)
-                        ))
-                    )
-                    :> JToken
+                    jobj
+                        [ "status", jstr "ok"
+                          "result",
+                          jobj
+                              [ "projectPath",
+                                capturedProjectPath |> Option.map jstr |> Option.defaultValue null
+                                "workspaceRoot", jstr capturedWorkspaceRoot
+                                "lspRestarted", jbool restartLsp
+                                "solutionMode", jbool isSolution
+                                "workspaceLoadStatus", jstr loadStatus ]
+                          :> JsonNode ]
+                    :> JsonNode
             else
                 return
-                    JObject(
-                        JProperty("status", "ok"),
-                        JProperty("result", JObject(
-                            JProperty("projectPath",
-                                capturedProjectPath |> Option.map JValue |> Option.defaultValue (JValue.CreateNull()) :> JToken),
-                            JProperty("workspaceRoot", capturedWorkspaceRoot),
-                            JProperty("lspRestarted", restartLsp),
-                            JProperty("solutionMode", isSolution),
-                            JProperty("workspaceLoadStatus", "not_started")
-                        ))
-                    )
-                    :> JToken
+                    jobj
+                        [ "status", jstr "ok"
+                          "result",
+                          jobj
+                              [ "projectPath",
+                                capturedProjectPath |> Option.map jstr |> Option.defaultValue null
+                                "workspaceRoot", jstr capturedWorkspaceRoot
+                                "lspRestarted", jbool restartLsp
+                                "solutionMode", jbool isSolution
+                                "workspaceLoadStatus", jstr "not_started" ]
+                          :> JsonNode ]
+                    :> JsonNode
         }
 
     // StartLspUnsafe: assumes gate is already held by caller
@@ -288,8 +288,10 @@ type internal FsAutoCompleteBridge() =
 
             stderrPump <- Some pumpStderr
 
-            let formatter = new JsonMessageFormatter()
-            formatter.JsonSerializer.NullValueHandling <- NullValueHandling.Ignore
+            let formatter = new SystemTextJsonFormatter()
+            let formatterOpts = JsonSerializerOptions()
+            formatterOpts.DefaultIgnoreCondition <- JsonIgnoreCondition.WhenWritingNull
+            formatter.JsonSerializerOptions <- formatterOpts
 
             let handler =
                 new HeaderDelimitedMessageHandler(
@@ -315,7 +317,7 @@ type internal FsAutoCompleteBridge() =
                       "trace", jstr "off"
                       "clientInfo", jobj [ "name", jstr "fsmcp-fsharp"; "version", jstr "0.1.0" ]
                       "workspaceFolders",
-                      JArray(jobj [ "uri", jstr rootUri; "name", jstr workspaceName ]) :> JToken
+                      JsonArray(jobj [ "uri", jstr rootUri; "name", jstr workspaceName ] :> JsonNode) :> JsonNode
                       "capabilities",
                       jobj
                           [ "workspace", jobj [ "workspaceFolders", jbool true ]
@@ -324,8 +326,8 @@ type internal FsAutoCompleteBridge() =
                                 [ "completion",
                                   jobj [ "completionItem", jobj [ "snippetSupport", jbool true ] ] ] ] ]
 
-            let! _ = jsonRpc.InvokeWithParameterObjectAsync<JToken>("initialize", initializeParams)
-            do! jsonRpc.NotifyWithParameterObjectAsync("initialized", JObject())
+            let! _ = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("initialize", initializeParams)
+            do! jsonRpc.NotifyWithParameterObjectAsync("initialized", JsonObject())
 
             rpc <- Some jsonRpc
             lspProcess <- Some fsacProc
@@ -361,7 +363,7 @@ type internal FsAutoCompleteBridge() =
                 let didChangeParams =
                     jobj
                         [ "textDocument", jobj [ "uri", jstr uri; "version", jint state.Version ]
-                          "contentChanges", JArray(jobj [ "text", jstr text ]) :> JToken ]
+                          "contentChanges", JsonArray(jobj [ "text", jstr text ] :> JsonNode) :> JsonNode ]
 
                 do! jsonRpc.NotifyWithParameterObjectAsync("textDocument/didChange", didChangeParams)
                 return uri
@@ -383,8 +385,8 @@ type internal FsAutoCompleteBridge() =
 
     // WithDocument: gate wraps only SyncDocument; released before LSP invoke
     member private this.WithDocument
-        (path: string, providedText: string option, methodName: string, mkParams: string -> JObject)
-        : Task<JToken> =
+        (path: string, providedText: string option, methodName: string, mkParams: string -> JsonObject)
+        : Task<JsonNode> =
         task {
             let! jsonRpc = this.EnsureStarted()
 
@@ -404,11 +406,11 @@ type internal FsAutoCompleteBridge() =
 
             // Gate released — StreamJsonRpc handles concurrent requests natively
             let parameters = mkParams uri
-            let! response = jsonRpc.InvokeWithParameterObjectAsync<JToken>(methodName, parameters)
-            return JObject(JProperty("status", "ok"), JProperty("result", response)) :> JToken
+            let! response = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>(methodName, parameters)
+            return jobj [ "status", jstr "ok"; "result", response ] :> JsonNode
         }
 
-    member private this.PositionParams(uri: string, line: int, character: int) =
+    member private this.PositionParams(uri: string, line: int, character: int) : JsonObject =
         jobj
             [ "textDocument", jobj [ "uri", jstr uri ]
               "position", jobj [ "line", jint line; "character", jint character ] ]
@@ -423,7 +425,7 @@ type internal FsAutoCompleteBridge() =
 
                 match args.triggerCharacter with
                 | Some ch ->
-                    parameters["context"] <- jobj [ "triggerKind", jint 2; "triggerCharacter", jstr ch ]
+                    parameters["context"] <- jobj [ "triggerKind", jint 2; "triggerCharacter", jstr ch ] :> JsonNode
                     parameters
                 | None -> parameters
         )
@@ -448,11 +450,12 @@ type internal FsAutoCompleteBridge() =
                     jobj
                         [ "includeDeclaration",
                           jbool (args.includeDeclaration |> Option.defaultValue false) ]
+                    :> JsonNode
 
                 baseParams
         )
 
-    member this.WorkspaceSymbol(args: WorkspaceSymbolArgs) : Task<JToken> =
+    member this.WorkspaceSymbol(args: WorkspaceSymbolArgs) : Task<JsonNode> =
         task {
             let! jsonRpc = this.EnsureStarted()
 
@@ -462,31 +465,31 @@ type internal FsAutoCompleteBridge() =
 
             // No document sync needed — just invoke directly, no gate
             let parameters = jobj [ "query", jstr args.query ]
-            let! response = jsonRpc.InvokeWithParameterObjectAsync<JToken>("workspace/symbol", parameters)
-            return JObject(JProperty("status", "ok"), JProperty("result", response)) :> JToken
+            let! response = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("workspace/symbol", parameters)
+            return jobj [ "status", jstr "ok"; "result", response ] :> JsonNode
         }
 
-    member _.Diagnostics(args: DiagnosticsArgs) : Task<JToken> =
+    member _.Diagnostics(args: DiagnosticsArgs) : Task<JsonNode> =
         task {
             let resolveByUri (uri: string) =
                 match diagnostics.TryGetValue(uri) with
                 | true, payload -> payload.DeepClone()
-                | false, _ -> JArray() :> JToken
+                | false, _ -> JsonArray() :> JsonNode
 
             match args.path with
             | Some path ->
                 let uri = toFileUri path
-                return JObject(JProperty("status", "ok"), JProperty("result", resolveByUri uri)) :> JToken
+                return jobj [ "status", jstr "ok"; "result", resolveByUri uri ] :> JsonNode
             | None ->
-                let root = JObject()
+                let root = JsonObject()
 
                 for KeyValue(uri, payload) in diagnostics do
                     root[uri] <- payload.DeepClone()
 
-                return JObject(JProperty("status", "ok"), JProperty("result", root)) :> JToken
+                return jobj [ "status", jstr "ok"; "result", root :> JsonNode ] :> JsonNode
         }
 
-    member this.Formatting(args: FormattingArgs) : Task<JToken> =
+    member this.Formatting(args: FormattingArgs) : Task<JsonNode> =
         task {
             let! jsonRpc = this.EnsureStarted()
 
@@ -508,26 +511,23 @@ type internal FsAutoCompleteBridge() =
                 }
 
             let formatParams =
-                JObject(
-                    JProperty("textDocument", JObject(JProperty("uri", uri))),
-                    JProperty("options", JObject(
-                        JProperty("tabSize", 4),
-                        JProperty("insertSpaces", true)))
-                )
+                jobj
+                    [ "textDocument", jobj [ "uri", jstr uri ]
+                      "options", jobj [ "tabSize", jint 4; "insertSpaces", jbool true ] ]
 
-            let! editsToken = jsonRpc.InvokeWithParameterObjectAsync<JToken>("textDocument/formatting", formatParams)
+            let! editsToken = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("textDocument/formatting", formatParams)
 
             // Apply text edits to produce formatted result
-            let applyEdits (text: string) (edits: JArray) =
+            let applyEdits (text: string) (edits: JsonArray) =
                 // Sort edits in reverse order (bottom to top) to preserve positions
-                let getRangeStart (e: JToken) =
+                let getRangeStart (e: JsonNode) =
                     let r = e["range"]
                     let s = r["start"]
-                    s["line"].Value<int>(), s["character"].Value<int>()
+                    s["line"].GetValue<int>(), s["character"].GetValue<int>()
 
                 let sortedEdits =
                     edits
-                    |> Seq.cast<JToken>
+                    |> Seq.cast<JsonNode>
                     |> Seq.sortByDescending (fun e ->
                         let sl, sc = getRangeStart e
                         sl, sc)
@@ -535,15 +535,15 @@ type internal FsAutoCompleteBridge() =
 
                 let lines = text.Split('\n') |> Array.map (fun l -> l.TrimEnd('\r'))
 
-                let applyEdit (linesArr: string array) (edit: JToken) =
+                let applyEdit (linesArr: string array) (edit: JsonNode) =
                     let range = edit["range"]
                     let startPos = range["start"]
                     let endPos = range["end"]
-                    let startLine = startPos["line"].Value<int>()
-                    let startChar = startPos["character"].Value<int>()
-                    let endLine = endPos["line"].Value<int>()
-                    let endChar = endPos["character"].Value<int>()
-                    let newText = edit["newText"].Value<string>()
+                    let startLine = startPos["line"].GetValue<int>()
+                    let startChar = startPos["character"].GetValue<int>()
+                    let endLine = endPos["line"].GetValue<int>()
+                    let endChar = endPos["character"].GetValue<int>()
+                    let newText = edit["newText"].GetValue<string>()
 
                     let before =
                         if startLine < linesArr.Length && startChar > 0 then
@@ -574,46 +574,46 @@ type internal FsAutoCompleteBridge() =
 
             let formatted =
                 match editsToken with
-                | :? JArray as edits when edits.Count > 0 ->
+                | :? JsonArray as edits when edits.Count > 0 ->
                     applyEdits originalText edits
                 | _ -> originalText
 
             return
-                JObject(
-                    JProperty("status", "ok"),
-                    JProperty("result", JObject(
-                        JProperty("formatted", formatted),
-                        JProperty("edits", if editsToken :? JArray then editsToken else JArray() :> JToken)
-                    ))
-                )
-                :> JToken
+                jobj
+                    [ "status", jstr "ok"
+                      "result",
+                      jobj
+                          [ "formatted", jstr formatted
+                            "edits",
+                            (match editsToken with
+                             | :? JsonArray -> editsToken
+                             | _ -> JsonArray() :> JsonNode) ] :> JsonNode ]
+                :> JsonNode
         }
 
-    member this.CodeAction(args: CodeActionArgs) : Task<JToken> =
+    member this.CodeAction(args: CodeActionArgs) : Task<JsonNode> =
         this.WithDocument(
             args.path,
             args.text,
             "textDocument/codeAction",
             fun uri ->
-                let pos = JObject(JProperty("line", args.line), JProperty("character", args.character))
-                JObject(
-                    JProperty("textDocument", JObject(JProperty("uri", uri))),
-                    JProperty("range", JObject(JProperty("start", pos), JProperty("end", pos))),
-                    JProperty("context", JObject(JProperty("diagnostics", JArray())))
-                )
+                let pos = jobj [ "line", jint args.line; "character", jint args.character ]
+                jobj
+                    [ "textDocument", jobj [ "uri", jstr uri ]
+                      "range", jobj [ "start", pos :> JsonNode; "end", pos :> JsonNode ]
+                      "context", jobj [ "diagnostics", JsonArray() :> JsonNode ] ]
         )
 
-    member this.Rename(args: RenameArgs) : Task<JToken> =
+    member this.Rename(args: RenameArgs) : Task<JsonNode> =
         this.WithDocument(
             args.path,
             args.text,
             "textDocument/rename",
             fun uri ->
-                JObject(
-                    JProperty("textDocument", JObject(JProperty("uri", uri))),
-                    JProperty("position", JObject(JProperty("line", args.line), JProperty("character", args.character))),
-                    JProperty("newName", args.newName)
-                )
+                jobj
+                    [ "textDocument", jobj [ "uri", jstr uri ]
+                      "position", jobj [ "line", jint args.line; "character", jint args.character ]
+                      "newName", jstr args.newName ]
         )
 
     interface IDisposable with
