@@ -15,6 +15,8 @@ open FSharp.Compiler.EditorServices
 open Newtonsoft.Json
 open Newtonsoft.Json.Linq
 open StreamJsonRpc
+open Ionide.ProjInfo
+open Ionide.ProjInfo.Types
 
 // ─── Shared arg types ──────────────────────────────────────────────────────────
 
@@ -307,17 +309,24 @@ type private FsAutoCompleteBridge() =
                         runtimeProjectPath |> Option.defaultValue "")
                     Environment.SetEnvironmentVariable("FSA_WORKSPACE_ROOT", resolvedWorkspace)
 
-                    if restartLsp then
-                        this.StopLspUnsafe()
-
                     runtimeProjectPath, resolvedWorkspace
+                with ex ->
+                    gate.Release() |> ignore
+                    reraise()
+
+            // Call StartLspUnsafe while still holding the gate — atomic stop+start
+            if restartLsp then
+                try
+                    this.StopLspUnsafe()
+                    let! _ = this.StartLspUnsafe()
+                    ()
                 finally
                     gate.Release() |> ignore
+            else
+                gate.Release() |> ignore
 
-            // After releasing gate, wait for workspace to be ready if we restarted
+            // Wait for workspace to be ready outside the gate
             if restartLsp then
-                // Trigger EnsureStarted so we begin LSP and start listening for workspaceLoad
-                let! _ = this.EnsureStarted()
                 let! ready = this.WaitForReady(TimeSpan.FromSeconds(30.0))
                 let loadStatus = if ready then "ready" else "timeout"
 
@@ -346,107 +355,110 @@ type private FsAutoCompleteBridge() =
                     :> JToken
         }
 
+    // StartLspUnsafe: assumes gate is already held by caller
+    member private this.StartLspUnsafe() : Task<JsonRpc> =
+        task {
+            let command = fsacCommand ()
+            let args = fsacArgs ()
+            let workspaceRoot = getWorkspaceRoot ()
+
+            let psi = ProcessStartInfo()
+            psi.FileName <- command
+            psi.UseShellExecute <- false
+            psi.RedirectStandardInput <- true
+            psi.RedirectStandardOutput <- true
+            psi.RedirectStandardError <- true
+            psi.CreateNoWindow <- true
+
+            if Directory.Exists(workspaceRoot) then
+                psi.WorkingDirectory <- workspaceRoot
+
+            for arg in args do
+                psi.ArgumentList.Add(arg)
+
+            let fsacProc = new Process(StartInfo = psi)
+
+            if not (fsacProc.Start()) then
+                invalidOp $"Unable to start {command}"
+
+            let pumpStderr : Task =
+                task {
+                    let mutable keepReading = true
+
+                    while keepReading do
+                        let! line = fsacProc.StandardError.ReadLineAsync()
+
+                        if isNull line then
+                            keepReading <- false
+                        elif not (String.IsNullOrWhiteSpace line) then
+                            Console.Error.WriteLine($"[fsautocomplete] {line}")
+                }
+
+            pumpStderr.ContinueWith(
+                (fun (t: Task) ->
+                    if t.IsFaulted then
+                        let ex = t.Exception.GetBaseException()
+                        if not (ex :? ObjectDisposedException) then
+                            Console.Error.WriteLine($"[stderr pump] {ex.Message}")),
+                TaskContinuationOptions.OnlyOnFaulted) |> ignore
+
+            stderrPump <- Some pumpStderr
+
+            let formatter = new JsonMessageFormatter()
+            formatter.JsonSerializer.NullValueHandling <- NullValueHandling.Ignore
+
+            let handler =
+                new HeaderDelimitedMessageHandler(
+                    fsacProc.StandardInput.BaseStream,
+                    fsacProc.StandardOutput.BaseStream,
+                    formatter
+                )
+
+            let jsonRpc = new JsonRpc(handler)
+            jsonRpc.AddLocalRpcTarget(new DiagnosticsTarget(diagnostics)) |> ignore
+            jsonRpc.AddLocalRpcTarget(new WorkspaceLoadTarget(fun () ->
+                workspaceReady <- true
+                workspaceReadyEvent.Set())) |> ignore
+            jsonRpc.StartListening()
+
+            let rootUri = Uri(workspaceRoot).AbsoluteUri
+            let workspaceName = Path.GetFileName(workspaceRoot)
+
+            let initializeParams =
+                jobj
+                    [ "processId", jint Environment.ProcessId
+                      "rootUri", jstr rootUri
+                      "trace", jstr "off"
+                      "clientInfo", jobj [ "name", jstr "fsmcp-fsharp"; "version", jstr "0.1.0" ]
+                      "workspaceFolders",
+                      JArray(jobj [ "uri", jstr rootUri; "name", jstr workspaceName ]) :> JToken
+                      "capabilities",
+                      jobj
+                          [ "workspace", jobj [ "workspaceFolders", jbool true ]
+                            "textDocument",
+                            jobj
+                                [ "completion",
+                                  jobj [ "completionItem", jobj [ "snippetSupport", jbool true ] ] ] ] ]
+
+            let! _ = jsonRpc.InvokeWithParameterObjectAsync<JToken>("initialize", initializeParams)
+            do! jsonRpc.NotifyWithParameterObjectAsync("initialized", JObject())
+
+            rpc <- Some jsonRpc
+            lspProcess <- Some fsacProc
+            return jsonRpc
+        }
+
     member private this.EnsureStarted() : Task<JsonRpc> =
         task {
-            match rpc with
-            | Some existing -> return existing
-            | None ->
-                do! gate.WaitAsync()
-
-                try
-                    match rpc with
-                    | Some existing -> return existing
-                    | None ->
-                        let command = fsacCommand ()
-                        let args = fsacArgs ()
-                        let workspaceRoot = getWorkspaceRoot ()
-
-                        let psi = ProcessStartInfo()
-                        psi.FileName <- command
-                        psi.UseShellExecute <- false
-                        psi.RedirectStandardInput <- true
-                        psi.RedirectStandardOutput <- true
-                        psi.RedirectStandardError <- true
-                        psi.CreateNoWindow <- true
-
-                        if Directory.Exists(workspaceRoot) then
-                            psi.WorkingDirectory <- workspaceRoot
-
-                        for arg in args do
-                            psi.ArgumentList.Add(arg)
-
-                        let fsacProc = new Process(StartInfo = psi)
-
-                        if not (fsacProc.Start()) then
-                            invalidOp $"Unable to start {command}"
-
-                        let pumpStderr : Task =
-                            task {
-                                let mutable keepReading = true
-
-                                while keepReading do
-                                    let! line = fsacProc.StandardError.ReadLineAsync()
-
-                                    if isNull line then
-                                        keepReading <- false
-                                    elif not (String.IsNullOrWhiteSpace line) then
-                                        Console.Error.WriteLine($"[fsautocomplete] {line}")
-                            }
-
-                        pumpStderr.ContinueWith(
-                            (fun (t: Task) ->
-                                if t.IsFaulted then
-                                    let ex = t.Exception.GetBaseException()
-                                    if not (ex :? ObjectDisposedException) then
-                                        Console.Error.WriteLine($"[stderr pump] {ex.Message}")),
-                            TaskContinuationOptions.OnlyOnFaulted) |> ignore
-
-                        stderrPump <- Some pumpStderr
-
-                        let formatter = new JsonMessageFormatter()
-                        formatter.JsonSerializer.NullValueHandling <- NullValueHandling.Ignore
-
-                        let handler =
-                            new HeaderDelimitedMessageHandler(
-                                fsacProc.StandardInput.BaseStream,
-                                fsacProc.StandardOutput.BaseStream,
-                                formatter
-                            )
-
-                        let jsonRpc = new JsonRpc(handler)
-                        jsonRpc.AddLocalRpcTarget(new DiagnosticsTarget(diagnostics)) |> ignore
-                        jsonRpc.AddLocalRpcTarget(new WorkspaceLoadTarget(fun () ->
-                            workspaceReady <- true
-                            workspaceReadyEvent.Set())) |> ignore
-                        jsonRpc.StartListening()
-
-                        let rootUri = Uri(workspaceRoot).AbsoluteUri
-                        let workspaceName = Path.GetFileName(workspaceRoot)
-
-                        let initializeParams =
-                            jobj
-                                [ "processId", jint Environment.ProcessId
-                                  "rootUri", jstr rootUri
-                                  "trace", jstr "off"
-                                  "clientInfo", jobj [ "name", jstr "fsmcp-fsharp"; "version", jstr "0.1.0" ]
-                                  "workspaceFolders",
-                                  JArray(jobj [ "uri", jstr rootUri; "name", jstr workspaceName ]) :> JToken
-                                  "capabilities",
-                                  jobj
-                                      [ "workspace", jobj [ "workspaceFolders", jbool true ]
-                                        "textDocument",
-                                        jobj
-                                            [ "completion",
-                                              jobj [ "completionItem", jobj [ "snippetSupport", jbool true ] ] ] ] ]
-
-                        let! _ = jsonRpc.InvokeWithParameterObjectAsync<JToken>("initialize", initializeParams)
-                        do! jsonRpc.NotifyWithParameterObjectAsync("initialized", JObject())
-
-                        rpc <- Some jsonRpc
-                        lspProcess <- Some fsacProc
-                        return jsonRpc
-                finally
-                    gate.Release() |> ignore
+            do! gate.WaitAsync()
+            try
+                match rpc with
+                | Some existing -> return existing
+                | None ->
+                    let! result = this.StartLspUnsafe()
+                    return result
+            finally
+                gate.Release() |> ignore
         }
 
     member private this.SyncDocument
@@ -723,6 +735,33 @@ type private FsAutoCompleteBridge() =
             this.StopLspUnsafe()
             gate.Dispose()
 
+// ─── BoundedCache ──────────────────────────────────────────────────────────────
+
+type private BoundedCache<'K, 'V when 'K : equality>(maxSize: int) =
+    let dict = System.Collections.Generic.Dictionary<'K, 'V>()
+    let order = System.Collections.Generic.Queue<'K>()
+    let lockObj = obj()
+
+    member _.TryGet(key: 'K) : 'V option =
+        lock lockObj (fun () ->
+            match dict.TryGetValue(key) with
+            | true, v -> Some v
+            | _ -> None)
+
+    member _.Set(key: 'K, value: 'V) =
+        lock lockObj (fun () ->
+            if not (dict.ContainsKey(key)) then
+                if dict.Count >= maxSize then
+                    let oldest = order.Dequeue()
+                    dict.Remove(oldest) |> ignore
+                order.Enqueue(key)
+            dict[key] <- value)
+
+    member _.Clear() =
+        lock lockObj (fun () ->
+            dict.Clear()
+            order.Clear())
+
 // ─── FcsBridge ─────────────────────────────────────────────────────────────────
 
 type private FcsBridge() =
@@ -733,9 +772,9 @@ type private FcsBridge() =
             keepAllBackgroundSymbolUses = true
         )
 
-    // Caches keyed by a string combining projectPath + projectOptions hash
-    let optionsCache = ConcurrentDictionary<string, FSharpProjectOptions>()
-    let projectResultsCache = ConcurrentDictionary<string, FSharpCheckProjectResults>()
+    // Bounded caches keyed by a string combining projectPath + projectOptions hash
+    let optionsCache = BoundedCache<string, FSharpProjectOptions>(10)
+    let projectResultsCache = BoundedCache<string, FSharpCheckProjectResults>(3)
 
     let asTask (workflow: Async<'T>) : Task<'T> =
         Async.StartAsTask(workflow, cancellationToken = CancellationToken.None)
@@ -808,7 +847,22 @@ type private FcsBridge() =
             |> Option.defaultValue ""
         $"{pp}::{po}"
 
-    member private _.ResolveProjectOptions
+    member private _.LoadProjectOptionsFromFsproj(fsprojPath: string) : FSharpProjectOptions option =
+        try
+            let projectDir = Path.GetDirectoryName(fsprojPath)
+            let toolsPath = Init.init (DirectoryInfo(projectDir)) None
+            let loader = WorkspaceLoader.Create(toolsPath, [])
+            let projects = loader.LoadProjects([ fsprojPath ]) |> Seq.toList
+            match projects with
+            | proj :: _ ->
+                let fcsOpts = FCS.mapToFSharpProjectOptions proj (projects |> Seq.map id)
+                Some fcsOpts
+            | [] -> None
+        with ex ->
+            Console.Error.WriteLine($"[proj-info] Failed to load {fsprojPath}: {ex.Message}")
+            None
+
+    member private this.ResolveProjectOptions
         (path: string, text: string, projectPath: string option, projectOptions: string list option)
         : Task<FSharpProjectOptions * string> =
         task {
@@ -822,13 +876,13 @@ type private FcsBridge() =
                     |> Option.defaultValue (Path.ChangeExtension(fullPath, ".fsproj"))
                     |> normalizePath
 
-                match optionsCache.TryGetValue(cacheKey) with
-                | true, cached ->
+                match optionsCache.TryGet(cacheKey) with
+                | Some cached ->
                     return cached, "commandLineArgs"
-                | false, _ ->
+                | None ->
                     let resolvedOptions =
                         checker.GetProjectOptionsFromCommandLineArgs(projectFileName, options |> List.toArray)
-                    optionsCache[cacheKey] <- resolvedOptions
+                    optionsCache.Set(cacheKey, resolvedOptions)
                     return resolvedOptions, "commandLineArgs"
             | _ ->
                 // Try auto-discover .fsproj
@@ -836,29 +890,31 @@ type private FcsBridge() =
                 match discoveredFsproj with
                 | Some fsprojPath ->
                     let fsprojKey = $"fsproj::{fsprojPath}"
-                    match optionsCache.TryGetValue(fsprojKey) with
-                    | true, cached ->
+                    match optionsCache.TryGet(fsprojKey) with
+                    | Some cached ->
                         return cached, "auto-discovered"
-                    | false, _ ->
-                        // Use GetProjectOptionsFromScript as fallback since we can't easily
-                        // call Ionide's MSBuild evaluation without a proper toolsPath setup
-                        let sourceText = SourceText.ofString text
-                        let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
-                        // Override the project file name to the discovered .fsproj
-                        let discovered =
-                            { scriptOptions with
-                                ProjectFileName = fsprojPath }
-                        optionsCache[fsprojKey] <- discovered
-                        return discovered, "auto-discovered-script-fallback"
+                    | None ->
+                        // Try real MSBuild loading via Ionide.ProjInfo.FCS
+                        match this.LoadProjectOptionsFromFsproj(fsprojPath) with
+                        | Some projOpts ->
+                            optionsCache.Set(fsprojKey, projOpts)
+                            return projOpts, "ionide-proj-info"
+                        | None ->
+                            // Fall back to script inference with honest labelling
+                            let sourceText = SourceText.ofString text
+                            let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
+                            let discovered = { scriptOptions with ProjectFileName = fsprojPath }
+                            optionsCache.Set(fsprojKey, discovered)
+                            return discovered, "auto-discovered-script-fallback"
                 | None ->
                     let scriptKey = $"script::{fullPath}"
-                    match optionsCache.TryGetValue(scriptKey) with
-                    | true, cached ->
+                    match optionsCache.TryGet(scriptKey) with
+                    | Some cached ->
                         return cached, "scriptInference"
-                    | false, _ ->
+                    | None ->
                         let sourceText = SourceText.ofString text
                         let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
-                        optionsCache[scriptKey] <- scriptOptions
+                        optionsCache.Set(scriptKey, scriptOptions)
                         return scriptOptions, "scriptInference"
         }
 
@@ -980,12 +1036,12 @@ type private FcsBridge() =
             let cacheKey = makeCacheKey args.projectPath args.projectOptions
             let! projectResults, cached =
                 task {
-                    match projectResultsCache.TryGetValue(cacheKey) with
-                    | true, existing ->
+                    match projectResultsCache.TryGet(cacheKey) with
+                    | Some existing ->
                         return existing, true
-                    | false, _ ->
+                    | None ->
                         let! results = checker.ParseAndCheckProject(projectOptions) |> asTask
-                        projectResultsCache[cacheKey] <- results
+                        projectResultsCache.Set(cacheKey, results)
                         return results, false
                 }
 
