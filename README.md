@@ -1,5 +1,7 @@
 # FsLangMCP (F# + FsMcp + FsAutoComplete + FCS)
 
+[![CI](https://github.com/Neftedollar/FsLangMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/Neftedollar/FsLangMCP/actions/workflows/ci.yml)
+
 An MCP server written in F# that combines:
 
 - `fsautocomplete` (LSP bridge for editor-like features)
