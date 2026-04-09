@@ -25,6 +25,7 @@ type ToolError =
     | NotReady     of string
     | InfraFailure of exn
     | FcsAborted   of string
+    | FileNotFound of string
 
 let private toolErrorToJson (err: ToolError) : string =
     match err with
@@ -32,6 +33,7 @@ let private toolErrorToJson (err: ToolError) : string =
     | NotReady msg     -> sprintf """{"errorKind":"NotReady","message":%s}"""      (Newtonsoft.Json.JsonConvert.SerializeObject msg)
     | InfraFailure ex  -> sprintf """{"errorKind":"InfraFailure","message":%s}"""  (Newtonsoft.Json.JsonConvert.SerializeObject ex.Message)
     | FcsAborted msg   -> sprintf """{"errorKind":"FcsAborted","message":%s}"""    (Newtonsoft.Json.JsonConvert.SerializeObject msg)
+    | FileNotFound msg -> sprintf """{"errorKind":"FileNotFound","message":%s}"""  (Newtonsoft.Json.JsonConvert.SerializeObject msg)
 
 // ─── Shared arg types ──────────────────────────────────────────────────────────
 
@@ -1315,8 +1317,8 @@ let private toolResult (work: Task<JToken>) : Task<Result<Content list, McpError
                || ex.Message.IndexOf("NotReady", StringComparison.Ordinal) >= 0 ->
             let err = NotReady ex.Message
             return Error(McpError.TransportError (toolErrorToJson err))
-        | ex when ex.Message.StartsWith("Invalid", StringComparison.OrdinalIgnoreCase) ->
-            let err = InvalidArgs ex.Message
+        | :? System.IO.FileNotFoundException as ex ->
+            let err = FileNotFound ex.Message
             return Error(McpError.TransportError (toolErrorToJson err))
         | ex ->
             let err = InfraFailure ex
