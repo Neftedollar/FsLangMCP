@@ -106,6 +106,9 @@ type RenameArgs =
       newName: string
       text: string option }
 
+[<CLIMutable>]
+type FcsGetProjectOptionsArgs = { projectPath: string }
+
 // ─── Helper: find nearest .fsproj ──────────────────────────────────────────────
 
 let private findNearestFsproj (filePath: string) : string option =
@@ -1527,6 +1530,57 @@ let main argv =
                         "textDocument_rename"
                         "Renames a symbol at a position via fsautocomplete. line/character are 0-based. Requires set_project to be called first (or --project at startup). Pass 'text' to analyze unsaved source content without writing to disk."
                         (fun args -> toolResult (bridge.Rename args))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsGetProjectOptionsArgs>
+                        "fcs_get_project_options"
+                        "Get FSharp compiler project options (OtherOptions) for a .fsproj file using proj-info. Returns the options list to use as `projectOptions` in FCS tools."
+                        (fun args ->
+                            toolResult (task {
+                                let path = args.projectPath
+                                if String.IsNullOrWhiteSpace(path) then
+                                    raise (ArgumentException "projectPath is required")
+
+                                let psi = ProcessStartInfo()
+                                psi.FileName <- "proj-info"
+                                psi.UseShellExecute <- false
+                                psi.RedirectStandardOutput <- true
+                                psi.RedirectStandardError <- true
+                                psi.CreateNoWindow <- true
+                                psi.ArgumentList.Add("--project")
+                                psi.ArgumentList.Add(path)
+                                psi.ArgumentList.Add("--fcs")
+                                psi.ArgumentList.Add("--serialize")
+
+                                use proc = new Process(StartInfo = psi)
+                                if not (proc.Start()) then
+                                    raise (InvalidOperationException "Unable to start proj-info process")
+
+                                let stdout = proc.StandardOutput.ReadToEnd()
+                                let stderr = proc.StandardError.ReadToEnd()
+                                proc.WaitForExit()
+
+                                if proc.ExitCode <> 0 then
+                                    return JObject(
+                                        JProperty("error", $"proj-info failed (exit {proc.ExitCode})"),
+                                        JProperty("stderr", stderr)
+                                    ) :> JToken
+                                else
+                                    let json = JObject.Parse(stdout)
+                                    let otherOptions =
+                                        json["OtherOptions"]
+                                        |> Option.ofObj
+                                        |> Option.map (fun t -> t.ToObject<string[]>())
+                                        |> Option.defaultValue [||]
+
+                                    return JObject(
+                                        JProperty("projectPath", path),
+                                        JProperty("otherOptions", JArray(otherOptions)),
+                                        JProperty("optionsCount", otherOptions.Length)
+                                    ) :> JToken
+                            }))
                     |> unwrapResult
                 )
 
