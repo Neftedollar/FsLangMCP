@@ -17,6 +17,9 @@ An MCP server written in F# that combines:
 - `textDocument_hover`
 - `textDocument_definition`
 - `textDocument_references`
+- `textDocument_formatting` — format F# file via Fantomas (via fsautocomplete)
+- `textDocument_codeAction` — available code actions / quick fixes at cursor
+- `textDocument_rename` — rename a symbol across the project
 - `workspace_symbol`
 - `workspace_diagnostics` (cache of latest `publishDiagnostics`)
 - `set_project` (switch active project/workspace for LSP context)
@@ -28,6 +31,8 @@ LSP positions (`line`, `character`) are **0-based**.
 - `fcs_parse_and_check_file`
 - `fcs_file_symbols`
 - `fcs_project_symbol_uses`
+- `fcs_type_at_position` — inferred F# type and symbol info at cursor (works without LSP workspace)
+- `fcs_signature_help` — method overloads and parameter info at cursor
 
 ## Prerequisites
 
@@ -97,7 +102,7 @@ Environment fallbacks still work:
       "args": [
         "run",
         "--project",
-        "/Users/roman/FsLangMCP/FsLangMcp.fsproj",
+        "/path/to/FsLangMcp.fsproj",
         "--",
         "--project",
         "/absolute/path/to/App.fsproj"

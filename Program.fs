@@ -151,11 +151,14 @@ type private FsAutoCompleteBridge() =
     [<VolatileField>]
     let mutable rpc: JsonRpc option = None
     let mutable lspProcess: Process option = None
+    [<VolatileField>]
     let mutable runtimeProjectPath: string option = None
+    [<VolatileField>]
     let mutable runtimeWorkspaceRoot: string option = None
     let workspaceReadyEvent = new ManualResetEventSlim(false)
     [<VolatileField>]
     let mutable workspaceReady = false
+    let mutable stderrPump: Task option = None
 
     let parseArgs (raw: string option) =
         raw
@@ -233,6 +236,10 @@ type private FsAutoCompleteBridge() =
         match lspProcess with
         | Some fsacProc when not fsacProc.HasExited ->
             fsacProc.Kill(true)
+            // Give pump 500ms to notice process died
+            match stderrPump with
+            | Some pump -> try pump.Wait(500) |> ignore with _ -> ()
+            | None -> ()
             fsacProc.Dispose()
             lspProcess <- None
         | Some fsacProc ->
@@ -240,6 +247,7 @@ type private FsAutoCompleteBridge() =
             lspProcess <- None
         | None -> ()
 
+        stderrPump <- None
         documents.Clear()
         diagnostics.Clear()
         workspaceReady <- false
@@ -372,7 +380,7 @@ type private FsAutoCompleteBridge() =
                         if not (fsacProc.Start()) then
                             invalidOp $"Unable to start {command}"
 
-                        let pumpStderr =
+                        let pumpStderr : Task =
                             task {
                                 let mutable keepReading = true
 
@@ -385,7 +393,15 @@ type private FsAutoCompleteBridge() =
                                         Console.Error.WriteLine($"[fsautocomplete] {line}")
                             }
 
-                        pumpStderr |> ignore
+                        pumpStderr.ContinueWith(
+                            (fun (t: Task) ->
+                                if t.IsFaulted then
+                                    let ex = t.Exception.GetBaseException()
+                                    if not (ex :? ObjectDisposedException) then
+                                        Console.Error.WriteLine($"[stderr pump] {ex.Message}")),
+                            TaskContinuationOptions.OnlyOnFaulted) |> ignore
+
+                        stderrPump <- Some pumpStderr
 
                         let formatter = new JsonMessageFormatter()
                         formatter.JsonSerializer.NullValueHandling <- NullValueHandling.Ignore
@@ -634,7 +650,7 @@ type private FsAutoCompleteBridge() =
                     let newText = edit["newText"].Value<string>()
 
                     let before =
-                        if startLine < linesArr.Length then
+                        if startLine < linesArr.Length && startChar > 0 then
                             linesArr[startLine][..startChar - 1]
                         else ""
                     let after =
@@ -1161,7 +1177,9 @@ type private FcsBridge() =
 
                                 let returnType =
                                     try m.ReturnParameter.Type.BasicQualifiedName
-                                    with _ -> ""
+                                    with ex ->
+                                        Console.Error.WriteLine($"[fcs_signature_help] ReturnParameter error: {ex.Message}")
+                                        ""
 
                                 let signature =
                                     let paramStr =
@@ -1214,8 +1232,13 @@ let private toolResult (work: Task<JToken>) : Task<Result<Content list, McpError
         try
             let! payload = work
             return Ok [ Content.text (renderToken payload) ]
-        with ex ->
-            return Error(McpError.TransportError ex.Message)
+        with
+        | :? ArgumentException as ex ->
+            return Error(McpError.TransportError $"[InvalidArgs] {ex.Message}")
+        | :? FileNotFoundException as ex ->
+            return Error(McpError.TransportError $"[FileNotFound] {ex.Message}")
+        | ex ->
+            return Error(McpError.TransportError $"[Error] {ex.Message}")
     }
 
 // ─── CLI helpers ───────────────────────────────────────────────────────────────
@@ -1329,7 +1352,7 @@ let main argv =
                 tool (
                     TypedTool.define<CompletionArgs>
                         "textDocument_completion"
-                        "Proxy to fsautocomplete textDocument/completion. line/character are 0-based."
+                        "Proxy to fsautocomplete textDocument/completion. line/character are 0-based. Requires set_project to be called first (or --project at startup). Pass 'text' to analyze unsaved source content without writing to disk."
                         (fun args -> toolResult (bridge.Completion args))
                     |> unwrapResult
                 )
@@ -1337,7 +1360,7 @@ let main argv =
                 tool (
                     TypedTool.define<PositionArgs>
                         "textDocument_hover"
-                        "Proxy to fsautocomplete textDocument/hover. line/character are 0-based."
+                        "Get hover info (type, docs) for the F# symbol at the cursor via fsautocomplete. Richer output than fcs_type_at_position but requires a loaded LSP workspace. Requires set_project first. Pass 'text' for unsaved content."
                         (fun args -> toolResult (bridge.Hover args))
                     |> unwrapResult
                 )
@@ -1345,7 +1368,7 @@ let main argv =
                 tool (
                     TypedTool.define<PositionArgs>
                         "textDocument_definition"
-                        "Proxy to fsautocomplete textDocument/definition. line/character are 0-based."
+                        "Proxy to fsautocomplete textDocument/definition. line/character are 0-based. Requires set_project to be called first (or --project at startup). Pass 'text' to analyze unsaved source content without writing to disk."
                         (fun args -> toolResult (bridge.Definition args))
                     |> unwrapResult
                 )
@@ -1353,7 +1376,7 @@ let main argv =
                 tool (
                     TypedTool.define<ReferencesArgs>
                         "textDocument_references"
-                        "Proxy to fsautocomplete textDocument/references. line/character are 0-based."
+                        "Proxy to fsautocomplete textDocument/references. line/character are 0-based. Requires set_project to be called first (or --project at startup). Pass 'text' to analyze unsaved source content without writing to disk."
                         (fun args -> toolResult (bridge.References args))
                     |> unwrapResult
                 )
@@ -1361,7 +1384,7 @@ let main argv =
                 tool (
                     TypedTool.define<WorkspaceSymbolArgs>
                         "workspace_symbol"
-                        "Proxy to fsautocomplete workspace/symbol."
+                        "Proxy to fsautocomplete workspace/symbol. Requires set_project to be called first (or --project at startup)."
                         (fun args -> toolResult (bridge.WorkspaceSymbol args))
                     |> unwrapResult
                 )
@@ -1369,7 +1392,7 @@ let main argv =
                 tool (
                     TypedTool.define<DiagnosticsArgs>
                         "workspace_diagnostics"
-                        "Returns latest cached publishDiagnostics payload (per file or full map)."
+                        "Returns latest cached publishDiagnostics payload (per file or full map). Requires set_project to be called first (or --project at startup)."
                         (fun args -> toolResult (bridge.Diagnostics args))
                     |> unwrapResult
                 )
@@ -1377,7 +1400,7 @@ let main argv =
                 tool (
                     TypedTool.define<SetProjectArgs>
                         "set_project"
-                        "Sets active project/workspace for fsautocomplete. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load."
+                        "Initialize or switch the F# project context. Must be called once before any textDocument_* or workspace_* tool will work. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load. Also clears the FCS symbol cache."
                         (fun args ->
                             toolResult (task {
                                 let! result = bridge.SetProject args
@@ -1390,7 +1413,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsParseAndCheckArgs>
                         "fcs_parse_and_check_file"
-                        "FCS parse+typecheck for a file. Use projectOptions for accurate fsproj/sln context."
+                        "FCS parse+typecheck for a file. Use projectOptions for accurate fsproj/sln context. Pass 'text' to analyze unsaved source content without writing to disk."
                         (fun args -> toolResult (fcsBridge.ParseAndCheckFile args))
                     |> unwrapResult
                 )
@@ -1398,7 +1421,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsFileSymbolsArgs>
                         "fcs_file_symbols"
-                        "FCS symbol extraction from a file (definitions by default, or all uses)."
+                        "FCS symbol extraction from a file (definitions by default, or all uses). Pass 'text' to analyze unsaved source content without writing to disk."
                         (fun args -> toolResult (fcsBridge.FileSymbols args))
                     |> unwrapResult
                 )
@@ -1406,7 +1429,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsProjectSymbolUsesArgs>
                         "fcs_project_symbol_uses"
-                        "FCS project-wide symbol use search by symbol name/fullname. Results are cached per project."
+                        "FCS project-wide symbol use search by symbol name/fullname. Results are cached per project. Pass 'text' to analyze unsaved source content without writing to disk."
                         (fun args -> toolResult (fcsBridge.ProjectSymbolUses args))
                     |> unwrapResult
                 )
@@ -1414,7 +1437,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsTypeAtPositionArgs>
                         "fcs_type_at_position"
-                        "Returns the F# type and symbol info at a cursor position. line/character are 0-based (LSP convention)."
+                        "Get the inferred F# type and symbol info at a cursor position using the compiler directly. Works without a loaded LSP workspace (no set_project needed). For better accuracy provide projectOptions (run: proj-info --project App.fsproj --fcs --serialize, use OtherOptions). Pass 'text' for unsaved content."
                         (fun args -> toolResult (fcsBridge.TypeAtPosition args))
                     |> unwrapResult
                 )
@@ -1422,7 +1445,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsSignatureHelpArgs>
                         "fcs_signature_help"
-                        "Returns method signature and overloads at a cursor position. line/character are 0-based (LSP convention)."
+                        "Returns method signature and overloads at a cursor position. line/character are 0-based (LSP convention). Pass 'text' to analyze unsaved source content without writing to disk."
                         (fun args -> toolResult (fcsBridge.SignatureHelp args))
                     |> unwrapResult
                 )
@@ -1430,7 +1453,7 @@ let main argv =
                 tool (
                     TypedTool.define<FormattingArgs>
                         "textDocument_formatting"
-                        "Formats F# code via fsautocomplete/Fantomas. Returns formatted text and applied edits."
+                        "Formats F# code via fsautocomplete/Fantomas. Returns formatted text and applied edits. Requires set_project to be called first (or --project at startup). Pass 'text' to analyze unsaved source content without writing to disk."
                         (fun args -> toolResult (bridge.Formatting args))
                     |> unwrapResult
                 )
@@ -1438,7 +1461,7 @@ let main argv =
                 tool (
                     TypedTool.define<CodeActionArgs>
                         "textDocument_codeAction"
-                        "Returns available code actions at a position via fsautocomplete. line/character are 0-based."
+                        "Returns available code actions at a position via fsautocomplete. line/character are 0-based. Requires set_project to be called first (or --project at startup). Pass 'text' to analyze unsaved source content without writing to disk."
                         (fun args -> toolResult (bridge.CodeAction args))
                     |> unwrapResult
                 )
@@ -1446,7 +1469,7 @@ let main argv =
                 tool (
                     TypedTool.define<RenameArgs>
                         "textDocument_rename"
-                        "Renames a symbol at a position via fsautocomplete. line/character are 0-based."
+                        "Renames a symbol at a position via fsautocomplete. line/character are 0-based. Requires set_project to be called first (or --project at startup). Pass 'text' to analyze unsaved source content without writing to disk."
                         (fun args -> toolResult (bridge.Rename args))
                     |> unwrapResult
                 )
