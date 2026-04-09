@@ -1,0 +1,58 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/roman/.dotnet/tools/multiagent-setup hook block-dangerous"
+          },
+          {
+            "type": "command",
+            "command": "/Users/roman/.dotnet/tools/multiagent-setup hook enforce-commit-msg"
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/roman/.dotnet/tools/multiagent-setup hook log-agent"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/roman/.dotnet/tools/multiagent-setup hook auto-lint"
+          }
+        ]
+      },
+      {
+        "matcher": "WebSearch|WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/roman/.dotnet/tools/multiagent-setup hook research-reminder"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/roman/.dotnet/tools/multiagent-setup hook stop-guard"
+          }
+        ]
+      }
+    ]
+  }
+}

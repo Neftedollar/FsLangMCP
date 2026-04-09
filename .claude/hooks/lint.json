@@ -1,0 +1,18 @@
+{
+  "_comment": "Map file extensions to lint/format commands. The file path is appended as the last argument.",
+  "linters": {
+    ".ts": "npx prettier --write",
+    ".tsx": "npx prettier --write",
+    ".js": "npx prettier --write",
+    ".jsx": "npx prettier --write",
+    ".css": "npx prettier --write",
+    ".html": "npx prettier --write",
+    ".json": "npx prettier --write",
+    ".fs": "dotnet fantomas",
+    ".fsx": "dotnet fantomas",
+    ".fsi": "dotnet fantomas",
+    ".py": "ruff format",
+    ".go": "gofmt -w",
+    ".rs": "rustfmt"
+  }
+}
