@@ -150,11 +150,9 @@ Input shape:
 
 ## Known Issues
 
-- LSP proxy tools (`textDocument_hover`, `textDocument_definition`, `textDocument_completion`, `textDocument_references`) may return an error like:
-  `"Couldn't find <file> in LoadedProjects..."` if `fsautocomplete` has not loaded the target project yet.
-  This usually means the workspace/project context is not fully ready.
-- FCS tools fall back to script-style inference (`GetProjectOptionsFromScript`) when `projectOptions` is not provided.
-  In that mode, diagnostics and symbol data can be incomplete for multi-project solutions.
+- LSP proxy tools return `{"status": "not_ready"}` if called before `fsautocomplete` has finished loading the project. `set_project` waits up to 30 seconds — if you still get `not_ready`, the project may be too large or `fsautocomplete` may have failed to start.
+- FCS tools fall back to script-style inference (`GetProjectOptionsFromScript`) when `projectOptions` is not provided. In that mode, diagnostics and symbol data can be incomplete for multi-project solutions.
+- `fcs_project_symbol_uses` results are cached per project. Call `set_project` to flush the cache when source files change on disk.
 
 ## About Tool Dependencies
 
