@@ -733,6 +733,33 @@ type private FsAutoCompleteBridge() =
             this.StopLspUnsafe()
             gate.Dispose()
 
+// ─── BoundedCache ──────────────────────────────────────────────────────────────
+
+type private BoundedCache<'K, 'V when 'K : equality>(maxSize: int) =
+    let dict = System.Collections.Generic.Dictionary<'K, 'V>()
+    let order = System.Collections.Generic.Queue<'K>()
+    let lockObj = obj()
+
+    member _.TryGet(key: 'K) : 'V option =
+        lock lockObj (fun () ->
+            match dict.TryGetValue(key) with
+            | true, v -> Some v
+            | _ -> None)
+
+    member _.Set(key: 'K, value: 'V) =
+        lock lockObj (fun () ->
+            if not (dict.ContainsKey(key)) then
+                if dict.Count >= maxSize then
+                    let oldest = order.Dequeue()
+                    dict.Remove(oldest) |> ignore
+                order.Enqueue(key)
+            dict[key] <- value)
+
+    member _.Clear() =
+        lock lockObj (fun () ->
+            dict.Clear()
+            order.Clear())
+
 // ─── FcsBridge ─────────────────────────────────────────────────────────────────
 
 type private FcsBridge() =
@@ -743,9 +770,9 @@ type private FcsBridge() =
             keepAllBackgroundSymbolUses = true
         )
 
-    // Caches keyed by a string combining projectPath + projectOptions hash
-    let optionsCache = ConcurrentDictionary<string, FSharpProjectOptions>()
-    let projectResultsCache = ConcurrentDictionary<string, FSharpCheckProjectResults>()
+    // Bounded caches keyed by a string combining projectPath + projectOptions hash
+    let optionsCache = BoundedCache<string, FSharpProjectOptions>(10)
+    let projectResultsCache = BoundedCache<string, FSharpCheckProjectResults>(3)
 
     let asTask (workflow: Async<'T>) : Task<'T> =
         Async.StartAsTask(workflow, cancellationToken = CancellationToken.None)
@@ -832,13 +859,13 @@ type private FcsBridge() =
                     |> Option.defaultValue (Path.ChangeExtension(fullPath, ".fsproj"))
                     |> normalizePath
 
-                match optionsCache.TryGetValue(cacheKey) with
-                | true, cached ->
+                match optionsCache.TryGet(cacheKey) with
+                | Some cached ->
                     return cached, "commandLineArgs"
-                | false, _ ->
+                | None ->
                     let resolvedOptions =
                         checker.GetProjectOptionsFromCommandLineArgs(projectFileName, options |> List.toArray)
-                    optionsCache[cacheKey] <- resolvedOptions
+                    optionsCache.Set(cacheKey, resolvedOptions)
                     return resolvedOptions, "commandLineArgs"
             | _ ->
                 // Try auto-discover .fsproj
@@ -846,10 +873,10 @@ type private FcsBridge() =
                 match discoveredFsproj with
                 | Some fsprojPath ->
                     let fsprojKey = $"fsproj::{fsprojPath}"
-                    match optionsCache.TryGetValue(fsprojKey) with
-                    | true, cached ->
+                    match optionsCache.TryGet(fsprojKey) with
+                    | Some cached ->
                         return cached, "auto-discovered"
-                    | false, _ ->
+                    | None ->
                         // Use GetProjectOptionsFromScript as fallback since we can't easily
                         // call Ionide's MSBuild evaluation without a proper toolsPath setup
                         let sourceText = SourceText.ofString text
@@ -858,17 +885,17 @@ type private FcsBridge() =
                         let discovered =
                             { scriptOptions with
                                 ProjectFileName = fsprojPath }
-                        optionsCache[fsprojKey] <- discovered
+                        optionsCache.Set(fsprojKey, discovered)
                         return discovered, "auto-discovered-script-fallback"
                 | None ->
                     let scriptKey = $"script::{fullPath}"
-                    match optionsCache.TryGetValue(scriptKey) with
-                    | true, cached ->
+                    match optionsCache.TryGet(scriptKey) with
+                    | Some cached ->
                         return cached, "scriptInference"
-                    | false, _ ->
+                    | None ->
                         let sourceText = SourceText.ofString text
                         let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
-                        optionsCache[scriptKey] <- scriptOptions
+                        optionsCache.Set(scriptKey, scriptOptions)
                         return scriptOptions, "scriptInference"
         }
 
@@ -990,12 +1017,12 @@ type private FcsBridge() =
             let cacheKey = makeCacheKey args.projectPath args.projectOptions
             let! projectResults, cached =
                 task {
-                    match projectResultsCache.TryGetValue(cacheKey) with
-                    | true, existing ->
+                    match projectResultsCache.TryGet(cacheKey) with
+                    | Some existing ->
                         return existing, true
-                    | false, _ ->
+                    | None ->
                         let! results = checker.ParseAndCheckProject(projectOptions) |> asTask
-                        projectResultsCache[cacheKey] <- results
+                        projectResultsCache.Set(cacheKey, results)
                         return results, false
                 }
 
