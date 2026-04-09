@@ -6,6 +6,9 @@ open System.Threading
 open System.Threading.Tasks
 open FSharp.Compiler.CodeAnalysis
 open FSharp.Compiler.Text
+open System.Text.Encodings.Web
+open System.Text.Json
+open System.Text.Json.Nodes
 open Xunit
 open FsLangMcp.Types
 open FsLangMcp.Tools
@@ -49,8 +52,22 @@ let ``ToolError FileNotFound serializes with correct errorKind`` () =
 let ``ToolError message with quotes is properly escaped`` () =
     let json = toolErrorToJson (InvalidArgs "message with \"quotes\"")
     Assert.Contains("\"errorKind\":\"InvalidArgs\"", json)
-    // Newtonsoft.Json should escape the inner quotes
+    // System.Text.Json with UnsafeRelaxedJsonEscaping escapes inner quotes as \" (not \u0022)
     Assert.Contains("\\\"quotes\\\"", json)
+
+[<Fact>]
+let ``renderToken preserves F# type signature characters without unicode escaping`` () =
+    // Regression for STJ default encoder mangling 'a -> 'b to \u0027a -\u003E \u0027b
+    let renderOpts =
+        JsonSerializerOptions(
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+            WriteIndented = true)
+    let node = JsonObject()
+    node["typeString"] <- JsonValue.Create("'a -> 'b when 'a : comparison")
+    let rendered = JsonSerializer.Serialize(node, renderOpts)
+    Assert.Contains("'a -> 'b", rendered)
+    Assert.DoesNotContain("\\u0027", rendered)
+    Assert.DoesNotContain("\\u003E", rendered)
 
 // Helpers
 

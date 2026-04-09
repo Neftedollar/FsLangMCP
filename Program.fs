@@ -11,7 +11,8 @@ open FsLangMcp.Tools
 open FsMcp.Core
 open FsMcp.Core.Validation
 open FsMcp.Server
-open Newtonsoft.Json.Linq
+open System.Text.Json
+open System.Text.Json.Nodes
 
 // ─── CLI helpers ───────────────────────────────────────────────────────────────
 
@@ -36,36 +37,34 @@ let private runProcess (fileName: string) (args: string list) =
     proc.WaitForExit()
     proc.ExitCode, stdout, stderr
 
-let private parseProjInfoOutput (path: string) (exitCode: int) (stdout: string) (stderr: string) : JToken =
+let private parseProjInfoOutput (path: string) (exitCode: int) (stdout: string) (stderr: string) : JsonNode =
     if exitCode <> 0 then
-        JObject(
-            JProperty("error", $"proj-info failed (exit {exitCode})"),
-            JProperty("stderr", stderr)
-        ) :> JToken
+        jobj [ "error", jstr $"proj-info failed (exit {exitCode})"; "stderr", jstr stderr ]
+        :> JsonNode
     elif String.IsNullOrWhiteSpace(stdout) then
-        JObject(JProperty("error", "proj-info produced no output")) :> JToken
+        jobj [ "error", jstr "proj-info produced no output" ] :> JsonNode
     else
-        let token = JToken.Parse(stdout)
+        let token = JsonNode.Parse(stdout)
         let json =
             match token with
-            | :? JArray as arr when arr.Count > 0 ->
+            | :? JsonArray as arr when arr.Count > 0 ->
                 match arr.[0] with
-                | :? JObject as obj -> obj
-                | other -> JObject(JProperty("warning", sprintf "unexpected element type: %s" (other.Type.ToString())))
-            | :? JObject as obj -> obj
-            | _ -> JObject()
+                | :? JsonObject as obj -> obj
+                | other -> jobj [ "warning", jstr (sprintf "unexpected element type: %s" (other.GetValueKind().ToString())) ]
+            | :? JsonObject as obj -> obj
+            | _ -> JsonObject()
         let otherOptions =
             json["OtherOptions"]
             |> Option.ofObj
-            |> Option.map (fun t -> t.ToObject<string[]>())
+            |> Option.map (fun t -> t.Deserialize<string[]>() |> Option.ofObj |> Option.defaultValue [||])
             |> Option.defaultValue [||]
-        JObject(
-            JProperty("projectPath", path),
-            JProperty("otherOptions", JArray(otherOptions)),
-            JProperty("optionsCount", otherOptions.Length)
-        ) :> JToken
+        jobj
+            [ "projectPath", jstr path
+              "otherOptions", JsonArray(otherOptions |> Array.map jstr) :> JsonNode
+              "optionsCount", jint otherOptions.Length ]
+        :> JsonNode
 
-let private runProjInfoAsync (path: string) : Task<JToken> = task {
+let private runProjInfoAsync (path: string) : Task<JsonNode> = task {
     let psi = ProcessStartInfo()
     psi.FileName <- "proj-info"
     psi.UseShellExecute <- false
@@ -307,7 +306,7 @@ let main argv =
                         (fun args ->
                             let path = args.projectPath
                             if String.IsNullOrWhiteSpace(path) then
-                                toolResult (Task.FromException<JToken>(ArgumentException "projectPath is required"))
+                                toolResult (Task.FromException<JsonNode>(ArgumentException "projectPath is required"))
                             else
                                 toolResult (runProjInfoAsync path))
                     |> unwrapResult
