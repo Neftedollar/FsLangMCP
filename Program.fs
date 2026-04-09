@@ -15,6 +15,8 @@ open FSharp.Compiler.EditorServices
 open Newtonsoft.Json
 open Newtonsoft.Json.Linq
 open StreamJsonRpc
+open Ionide.ProjInfo
+open Ionide.ProjInfo.Types
 
 // ─── Shared arg types ──────────────────────────────────────────────────────────
 
@@ -845,7 +847,22 @@ type private FcsBridge() =
             |> Option.defaultValue ""
         $"{pp}::{po}"
 
-    member private _.ResolveProjectOptions
+    member private _.LoadProjectOptionsFromFsproj(fsprojPath: string) : FSharpProjectOptions option =
+        try
+            let projectDir = Path.GetDirectoryName(fsprojPath)
+            let toolsPath = Init.init (DirectoryInfo(projectDir)) None
+            let loader = WorkspaceLoader.Create(toolsPath, [])
+            let projects = loader.LoadProjects([ fsprojPath ]) |> Seq.toList
+            match projects with
+            | proj :: _ ->
+                let fcsOpts = FCS.mapToFSharpProjectOptions proj (projects |> Seq.map id)
+                Some fcsOpts
+            | [] -> None
+        with ex ->
+            Console.Error.WriteLine($"[proj-info] Failed to load {fsprojPath}: {ex.Message}")
+            None
+
+    member private this.ResolveProjectOptions
         (path: string, text: string, projectPath: string option, projectOptions: string list option)
         : Task<FSharpProjectOptions * string> =
         task {
@@ -877,16 +894,18 @@ type private FcsBridge() =
                     | Some cached ->
                         return cached, "auto-discovered"
                     | None ->
-                        // Use GetProjectOptionsFromScript as fallback since we can't easily
-                        // call Ionide's MSBuild evaluation without a proper toolsPath setup
-                        let sourceText = SourceText.ofString text
-                        let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
-                        // Override the project file name to the discovered .fsproj
-                        let discovered =
-                            { scriptOptions with
-                                ProjectFileName = fsprojPath }
-                        optionsCache.Set(fsprojKey, discovered)
-                        return discovered, "auto-discovered-script-fallback"
+                        // Try real MSBuild loading via Ionide.ProjInfo.FCS
+                        match this.LoadProjectOptionsFromFsproj(fsprojPath) with
+                        | Some projOpts ->
+                            optionsCache.Set(fsprojKey, projOpts)
+                            return projOpts, "ionide-proj-info"
+                        | None ->
+                            // Fall back to script inference with honest labelling
+                            let sourceText = SourceText.ofString text
+                            let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
+                            let discovered = { scriptOptions with ProjectFileName = fsprojPath }
+                            optionsCache.Set(fsprojKey, discovered)
+                            return discovered, "auto-discovered-script-fallback"
                 | None ->
                     let scriptKey = $"script::{fullPath}"
                     match optionsCache.TryGet(scriptKey) with
