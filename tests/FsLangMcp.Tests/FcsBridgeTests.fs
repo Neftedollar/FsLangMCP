@@ -6,54 +6,48 @@ open System.Threading
 open System.Threading.Tasks
 open FSharp.Compiler.CodeAnalysis
 open FSharp.Compiler.Text
-open Newtonsoft.Json
 open Xunit
+open FsLangMcp.Types
+open FsLangMcp.Tools
 
 // ─── ToolError serialization tests ────────────────────────────────────────────
-// These tests replicate the serialization pattern from Program.fs inline,
-// providing regression coverage without requiring a reference to the Exe project.
-
-let private serialize (msg: string) = JsonConvert.SerializeObject msg
+// These tests call the real toolErrorToJson from Tools.fs so that regressions
+// in the serialization logic are caught directly.
 
 [<Fact>]
 let ``ToolError InvalidArgs serializes with correct errorKind and message`` () =
-    let msg = "bad argument"
-    let json = sprintf """{"errorKind":"InvalidArgs","message":%s}""" (serialize msg)
+    let json = toolErrorToJson (InvalidArgs "bad argument")
     Assert.Contains("\"errorKind\":\"InvalidArgs\"", json)
     Assert.Contains("bad argument", json)
 
 [<Fact>]
 let ``ToolError NotReady serializes with correct errorKind`` () =
-    let msg = "not loaded"
-    let json = sprintf """{"errorKind":"NotReady","message":%s}""" (serialize msg)
+    let json = toolErrorToJson (NotReady "not loaded")
     Assert.Contains("\"errorKind\":\"NotReady\"", json)
     Assert.Contains("not loaded", json)
 
 [<Fact>]
 let ``ToolError InfraFailure serializes with correct errorKind`` () =
-    let ex = System.Exception("oops")
-    let json = sprintf """{"errorKind":"InfraFailure","message":%s}""" (serialize ex.Message)
+    let ex = Exception("oops")
+    let json = toolErrorToJson (InfraFailure ex)
     Assert.Contains("\"errorKind\":\"InfraFailure\"", json)
     Assert.Contains("oops", json)
 
 [<Fact>]
 let ``ToolError FcsAborted serializes with correct errorKind`` () =
-    let msg = "cancelled"
-    let json = sprintf """{"errorKind":"FcsAborted","message":%s}""" (serialize msg)
+    let json = toolErrorToJson (FcsAborted "cancelled")
     Assert.Contains("\"errorKind\":\"FcsAborted\"", json)
     Assert.Contains("cancelled", json)
 
 [<Fact>]
 let ``ToolError FileNotFound serializes with correct errorKind`` () =
-    let msg = "/some/path"
-    let json = sprintf """{"errorKind":"FileNotFound","message":%s}""" (serialize msg)
+    let json = toolErrorToJson (FileNotFound "/some/path")
     Assert.Contains("\"errorKind\":\"FileNotFound\"", json)
     Assert.Contains("/some/path", json)
 
 [<Fact>]
 let ``ToolError message with quotes is properly escaped`` () =
-    let msg = "message with \"quotes\""
-    let json = sprintf """{"errorKind":"InvalidArgs","message":%s}""" (serialize msg)
+    let json = toolErrorToJson (InvalidArgs "message with \"quotes\"")
     Assert.Contains("\"errorKind\":\"InvalidArgs\"", json)
     // Newtonsoft.Json should escape the inner quotes
     Assert.Contains("\\\"quotes\\\"", json)
