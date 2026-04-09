@@ -18,6 +18,21 @@ open StreamJsonRpc
 open Ionide.ProjInfo
 open Ionide.ProjInfo.Types
 
+// ─── Tool error DU ─────────────────────────────────────────────────────────────
+
+type ToolError =
+    | InvalidArgs  of string
+    | NotReady     of string
+    | InfraFailure of exn
+    | FcsAborted   of string
+
+let private toolErrorToJson (err: ToolError) : string =
+    match err with
+    | InvalidArgs msg  -> sprintf """{"errorKind":"InvalidArgs","message":%s}"""   (Newtonsoft.Json.JsonConvert.SerializeObject msg)
+    | NotReady msg     -> sprintf """{"errorKind":"NotReady","message":%s}"""      (Newtonsoft.Json.JsonConvert.SerializeObject msg)
+    | InfraFailure ex  -> sprintf """{"errorKind":"InfraFailure","message":%s}"""  (Newtonsoft.Json.JsonConvert.SerializeObject ex.Message)
+    | FcsAborted msg   -> sprintf """{"errorKind":"FcsAborted","message":%s}"""    (Newtonsoft.Json.JsonConvert.SerializeObject msg)
+
 // ─── Shared arg types ──────────────────────────────────────────────────────────
 
 type CompletionArgs =
@@ -1289,12 +1304,23 @@ let private toolResult (work: Task<JToken>) : Task<Result<Content list, McpError
             let! payload = work
             return Ok [ Content.text (renderToken payload) ]
         with
+        | :? OperationCanceledException as ex ->
+            // TaskCanceledException is a subclass of OperationCanceledException — both caught here
+            let err = FcsAborted ex.Message
+            return Error(McpError.TransportError (toolErrorToJson err))
         | :? ArgumentException as ex ->
-            return Error(McpError.TransportError $"[InvalidArgs] {ex.Message}")
-        | :? FileNotFoundException as ex ->
-            return Error(McpError.TransportError $"[FileNotFound] {ex.Message}")
+            let err = InvalidArgs ex.Message
+            return Error(McpError.TransportError (toolErrorToJson err))
+        | ex when ex.Message.IndexOf("not ready", StringComparison.OrdinalIgnoreCase) >= 0
+               || ex.Message.IndexOf("NotReady", StringComparison.Ordinal) >= 0 ->
+            let err = NotReady ex.Message
+            return Error(McpError.TransportError (toolErrorToJson err))
+        | ex when ex.Message.StartsWith("Invalid", StringComparison.OrdinalIgnoreCase) ->
+            let err = InvalidArgs ex.Message
+            return Error(McpError.TransportError (toolErrorToJson err))
         | ex ->
-            return Error(McpError.TransportError $"[Error] {ex.Message}")
+            let err = InfraFailure ex
+            return Error(McpError.TransportError (toolErrorToJson err))
     }
 
 // ─── CLI helpers ───────────────────────────────────────────────────────────────
