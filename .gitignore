@@ -2,3 +2,5 @@ bin/
 obj/
 nupkg/
 *.binlog
+tests/*/bin/
+tests/*/obj/
