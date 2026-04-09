@@ -33,6 +33,18 @@ let ``Update existing key preserves value`` () =
     Assert.Equal(Some 99, cache.TryGet("a"))
 
 [<Fact>]
+let ``Update existing key preserves original eviction order`` () =
+    // capacity 2: a→b inserted, a updated, then c inserted → evicts a (oldest insertion)
+    let cache = BoundedCache<string, int>(2)
+    cache.Set("a", 1)
+    cache.Set("b", 2)
+    cache.Set("a", 99)   // update value; eviction order must NOT change
+    cache.Set("c", 3)    // triggers eviction — must evict "a", not "b"
+    Assert.Equal(None,   cache.TryGet("a"))   // evicted (was oldest)
+    Assert.Equal(Some 2, cache.TryGet("b"))   // retained
+    Assert.Equal(Some 3, cache.TryGet("c"))   // just inserted
+
+[<Fact>]
 let ``Clear empties the cache`` () =
     let cache = BoundedCache<string, int>(3)
     cache.Set("a", 1)
