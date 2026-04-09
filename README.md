@@ -39,11 +39,18 @@ LSP positions (`line`, `character`) are **0-based**.
 
 - .NET SDK 10+
 - `fsautocomplete` installed
+- `ionide.projinfo.tool` (required for `fcs_get_project_options`)
 
 Install `fsautocomplete`:
 
 ```bash
 dotnet tool install -g fsautocomplete
+```
+
+Install `ionide.projinfo.tool`:
+
+```bash
+dotnet tool install -g ionide.projinfo.tool
 ```
 
 ## Install As Dotnet Tool

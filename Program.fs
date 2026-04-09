@@ -1555,12 +1555,21 @@ let main argv =
                                 psi.ArgumentList.Add("--serialize")
 
                                 use proc = new Process(StartInfo = psi)
-                                if not (proc.Start()) then
+                                let started =
+                                    try
+                                        proc.Start()
+                                    with
+                                    | :? System.ComponentModel.Win32Exception
+                                    | :? System.IO.IOException ->
+                                        raise (FileNotFoundException "proj-info not found on PATH. Install with: dotnet tool install -g ionide.projinfo.tool")
+                                if not started then
                                     raise (InvalidOperationException "Unable to start proj-info process")
 
-                                let stdout = proc.StandardOutput.ReadToEnd()
-                                let stderr = proc.StandardError.ReadToEnd()
-                                proc.WaitForExit()
+                                let stdoutTask = proc.StandardOutput.ReadToEndAsync()
+                                let stderrTask  = proc.StandardError.ReadToEndAsync()
+                                let! stdout = stdoutTask
+                                let! stderr = stderrTask
+                                do! proc.WaitForExitAsync()
 
                                 if proc.ExitCode <> 0 then
                                     return JObject(
@@ -1568,7 +1577,13 @@ let main argv =
                                         JProperty("stderr", stderr)
                                     ) :> JToken
                                 else
-                                    let json = JObject.Parse(stdout)
+                                    // proj-info --fcs --serialize outputs a JSON array; take first element
+                                    let token = JToken.Parse(stdout)
+                                    let json =
+                                        match token with
+                                        | :? JArray as arr when arr.Count > 0 -> arr.[0] :?> JObject
+                                        | :? JObject as obj -> obj
+                                        | _ -> JObject()
                                     let otherOptions =
                                         json["OtherOptions"]
                                         |> Option.ofObj
