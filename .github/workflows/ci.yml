@@ -6,12 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+  build-and-test:
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
@@ -20,13 +21,13 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "10.0.x"
+          dotnet-version: '10.x'
 
       - name: Restore
-        run: dotnet restore
+        run: dotnet restore FsLangMcp.slnx
 
       - name: Build
-        run: dotnet build --configuration Release --no-restore
+        run: dotnet build FsLangMcp.slnx --no-restore --configuration Release --warnaserror
 
-      - name: Pack
-        run: dotnet pack --configuration Release --no-build
+      - name: Test
+        run: dotnet test FsLangMcp.slnx --no-build --no-restore --configuration Release
