@@ -8,12 +8,15 @@
 
   <ItemGroup>
     <Compile Include="../../BoundedCache.fs" Link="BoundedCache.fs" />
+    <Compile Include="../../Types.fs" Link="Types.fs" />
+    <Compile Include="../../Tools.fs" Link="Tools.fs" />
     <Compile Include="BoundedCacheTests.fs" />
     <Compile Include="FcsBridgeTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="FSharp.Compiler.Service" Version="43.12.201" />
+    <PackageReference Include="FsMcp.Server" Version="1.0.1" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
     <PackageReference Include="xunit" Version="2.9.3" />
