@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/tests/">
+    <Project Path="tests/FsLangMcp.Tests/FsLangMcp.Tests.fsproj" />
+  </Folder>
+  <Project Path="FsLangMcp.fsproj" />
+</Solution>
