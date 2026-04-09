@@ -9,6 +9,14 @@ An MCP server written in F# that combines:
 
 > Work in progress: APIs and tool shapes may still change.
 
+## Response Shape
+
+All tools return a consistent JSON envelope:
+
+- **Success**: `{"status": "ok", "result": <payload>}` (LSP tools) or `{"status": "ok", ...fields}` (FCS tools)
+- **Not ready**: `{"status": "not_ready", "message": "..."}` — LSP workspace still loading
+- **Error**: MCP protocol error with `{"errorKind": "...", "message": "..."}` payload
+
 ## What You Get
 
 ### LSP-proxy tools (via `fsautocomplete`)
