@@ -12,6 +12,10 @@
 
   <ItemGroup>
     <Compile Include="BoundedCache.fs" />
+    <Compile Include="Types.fs" />
+    <Compile Include="LspBridge.fs" />
+    <Compile Include="FcsBridge.fs" />
+    <Compile Include="Tools.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
