@@ -11,9 +11,12 @@ open FSharp.Compiler.CodeAnalysis
 open FSharp.Compiler.Diagnostics
 open FSharp.Compiler.Symbols
 open FSharp.Compiler.Text
+open FSharp.Compiler.EditorServices
 open Newtonsoft.Json
 open Newtonsoft.Json.Linq
 open StreamJsonRpc
+
+// ─── Shared arg types ──────────────────────────────────────────────────────────
 
 type CompletionArgs =
     { path: string
@@ -37,6 +40,7 @@ type ReferencesArgs =
 
 type WorkspaceSymbolArgs = { query: string }
 type DiagnosticsArgs = { path: string option }
+
 type SetProjectArgs =
     { projectPath: string
       workspacePath: string option
@@ -65,6 +69,54 @@ type FcsProjectSymbolUsesArgs =
       exact: bool option
       maxResults: int option }
 
+// ─── New arg types ─────────────────────────────────────────────────────────────
+
+type FcsTypeAtPositionArgs =
+    { path: string
+      line: int
+      character: int
+      text: string option
+      projectPath: string option
+      projectOptions: string list option }
+
+type FcsSignatureHelpArgs =
+    { path: string
+      line: int
+      character: int
+      text: string option
+      projectPath: string option
+      projectOptions: string list option }
+
+type FormattingArgs =
+    { path: string
+      text: string option }
+
+type CodeActionArgs =
+    { path: string
+      line: int
+      character: int
+      text: string option }
+
+type RenameArgs =
+    { path: string
+      line: int
+      character: int
+      newName: string
+      text: string option }
+
+// ─── Helper: find nearest .fsproj ──────────────────────────────────────────────
+
+let private findNearestFsproj (filePath: string) : string option =
+    let rec walk (dir: string) =
+        if isNull dir then None
+        else
+            let fsprojs = Directory.GetFiles(dir, "*.fsproj")
+            if fsprojs.Length > 0 then Some fsprojs[0]
+            else walk (Path.GetDirectoryName(dir))
+    walk (Path.GetDirectoryName(Path.GetFullPath(filePath)))
+
+// ─── LSP types ─────────────────────────────────────────────────────────────────
+
 type private LspDocumentState =
     { mutable Version: int
       mutable Text: string }
@@ -79,14 +131,31 @@ type private DiagnosticsTarget(store: ConcurrentDictionary<string, JToken>) =
             let diagnostics = payload["diagnostics"]
             store[uri] <- if isNull diagnostics then JArray() :> JToken else diagnostics.DeepClone()
 
+// ─── WorkspaceLoadTarget: tracks fsharp/workspaceLoad notification ─────────────
+
+type private WorkspaceLoadTarget(setReady: unit -> unit) =
+    [<JsonRpcMethod("fsharp/workspaceLoad")>]
+    member _.WorkspaceLoad(payload: JObject) =
+        let statusToken = payload["status"]
+        if not (isNull statusToken) then
+            let status = statusToken.Value<string>()
+            if String.Equals(status, "finished", StringComparison.OrdinalIgnoreCase) then
+                setReady ()
+
+// ─── FsAutoCompleteBridge ──────────────────────────────────────────────────────
+
 type private FsAutoCompleteBridge() =
     let gate = new SemaphoreSlim(1, 1)
     let documents = ConcurrentDictionary<string, LspDocumentState>()
     let diagnostics = ConcurrentDictionary<string, JToken>()
+    [<VolatileField>]
     let mutable rpc: JsonRpc option = None
     let mutable lspProcess: Process option = None
     let mutable runtimeProjectPath: string option = None
     let mutable runtimeWorkspaceRoot: string option = None
+    let workspaceReadyEvent = new ManualResetEventSlim(false)
+    [<VolatileField>]
+    let mutable workspaceReady = false
 
     let parseArgs (raw: string option) =
         raw
@@ -173,8 +242,24 @@ type private FsAutoCompleteBridge() =
 
         documents.Clear()
         diagnostics.Clear()
+        workspaceReady <- false
+        workspaceReadyEvent.Reset()
 
     member _.DiagnosticsStore = diagnostics
+
+    // Wait until workspaceReady is true or timeout elapses
+    member _.WaitForReady(timeout: TimeSpan) : Task<bool> =
+        task {
+            return workspaceReadyEvent.Wait(timeout)
+        }
+
+    // Return not-ready JSON if workspace not loaded yet
+    member _.NotReadyResponse() : JToken =
+        JObject(
+            JProperty("status", "not_ready"),
+            JProperty("message", "fsautocomplete is still loading the project. Try again in a moment.")
+        )
+        :> JToken
 
     member this.SetProject(args: SetProjectArgs) : Task<JToken> =
         task {
@@ -183,33 +268,74 @@ type private FsAutoCompleteBridge() =
             if not (File.Exists(projectPath) || Directory.Exists(projectPath)) then
                 invalidArg (nameof args.projectPath) $"Path does not exist: {projectPath}"
 
+            // Detect solution files
+            let isSolution =
+                projectPath.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
+                || projectPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
+
             let resolvedWorkspace =
-                args.workspacePath
-                |> Option.map Path.GetFullPath
-                |> Option.defaultWith (fun () -> resolveWorkspaceFromProjectPath projectPath)
+                if isSolution then
+                    // For solution files use the solution's directory
+                    Path.GetDirectoryName(projectPath)
+                else
+                    args.workspacePath
+                    |> Option.map Path.GetFullPath
+                    |> Option.defaultWith (fun () -> resolveWorkspaceFromProjectPath projectPath)
 
             let restartLsp = args.restartLsp |> Option.defaultValue true
             do! gate.WaitAsync()
 
-            try
-                runtimeProjectPath <- Some projectPath
-                runtimeWorkspaceRoot <- Some resolvedWorkspace
-                Environment.SetEnvironmentVariable("FSA_PROJECT_PATH", projectPath)
-                Environment.SetEnvironmentVariable("FSA_WORKSPACE_ROOT", resolvedWorkspace)
+            let capturedProjectPath, capturedWorkspaceRoot =
+                try
+                    if isSolution then
+                        runtimeProjectPath <- None
+                        runtimeWorkspaceRoot <- Some resolvedWorkspace
+                    else
+                        runtimeProjectPath <- Some projectPath
+                        runtimeWorkspaceRoot <- Some resolvedWorkspace
 
-                if restartLsp then
-                    this.StopLspUnsafe()
+                    Environment.SetEnvironmentVariable(
+                        "FSA_PROJECT_PATH",
+                        runtimeProjectPath |> Option.defaultValue "")
+                    Environment.SetEnvironmentVariable("FSA_WORKSPACE_ROOT", resolvedWorkspace)
+
+                    if restartLsp then
+                        this.StopLspUnsafe()
+
+                    runtimeProjectPath, resolvedWorkspace
+                finally
+                    gate.Release() |> ignore
+
+            // After releasing gate, wait for workspace to be ready if we restarted
+            if restartLsp then
+                // Trigger EnsureStarted so we begin LSP and start listening for workspaceLoad
+                let! _ = this.EnsureStarted()
+                let! ready = this.WaitForReady(TimeSpan.FromSeconds(30.0))
+                let loadStatus = if ready then "ready" else "timeout"
 
                 return
                     JObject(
                         JProperty("status", "ok"),
-                        JProperty("projectPath", projectPath),
-                        JProperty("workspaceRoot", resolvedWorkspace),
-                        JProperty("lspRestarted", restartLsp)
+                        JProperty("projectPath",
+                            capturedProjectPath |> Option.map JValue |> Option.defaultValue (JValue.CreateNull()) :> JToken),
+                        JProperty("workspaceRoot", capturedWorkspaceRoot),
+                        JProperty("lspRestarted", restartLsp),
+                        JProperty("solutionMode", isSolution),
+                        JProperty("workspaceLoadStatus", loadStatus)
                     )
                     :> JToken
-            finally
-                gate.Release() |> ignore
+            else
+                return
+                    JObject(
+                        JProperty("status", "ok"),
+                        JProperty("projectPath",
+                            capturedProjectPath |> Option.map JValue |> Option.defaultValue (JValue.CreateNull()) :> JToken),
+                        JProperty("workspaceRoot", capturedWorkspaceRoot),
+                        JProperty("lspRestarted", restartLsp),
+                        JProperty("solutionMode", isSolution),
+                        JProperty("workspaceLoadStatus", "not_started")
+                    )
+                    :> JToken
         }
 
     member private this.EnsureStarted() : Task<JsonRpc> =
@@ -273,6 +399,9 @@ type private FsAutoCompleteBridge() =
 
                         let jsonRpc = new JsonRpc(handler)
                         jsonRpc.AddLocalRpcTarget(new DiagnosticsTarget(diagnostics)) |> ignore
+                        jsonRpc.AddLocalRpcTarget(new WorkspaceLoadTarget(fun () ->
+                            workspaceReady <- true
+                            workspaceReadyEvent.Set())) |> ignore
                         jsonRpc.StartListening()
 
                         let rootUri = Uri(workspaceRoot).AbsoluteUri
@@ -340,20 +469,31 @@ type private FsAutoCompleteBridge() =
                 return uri
         }
 
+    // WithDocument: gate wraps only SyncDocument; released before LSP invoke
     member private this.WithDocument
         (path: string, providedText: string option, methodName: string, mkParams: string -> JObject)
         : Task<JToken> =
         task {
             let! jsonRpc = this.EnsureStarted()
-            do! gate.WaitAsync()
 
-            try
-                let! uri = this.SyncDocument(jsonRpc, path, providedText)
-                let parameters = mkParams uri
-                let! response = jsonRpc.InvokeWithParameterObjectAsync<JToken>(methodName, parameters)
-                return response
-            finally
-                gate.Release() |> ignore
+            if not workspaceReady then
+                return this.NotReadyResponse()
+            else
+
+            // Lock only for document sync
+            let! uri =
+                task {
+                    do! gate.WaitAsync()
+                    try
+                        return! this.SyncDocument(jsonRpc, path, providedText)
+                    finally
+                        gate.Release() |> ignore
+                }
+
+            // Gate released — StreamJsonRpc handles concurrent requests natively
+            let parameters = mkParams uri
+            let! response = jsonRpc.InvokeWithParameterObjectAsync<JToken>(methodName, parameters)
+            return response
         }
 
     member private this.PositionParams(uri: string, line: int, character: int) =
@@ -403,14 +543,15 @@ type private FsAutoCompleteBridge() =
     member this.WorkspaceSymbol(args: WorkspaceSymbolArgs) : Task<JToken> =
         task {
             let! jsonRpc = this.EnsureStarted()
-            do! gate.WaitAsync()
 
-            try
-                let parameters = jobj [ "query", jstr args.query ]
-                let! response = jsonRpc.InvokeWithParameterObjectAsync<JToken>("workspace/symbol", parameters)
-                return response
-            finally
-                gate.Release() |> ignore
+            if not workspaceReady then
+                return this.NotReadyResponse()
+            else
+
+            // No document sync needed — just invoke directly, no gate
+            let parameters = jobj [ "query", jstr args.query ]
+            let! response = jsonRpc.InvokeWithParameterObjectAsync<JToken>("workspace/symbol", parameters)
+            return response
         }
 
     member _.Diagnostics(args: DiagnosticsArgs) : Task<JToken> =
@@ -433,10 +574,140 @@ type private FsAutoCompleteBridge() =
                 return root :> JToken
         }
 
+    member this.Formatting(args: FormattingArgs) : Task<JToken> =
+        task {
+            let! jsonRpc = this.EnsureStarted()
+
+            if not workspaceReady then
+                return this.NotReadyResponse()
+            else
+
+            let fullPath = Path.GetFullPath(args.path)
+            let originalText = args.text |> Option.defaultWith (fun () -> File.ReadAllText(fullPath))
+
+            // Lock only for document sync
+            let! uri =
+                task {
+                    do! gate.WaitAsync()
+                    try
+                        return! this.SyncDocument(jsonRpc, args.path, args.text)
+                    finally
+                        gate.Release() |> ignore
+                }
+
+            let formatParams =
+                JObject(
+                    JProperty("textDocument", JObject(JProperty("uri", uri))),
+                    JProperty("options", JObject(
+                        JProperty("tabSize", 4),
+                        JProperty("insertSpaces", true)))
+                )
+
+            let! editsToken = jsonRpc.InvokeWithParameterObjectAsync<JToken>("textDocument/formatting", formatParams)
+
+            // Apply text edits to produce formatted result
+            let applyEdits (text: string) (edits: JArray) =
+                // Sort edits in reverse order (bottom to top) to preserve positions
+                let getRangeStart (e: JToken) =
+                    let r = e["range"]
+                    let s = r["start"]
+                    s["line"].Value<int>(), s["character"].Value<int>()
+
+                let sortedEdits =
+                    edits
+                    |> Seq.cast<JToken>
+                    |> Seq.sortByDescending (fun e ->
+                        let sl, sc = getRangeStart e
+                        sl, sc)
+                    |> Seq.toArray
+
+                let lines = text.Split('\n') |> Array.map (fun l -> l.TrimEnd('\r'))
+
+                let applyEdit (linesArr: string array) (edit: JToken) =
+                    let range = edit["range"]
+                    let startPos = range["start"]
+                    let endPos = range["end"]
+                    let startLine = startPos["line"].Value<int>()
+                    let startChar = startPos["character"].Value<int>()
+                    let endLine = endPos["line"].Value<int>()
+                    let endChar = endPos["character"].Value<int>()
+                    let newText = edit["newText"].Value<string>()
+
+                    let before =
+                        if startLine < linesArr.Length then
+                            linesArr[startLine][..startChar - 1]
+                        else ""
+                    let after =
+                        if endLine < linesArr.Length then
+                            let endLineText = linesArr[endLine]
+                            if endChar < endLineText.Length then endLineText[endChar..] else ""
+                        else ""
+
+                    let replacement = before + newText + after
+                    let replacementLines = replacement.Split('\n')
+
+                    let result = System.Collections.Generic.List<string>()
+                    for i in 0 .. startLine - 1 do
+                        result.Add(linesArr[i])
+                    for l in replacementLines do
+                        result.Add(l)
+                    for i in endLine + 1 .. linesArr.Length - 1 do
+                        result.Add(linesArr[i])
+                    result.ToArray()
+
+                let mutable currentLines = lines
+                for edit in sortedEdits do
+                    currentLines <- applyEdit currentLines edit
+                String.concat "\n" currentLines
+
+            let formatted =
+                match editsToken with
+                | :? JArray as edits when edits.Count > 0 ->
+                    applyEdits originalText edits
+                | _ -> originalText
+
+            return
+                JObject(
+                    JProperty("status", "ok"),
+                    JProperty("formatted", formatted),
+                    JProperty("edits", if editsToken :? JArray then editsToken else JArray() :> JToken)
+                )
+                :> JToken
+        }
+
+    member this.CodeAction(args: CodeActionArgs) : Task<JToken> =
+        this.WithDocument(
+            args.path,
+            args.text,
+            "textDocument/codeAction",
+            fun uri ->
+                let pos = JObject(JProperty("line", args.line), JProperty("character", args.character))
+                JObject(
+                    JProperty("textDocument", JObject(JProperty("uri", uri))),
+                    JProperty("range", JObject(JProperty("start", pos), JProperty("end", pos))),
+                    JProperty("context", JObject(JProperty("diagnostics", JArray())))
+                )
+        )
+
+    member this.Rename(args: RenameArgs) : Task<JToken> =
+        this.WithDocument(
+            args.path,
+            args.text,
+            "textDocument/rename",
+            fun uri ->
+                JObject(
+                    JProperty("textDocument", JObject(JProperty("uri", uri))),
+                    JProperty("position", JObject(JProperty("line", args.line), JProperty("character", args.character))),
+                    JProperty("newName", args.newName)
+                )
+        )
+
     interface IDisposable with
         member this.Dispose() =
             this.StopLspUnsafe()
             gate.Dispose()
+
+// ─── FcsBridge ─────────────────────────────────────────────────────────────────
 
 type private FcsBridge() =
     let checker =
@@ -445,6 +716,10 @@ type private FcsBridge() =
             keepAllBackgroundResolutions = true,
             keepAllBackgroundSymbolUses = true
         )
+
+    // Caches keyed by a string combining projectPath + projectOptions hash
+    let optionsCache = ConcurrentDictionary<string, FSharpProjectOptions>()
+    let projectResultsCache = ConcurrentDictionary<string, FSharpCheckProjectResults>()
 
     let asTask (workflow: Async<'T>) : Task<'T> =
         Async.StartAsTask(workflow, cancellationToken = CancellationToken.None)
@@ -508,12 +783,21 @@ type private FcsBridge() =
         )
         :> JToken
 
+    // Build a stable cache key from projectPath and projectOptions list
+    let makeCacheKey (projectPath: string option) (projectOptions: string list option) =
+        let pp = projectPath |> Option.defaultValue ""
+        let po =
+            projectOptions
+            |> Option.map (fun opts -> String.concat "|" opts)
+            |> Option.defaultValue ""
+        $"{pp}::{po}"
+
     member private _.ResolveProjectOptions
         (path: string, text: string, projectPath: string option, projectOptions: string list option)
         : Task<FSharpProjectOptions * string> =
         task {
             let fullPath = normalizePath path
-            let sourceText = SourceText.ofString text
+            let cacheKey = makeCacheKey projectPath projectOptions
 
             match projectOptions with
             | Some options when not options.IsEmpty ->
@@ -522,13 +806,44 @@ type private FcsBridge() =
                     |> Option.defaultValue (Path.ChangeExtension(fullPath, ".fsproj"))
                     |> normalizePath
 
-                let resolvedOptions =
-                    checker.GetProjectOptionsFromCommandLineArgs(projectFileName, options |> List.toArray)
-
-                return resolvedOptions, "commandLineArgs"
+                match optionsCache.TryGetValue(cacheKey) with
+                | true, cached ->
+                    return cached, "commandLineArgs"
+                | false, _ ->
+                    let resolvedOptions =
+                        checker.GetProjectOptionsFromCommandLineArgs(projectFileName, options |> List.toArray)
+                    optionsCache[cacheKey] <- resolvedOptions
+                    return resolvedOptions, "commandLineArgs"
             | _ ->
-                let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
-                return scriptOptions, "scriptInference"
+                // Try auto-discover .fsproj
+                let discoveredFsproj = findNearestFsproj fullPath
+                match discoveredFsproj with
+                | Some fsprojPath ->
+                    let fsprojKey = $"fsproj::{fsprojPath}"
+                    match optionsCache.TryGetValue(fsprojKey) with
+                    | true, cached ->
+                        return cached, "auto-discovered"
+                    | false, _ ->
+                        // Use GetProjectOptionsFromScript as fallback since we can't easily
+                        // call Ionide's MSBuild evaluation without a proper toolsPath setup
+                        let sourceText = SourceText.ofString text
+                        let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
+                        // Override the project file name to the discovered .fsproj
+                        let discovered =
+                            { scriptOptions with
+                                ProjectFileName = fsprojPath }
+                        optionsCache[fsprojKey] <- discovered
+                        return discovered, "auto-discovered-script-fallback"
+                | None ->
+                    let scriptKey = $"script::{fullPath}"
+                    match optionsCache.TryGetValue(scriptKey) with
+                    | true, cached ->
+                        return cached, "scriptInference"
+                    | false, _ ->
+                        let sourceText = SourceText.ofString text
+                        let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
+                        optionsCache[scriptKey] <- scriptOptions
+                        return scriptOptions, "scriptInference"
         }
 
     member private this.PrepareCheckContext
@@ -645,7 +960,18 @@ type private FcsBridge() =
             let! _, _, optionsSource, projectOptions, _, _ =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
 
-            let! projectResults = checker.ParseAndCheckProject(projectOptions) |> asTask
+            // Use cached project results if available
+            let cacheKey = makeCacheKey args.projectPath args.projectOptions
+            let! projectResults, cached =
+                task {
+                    match projectResultsCache.TryGetValue(cacheKey) with
+                    | true, existing ->
+                        return existing, true
+                    | false, _ ->
+                        let! results = checker.ParseAndCheckProject(projectOptions) |> asTask
+                        projectResultsCache[cacheKey] <- results
+                        return results, false
+                }
 
             let exact = args.exact |> Option.defaultValue false
             let maxResults = args.maxResults |> Option.defaultValue 500
@@ -681,6 +1007,7 @@ type private FcsBridge() =
                     JProperty("projectFileName", projectOptions.ProjectFileName),
                     JProperty("query", query),
                     JProperty("exact", exact),
+                    JProperty("cached", cached),
                     JProperty("totalProjectSymbolUses", allUses.Length),
                     JProperty("matchedCount", matchedUses.Length),
                     JProperty("uses", JArray(matchedUses)),
@@ -688,6 +1015,196 @@ type private FcsBridge() =
                 )
                 :> JToken
         }
+
+    member this.TypeAtPosition(args: FcsTypeAtPositionArgs) : Task<JToken> =
+        task {
+            let! path, source, optionsSource, _, _, checkedResults =
+                this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
+
+            match checkedResults with
+            | None ->
+                return
+                    JObject(
+                        JProperty("status", "aborted"),
+                        JProperty("message", "Type checking was aborted.")
+                    )
+                    :> JToken
+            | Some checkResults ->
+                // FCS uses 1-based lines; assume input is 0-based (LSP convention)
+                let fcsLine = args.line + 1
+                let fcsCol = args.character
+
+                // Get the line text for FCS APIs
+                let lines = source.Split('\n')
+                let lineText =
+                    if fcsLine - 1 < lines.Length then lines[fcsLine - 1].TrimEnd('\r')
+                    else ""
+
+                let symbolUse =
+                    checkResults.GetSymbolUseAtLocation(fcsLine, fcsCol, lineText, [])
+
+                let toolTip =
+                    checkResults.GetToolTip(fcsLine, fcsCol, lineText, [], FSharp.Compiler.Tokenization.FSharpTokenTag.IDENT)
+
+                let typeString =
+                    match toolTip with
+                    | ToolTipText elements ->
+                        elements
+                        |> List.choose (fun el ->
+                            match el with
+                            | ToolTipElement.Group items ->
+                                items
+                                |> List.map (fun item ->
+                                    item.MainDescription
+                                    |> Array.map (fun tagged -> tagged.Text)
+                                    |> String.concat "")
+                                |> Some
+                            | _ -> None)
+                        |> List.collect id
+                        |> String.concat "\n"
+
+                let xmlDoc =
+                    match toolTip with
+                    | ToolTipText elements ->
+                        elements
+                        |> List.choose (fun el ->
+                            match el with
+                            | ToolTipElement.Group items ->
+                                items
+                                |> List.choose (fun item ->
+                                    match item.XmlDoc with
+                                    | FSharpXmlDoc.FromXmlText xmlText ->
+                                        Some (xmlText.GetXmlText())
+                                    | _ -> None)
+                                |> Some
+                            | _ -> None)
+                        |> List.collect id
+                        |> String.concat "\n"
+
+                match symbolUse with
+                | None ->
+                    return
+                        JObject(
+                            JProperty("status", "no_symbol"),
+                            JProperty("message", "No symbol at this position"),
+                            JProperty("file", path),
+                            JProperty("line", args.line),
+                            JProperty("character", args.character),
+                            JProperty("typeString", typeString)
+                        )
+                        :> JToken
+                | Some su ->
+                    return
+                        JObject(
+                            JProperty("status", "ok"),
+                            JProperty("file", path),
+                            JProperty("line", args.line),
+                            JProperty("character", args.character),
+                            JProperty("optionsSource", optionsSource),
+                            JProperty("symbolName", su.Symbol.DisplayName),
+                            JProperty("fullName", jstrOrNull su.Symbol.FullName),
+                            JProperty("typeString", typeString),
+                            JProperty("xmlDoc", xmlDoc)
+                        )
+                        :> JToken
+        }
+
+    member _.ClearCaches() =
+        optionsCache.Clear()
+        projectResultsCache.Clear()
+
+    member this.SignatureHelp(args: FcsSignatureHelpArgs) : Task<JToken> =
+        task {
+            let! path, source, optionsSource, _, _, checkedResults =
+                this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
+
+            match checkedResults with
+            | None ->
+                return
+                    JObject(
+                        JProperty("status", "aborted"),
+                        JProperty("message", "Type checking was aborted.")
+                    )
+                    :> JToken
+            | Some checkResults ->
+                // FCS uses 1-based lines; assume input is 0-based (LSP convention)
+                let fcsLine = args.line + 1
+                let fcsCol = args.character
+
+                let lines = source.Split('\n')
+                let lineText =
+                    if fcsLine - 1 < lines.Length then lines[fcsLine - 1].TrimEnd('\r')
+                    else ""
+
+                let methodsOpt =
+                    checkResults.GetMethodsAsSymbols(fcsLine, fcsCol, lineText, [])
+
+                let overloads =
+                    match methodsOpt with
+                    | None -> [||]
+                    | Some symbolUses ->
+                        symbolUses
+                        |> List.choose (fun su ->
+                            match su.Symbol with
+                            | :? FSharpMemberOrFunctionOrValue as m ->
+                                let paramGroups = m.CurriedParameterGroups
+                                let parameters =
+                                    paramGroups
+                                    |> Seq.collect id
+                                    |> Seq.map (fun p ->
+                                        JObject(
+                                            JProperty("name", p.Name |> Option.defaultValue ""),
+                                            JProperty("type", p.Type.BasicQualifiedName)
+                                        )
+                                        :> JToken)
+                                    |> Seq.toArray
+
+                                let returnType =
+                                    try m.ReturnParameter.Type.BasicQualifiedName
+                                    with _ -> ""
+
+                                let signature =
+                                    let paramStr =
+                                        parameters
+                                        |> Array.map (fun p ->
+                                            let pName = p["name"].Value<string>()
+                                            let pType = p["type"].Value<string>()
+                                            $"{pName}: {pType}")
+                                        |> String.concat ", "
+                                    $"{m.DisplayName}({paramStr}) -> {returnType}"
+
+                                Some (JObject(
+                                    JProperty("signature", signature),
+                                    JProperty("parameters", JArray(parameters)),
+                                    JProperty("returnType", returnType)
+                                )
+                                :> JToken)
+                            | _ -> None)
+                        |> List.toArray
+
+                if overloads.Length = 0 then
+                    return
+                        JObject(
+                            JProperty("status", "no_overloads"),
+                            JProperty("file", path),
+                            JProperty("line", args.line),
+                            JProperty("character", args.character)
+                        )
+                        :> JToken
+                else
+                    return
+                        JObject(
+                            JProperty("status", "ok"),
+                            JProperty("file", path),
+                            JProperty("line", args.line),
+                            JProperty("character", args.character),
+                            JProperty("optionsSource", optionsSource),
+                            JProperty("overloads", JArray(overloads))
+                        )
+                        :> JToken
+        }
+
+// ─── MCP helpers ───────────────────────────────────────────────────────────────
 
 let private renderToken (token: JToken) =
     token.ToString(Newtonsoft.Json.Formatting.Indented)
@@ -700,6 +1217,8 @@ let private toolResult (work: Task<JToken>) : Task<Result<Content list, McpError
         with ex ->
             return Error(McpError.TransportError ex.Message)
     }
+
+// ─── CLI helpers ───────────────────────────────────────────────────────────────
 
 type private CliParseResult =
     | Start
@@ -785,6 +1304,8 @@ let private applyCliOverrides (argv: string array) =
 
     loop 0
 
+// ─── Entry point ───────────────────────────────────────────────────────────────
+
 [<EntryPoint>]
 let main argv =
     match applyCliOverrides argv with
@@ -856,8 +1377,13 @@ let main argv =
                 tool (
                     TypedTool.define<SetProjectArgs>
                         "set_project"
-                        "Sets active project/workspace for fsautocomplete and optionally restarts LSP."
-                        (fun args -> toolResult (bridge.SetProject args))
+                        "Sets active project/workspace for fsautocomplete. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load."
+                        (fun args ->
+                            toolResult (task {
+                                let! result = bridge.SetProject args
+                                fcsBridge.ClearCaches()
+                                return result
+                            }))
                     |> unwrapResult
                 )
 
@@ -880,8 +1406,48 @@ let main argv =
                 tool (
                     TypedTool.define<FcsProjectSymbolUsesArgs>
                         "fcs_project_symbol_uses"
-                        "FCS project-wide symbol use search by symbol name/fullname."
+                        "FCS project-wide symbol use search by symbol name/fullname. Results are cached per project."
                         (fun args -> toolResult (fcsBridge.ProjectSymbolUses args))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsTypeAtPositionArgs>
+                        "fcs_type_at_position"
+                        "Returns the F# type and symbol info at a cursor position. line/character are 0-based (LSP convention)."
+                        (fun args -> toolResult (fcsBridge.TypeAtPosition args))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsSignatureHelpArgs>
+                        "fcs_signature_help"
+                        "Returns method signature and overloads at a cursor position. line/character are 0-based (LSP convention)."
+                        (fun args -> toolResult (fcsBridge.SignatureHelp args))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FormattingArgs>
+                        "textDocument_formatting"
+                        "Formats F# code via fsautocomplete/Fantomas. Returns formatted text and applied edits."
+                        (fun args -> toolResult (bridge.Formatting args))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<CodeActionArgs>
+                        "textDocument_codeAction"
+                        "Returns available code actions at a position via fsautocomplete. line/character are 0-based."
+                        (fun args -> toolResult (bridge.CodeAction args))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<RenameArgs>
+                        "textDocument_rename"
+                        "Renames a symbol at a position via fsautocomplete. line/character are 0-based."
+                        (fun args -> toolResult (bridge.Rename args))
                     |> unwrapResult
                 )
 
