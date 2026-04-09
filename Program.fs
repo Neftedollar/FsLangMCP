@@ -356,24 +356,28 @@ type private FsAutoCompleteBridge() =
                 return
                     JObject(
                         JProperty("status", "ok"),
-                        JProperty("projectPath",
-                            capturedProjectPath |> Option.map JValue |> Option.defaultValue (JValue.CreateNull()) :> JToken),
-                        JProperty("workspaceRoot", capturedWorkspaceRoot),
-                        JProperty("lspRestarted", restartLsp),
-                        JProperty("solutionMode", isSolution),
-                        JProperty("workspaceLoadStatus", loadStatus)
+                        JProperty("result", JObject(
+                            JProperty("projectPath",
+                                capturedProjectPath |> Option.map JValue |> Option.defaultValue (JValue.CreateNull()) :> JToken),
+                            JProperty("workspaceRoot", capturedWorkspaceRoot),
+                            JProperty("lspRestarted", restartLsp),
+                            JProperty("solutionMode", isSolution),
+                            JProperty("workspaceLoadStatus", loadStatus)
+                        ))
                     )
                     :> JToken
             else
                 return
                     JObject(
                         JProperty("status", "ok"),
-                        JProperty("projectPath",
-                            capturedProjectPath |> Option.map JValue |> Option.defaultValue (JValue.CreateNull()) :> JToken),
-                        JProperty("workspaceRoot", capturedWorkspaceRoot),
-                        JProperty("lspRestarted", restartLsp),
-                        JProperty("solutionMode", isSolution),
-                        JProperty("workspaceLoadStatus", "not_started")
+                        JProperty("result", JObject(
+                            JProperty("projectPath",
+                                capturedProjectPath |> Option.map JValue |> Option.defaultValue (JValue.CreateNull()) :> JToken),
+                            JProperty("workspaceRoot", capturedWorkspaceRoot),
+                            JProperty("lspRestarted", restartLsp),
+                            JProperty("solutionMode", isSolution),
+                            JProperty("workspaceLoadStatus", "not_started")
+                        ))
                     )
                     :> JToken
         }
@@ -544,7 +548,7 @@ type private FsAutoCompleteBridge() =
             // Gate released — StreamJsonRpc handles concurrent requests natively
             let parameters = mkParams uri
             let! response = jsonRpc.InvokeWithParameterObjectAsync<JToken>(methodName, parameters)
-            return response
+            return JObject(JProperty("status", "ok"), JProperty("result", response)) :> JToken
         }
 
     member private this.PositionParams(uri: string, line: int, character: int) =
@@ -602,7 +606,7 @@ type private FsAutoCompleteBridge() =
             // No document sync needed — just invoke directly, no gate
             let parameters = jobj [ "query", jstr args.query ]
             let! response = jsonRpc.InvokeWithParameterObjectAsync<JToken>("workspace/symbol", parameters)
-            return response
+            return JObject(JProperty("status", "ok"), JProperty("result", response)) :> JToken
         }
 
     member _.Diagnostics(args: DiagnosticsArgs) : Task<JToken> =
@@ -615,14 +619,14 @@ type private FsAutoCompleteBridge() =
             match args.path with
             | Some path ->
                 let uri = toFileUri path
-                return resolveByUri uri
+                return JObject(JProperty("status", "ok"), JProperty("result", resolveByUri uri)) :> JToken
             | None ->
                 let root = JObject()
 
                 for KeyValue(uri, payload) in diagnostics do
                     root[uri] <- payload.DeepClone()
 
-                return root :> JToken
+                return JObject(JProperty("status", "ok"), JProperty("result", root)) :> JToken
         }
 
     member this.Formatting(args: FormattingArgs) : Task<JToken> =
@@ -720,8 +724,10 @@ type private FsAutoCompleteBridge() =
             return
                 JObject(
                     JProperty("status", "ok"),
-                    JProperty("formatted", formatted),
-                    JProperty("edits", if editsToken :? JArray then editsToken else JArray() :> JToken)
+                    JProperty("result", JObject(
+                        JProperty("formatted", formatted),
+                        JProperty("edits", if editsToken :? JArray then editsToken else JArray() :> JToken)
+                    ))
                 )
                 :> JToken
         }
@@ -1187,97 +1193,94 @@ type private FcsBridge() =
         optionsCache.Clear()
         projectResultsCache.Clear()
 
+    member private _.BuildSignatureHelpResult
+        (path: string, source: string, optionsSource: string, args: FcsSignatureHelpArgs, checkedResults: FSharpCheckFileResults option) : JToken =
+        match checkedResults with
+        | None ->
+            JObject(
+                JProperty("status", "aborted"),
+                JProperty("message", "Type checking was aborted.")
+            ) :> JToken
+        | Some checkResults ->
+            // FCS uses 1-based lines; assume input is 0-based (LSP convention)
+            let fcsLine = args.line + 1
+            let fcsCol = args.character
+
+            let lines = source.Split('\n')
+            let lineText =
+                if fcsLine - 1 < lines.Length then lines[fcsLine - 1].TrimEnd('\r')
+                else ""
+
+            let methodsOpt =
+                checkResults.GetMethodsAsSymbols(fcsLine, fcsCol, lineText, [])
+
+            let overloads =
+                match methodsOpt with
+                | None -> [||]
+                | Some symbolUses ->
+                    symbolUses
+                    |> List.choose (fun su ->
+                        match su.Symbol with
+                        | :? FSharpMemberOrFunctionOrValue as m ->
+                            let paramGroups = m.CurriedParameterGroups
+                            let parameters =
+                                paramGroups
+                                |> Seq.collect id
+                                |> Seq.map (fun p ->
+                                    JObject(
+                                        JProperty("name", p.Name |> Option.defaultValue ""),
+                                        JProperty("type", p.Type.BasicQualifiedName)
+                                    )
+                                    :> JToken)
+                                |> Seq.toArray
+
+                            let returnType =
+                                try m.ReturnParameter.Type.BasicQualifiedName
+                                with ex ->
+                                    Console.Error.WriteLine($"[fcs_signature_help] ReturnParameter error: {ex.Message}")
+                                    ""
+
+                            let signature =
+                                let paramStr =
+                                    parameters
+                                    |> Array.map (fun p ->
+                                        let pName = p["name"].Value<string>()
+                                        let pType = p["type"].Value<string>()
+                                        $"{pName}: {pType}")
+                                    |> String.concat ", "
+                                $"{m.DisplayName}({paramStr}) -> {returnType}"
+
+                            Some (JObject(
+                                JProperty("signature", signature),
+                                JProperty("parameters", JArray(parameters)),
+                                JProperty("returnType", returnType)
+                            )
+                            :> JToken)
+                        | _ -> None)
+                    |> List.toArray
+
+            if overloads.Length = 0 then
+                JObject(
+                    JProperty("status", "no_overloads"),
+                    JProperty("file", path),
+                    JProperty("line", args.line),
+                    JProperty("character", args.character)
+                ) :> JToken
+            else
+                JObject(
+                    JProperty("status", "ok"),
+                    JProperty("file", path),
+                    JProperty("line", args.line),
+                    JProperty("character", args.character),
+                    JProperty("optionsSource", optionsSource),
+                    JProperty("overloads", JArray(overloads))
+                ) :> JToken
+
     member this.SignatureHelp(args: FcsSignatureHelpArgs) : Task<JToken> =
         task {
             let! path, source, optionsSource, _, _, checkedResults =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
-
-            match checkedResults with
-            | None ->
-                return
-                    JObject(
-                        JProperty("status", "aborted"),
-                        JProperty("message", "Type checking was aborted.")
-                    )
-                    :> JToken
-            | Some checkResults ->
-                // FCS uses 1-based lines; assume input is 0-based (LSP convention)
-                let fcsLine = args.line + 1
-                let fcsCol = args.character
-
-                let lines = source.Split('\n')
-                let lineText =
-                    if fcsLine - 1 < lines.Length then lines[fcsLine - 1].TrimEnd('\r')
-                    else ""
-
-                let methodsOpt =
-                    checkResults.GetMethodsAsSymbols(fcsLine, fcsCol, lineText, [])
-
-                let overloads =
-                    match methodsOpt with
-                    | None -> [||]
-                    | Some symbolUses ->
-                        symbolUses
-                        |> List.choose (fun su ->
-                            match su.Symbol with
-                            | :? FSharpMemberOrFunctionOrValue as m ->
-                                let paramGroups = m.CurriedParameterGroups
-                                let parameters =
-                                    paramGroups
-                                    |> Seq.collect id
-                                    |> Seq.map (fun p ->
-                                        JObject(
-                                            JProperty("name", p.Name |> Option.defaultValue ""),
-                                            JProperty("type", p.Type.BasicQualifiedName)
-                                        )
-                                        :> JToken)
-                                    |> Seq.toArray
-
-                                let returnType =
-                                    try m.ReturnParameter.Type.BasicQualifiedName
-                                    with ex ->
-                                        Console.Error.WriteLine($"[fcs_signature_help] ReturnParameter error: {ex.Message}")
-                                        ""
-
-                                let signature =
-                                    let paramStr =
-                                        parameters
-                                        |> Array.map (fun p ->
-                                            let pName = p["name"].Value<string>()
-                                            let pType = p["type"].Value<string>()
-                                            $"{pName}: {pType}")
-                                        |> String.concat ", "
-                                    $"{m.DisplayName}({paramStr}) -> {returnType}"
-
-                                Some (JObject(
-                                    JProperty("signature", signature),
-                                    JProperty("parameters", JArray(parameters)),
-                                    JProperty("returnType", returnType)
-                                )
-                                :> JToken)
-                            | _ -> None)
-                        |> List.toArray
-
-                if overloads.Length = 0 then
-                    return
-                        JObject(
-                            JProperty("status", "no_overloads"),
-                            JProperty("file", path),
-                            JProperty("line", args.line),
-                            JProperty("character", args.character)
-                        )
-                        :> JToken
-                else
-                    return
-                        JObject(
-                            JProperty("status", "ok"),
-                            JProperty("file", path),
-                            JProperty("line", args.line),
-                            JProperty("character", args.character),
-                            JProperty("optionsSource", optionsSource),
-                            JProperty("overloads", JArray(overloads))
-                        )
-                        :> JToken
+            return this.BuildSignatureHelpResult(path, source, optionsSource, args, checkedResults)
         }
 
 // ─── MCP helpers ───────────────────────────────────────────────────────────────
