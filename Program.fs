@@ -106,7 +106,7 @@ type RenameArgs =
 
 // ─── Helper: find nearest .fsproj ──────────────────────────────────────────────
 
-let findNearestFsproj (filePath: string) : string option =
+let private findNearestFsproj (filePath: string) : string option =
     let rec walk (dir: string) =
         if isNull dir then None
         else
@@ -148,10 +148,13 @@ type private FsAutoCompleteBridge() =
     let gate = new SemaphoreSlim(1, 1)
     let documents = ConcurrentDictionary<string, LspDocumentState>()
     let diagnostics = ConcurrentDictionary<string, JToken>()
+    [<VolatileField>]
     let mutable rpc: JsonRpc option = None
     let mutable lspProcess: Process option = None
     let mutable runtimeProjectPath: string option = None
     let mutable runtimeWorkspaceRoot: string option = None
+    let workspaceReadyEvent = new ManualResetEventSlim(false)
+    [<VolatileField>]
     let mutable workspaceReady = false
 
     let parseArgs (raw: string option) =
@@ -240,16 +243,14 @@ type private FsAutoCompleteBridge() =
         documents.Clear()
         diagnostics.Clear()
         workspaceReady <- false
+        workspaceReadyEvent.Reset()
 
     member _.DiagnosticsStore = diagnostics
 
     // Wait until workspaceReady is true or timeout elapses
     member _.WaitForReady(timeout: TimeSpan) : Task<bool> =
         task {
-            let deadline = DateTime.UtcNow + timeout
-            while not workspaceReady && DateTime.UtcNow < deadline do
-                do! Task.Delay(200)
-            return workspaceReady
+            return workspaceReadyEvent.Wait(timeout)
         }
 
     // Return not-ready JSON if workspace not loaded yet
@@ -284,23 +285,26 @@ type private FsAutoCompleteBridge() =
             let restartLsp = args.restartLsp |> Option.defaultValue true
             do! gate.WaitAsync()
 
-            try
-                if isSolution then
-                    runtimeProjectPath <- None
-                    runtimeWorkspaceRoot <- Some resolvedWorkspace
-                else
-                    runtimeProjectPath <- Some projectPath
-                    runtimeWorkspaceRoot <- Some resolvedWorkspace
+            let capturedProjectPath, capturedWorkspaceRoot =
+                try
+                    if isSolution then
+                        runtimeProjectPath <- None
+                        runtimeWorkspaceRoot <- Some resolvedWorkspace
+                    else
+                        runtimeProjectPath <- Some projectPath
+                        runtimeWorkspaceRoot <- Some resolvedWorkspace
 
-                Environment.SetEnvironmentVariable(
-                    "FSA_PROJECT_PATH",
-                    runtimeProjectPath |> Option.defaultValue "")
-                Environment.SetEnvironmentVariable("FSA_WORKSPACE_ROOT", resolvedWorkspace)
+                    Environment.SetEnvironmentVariable(
+                        "FSA_PROJECT_PATH",
+                        runtimeProjectPath |> Option.defaultValue "")
+                    Environment.SetEnvironmentVariable("FSA_WORKSPACE_ROOT", resolvedWorkspace)
 
-                if restartLsp then
-                    this.StopLspUnsafe()
-            finally
-                gate.Release() |> ignore
+                    if restartLsp then
+                        this.StopLspUnsafe()
+
+                    runtimeProjectPath, resolvedWorkspace
+                finally
+                    gate.Release() |> ignore
 
             // After releasing gate, wait for workspace to be ready if we restarted
             if restartLsp then
@@ -313,8 +317,8 @@ type private FsAutoCompleteBridge() =
                     JObject(
                         JProperty("status", "ok"),
                         JProperty("projectPath",
-                            runtimeProjectPath |> Option.map JValue |> Option.defaultValue (JValue.CreateNull()) :> JToken),
-                        JProperty("workspaceRoot", resolvedWorkspace),
+                            capturedProjectPath |> Option.map JValue |> Option.defaultValue (JValue.CreateNull()) :> JToken),
+                        JProperty("workspaceRoot", capturedWorkspaceRoot),
                         JProperty("lspRestarted", restartLsp),
                         JProperty("solutionMode", isSolution),
                         JProperty("workspaceLoadStatus", loadStatus)
@@ -325,8 +329,8 @@ type private FsAutoCompleteBridge() =
                     JObject(
                         JProperty("status", "ok"),
                         JProperty("projectPath",
-                            runtimeProjectPath |> Option.map JValue |> Option.defaultValue (JValue.CreateNull()) :> JToken),
-                        JProperty("workspaceRoot", resolvedWorkspace),
+                            capturedProjectPath |> Option.map JValue |> Option.defaultValue (JValue.CreateNull()) :> JToken),
+                        JProperty("workspaceRoot", capturedWorkspaceRoot),
                         JProperty("lspRestarted", restartLsp),
                         JProperty("solutionMode", isSolution),
                         JProperty("workspaceLoadStatus", "not_started")
@@ -395,7 +399,9 @@ type private FsAutoCompleteBridge() =
 
                         let jsonRpc = new JsonRpc(handler)
                         jsonRpc.AddLocalRpcTarget(new DiagnosticsTarget(diagnostics)) |> ignore
-                        jsonRpc.AddLocalRpcTarget(new WorkspaceLoadTarget(fun () -> workspaceReady <- true)) |> ignore
+                        jsonRpc.AddLocalRpcTarget(new WorkspaceLoadTarget(fun () ->
+                            workspaceReady <- true
+                            workspaceReadyEvent.Set())) |> ignore
                         jsonRpc.StartListening()
 
                         let rootUri = Uri(workspaceRoot).AbsoluteUri
@@ -827,7 +833,7 @@ type private FcsBridge() =
                             { scriptOptions with
                                 ProjectFileName = fsprojPath }
                         optionsCache[fsprojKey] <- discovered
-                        return discovered, "auto-discovered"
+                        return discovered, "auto-discovered-script-fallback"
                 | None ->
                     let scriptKey = $"script::{fullPath}"
                     match optionsCache.TryGetValue(scriptKey) with
@@ -1103,6 +1109,10 @@ type private FcsBridge() =
                         :> JToken
         }
 
+    member _.ClearCaches() =
+        optionsCache.Clear()
+        projectResultsCache.Clear()
+
     member this.SignatureHelp(args: FcsSignatureHelpArgs) : Task<JToken> =
         task {
             let! path, source, optionsSource, _, _, checkedResults =
@@ -1160,7 +1170,7 @@ type private FcsBridge() =
                                             let pName = p["name"].Value<string>()
                                             let pType = p["type"].Value<string>()
                                             $"{pName}: {pType}")
-                                        |> String.concat " -> "
+                                        |> String.concat ", "
                                     $"{m.DisplayName}({paramStr}) -> {returnType}"
 
                                 Some (JObject(
@@ -1368,7 +1378,12 @@ let main argv =
                     TypedTool.define<SetProjectArgs>
                         "set_project"
                         "Sets active project/workspace for fsautocomplete. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load."
-                        (fun args -> toolResult (bridge.SetProject args))
+                        (fun args ->
+                            toolResult (task {
+                                let! result = bridge.SetProject args
+                                fcsBridge.ClearCaches()
+                                return result
+                            }))
                     |> unwrapResult
                 )
 
