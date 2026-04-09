@@ -307,17 +307,24 @@ type private FsAutoCompleteBridge() =
                         runtimeProjectPath |> Option.defaultValue "")
                     Environment.SetEnvironmentVariable("FSA_WORKSPACE_ROOT", resolvedWorkspace)
 
-                    if restartLsp then
-                        this.StopLspUnsafe()
-
                     runtimeProjectPath, resolvedWorkspace
+                with ex ->
+                    gate.Release() |> ignore
+                    reraise()
+
+            // Call StartLspUnsafe while still holding the gate — atomic stop+start
+            if restartLsp then
+                try
+                    this.StopLspUnsafe()
+                    let! _ = this.StartLspUnsafe()
+                    ()
                 finally
                     gate.Release() |> ignore
+            else
+                gate.Release() |> ignore
 
-            // After releasing gate, wait for workspace to be ready if we restarted
+            // Wait for workspace to be ready outside the gate
             if restartLsp then
-                // Trigger EnsureStarted so we begin LSP and start listening for workspaceLoad
-                let! _ = this.EnsureStarted()
                 let! ready = this.WaitForReady(TimeSpan.FromSeconds(30.0))
                 let loadStatus = if ready then "ready" else "timeout"
 
@@ -346,107 +353,110 @@ type private FsAutoCompleteBridge() =
                     :> JToken
         }
 
+    // StartLspUnsafe: assumes gate is already held by caller
+    member private this.StartLspUnsafe() : Task<JsonRpc> =
+        task {
+            let command = fsacCommand ()
+            let args = fsacArgs ()
+            let workspaceRoot = getWorkspaceRoot ()
+
+            let psi = ProcessStartInfo()
+            psi.FileName <- command
+            psi.UseShellExecute <- false
+            psi.RedirectStandardInput <- true
+            psi.RedirectStandardOutput <- true
+            psi.RedirectStandardError <- true
+            psi.CreateNoWindow <- true
+
+            if Directory.Exists(workspaceRoot) then
+                psi.WorkingDirectory <- workspaceRoot
+
+            for arg in args do
+                psi.ArgumentList.Add(arg)
+
+            let fsacProc = new Process(StartInfo = psi)
+
+            if not (fsacProc.Start()) then
+                invalidOp $"Unable to start {command}"
+
+            let pumpStderr : Task =
+                task {
+                    let mutable keepReading = true
+
+                    while keepReading do
+                        let! line = fsacProc.StandardError.ReadLineAsync()
+
+                        if isNull line then
+                            keepReading <- false
+                        elif not (String.IsNullOrWhiteSpace line) then
+                            Console.Error.WriteLine($"[fsautocomplete] {line}")
+                }
+
+            pumpStderr.ContinueWith(
+                (fun (t: Task) ->
+                    if t.IsFaulted then
+                        let ex = t.Exception.GetBaseException()
+                        if not (ex :? ObjectDisposedException) then
+                            Console.Error.WriteLine($"[stderr pump] {ex.Message}")),
+                TaskContinuationOptions.OnlyOnFaulted) |> ignore
+
+            stderrPump <- Some pumpStderr
+
+            let formatter = new JsonMessageFormatter()
+            formatter.JsonSerializer.NullValueHandling <- NullValueHandling.Ignore
+
+            let handler =
+                new HeaderDelimitedMessageHandler(
+                    fsacProc.StandardInput.BaseStream,
+                    fsacProc.StandardOutput.BaseStream,
+                    formatter
+                )
+
+            let jsonRpc = new JsonRpc(handler)
+            jsonRpc.AddLocalRpcTarget(new DiagnosticsTarget(diagnostics)) |> ignore
+            jsonRpc.AddLocalRpcTarget(new WorkspaceLoadTarget(fun () ->
+                workspaceReady <- true
+                workspaceReadyEvent.Set())) |> ignore
+            jsonRpc.StartListening()
+
+            let rootUri = Uri(workspaceRoot).AbsoluteUri
+            let workspaceName = Path.GetFileName(workspaceRoot)
+
+            let initializeParams =
+                jobj
+                    [ "processId", jint Environment.ProcessId
+                      "rootUri", jstr rootUri
+                      "trace", jstr "off"
+                      "clientInfo", jobj [ "name", jstr "fsmcp-fsharp"; "version", jstr "0.1.0" ]
+                      "workspaceFolders",
+                      JArray(jobj [ "uri", jstr rootUri; "name", jstr workspaceName ]) :> JToken
+                      "capabilities",
+                      jobj
+                          [ "workspace", jobj [ "workspaceFolders", jbool true ]
+                            "textDocument",
+                            jobj
+                                [ "completion",
+                                  jobj [ "completionItem", jobj [ "snippetSupport", jbool true ] ] ] ] ]
+
+            let! _ = jsonRpc.InvokeWithParameterObjectAsync<JToken>("initialize", initializeParams)
+            do! jsonRpc.NotifyWithParameterObjectAsync("initialized", JObject())
+
+            rpc <- Some jsonRpc
+            lspProcess <- Some fsacProc
+            return jsonRpc
+        }
+
     member private this.EnsureStarted() : Task<JsonRpc> =
         task {
-            match rpc with
-            | Some existing -> return existing
-            | None ->
-                do! gate.WaitAsync()
-
-                try
-                    match rpc with
-                    | Some existing -> return existing
-                    | None ->
-                        let command = fsacCommand ()
-                        let args = fsacArgs ()
-                        let workspaceRoot = getWorkspaceRoot ()
-
-                        let psi = ProcessStartInfo()
-                        psi.FileName <- command
-                        psi.UseShellExecute <- false
-                        psi.RedirectStandardInput <- true
-                        psi.RedirectStandardOutput <- true
-                        psi.RedirectStandardError <- true
-                        psi.CreateNoWindow <- true
-
-                        if Directory.Exists(workspaceRoot) then
-                            psi.WorkingDirectory <- workspaceRoot
-
-                        for arg in args do
-                            psi.ArgumentList.Add(arg)
-
-                        let fsacProc = new Process(StartInfo = psi)
-
-                        if not (fsacProc.Start()) then
-                            invalidOp $"Unable to start {command}"
-
-                        let pumpStderr : Task =
-                            task {
-                                let mutable keepReading = true
-
-                                while keepReading do
-                                    let! line = fsacProc.StandardError.ReadLineAsync()
-
-                                    if isNull line then
-                                        keepReading <- false
-                                    elif not (String.IsNullOrWhiteSpace line) then
-                                        Console.Error.WriteLine($"[fsautocomplete] {line}")
-                            }
-
-                        pumpStderr.ContinueWith(
-                            (fun (t: Task) ->
-                                if t.IsFaulted then
-                                    let ex = t.Exception.GetBaseException()
-                                    if not (ex :? ObjectDisposedException) then
-                                        Console.Error.WriteLine($"[stderr pump] {ex.Message}")),
-                            TaskContinuationOptions.OnlyOnFaulted) |> ignore
-
-                        stderrPump <- Some pumpStderr
-
-                        let formatter = new JsonMessageFormatter()
-                        formatter.JsonSerializer.NullValueHandling <- NullValueHandling.Ignore
-
-                        let handler =
-                            new HeaderDelimitedMessageHandler(
-                                fsacProc.StandardInput.BaseStream,
-                                fsacProc.StandardOutput.BaseStream,
-                                formatter
-                            )
-
-                        let jsonRpc = new JsonRpc(handler)
-                        jsonRpc.AddLocalRpcTarget(new DiagnosticsTarget(diagnostics)) |> ignore
-                        jsonRpc.AddLocalRpcTarget(new WorkspaceLoadTarget(fun () ->
-                            workspaceReady <- true
-                            workspaceReadyEvent.Set())) |> ignore
-                        jsonRpc.StartListening()
-
-                        let rootUri = Uri(workspaceRoot).AbsoluteUri
-                        let workspaceName = Path.GetFileName(workspaceRoot)
-
-                        let initializeParams =
-                            jobj
-                                [ "processId", jint Environment.ProcessId
-                                  "rootUri", jstr rootUri
-                                  "trace", jstr "off"
-                                  "clientInfo", jobj [ "name", jstr "fsmcp-fsharp"; "version", jstr "0.1.0" ]
-                                  "workspaceFolders",
-                                  JArray(jobj [ "uri", jstr rootUri; "name", jstr workspaceName ]) :> JToken
-                                  "capabilities",
-                                  jobj
-                                      [ "workspace", jobj [ "workspaceFolders", jbool true ]
-                                        "textDocument",
-                                        jobj
-                                            [ "completion",
-                                              jobj [ "completionItem", jobj [ "snippetSupport", jbool true ] ] ] ] ]
-
-                        let! _ = jsonRpc.InvokeWithParameterObjectAsync<JToken>("initialize", initializeParams)
-                        do! jsonRpc.NotifyWithParameterObjectAsync("initialized", JObject())
-
-                        rpc <- Some jsonRpc
-                        lspProcess <- Some fsacProc
-                        return jsonRpc
-                finally
-                    gate.Release() |> ignore
+            do! gate.WaitAsync()
+            try
+                match rpc with
+                | Some existing -> return existing
+                | None ->
+                    let! result = this.StartLspUnsafe()
+                    return result
+            finally
+                gate.Release() |> ignore
         }
 
     member private this.SyncDocument
