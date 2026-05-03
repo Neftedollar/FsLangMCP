@@ -27,6 +27,12 @@ let private findNearestFsproj (filePath: string) : string option =
             else walk (Path.GetDirectoryName(dir))
     walk (Path.GetDirectoryName(Path.GetFullPath(filePath)))
 
+let private explicitFsproj (projectPath: string option) : string option =
+    projectPath
+    |> Option.map normalizePath
+    |> Option.filter (fun path ->
+        String.Equals(Path.GetExtension(path), ".fsproj", StringComparison.OrdinalIgnoreCase))
+
 // ─── FcsBridge ─────────────────────────────────────────────────────────────────
 
 type internal FcsBridge() =
@@ -106,6 +112,10 @@ type internal FcsBridge() =
             |> Option.defaultValue ""
         $"{pp}::{po}"
 
+    let makeResolvedProjectCacheKey (projectOptions: FSharpProjectOptions) =
+        let optionsHash = String.concat "|" projectOptions.OtherOptions
+        $"{projectOptions.ProjectFileName}::{optionsHash}"
+
     member private _.LoadProjectOptionsFromFsproj(fsprojPath: string) : Task<FSharpProjectOptions option> =
         // Offload to thread pool — MSBuild/SDK probing is CPU+IO bound.
         // Assumption: Init.init and WorkspaceLoader do not rely on thread-local or
@@ -149,9 +159,12 @@ type internal FcsBridge() =
                     optionsCache.Set(cacheKey, resolvedOptions)
                     return resolvedOptions, "commandLineArgs"
             | _ ->
-                // Try auto-discover .fsproj
-                let discoveredFsproj = findNearestFsproj fullPath
-                match discoveredFsproj with
+                let requestedFsproj = explicitFsproj projectPath
+                let resolvedFsproj =
+                    requestedFsproj
+                    |> Option.orElseWith (fun () -> findNearestFsproj fullPath)
+
+                match resolvedFsproj with
                 | Some fsprojPath ->
                     let fsprojKey = $"fsproj::{fsprojPath}"
                     match optionsCache.TryGet(fsprojKey) with
@@ -165,12 +178,16 @@ type internal FcsBridge() =
                             optionsCache.Set(fsprojKey, projOpts)
                             return projOpts, "ionide-proj-info"
                         | None ->
-                            // Fall back to script inference with honest labelling
-                            let sourceText = SourceText.ofString text
-                            let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
-                            let discovered = { scriptOptions with ProjectFileName = fsprojPath }
-                            optionsCache.Set(fsprojKey, discovered)
-                            return discovered, "auto-discovered-script-fallback"
+                            match requestedFsproj with
+                            | Some _ ->
+                                return raise (InvalidOperationException($"Unable to load F# project options from explicit projectPath: {fsprojPath}"))
+                            | None ->
+                                // Fall back to script inference with honest labelling
+                                let sourceText = SourceText.ofString text
+                                let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
+                                let discovered = { scriptOptions with ProjectFileName = fsprojPath }
+                                optionsCache.Set(fsprojKey, discovered)
+                                return discovered, "auto-discovered-script-fallback"
                 | None ->
                     let scriptKey = $"script::{fullPath}"
                     match optionsCache.TryGet(scriptKey) with
@@ -298,8 +315,9 @@ type internal FcsBridge() =
             let! _, _, optionsSource, projectOptions, _, _ =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
 
-            // Use cached project results if available
-            let cacheKey = makeCacheKey args.projectPath args.projectOptions
+            // Use the resolved project as the cache key. When projectPath is omitted,
+            // different files may auto-discover different projects.
+            let cacheKey = makeResolvedProjectCacheKey projectOptions
             let! projectResults, cached =
                 task {
                     match projectResultsCache.TryGet(cacheKey) with

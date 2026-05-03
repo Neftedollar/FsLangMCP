@@ -12,6 +12,7 @@ open System.Text.Json.Nodes
 open Xunit
 open FsLangMcp.Types
 open FsLangMcp.Tools
+open FsLangMcp.FcsBridge
 
 // ─── ToolError serialization tests ────────────────────────────────────────────
 // These tests call the real toolErrorToJson from Tools.fs so that regressions
@@ -87,6 +88,45 @@ let private writeTempFs (content: string) =
     File.WriteAllText(path, content)
     path
 
+let private findRepoRoot () =
+    let rec loop (dir: DirectoryInfo) =
+        if isNull dir then
+            failwith "Could not locate FsLangMcp repo root."
+        elif File.Exists(Path.Combine(dir.FullName, "FsLangMcp.fsproj")) then
+            dir.FullName
+        else
+            loop dir.Parent
+
+    loop (DirectoryInfo(AppContext.BaseDirectory))
+
+let private jsonArrayLength (node: JsonNode) =
+    (node :?> JsonArray).Count
+
+let private writeSimpleProject (root: string) (projectName: string) (symbolName: string) =
+    let dir = Path.Combine(root, projectName)
+    Directory.CreateDirectory(dir) |> ignore
+
+    let sourcePath = Path.Combine(dir, "Library.fs")
+    File.WriteAllText(
+        sourcePath,
+        $"module {projectName}.Library\n\nlet {symbolName} = 42\n")
+
+    let projectPath = Path.Combine(dir, $"{projectName}.fsproj")
+    File.WriteAllText(
+        projectPath,
+        String.concat
+            Environment.NewLine
+            [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+              "  <PropertyGroup>"
+              "    <TargetFramework>net10.0</TargetFramework>"
+              "  </PropertyGroup>"
+              "  <ItemGroup>"
+              "    <Compile Include=\"Library.fs\" />"
+              "  </ItemGroup>"
+              "</Project>" ])
+
+    sourcePath, projectPath
+
 [<Fact>]
 let ``fcs_parse_and_check_file succeeds on valid F# snippet`` () : Task =
     task {
@@ -113,6 +153,69 @@ let result = add 1 2
                 Assert.Fail("Type checking was aborted unexpectedly")
         finally
             if File.Exists(path) then File.Delete(path)
+    }
+
+[<Fact>]
+let ``FcsBridge uses explicit fsproj projectPath without projectOptions`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let sourcePath = Path.Combine(root, "FcsBridge.fs")
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.ParseAndCheckFile(
+                { path = sourcePath
+                  text = None
+                  projectPath = Some projectPath
+                  projectOptions = None })
+
+        Assert.Equal("ionide-proj-info", result["optionsSource"].GetValue<string>())
+        Assert.Equal(Path.GetFullPath(projectPath), result["projectFileName"].GetValue<string>())
+        Assert.True(result["hasFullTypeCheckInfo"].GetValue<bool>())
+        Assert.Equal(0, jsonArrayLength result["parseDiagnostics"])
+        Assert.Equal(0, jsonArrayLength result["checkDiagnostics"])
+    }
+
+[<Fact>]
+let ``FcsBridge project symbol cache is keyed by auto-discovered project`` () : Task =
+    task {
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_projects_{Guid.NewGuid():N}")
+        let bridge = FcsBridge()
+
+        try
+            let projectAFile, _ = writeSimpleProject tempRoot "ProjectA" "onlyInProjectA"
+            let projectBFile, _ = writeSimpleProject tempRoot "ProjectB" "onlyInProjectB"
+
+            let! resultA =
+                bridge.ProjectSymbolUses(
+                    { path = projectAFile
+                      text = None
+                      projectPath = None
+                      projectOptions = None
+                      symbolQuery = "onlyInProjectA"
+                      exact = Some true
+                      maxResults = Some 10 })
+
+            let! resultB =
+                bridge.ProjectSymbolUses(
+                    { path = projectBFile
+                      text = None
+                      projectPath = None
+                      projectOptions = None
+                      symbolQuery = "onlyInProjectB"
+                      exact = Some true
+                      maxResults = Some 10 })
+
+            Assert.Equal("succeeded", resultA["status"].GetValue<string>())
+            Assert.Equal("succeeded", resultB["status"].GetValue<string>())
+            Assert.True(resultA["matchedCount"].GetValue<int>() > 0)
+            Assert.True(resultB["matchedCount"].GetValue<int>() > 0)
+            Assert.Contains("ProjectA.fsproj", resultA["projectFileName"].GetValue<string>())
+            Assert.Contains("ProjectB.fsproj", resultB["projectFileName"].GetValue<string>())
+        finally
+            if Directory.Exists(tempRoot) then
+                Directory.Delete(tempRoot, true)
     }
 
 [<Fact>]

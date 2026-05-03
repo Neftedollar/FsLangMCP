@@ -108,6 +108,24 @@ Environment fallbacks still work:
 }
 ```
 
+## Parallel Agent Usage
+
+For multiple agents sharing one FsLangMCP server, prefer the FCS tools and pass `projectPath` on every request:
+
+```json
+{
+  "path": "/absolute/path/to/File.fs",
+  "projectPath": "/absolute/path/to/App.fsproj"
+}
+```
+
+FCS tools resolve compiler options per project and cache project-wide results by the resolved `.fsproj`, so agents working on different projects do not share stale symbol caches. The server also limits expensive work by default:
+
+- `FSLANGMCP_MAX_CONCURRENT_FCS=2`
+- `FSLANGMCP_MAX_CONCURRENT_LSP=1`
+
+The LSP-proxy tools use one `fsautocomplete` workspace per server process. They are serialized to avoid corrupting the active document/workspace state, but they are not intended for independent parallel workspaces in the same MCP process.
+
 ## MCP Stdio Config (Local Dev Without Install)
 
 ```json
@@ -146,7 +164,7 @@ Use `OtherOptions` from the emitted JSON as `projectOptions` in:
 - `fcs_file_symbols`
 - `fcs_project_symbol_uses`
 
-If `projectOptions` is omitted, the server falls back to script-style inference (`GetProjectOptionsFromScript`), which is less accurate for large multi-project solutions.
+If both `projectPath` and `projectOptions` are omitted, the server first tries to auto-discover the nearest `.fsproj`. If no project can be found, it falls back to script-style inference (`GetProjectOptionsFromScript`), which is less accurate for large multi-project solutions.
 
 ## `set_project` Tool
 
@@ -167,7 +185,7 @@ Input shape:
 ## Known Issues
 
 - LSP proxy tools return `{"status": "not_ready"}` if called before `fsautocomplete` has finished loading the project. `set_project` waits up to 30 seconds — if you still get `not_ready`, the project may be too large or `fsautocomplete` may have failed to start.
-- FCS tools fall back to script-style inference (`GetProjectOptionsFromScript`) when `projectOptions` is not provided. In that mode, diagnostics and symbol data can be incomplete for multi-project solutions.
+- FCS tools fall back to script-style inference (`GetProjectOptionsFromScript`) only when neither `projectPath` nor an auto-discovered `.fsproj` is available. In that mode, diagnostics and symbol data can be incomplete for multi-project solutions.
 - `fcs_project_symbol_uses` results are cached per project. Call `set_project` to flush the cache when source files change on disk.
 
 ## About Tool Dependencies
