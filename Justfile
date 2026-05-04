@@ -10,6 +10,9 @@ default:
 restore:
     dotnet restore {{solution}}
 
+tool-restore:
+    dotnet tool restore
+
 build:
     dotnet build {{solution}} --no-restore
 
@@ -17,6 +20,10 @@ test:
     dotnet test {{test_project}} --no-restore
 
 check: build test
+
+analyze: tool-restore
+    dotnet msbuild FsLangMcp.fsproj /t:AnalyzeFSharpProject
+    dotnet msbuild {{test_project}} /t:AnalyzeFSharpProject
 
 pack:
     dotnet pack FsLangMcp.fsproj --no-restore -c Debug

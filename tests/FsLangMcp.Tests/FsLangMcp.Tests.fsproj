@@ -9,18 +9,35 @@
   <ItemGroup>
     <Compile Include="../../BoundedCache.fs" Link="BoundedCache.fs" />
     <Compile Include="../../Types.fs" Link="Types.fs" />
+    <Compile Include="../../ProjectHealth.fs" Link="ProjectHealth.fs" />
+    <Compile Include="../../LspBridge.fs" Link="LspBridge.fs" />
     <Compile Include="../../FcsBridge.fs" Link="FcsBridge.fs" />
     <Compile Include="../../Tools.fs" Link="Tools.fs" />
     <Compile Include="TypesToolsTests.fs" />
+    <Compile Include="LspBridgeTests.fs" />
+    <Compile Include="ProjectHealthTests.fs" />
     <Compile Include="BoundedCacheTests.fs" />
     <Compile Include="FcsBridgeTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="FSharp.Compiler.Service" Version="43.12.201" />
+    <PackageReference Include="FSharp.Analyzers.Build" Version="0.5.0">
+      <IncludeAssets>build</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
     <PackageReference Include="FsMcp.Server" Version="1.0.1" />
+    <PackageReference Include="G-Research.FSharp.Analyzers" Version="0.22.0" GeneratePathProperty="true">
+      <IncludeAssets>analyzers</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="Ionide.Analyzers" Version="0.15.0" GeneratePathProperty="true">
+      <IncludeAssets>analyzers</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
     <PackageReference Include="Ionide.ProjInfo.FCS" Version="0.74.2" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="StreamJsonRpc" Version="2.24.84" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.0.0">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>

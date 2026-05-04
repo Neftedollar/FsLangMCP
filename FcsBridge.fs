@@ -20,18 +20,22 @@ open Ionide.ProjInfo.Types
 
 let private findNearestFsproj (filePath: string) : string option =
     let rec walk (dir: string) =
-        if isNull dir then None
+        if isNull dir then
+            None
         else
             let fsprojs = Directory.GetFiles(dir, "*.fsproj")
-            if fsprojs.Length > 0 then Some fsprojs[0]
-            else walk (Path.GetDirectoryName(dir))
+
+            if fsprojs.Length > 0 then
+                Some fsprojs[0]
+            else
+                walk (Path.GetDirectoryName(dir))
+
     walk (Path.GetDirectoryName(Path.GetFullPath(filePath)))
 
 let private explicitFsproj (projectPath: string option) : string option =
     projectPath
     |> Option.map normalizePath
-    |> Option.filter (fun path ->
-        String.Equals(Path.GetExtension(path), ".fsproj", StringComparison.OrdinalIgnoreCase))
+    |> Option.filter (fun path -> String.Equals(Path.GetExtension(path), ".fsproj", StringComparison.OrdinalIgnoreCase))
 
 // ─── FcsBridge ─────────────────────────────────────────────────────────────────
 
@@ -43,15 +47,20 @@ type internal FcsBridge() =
             keepAllBackgroundSymbolUses = true
         )
 
-    // Bounded caches keyed by a string combining projectPath + projectOptions hash
-    let optionsCache = BoundedCache<string, FSharpProjectOptions>(10)
+    // Bounded caches keyed by a string combining projectPath + projectOptions hash.
+    // Keep the source label with the options so cache hits report the same
+    // resolution path as the original miss.
+    let optionsCache = BoundedCache<string, FSharpProjectOptions * string>(10)
     let projectResultsCache = BoundedCache<string, FSharpCheckProjectResults>(3)
 
     let asTask (workflow: Async<'T>) : Task<'T> =
         Async.StartAsTask(workflow, cancellationToken = CancellationToken.None)
 
     let jstrOrNull (value: string) : JsonNode =
-        if String.IsNullOrWhiteSpace(value) then null else JsonValue.Create(value)
+        if String.IsNullOrWhiteSpace(value) then
+            null
+        else
+            JsonValue.Create(value)
 
     let rangeToJson (r: range) : JsonNode =
         jobj
@@ -106,15 +115,17 @@ type internal FcsBridge() =
     // Build a stable cache key from projectPath and projectOptions list
     let makeCacheKey (projectPath: string option) (projectOptions: string list option) =
         let pp = projectPath |> Option.defaultValue ""
+
         let po =
             projectOptions
             |> Option.map (fun opts -> String.concat "|" opts)
             |> Option.defaultValue ""
-        $"{pp}::{po}"
+
+        $"%s{pp}::%s{po}"
 
     let makeResolvedProjectCacheKey (projectOptions: FSharpProjectOptions) =
         let optionsHash = String.concat "|" projectOptions.OtherOptions
-        $"{projectOptions.ProjectFileName}::{optionsHash}"
+        $"%s{projectOptions.ProjectFileName}::%s{optionsHash}"
 
     member private _.LoadProjectOptionsFromFsproj(fsprojPath: string) : Task<FSharpProjectOptions option> =
         // Offload to thread pool — MSBuild/SDK probing is CPU+IO bound.
@@ -126,15 +137,15 @@ type internal FcsBridge() =
                 let toolsPath = Init.init (DirectoryInfo(projectDir)) None
                 let loader = WorkspaceLoader.Create(toolsPath, [])
                 let projects = loader.LoadProjects([ fsprojPath ]) |> Seq.toList
+
                 match projects with
                 | proj :: _ ->
                     let fcsOpts = FCS.mapToFSharpProjectOptions proj (projects |> Seq.map id)
                     Some fcsOpts
                 | [] -> None
             with ex ->
-                Console.Error.WriteLine($"[proj-info] Failed to load {fsprojPath}: {ex.Message}")
-                None
-        )
+                Console.Error.WriteLine($"[proj-info] Failed to load %s{fsprojPath}: %s{ex.Message}")
+                None)
 
     member private this.ResolveProjectOptions
         (path: string, text: string, projectPath: string option, projectOptions: string list option)
@@ -151,65 +162,70 @@ type internal FcsBridge() =
                     |> normalizePath
 
                 match optionsCache.TryGet(cacheKey) with
-                | Some cached ->
-                    return cached, "commandLineArgs"
+                | Some(cached, source) -> return cached, source
                 | None ->
                     let resolvedOptions =
                         checker.GetProjectOptionsFromCommandLineArgs(projectFileName, options |> List.toArray)
-                    optionsCache.Set(cacheKey, resolvedOptions)
+
+                    optionsCache.Set(cacheKey, (resolvedOptions, "commandLineArgs"))
                     return resolvedOptions, "commandLineArgs"
             | _ ->
                 let requestedFsproj = explicitFsproj projectPath
+
                 let resolvedFsproj =
-                    requestedFsproj
-                    |> Option.orElseWith (fun () -> findNearestFsproj fullPath)
+                    requestedFsproj |> Option.orElseWith (fun () -> findNearestFsproj fullPath)
 
                 match resolvedFsproj with
                 | Some fsprojPath ->
-                    let fsprojKey = $"fsproj::{fsprojPath}"
+                    let fsprojKey = $"fsproj::%s{fsprojPath}"
+
                     match optionsCache.TryGet(fsprojKey) with
-                    | Some cached ->
-                        return cached, "auto-discovered"
+                    | Some(cached, source) -> return cached, source
                     | None ->
                         // Try real MSBuild loading via Ionide.ProjInfo.FCS
                         let! projInfoResult = this.LoadProjectOptionsFromFsproj(fsprojPath)
+
                         match projInfoResult with
                         | Some projOpts ->
-                            optionsCache.Set(fsprojKey, projOpts)
+                            optionsCache.Set(fsprojKey, (projOpts, "ionide-proj-info"))
                             return projOpts, "ionide-proj-info"
                         | None ->
                             match requestedFsproj with
                             | Some _ ->
-                                return raise (InvalidOperationException($"Unable to load F# project options from explicit projectPath: {fsprojPath}"))
+                                return
+                                    raise (
+                                        InvalidOperationException(
+                                            $"Unable to load F# project options from explicit projectPath: %s{fsprojPath}"
+                                        )
+                                    )
                             | None ->
                                 // Fall back to script inference with honest labelling
                                 let sourceText = SourceText.ofString text
-                                let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
-                                let discovered = { scriptOptions with ProjectFileName = fsprojPath }
-                                optionsCache.Set(fsprojKey, discovered)
+
+                                let! scriptOptions, _ =
+                                    checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
+
+                                let discovered =
+                                    { scriptOptions with
+                                        ProjectFileName = fsprojPath }
+
+                                optionsCache.Set(fsprojKey, (discovered, "auto-discovered-script-fallback"))
                                 return discovered, "auto-discovered-script-fallback"
                 | None ->
-                    let scriptKey = $"script::{fullPath}"
+                    let scriptKey = $"script::%s{fullPath}"
+
                     match optionsCache.TryGet(scriptKey) with
-                    | Some cached ->
-                        return cached, "scriptInference"
+                    | Some(cached, source) -> return cached, source
                     | None ->
                         let sourceText = SourceText.ofString text
                         let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
-                        optionsCache.Set(scriptKey, scriptOptions)
+                        optionsCache.Set(scriptKey, (scriptOptions, "scriptInference"))
                         return scriptOptions, "scriptInference"
         }
 
     member private this.PrepareCheckContext
         (path: string, text: string option, projectPath: string option, projectOptions: string list option)
-        : Task<
-            string
-            * string
-            * string
-            * FSharpProjectOptions
-            * FSharpParseFileResults
-            * FSharpCheckFileResults option
-        > =
+        : Task<string * string * string * FSharpProjectOptions * FSharpParseFileResults * FSharpCheckFileResults option> =
         task {
             let fullPath = normalizePath path
             let source = text |> Option.defaultWith (fun () -> File.ReadAllText(fullPath))
@@ -233,12 +249,15 @@ type internal FcsBridge() =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
 
             let parseDiagnostics = parseResults.Diagnostics |> Array.map diagnosticToJson
+
             let checkDiagnostics =
                 checkedResults
                 |> Option.map (fun r -> r.Diagnostics |> Array.map diagnosticToJson)
                 |> Option.defaultValue [||]
 
-            let hasTypeCheckInfo = checkedResults |> Option.map _.HasFullTypeCheckInfo |> Option.defaultValue false
+            let hasTypeCheckInfo =
+                checkedResults |> Option.map _.HasFullTypeCheckInfo |> Option.defaultValue false
+
             let status = if checkedResults.IsSome then "succeeded" else "aborted"
 
             return
@@ -247,8 +266,7 @@ type internal FcsBridge() =
                       "file", jstr path
                       "optionsSource", jstr optionsSource
                       "projectFileName", jstr projectOptions.ProjectFileName
-                      "projectSourceFiles",
-                      JsonArray(projectOptions.SourceFiles |> Array.map jstr) :> JsonNode
+                      "projectSourceFiles", JsonArray(projectOptions.SourceFiles |> Array.map jstr) :> JsonNode
                       "parseHadErrors", jbool parseResults.ParseHadErrors
                       "hasFullTypeCheckInfo", jbool hasTypeCheckInfo
                       "parseDiagnostics", JsonArray(parseDiagnostics) :> JsonNode
@@ -318,11 +336,11 @@ type internal FcsBridge() =
             // Use the resolved project as the cache key. When projectPath is omitted,
             // different files may auto-discover different projects.
             let cacheKey = makeResolvedProjectCacheKey projectOptions
+
             let! projectResults, cached =
                 task {
                     match projectResultsCache.TryGet(cacheKey) with
-                    | Some existing ->
-                        return existing, true
+                    | Some existing -> return existing, true
                     | None ->
                         let! results = checker.ParseAndCheckProject(projectOptions) |> asTask
                         projectResultsCache.Set(cacheKey, results)
@@ -351,7 +369,8 @@ type internal FcsBridge() =
             let matchedUses =
                 allUses
                 |> Seq.filter (fun symbolUse -> symbolMatches symbolUse.Symbol)
-                |> Seq.sortBy (fun symbolUse -> symbolUse.FileName, symbolUse.Range.StartLine, symbolUse.Range.StartColumn)
+                |> Seq.sortBy (fun symbolUse ->
+                    symbolUse.FileName, symbolUse.Range.StartLine, symbolUse.Range.StartColumn)
                 |> Seq.truncate maxResults
                 |> Seq.map symbolUseToJson
                 |> Seq.toArray
@@ -378,10 +397,7 @@ type internal FcsBridge() =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
 
             match checkedResults with
-            | None ->
-                return
-                    jobj [ "status", jstr "aborted"; "message", jstr "Type checking was aborted." ]
-                    :> JsonNode
+            | None -> return jobj [ "status", jstr "aborted"; "message", jstr "Type checking was aborted." ] :> JsonNode
             | Some checkResults ->
                 // FCS uses 1-based lines; assume input is 0-based (LSP convention)
                 let fcsLine = args.line + 1
@@ -389,15 +405,23 @@ type internal FcsBridge() =
 
                 // Get the line text for FCS APIs
                 let lines = source.Split('\n')
-                let lineText =
-                    if fcsLine - 1 < lines.Length then lines[fcsLine - 1].TrimEnd('\r')
-                    else ""
 
-                let symbolUse =
-                    checkResults.GetSymbolUseAtLocation(fcsLine, fcsCol, lineText, [])
+                let lineText =
+                    if fcsLine - 1 < lines.Length then
+                        lines[fcsLine - 1].TrimEnd('\r')
+                    else
+                        ""
+
+                let symbolUse = checkResults.GetSymbolUseAtLocation(fcsLine, fcsCol, lineText, [])
 
                 let toolTip =
-                    checkResults.GetToolTip(fcsLine, fcsCol, lineText, [], FSharp.Compiler.Tokenization.FSharpTokenTag.IDENT)
+                    checkResults.GetToolTip(
+                        fcsLine,
+                        fcsCol,
+                        lineText,
+                        [],
+                        FSharp.Compiler.Tokenization.FSharpTokenTag.IDENT
+                    )
 
                 let typeString =
                     match toolTip with
@@ -426,8 +450,7 @@ type internal FcsBridge() =
                                 items
                                 |> List.choose (fun item ->
                                     match item.XmlDoc with
-                                    | FSharpXmlDoc.FromXmlText xmlText ->
-                                        Some (xmlText.GetXmlText())
+                                    | FSharpXmlDoc.FromXmlText xmlText -> Some(xmlText.GetXmlText())
                                     | _ -> None)
                                 |> Some
                             | _ -> None)
@@ -464,25 +487,43 @@ type internal FcsBridge() =
         optionsCache.Clear()
         projectResultsCache.Clear()
 
+    member this.ProbeProjectOptions(fsprojPath: string) : Task<Result<string, string>> =
+        task {
+            try
+                let! result = this.LoadProjectOptionsFromFsproj(fsprojPath)
+
+                return
+                    match result with
+                    | Some _ -> Ok "ionide-proj-info"
+                    | None -> Error "Ionide.ProjInfo could not load project options."
+            with ex ->
+                return Error ex.Message
+        }
+
     member private _.BuildSignatureHelpResult
-        (path: string, source: string, optionsSource: string, args: FcsSignatureHelpArgs, checkedResults: FSharpCheckFileResults option)
-        : JsonNode =
+        (
+            path: string,
+            source: string,
+            optionsSource: string,
+            args: FcsSignatureHelpArgs,
+            checkedResults: FSharpCheckFileResults option
+        ) : JsonNode =
         match checkedResults with
-        | None ->
-            jobj [ "status", jstr "aborted"; "message", jstr "Type checking was aborted." ]
-            :> JsonNode
+        | None -> jobj [ "status", jstr "aborted"; "message", jstr "Type checking was aborted." ] :> JsonNode
         | Some checkResults ->
             // FCS uses 1-based lines; assume input is 0-based (LSP convention)
             let fcsLine = args.line + 1
             let fcsCol = args.character
 
             let lines = source.Split('\n')
-            let lineText =
-                if fcsLine - 1 < lines.Length then lines[fcsLine - 1].TrimEnd('\r')
-                else ""
 
-            let methodsOpt =
-                checkResults.GetMethodsAsSymbols(fcsLine, fcsCol, lineText, [])
+            let lineText =
+                if fcsLine - 1 < lines.Length then
+                    lines[fcsLine - 1].TrimEnd('\r')
+                else
+                    ""
+
+            let methodsOpt = checkResults.GetMethodsAsSymbols(fcsLine, fcsCol, lineText, [])
 
             let overloads =
                 match methodsOpt with
@@ -493,6 +534,7 @@ type internal FcsBridge() =
                         match su.Symbol with
                         | :? FSharpMemberOrFunctionOrValue as m ->
                             let paramGroups = m.CurriedParameterGroups
+
                             let parameters =
                                 paramGroups
                                 |> Seq.collect id
@@ -504,9 +546,13 @@ type internal FcsBridge() =
                                 |> Seq.toArray
 
                             let returnType =
-                                try m.ReturnParameter.Type.BasicQualifiedName
+                                try
+                                    m.ReturnParameter.Type.BasicQualifiedName
                                 with ex ->
-                                    Console.Error.WriteLine($"[fcs_signature_help] ReturnParameter error: {ex.Message}")
+                                    Console.Error.WriteLine(
+                                        $"[fcs_signature_help] ReturnParameter error: %s{ex.Message}"
+                                    )
+
                                     ""
 
                             let signature =
@@ -515,15 +561,18 @@ type internal FcsBridge() =
                                     |> Array.map (fun p ->
                                         let pName = p["name"].GetValue<string>()
                                         let pType = p["type"].GetValue<string>()
-                                        $"{pName}: {pType}")
+                                        $"%s{pName}: %s{pType}")
                                     |> String.concat ", "
-                                $"{m.DisplayName}({paramStr}) -> {returnType}"
 
-                            Some (jobj
-                                [ "signature", jstr signature
-                                  "parameters", JsonArray(parameters) :> JsonNode
-                                  "returnType", jstr returnType ]
-                            :> JsonNode)
+                                $"%s{m.DisplayName}(%s{paramStr}) -> %s{returnType}"
+
+                            Some(
+                                jobj
+                                    [ "signature", jstr signature
+                                      "parameters", JsonArray(parameters) :> JsonNode
+                                      "returnType", jstr returnType ]
+                                :> JsonNode
+                            )
                         | _ -> None)
                     |> List.toArray
 
@@ -548,5 +597,6 @@ type internal FcsBridge() =
         task {
             let! path, source, optionsSource, _, _, checkedResults =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
+
             return this.BuildSignatureHelpResult(path, source, optionsSource, args, checkedResults)
         }

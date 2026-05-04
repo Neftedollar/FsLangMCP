@@ -19,25 +19,158 @@ type private LspDocumentState =
       mutable Text: string }
 
 type private DiagnosticsTarget(store: ConcurrentDictionary<string, JsonNode>) =
-    [<JsonRpcMethod("textDocument/publishDiagnostics")>]
+    [<JsonRpcMethod("textDocument/publishDiagnostics", UseSingleObjectParameterDeserialization = true)>]
     member _.PublishDiagnostics(payload: JsonObject) =
         let uriToken = payload["uri"]
 
         if not (isNull uriToken) then
             let uri = uriToken.GetValue<string>()
             let diagnostics = payload["diagnostics"]
-            store[uri] <- if isNull diagnostics then JsonArray() :> JsonNode else diagnostics.DeepClone()
 
-// ─── WorkspaceLoadTarget: tracks fsharp/workspaceLoad notification ─────────────
+            store[uri] <-
+                if isNull diagnostics then
+                    JsonArray() :> JsonNode
+                else
+                    diagnostics.DeepClone()
+
+module internal CompileResult =
+    let private tryIntProperty (name: string) (response: JsonNode) =
+        match response with
+        | :? JsonObject as obj ->
+            match obj[name] with
+            | null -> None
+            | value ->
+                try
+                    Some(value.GetValue<int>())
+                with _ ->
+                    None
+        | _ -> None
+
+    let private tryArrayCount (name: string) (response: JsonNode) =
+        match response with
+        | :? JsonObject as obj ->
+            match obj[name] with
+            | :? JsonArray as arr -> Some arr.Count
+            | _ -> None
+        | _ -> None
+
+    let classify (response: JsonNode) =
+        let exitCode =
+            tryIntProperty "ExitCode" response
+            |> Option.orElseWith (fun () -> tryIntProperty "exitCode" response)
+            |> Option.orElseWith (fun () -> tryIntProperty "StatusCode" response)
+            |> Option.orElseWith (fun () -> tryIntProperty "statusCode" response)
+
+        let diagnosticsCount =
+            tryArrayCount "Errors" response
+            |> Option.orElseWith (fun () -> tryArrayCount "errors" response)
+            |> Option.orElseWith (fun () -> tryArrayCount "Diagnostics" response)
+            |> Option.orElseWith (fun () -> tryArrayCount "diagnostics" response)
+
+        let status =
+            match exitCode, diagnosticsCount with
+            | Some 0, _ -> "succeeded"
+            | Some _, _ -> "failed"
+            | None, Some 0 -> "succeeded"
+            | None, Some _ -> "failed"
+            | None, None -> "unknown"
+
+        status, exitCode, diagnosticsCount
+
+// ─── Workspace load notification parsing ──────────────────────────────────────
+
+module internal WorkspaceNotification =
+    let private tryStringProperty (name: string) (node: JsonNode) =
+        match node with
+        | :? JsonObject as obj ->
+            match obj[name] with
+            | null -> None
+            | value ->
+                try
+                    Some(value.GetValue<string>())
+                with _ ->
+                    None
+        | _ -> None
+
+    let private tryObjectProperty (name: string) (node: JsonNode) =
+        match node with
+        | :? JsonObject as obj ->
+            match obj[name] with
+            | :? JsonObject as value -> Some(value :> JsonNode)
+            | _ -> None
+        | _ -> None
+
+    let private jsonElementToNode (payload: JsonElement) =
+        try
+            match payload.ValueKind with
+            | JsonValueKind.String ->
+                let content = payload.GetString()
+
+                if String.IsNullOrWhiteSpace content then
+                    JsonValue.Create("") :> JsonNode
+                else
+                    JsonNode.Parse(content)
+                    |> Option.ofObj
+                    |> Option.defaultValue (JsonValue.Create(content) :> JsonNode)
+            | _ ->
+                JsonNode.Parse(payload.GetRawText())
+                |> Option.ofObj
+                |> Option.defaultValue (JsonObject() :> JsonNode)
+        with _ ->
+            JsonObject() :> JsonNode
+
+    let private tryParseContentPayload (payload: JsonNode) =
+        match tryStringProperty "content" payload with
+        | Some content when not (String.IsNullOrWhiteSpace content) ->
+            try
+                JsonNode.Parse(content) |> Option.ofObj |> Option.defaultValue payload
+            with _ ->
+                payload
+        | _ -> payload
+
+    let private isFinished (value: string option) =
+        value
+        |> Option.exists (fun status -> String.Equals(status, "finished", StringComparison.OrdinalIgnoreCase))
+
+    let isWorkspaceLoadFinished (payload: JsonElement) =
+        let node = payload |> jsonElementToNode |> tryParseContentPayload
+
+        let kind =
+            tryStringProperty "Kind" node
+            |> Option.orElseWith (fun () -> tryStringProperty "kind" node)
+
+        let data =
+            tryObjectProperty "Data" node
+            |> Option.orElseWith (fun () -> tryObjectProperty "data" node)
+
+        let topLevelFinished =
+            tryStringProperty "status" node
+            |> Option.orElseWith (fun () -> tryStringProperty "Status" node)
+            |> isFinished
+
+        let workspaceLoadFinished =
+            kind
+            |> Option.exists (fun value -> String.Equals(value, "workspaceLoad", StringComparison.OrdinalIgnoreCase))
+            && (data
+                |> Option.bind (fun value ->
+                    tryStringProperty "Status" value
+                    |> Option.orElseWith (fun () -> tryStringProperty "status" value))
+                |> isFinished)
+
+        topLevelFinished || workspaceLoadFinished
+
+// ─── WorkspaceLoadTarget: tracks FsAutoComplete workspace load notifications ───
 
 type private WorkspaceLoadTarget(setReady: unit -> unit) =
-    [<JsonRpcMethod("fsharp/workspaceLoad")>]
-    member _.WorkspaceLoad(payload: JsonObject) =
-        let statusToken = payload["status"]
-        if not (isNull statusToken) then
-            let status = statusToken.GetValue<string>()
-            if String.Equals(status, "finished", StringComparison.OrdinalIgnoreCase) then
-                setReady ()
+    let notifyIfReady (payload: JsonElement) =
+        if WorkspaceNotification.isWorkspaceLoadFinished payload then
+            setReady ()
+
+    [<JsonRpcMethod("fsharp/notifyWorkspace", UseSingleObjectParameterDeserialization = true)>]
+    member _.NotifyWorkspace(payload: JsonElement) = notifyIfReady payload
+
+    [<JsonRpcMethod("fsharp/workspaceLoad", UseSingleObjectParameterDeserialization = true)>]
+    member _.WorkspaceLoad(payload: JsonElement) = notifyIfReady payload
 
 // ─── FsAutoCompleteBridge ──────────────────────────────────────────────────────
 
@@ -45,17 +178,24 @@ type internal FsAutoCompleteBridge() =
     let gate = new SemaphoreSlim(1, 1)
     let documents = ConcurrentDictionary<string, LspDocumentState>()
     let diagnostics = ConcurrentDictionary<string, JsonNode>()
+
     [<VolatileField>]
     let mutable rpc: JsonRpc option = None
+
     [<VolatileField>]
     let mutable lspProcess: Process option = None
+
     [<VolatileField>]
     let mutable runtimeProjectPath: string option = None
+
     [<VolatileField>]
     let mutable runtimeWorkspaceRoot: string option = None
+
     let workspaceReadyEvent = new ManualResetEventSlim(false)
+
     [<VolatileField>]
     let mutable workspaceReady = false
+
     [<VolatileField>]
     let mutable stderrPump: Task option = None
 
@@ -72,7 +212,11 @@ type internal FsAutoCompleteBridge() =
             full
         else
             let parent = Path.GetDirectoryName(full)
-            if String.IsNullOrWhiteSpace(parent) then Directory.GetCurrentDirectory() else parent
+
+            if String.IsNullOrWhiteSpace(parent) then
+                Directory.GetCurrentDirectory()
+            else
+                parent
 
     let getWorkspaceRoot () =
         let fromRuntimeWorkspace = runtimeWorkspaceRoot |> Option.map Path.GetFullPath
@@ -83,7 +227,8 @@ type internal FsAutoCompleteBridge() =
             |> Option.filter (String.IsNullOrWhiteSpace >> not)
             |> Option.map Path.GetFullPath
 
-        let fromRuntimeProject = runtimeProjectPath |> Option.map resolveWorkspaceFromProjectPath
+        let fromRuntimeProject =
+            runtimeProjectPath |> Option.map resolveWorkspaceFromProjectPath
 
         let fromProjectPathEnv =
             Environment.GetEnvironmentVariable("FSA_PROJECT_PATH")
@@ -105,9 +250,7 @@ type internal FsAutoCompleteBridge() =
         |> Option.defaultValue "fsautocomplete"
 
     let fsacArgs () =
-        Environment.GetEnvironmentVariable("FSAC_ARGS")
-        |> Option.ofObj
-        |> parseArgs
+        Environment.GetEnvironmentVariable("FSAC_ARGS") |> Option.ofObj |> parseArgs
 
     member private _.StopLspUnsafe() =
         match rpc with
@@ -121,8 +264,13 @@ type internal FsAutoCompleteBridge() =
             fsacProc.Kill(true)
             // Give pump 500ms to notice process died
             match stderrPump with
-            | Some pump -> try pump.Wait(500) |> ignore with _ -> ()
+            | Some pump ->
+                try
+                    pump.Wait(500) |> ignore
+                with _ ->
+                    ()
             | None -> ()
+
             fsacProc.Dispose()
             lspProcess <- None
         | Some fsacProc ->
@@ -138,11 +286,17 @@ type internal FsAutoCompleteBridge() =
 
     member _.DiagnosticsStore = diagnostics
 
+    member _.CurrentProjectPath = runtimeProjectPath
+
+    member _.CurrentWorkspaceRoot = runtimeWorkspaceRoot
+
+    member _.IsWorkspaceReady = workspaceReady
+
+    member _.DiagnosticsFileCount = diagnostics.Count
+
     // Wait until workspaceReady is true or timeout elapses
     member _.WaitForReady(timeout: TimeSpan) : Task<bool> =
-        task {
-            return workspaceReadyEvent.Wait(timeout)
-        }
+        task { return workspaceReadyEvent.Wait(timeout) }
 
     // Return not-ready JSON if workspace not loaded yet
     member _.NotReadyResponse() : JsonNode =
@@ -156,7 +310,7 @@ type internal FsAutoCompleteBridge() =
             let projectPath = Path.GetFullPath(args.projectPath)
 
             if not (File.Exists(projectPath) || Directory.Exists(projectPath)) then
-                invalidArg (nameof args.projectPath) $"Path does not exist: {projectPath}"
+                invalidArg (nameof args.projectPath) $"Path does not exist: %s{projectPath}"
 
             // Detect solution files
             let isSolution =
@@ -184,15 +338,13 @@ type internal FsAutoCompleteBridge() =
                         runtimeProjectPath <- Some projectPath
                         runtimeWorkspaceRoot <- Some resolvedWorkspace
 
-                    Environment.SetEnvironmentVariable(
-                        "FSA_PROJECT_PATH",
-                        runtimeProjectPath |> Option.defaultValue "")
+                    Environment.SetEnvironmentVariable("FSA_PROJECT_PATH", runtimeProjectPath |> Option.defaultValue "")
                     Environment.SetEnvironmentVariable("FSA_WORKSPACE_ROOT", resolvedWorkspace)
 
                     runtimeProjectPath, resolvedWorkspace
                 with ex ->
                     gate.Release() |> ignore
-                    reraise()
+                    reraise ()
 
             // Call StartLspUnsafe while still holding the gate — atomic stop+start
             if restartLsp then
@@ -215,8 +367,7 @@ type internal FsAutoCompleteBridge() =
                         [ "status", jstr "ok"
                           "result",
                           jobj
-                              [ "projectPath",
-                                capturedProjectPath |> Option.map jstr |> Option.defaultValue null
+                              [ "projectPath", capturedProjectPath |> Option.map jstr |> Option.defaultValue null
                                 "workspaceRoot", jstr capturedWorkspaceRoot
                                 "lspRestarted", jbool restartLsp
                                 "solutionMode", jbool isSolution
@@ -229,8 +380,7 @@ type internal FsAutoCompleteBridge() =
                         [ "status", jstr "ok"
                           "result",
                           jobj
-                              [ "projectPath",
-                                capturedProjectPath |> Option.map jstr |> Option.defaultValue null
+                              [ "projectPath", capturedProjectPath |> Option.map jstr |> Option.defaultValue null
                                 "workspaceRoot", jstr capturedWorkspaceRoot
                                 "lspRestarted", jbool restartLsp
                                 "solutionMode", jbool isSolution
@@ -263,9 +413,9 @@ type internal FsAutoCompleteBridge() =
             let fsacProc = new Process(StartInfo = psi)
 
             if not (fsacProc.Start()) then
-                invalidOp $"Unable to start {command}"
+                invalidOp $"Unable to start %s{command}"
 
-            let pumpStderr : Task =
+            let pumpStderr: Task =
                 task {
                     let mutable keepReading = true
 
@@ -282,9 +432,12 @@ type internal FsAutoCompleteBridge() =
                 (fun (t: Task) ->
                     if t.IsFaulted then
                         let ex = t.Exception.GetBaseException()
+
                         if not (ex :? ObjectDisposedException) then
-                            Console.Error.WriteLine($"[stderr pump] {ex.Message}")),
-                TaskContinuationOptions.OnlyOnFaulted) |> ignore
+                            Console.Error.WriteLine($"[stderr pump] %s{ex.Message}")),
+                TaskContinuationOptions.OnlyOnFaulted
+            )
+            |> ignore
 
             stderrPump <- Some pumpStderr
 
@@ -301,10 +454,19 @@ type internal FsAutoCompleteBridge() =
                 )
 
             let jsonRpc = new JsonRpc(handler)
-            jsonRpc.AddLocalRpcTarget(new DiagnosticsTarget(diagnostics)) |> ignore
-            jsonRpc.AddLocalRpcTarget(new WorkspaceLoadTarget(fun () ->
-                workspaceReady <- true
-                workspaceReadyEvent.Set())) |> ignore
+            let targetOptions = JsonRpcTargetOptions(AllowNonPublicInvocation = true)
+
+            jsonRpc.AddLocalRpcTarget(new DiagnosticsTarget(diagnostics), targetOptions)
+            |> ignore
+
+            jsonRpc.AddLocalRpcTarget(
+                new WorkspaceLoadTarget(fun () ->
+                    workspaceReady <- true
+                    workspaceReadyEvent.Set()),
+                targetOptions
+            )
+            |> ignore
+
             jsonRpc.StartListening()
 
             let rootUri = Uri(workspaceRoot).AbsoluteUri
@@ -316,15 +478,14 @@ type internal FsAutoCompleteBridge() =
                       "rootUri", jstr rootUri
                       "trace", jstr "off"
                       "clientInfo", jobj [ "name", jstr "fsmcp-fsharp"; "version", jstr "0.1.0" ]
+                      "initializationOptions", jobj [ "AutomaticWorkspaceInit", jbool true ]
                       "workspaceFolders",
                       JsonArray(jobj [ "uri", jstr rootUri; "name", jstr workspaceName ] :> JsonNode) :> JsonNode
                       "capabilities",
                       jobj
                           [ "workspace", jobj [ "workspaceFolders", jbool true ]
                             "textDocument",
-                            jobj
-                                [ "completion",
-                                  jobj [ "completionItem", jobj [ "snippetSupport", jbool true ] ] ] ] ]
+                            jobj [ "completion", jobj [ "completionItem", jobj [ "snippetSupport", jbool true ] ] ] ] ]
 
             let! _ = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("initialize", initializeParams)
             do! jsonRpc.NotifyWithParameterObjectAsync("initialized", JsonObject())
@@ -337,6 +498,7 @@ type internal FsAutoCompleteBridge() =
     member private this.EnsureStarted() : Task<JsonRpc> =
         task {
             do! gate.WaitAsync()
+
             try
                 match rpc with
                 | Some existing -> return existing
@@ -347,9 +509,7 @@ type internal FsAutoCompleteBridge() =
                 gate.Release() |> ignore
         }
 
-    member private this.SyncDocument
-        (jsonRpc: JsonRpc, path: string, providedText: string option)
-        : Task<string> =
+    member private this.SyncDocument(jsonRpc: JsonRpc, path: string, providedText: string option) : Task<string> =
         task {
             let fullPath = Path.GetFullPath(path)
             let uri = toFileUri fullPath
@@ -394,20 +554,21 @@ type internal FsAutoCompleteBridge() =
                 return this.NotReadyResponse()
             else
 
-            // Lock only for document sync
-            let! uri =
-                task {
-                    do! gate.WaitAsync()
-                    try
-                        return! this.SyncDocument(jsonRpc, path, providedText)
-                    finally
-                        gate.Release() |> ignore
-                }
+                // Lock only for document sync
+                let! uri =
+                    task {
+                        do! gate.WaitAsync()
 
-            // Gate released — StreamJsonRpc handles concurrent requests natively
-            let parameters = mkParams uri
-            let! response = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>(methodName, parameters)
-            return jobj [ "status", jstr "ok"; "result", response ] :> JsonNode
+                        try
+                            return! this.SyncDocument(jsonRpc, path, providedText)
+                        finally
+                            gate.Release() |> ignore
+                    }
+
+                // Gate released — StreamJsonRpc handles concurrent requests natively
+                let parameters = mkParams uri
+                let! response = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>(methodName, parameters)
+                return jobj [ "status", jstr "ok"; "result", response ] :> JsonNode
         }
 
     member private this.PositionParams(uri: string, line: int, character: int) : JsonObject =
@@ -431,12 +592,20 @@ type internal FsAutoCompleteBridge() =
         )
 
     member this.Hover(args: PositionArgs) =
-        this.WithDocument(args.path, args.text, "textDocument/hover", fun uri ->
-            this.PositionParams(uri, args.line, args.character))
+        this.WithDocument(
+            args.path,
+            args.text,
+            "textDocument/hover",
+            fun uri -> this.PositionParams(uri, args.line, args.character)
+        )
 
     member this.Definition(args: PositionArgs) =
-        this.WithDocument(args.path, args.text, "textDocument/definition", fun uri ->
-            this.PositionParams(uri, args.line, args.character))
+        this.WithDocument(
+            args.path,
+            args.text,
+            "textDocument/definition",
+            fun uri -> this.PositionParams(uri, args.line, args.character)
+        )
 
     member this.References(args: ReferencesArgs) =
         this.WithDocument(
@@ -447,9 +616,7 @@ type internal FsAutoCompleteBridge() =
                 let baseParams = this.PositionParams(uri, args.line, args.character)
 
                 baseParams["context"] <-
-                    jobj
-                        [ "includeDeclaration",
-                          jbool (args.includeDeclaration |> Option.defaultValue false) ]
+                    jobj [ "includeDeclaration", jbool (args.includeDeclaration |> Option.defaultValue false) ]
                     :> JsonNode
 
                 baseParams
@@ -463,10 +630,80 @@ type internal FsAutoCompleteBridge() =
                 return this.NotReadyResponse()
             else
 
-            // No document sync needed — just invoke directly, no gate
-            let parameters = jobj [ "query", jstr args.query ]
-            let! response = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("workspace/symbol", parameters)
-            return jobj [ "status", jstr "ok"; "result", response ] :> JsonNode
+                // No document sync needed — just invoke directly, no gate
+                let parameters = jobj [ "query", jstr args.query ]
+                let! response = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("workspace/symbol", parameters)
+                return jobj [ "status", jstr "ok"; "result", response ] :> JsonNode
+        }
+
+    member this.Compile(args: FSharpCompileArgs) : Task<JsonNode> =
+        task {
+            let projectPath = Path.GetFullPath(args.projectPath)
+
+            if not (File.Exists projectPath) then
+                invalidArg (nameof args.projectPath) $"Project file does not exist: %s{projectPath}"
+
+            let! jsonRpc = this.EnsureStarted()
+
+            if not workspaceReady then
+                return this.NotReadyResponse()
+            else
+                let timeoutMs = args.timeoutMs |> Option.defaultValue 60000
+
+                let payloads =
+                    [| jobj [ "Project", jstr projectPath ]
+                       jobj [ "Project", jstr (toFileUri projectPath) ]
+                       jobj [ "project", jstr projectPath ] |]
+
+                let invokeWithTimeout (payload: JsonObject) =
+                    task {
+                        let request =
+                            jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("fsharp/compile", payload)
+
+                        let! completed = Task.WhenAny(request, Task.Delay(timeoutMs))
+
+                        if Object.ReferenceEquals(completed, request) then
+                            let! result = request
+                            return Ok result
+                        else
+                            return Error $"fsharp/compile timed out after %d{timeoutMs}ms"
+                    }
+
+                let mutable compileResult: Result<JsonNode, string> =
+                    Error "No compile payload was attempted."
+
+                let mutable payloadIndex = 0
+
+                while payloadIndex < payloads.Length && Result.isError compileResult do
+                    try
+                        let! attempt = invokeWithTimeout payloads[payloadIndex]
+                        compileResult <- attempt
+                    with ex ->
+                        compileResult <- Error ex.Message
+
+                    payloadIndex <- payloadIndex + 1
+
+                match compileResult with
+                | Error error ->
+                    return
+                        jobj
+                            [ "status", jstr "failed"
+                              "backend", jstr "fsautocomplete"
+                              "projectPath", jstr projectPath
+                              "error", jstr error ]
+                        :> JsonNode
+                | Ok response ->
+                    let compileStatus, exitCode, diagnosticsCount = CompileResult.classify response
+
+                    return
+                        jobj
+                            [ "status", jstr compileStatus
+                              "backend", jstr "fsautocomplete"
+                              "projectPath", jstr projectPath
+                              "exitCode", exitCode |> Option.map jint |> Option.defaultValue null
+                              "diagnosticsCount", diagnosticsCount |> Option.map jint |> Option.defaultValue null
+                              "result", response.DeepClone() ]
+                        :> JsonNode
         }
 
     member _.Diagnostics(args: DiagnosticsArgs) : Task<JsonNode> =
@@ -497,98 +734,115 @@ type internal FsAutoCompleteBridge() =
                 return this.NotReadyResponse()
             else
 
-            let fullPath = Path.GetFullPath(args.path)
-            let originalText = args.text |> Option.defaultWith (fun () -> File.ReadAllText(fullPath))
+                let fullPath = Path.GetFullPath(args.path)
 
-            // Lock only for document sync
-            let! uri =
-                task {
-                    do! gate.WaitAsync()
-                    try
-                        return! this.SyncDocument(jsonRpc, args.path, args.text)
-                    finally
-                        gate.Release() |> ignore
-                }
+                let originalText =
+                    args.text |> Option.defaultWith (fun () -> File.ReadAllText(fullPath))
 
-            let formatParams =
-                jobj
-                    [ "textDocument", jobj [ "uri", jstr uri ]
-                      "options", jobj [ "tabSize", jint 4; "insertSpaces", jbool true ] ]
+                // Lock only for document sync
+                let! uri =
+                    task {
+                        do! gate.WaitAsync()
 
-            let! editsToken = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("textDocument/formatting", formatParams)
+                        try
+                            return! this.SyncDocument(jsonRpc, args.path, args.text)
+                        finally
+                            gate.Release() |> ignore
+                    }
 
-            // Apply text edits to produce formatted result
-            let applyEdits (text: string) (edits: JsonArray) =
-                // Sort edits in reverse order (bottom to top) to preserve positions
-                let getRangeStart (e: JsonNode) =
-                    let r = e["range"]
-                    let s = r["start"]
-                    s["line"].GetValue<int>(), s["character"].GetValue<int>()
+                let formatParams =
+                    jobj
+                        [ "textDocument", jobj [ "uri", jstr uri ]
+                          "options", jobj [ "tabSize", jint 4; "insertSpaces", jbool true ] ]
 
-                let sortedEdits =
-                    edits
-                    |> Seq.cast<JsonNode>
-                    |> Seq.sortByDescending (fun e ->
-                        let sl, sc = getRangeStart e
-                        sl, sc)
-                    |> Seq.toArray
+                let! editsToken =
+                    jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("textDocument/formatting", formatParams)
 
-                let lines = text.Split('\n') |> Array.map (fun l -> l.TrimEnd('\r'))
+                // Apply text edits to produce formatted result
+                let applyEdits (text: string) (edits: JsonArray) =
+                    // Sort edits in reverse order (bottom to top) to preserve positions
+                    let getRangeStart (e: JsonNode) =
+                        let r = e["range"]
+                        let s = r["start"]
+                        s["line"].GetValue<int>(), s["character"].GetValue<int>()
 
-                let applyEdit (linesArr: string array) (edit: JsonNode) =
-                    let range = edit["range"]
-                    let startPos = range["start"]
-                    let endPos = range["end"]
-                    let startLine = startPos["line"].GetValue<int>()
-                    let startChar = startPos["character"].GetValue<int>()
-                    let endLine = endPos["line"].GetValue<int>()
-                    let endChar = endPos["character"].GetValue<int>()
-                    let newText = edit["newText"].GetValue<string>()
+                    let sortedEdits =
+                        edits
+                        |> Seq.cast<JsonNode>
+                        |> Seq.sortByDescending (fun e ->
+                            let sl, sc = getRangeStart e
+                            sl, sc)
+                        |> Seq.toArray
 
-                    let before =
-                        if startLine < linesArr.Length && startChar > 0 then
-                            linesArr[startLine][..startChar - 1]
-                        else ""
-                    let after =
-                        if endLine < linesArr.Length then
-                            let endLineText = linesArr[endLine]
-                            if endChar < endLineText.Length then endLineText[endChar..] else ""
-                        else ""
+                    let lines = text.Split('\n') |> Array.map (fun l -> l.TrimEnd('\r'))
 
-                    let replacement = before + newText + after
-                    let replacementLines = replacement.Split('\n')
+                    let applyEdit (linesArr: string array) (edit: JsonNode) =
+                        let range = edit["range"]
+                        let startPos = range["start"]
+                        let endPos = range["end"]
+                        let startLine = startPos["line"].GetValue<int>()
+                        let startChar = startPos["character"].GetValue<int>()
+                        let endLine = endPos["line"].GetValue<int>()
+                        let endChar = endPos["character"].GetValue<int>()
+                        let newText = edit["newText"].GetValue<string>()
 
-                    let result = System.Collections.Generic.List<string>()
-                    for i in 0 .. startLine - 1 do
-                        result.Add(linesArr[i])
-                    for l in replacementLines do
-                        result.Add(l)
-                    for i in endLine + 1 .. linesArr.Length - 1 do
-                        result.Add(linesArr[i])
-                    result.ToArray()
+                        let before =
+                            if startLine < linesArr.Length && startChar > 0 then
+                                linesArr[startLine][.. startChar - 1]
+                            else
+                                ""
 
-                let mutable currentLines = lines
-                for edit in sortedEdits do
-                    currentLines <- applyEdit currentLines edit
-                String.concat "\n" currentLines
+                        let after =
+                            if endLine < linesArr.Length then
+                                let endLineText = linesArr[endLine]
 
-            let formatted =
-                match editsToken with
-                | :? JsonArray as edits when edits.Count > 0 ->
-                    applyEdits originalText edits
-                | _ -> originalText
+                                if endChar < endLineText.Length then
+                                    endLineText[endChar..]
+                                else
+                                    ""
+                            else
+                                ""
 
-            return
-                jobj
-                    [ "status", jstr "ok"
-                      "result",
-                      jobj
-                          [ "formatted", jstr formatted
-                            "edits",
-                            (match editsToken with
-                             | :? JsonArray -> editsToken
-                             | _ -> JsonArray() :> JsonNode) ] :> JsonNode ]
-                :> JsonNode
+                        let replacement = before + newText + after
+                        let replacementLines = replacement.Split('\n')
+
+                        let result = System.Collections.Generic.List<string>()
+
+                        for i in 0 .. startLine - 1 do
+                            result.Add(linesArr[i])
+
+                        for l in replacementLines do
+                            result.Add(l)
+
+                        for i in endLine + 1 .. linesArr.Length - 1 do
+                            result.Add(linesArr[i])
+
+                        result.ToArray()
+
+                    let mutable currentLines = lines
+
+                    for edit in sortedEdits do
+                        currentLines <- applyEdit currentLines edit
+
+                    String.concat "\n" currentLines
+
+                let formatted =
+                    match editsToken with
+                    | :? JsonArray as edits when edits.Count > 0 -> applyEdits originalText edits
+                    | _ -> originalText
+
+                return
+                    jobj
+                        [ "status", jstr "ok"
+                          "result",
+                          jobj
+                              [ "formatted", jstr formatted
+                                "edits",
+                                (match editsToken with
+                                 | :? JsonArray -> editsToken
+                                 | _ -> JsonArray() :> JsonNode) ]
+                          :> JsonNode ]
+                    :> JsonNode
         }
 
     member this.CodeAction(args: CodeActionArgs) : Task<JsonNode> =
@@ -598,6 +852,7 @@ type internal FsAutoCompleteBridge() =
             "textDocument/codeAction",
             fun uri ->
                 let pos = jobj [ "line", jint args.line; "character", jint args.character ]
+
                 jobj
                     [ "textDocument", jobj [ "uri", jstr uri ]
                       "range", jobj [ "start", pos :> JsonNode; "end", pos :> JsonNode ]

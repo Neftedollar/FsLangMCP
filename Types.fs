@@ -8,10 +8,10 @@ open System.Text.Json.Nodes
 // ─── Tool error DU ─────────────────────────────────────────────────────────────
 
 type ToolError =
-    | InvalidArgs  of string
-    | NotReady     of string
+    | InvalidArgs of string
+    | NotReady of string
     | InfraFailure of exn
-    | FcsAborted   of string
+    | FcsAborted of string
     | FileNotFound of string
 
 // ─── Shared arg types ──────────────────────────────────────────────────────────
@@ -43,6 +43,17 @@ type SetProjectArgs =
     { projectPath: string
       workspacePath: string option
       restartLsp: bool option }
+
+type FSharpCompileArgs =
+    { projectPath: string
+      workspacePath: string option
+      timeoutMs: int option }
+
+type ProjectHealthArgs =
+    { projectPath: string
+      workspacePath: string option
+      scope: string option
+      compileCheck: string option }
 
 type FcsParseAndCheckArgs =
     { path: string
@@ -85,9 +96,7 @@ type FcsSignatureHelpArgs =
       projectPath: string option
       projectOptions: string list option }
 
-type FormattingArgs =
-    { path: string
-      text: string option }
+type FormattingArgs = { path: string; text: string option }
 
 type CodeActionArgs =
     { path: string
@@ -107,6 +116,7 @@ type FcsGetProjectOptionsArgs = { projectPath: string }
 
 // ─── CLI parse result ──────────────────────────────────────────────────────────
 
+[<Struct>]
 type internal CliParseResult =
     | Start
     | BootstrapTools
@@ -117,8 +127,10 @@ type internal CliParseResult =
 
 let jobj (props: (string * JsonNode) list) =
     let result = JsonObject()
+
     for (key, value) in props do
         result[key] <- value
+
     result
 
 let jstr (value: string) : JsonNode = JsonValue.Create(value)

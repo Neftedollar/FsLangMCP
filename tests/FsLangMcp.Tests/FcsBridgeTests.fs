@@ -60,9 +60,8 @@ let ``ToolError message with quotes is properly escaped`` () =
 let ``renderToken preserves F# type signature characters without unicode escaping`` () =
     // Regression for STJ default encoder mangling 'a -> 'b to \u0027a -\u003E \u0027b
     let renderOpts =
-        JsonSerializerOptions(
-            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-            WriteIndented = true)
+        JsonSerializerOptions(Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping, WriteIndented = true)
+
     let node = JsonObject()
     node["typeString"] <- JsonValue.Create("'a -> 'b when 'a : comparison")
     let rendered = JsonSerializer.Serialize(node, renderOpts)
@@ -84,7 +83,7 @@ let private asTask workflow =
 
 /// Write a temp .fs file, return its path
 let private writeTempFs (content: string) =
-    let path = Path.Combine(Path.GetTempPath(), $"fslangmcp_test_{Guid.NewGuid()}.fs")
+    let path = Path.Combine(Path.GetTempPath(), $"fslangmcp_test_%O{Guid.NewGuid()}.fs")
     File.WriteAllText(path, content)
     path
 
@@ -99,19 +98,17 @@ let private findRepoRoot () =
 
     loop (DirectoryInfo(AppContext.BaseDirectory))
 
-let private jsonArrayLength (node: JsonNode) =
-    (node :?> JsonArray).Count
+let private jsonArrayLength (node: JsonNode) = (node :?> JsonArray).Count
 
 let private writeSimpleProject (root: string) (projectName: string) (symbolName: string) =
     let dir = Path.Combine(root, projectName)
     Directory.CreateDirectory(dir) |> ignore
 
     let sourcePath = Path.Combine(dir, "Library.fs")
-    File.WriteAllText(
-        sourcePath,
-        $"module {projectName}.Library\n\nlet {symbolName} = 42\n")
+    File.WriteAllText(sourcePath, $"module %s{projectName}.Library\n\nlet %s{symbolName} = 42\n")
 
-    let projectPath = Path.Combine(dir, $"{projectName}.fsproj")
+    let projectPath = Path.Combine(dir, $"%s{projectName}.fsproj")
+
     File.WriteAllText(
         projectPath,
         String.concat
@@ -123,21 +120,25 @@ let private writeSimpleProject (root: string) (projectName: string) (symbolName:
               "  <ItemGroup>"
               "    <Compile Include=\"Library.fs\" />"
               "  </ItemGroup>"
-              "</Project>" ])
+              "</Project>" ]
+    )
 
     sourcePath, projectPath
 
 [<Fact>]
 let ``fcs_parse_and_check_file succeeds on valid F# snippet`` () : Task =
     task {
-        let src = """
+        let src =
+            """
 module TestModule
 
 let add x y = x + y
 
 let result = add 1 2
 """
+
         let path = writeTempFs src
+
         try
             let sourceText = SourceText.ofString src
             let! opts, _ = checker.GetProjectOptionsFromScript(path, sourceText) |> asTask
@@ -149,10 +150,10 @@ let result = add 1 2
             | FSharpCheckFileAnswer.Succeeded results ->
                 Assert.True(results.HasFullTypeCheckInfo, "Should have full type check info")
                 Assert.False(parseResults.ParseHadErrors, "Parse should not have errors")
-            | FSharpCheckFileAnswer.Aborted ->
-                Assert.Fail("Type checking was aborted unexpectedly")
+            | FSharpCheckFileAnswer.Aborted -> Assert.Fail("Type checking was aborted unexpectedly")
         finally
-            if File.Exists(path) then File.Delete(path)
+            if File.Exists(path) then
+                File.Delete(path)
     }
 
 [<Fact>]
@@ -168,19 +169,35 @@ let ``FcsBridge uses explicit fsproj projectPath without projectOptions`` () : T
                 { path = sourcePath
                   text = None
                   projectPath = Some projectPath
-                  projectOptions = None })
+                  projectOptions = None }
+            )
 
         Assert.Equal("ionide-proj-info", result["optionsSource"].GetValue<string>())
         Assert.Equal(Path.GetFullPath(projectPath), result["projectFileName"].GetValue<string>())
         Assert.True(result["hasFullTypeCheckInfo"].GetValue<bool>())
         Assert.Equal(0, jsonArrayLength result["parseDiagnostics"])
         Assert.Equal(0, jsonArrayLength result["checkDiagnostics"])
+
+        let! cachedResult =
+            bridge.ParseAndCheckFile(
+                { path = Path.Combine(root, "Program.fs")
+                  text = None
+                  projectPath = Some projectPath
+                  projectOptions = None }
+            )
+
+        Assert.Equal("ionide-proj-info", cachedResult["optionsSource"].GetValue<string>())
+        Assert.Equal(Path.GetFullPath(projectPath), cachedResult["projectFileName"].GetValue<string>())
     }
 
 [<Fact>]
 let ``FcsBridge project symbol cache is keyed by auto-discovered project`` () : Task =
     task {
-        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_projects_{Guid.NewGuid():N}")
+        let projectRunId = Guid.NewGuid().ToString("N")
+
+        let tempRoot =
+            Path.Combine(Path.GetTempPath(), $"fslangmcp_projects_%s{projectRunId}")
+
         let bridge = FcsBridge()
 
         try
@@ -195,7 +212,8 @@ let ``FcsBridge project symbol cache is keyed by auto-discovered project`` () : 
                       projectOptions = None
                       symbolQuery = "onlyInProjectA"
                       exact = Some true
-                      maxResults = Some 10 })
+                      maxResults = Some 10 }
+                )
 
             let! resultB =
                 bridge.ProjectSymbolUses(
@@ -205,7 +223,8 @@ let ``FcsBridge project symbol cache is keyed by auto-discovered project`` () : 
                       projectOptions = None
                       symbolQuery = "onlyInProjectB"
                       exact = Some true
-                      maxResults = Some 10 })
+                      maxResults = Some 10 }
+                )
 
             Assert.Equal("succeeded", resultA["status"].GetValue<string>())
             Assert.Equal("succeeded", resultB["status"].GetValue<string>())
@@ -221,7 +240,8 @@ let ``FcsBridge project symbol cache is keyed by auto-discovered project`` () : 
 [<Fact>]
 let ``fcs_file_symbols returns expected symbols from a simple module`` () : Task =
     task {
-        let src = """
+        let src =
+            """
 module SymbolModule
 
 let myValue = 42
@@ -230,7 +250,9 @@ let myFunction x = x + 1
 
 type MyRecord = { Field1: int; Field2: string }
 """
+
         let path = writeTempFs src
+
         try
             let sourceText = SourceText.ofString src
             let! opts, _ = checker.GetProjectOptionsFromScript(path, sourceText) |> asTask
@@ -250,23 +272,26 @@ type MyRecord = { Field1: int; Field2: string }
                 Assert.Contains("myValue", definedSymbols)
                 Assert.Contains("myFunction", definedSymbols)
                 Assert.Contains("MyRecord", definedSymbols)
-            | FSharpCheckFileAnswer.Aborted ->
-                Assert.Fail("Type checking was aborted unexpectedly")
+            | FSharpCheckFileAnswer.Aborted -> Assert.Fail("Type checking was aborted unexpectedly")
         finally
-            if File.Exists(path) then File.Delete(path)
+            if File.Exists(path) then
+                File.Delete(path)
     }
 
 [<Fact>]
 let ``fcs_project_symbol_uses finds a symbol by name`` () : Task =
     task {
-        let src = """
+        let src =
+            """
 module SearchModule
 
 let targetFunction x y = x * y
 
 let callSite = targetFunction 3 4
 """
+
         let path = writeTempFs src
+
         try
             let sourceText = SourceText.ofString src
             let! opts, _ = checker.GetProjectOptionsFromScript(path, sourceText) |> asTask
@@ -286,5 +311,6 @@ let callSite = targetFunction 3 4
             let hasDefinition = targetUses |> Array.exists (fun su -> su.IsFromDefinition)
             Assert.True(hasDefinition, "Should find the definition of targetFunction")
         finally
-            if File.Exists(path) then File.Delete(path)
+            if File.Exists(path) then
+                File.Delete(path)
     }

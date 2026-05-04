@@ -88,13 +88,12 @@ let ``toFileUri returns a URI starting with file scheme and containing filename`
 [<Fact>]
 let ``toolResult success case returns Ok with Content text`` () : Task =
     task {
-        let node : JsonNode = JsonValue.Create(42)
+        let node: JsonNode = JsonValue.Create(42)
         let! result = toolResult (Task.FromResult(node))
+
         match result with
-        | Ok contents ->
-            Assert.NotEmpty(contents)
-        | Error e ->
-            Assert.Fail($"Expected Ok but got Error: {e}")
+        | Ok contents -> Assert.NotEmpty(contents)
+        | Error e -> Assert.Fail($"Expected Ok but got Error: {e}")
     }
 
 [<Fact>]
@@ -103,17 +102,17 @@ let ``toolResult OperationCanceledException returns Error with FcsAborted errorK
         let work =
             task {
                 raise (OperationCanceledException("cancelled by user"))
-                return (null : JsonNode)
+                return (null: JsonNode)
             }
+
         let! result = toolResult work
+
         match result with
-        | Error (McpError.TransportError msg) ->
+        | Error(McpError.TransportError msg) ->
             Assert.Contains("\"errorKind\":\"FcsAborted\"", msg)
             Assert.Contains("cancelled by user", msg)
-        | Ok _ ->
-            Assert.Fail("Expected Error but got Ok")
-        | Error e ->
-            Assert.Fail($"Expected TransportError but got: {e}")
+        | Ok _ -> Assert.Fail("Expected Error but got Ok")
+        | Error e -> Assert.Fail($"Expected TransportError but got: {e}")
     }
 
 [<Fact>]
@@ -122,17 +121,17 @@ let ``toolResult ArgumentException returns Error with InvalidArgs errorKind`` ()
         let work =
             task {
                 raise (ArgumentException("bad param"))
-                return (null : JsonNode)
+                return (null: JsonNode)
             }
+
         let! result = toolResult work
+
         match result with
-        | Error (McpError.TransportError msg) ->
+        | Error(McpError.TransportError msg) ->
             Assert.Contains("\"errorKind\":\"InvalidArgs\"", msg)
             Assert.Contains("bad param", msg)
-        | Ok _ ->
-            Assert.Fail("Expected Error but got Ok")
-        | Error e ->
-            Assert.Fail($"Expected TransportError but got: {e}")
+        | Ok _ -> Assert.Fail("Expected Error but got Ok")
+        | Error e -> Assert.Fail($"Expected TransportError but got: {e}")
     }
 
 [<Fact>]
@@ -141,17 +140,17 @@ let ``toolResult FileNotFoundException returns Error with FileNotFound errorKind
         let work =
             task {
                 raise (System.IO.FileNotFoundException("file is missing"))
-                return (null : JsonNode)
+                return (null: JsonNode)
             }
+
         let! result = toolResult work
+
         match result with
-        | Error (McpError.TransportError msg) ->
+        | Error(McpError.TransportError msg) ->
             Assert.Contains("\"errorKind\":\"FileNotFound\"", msg)
             Assert.Contains("file is missing", msg)
-        | Ok _ ->
-            Assert.Fail("Expected Error but got Ok")
-        | Error e ->
-            Assert.Fail($"Expected TransportError but got: {e}")
+        | Ok _ -> Assert.Fail("Expected Error but got Ok")
+        | Error e -> Assert.Fail($"Expected TransportError but got: {e}")
     }
 
 [<Fact>]
@@ -160,17 +159,17 @@ let ``toolResult generic exception returns Error with InfraFailure errorKind`` (
         let work =
             task {
                 raise (Exception("something went wrong"))
-                return (null : JsonNode)
+                return (null: JsonNode)
             }
+
         let! result = toolResult work
+
         match result with
-        | Error (McpError.TransportError msg) ->
+        | Error(McpError.TransportError msg) ->
             Assert.Contains("\"errorKind\":\"InfraFailure\"", msg)
             Assert.Contains("something went wrong", msg)
-        | Ok _ ->
-            Assert.Fail("Expected Error but got Ok")
-        | Error e ->
-            Assert.Fail($"Expected TransportError but got: {e}")
+        | Ok _ -> Assert.Fail("Expected Error but got Ok")
+        | Error e -> Assert.Fail($"Expected TransportError but got: {e}")
     }
 
 [<Fact>]
@@ -179,15 +178,15 @@ let ``toolResult exception with not ready message returns Error with NotReady er
         let work =
             task {
                 raise (Exception("service not ready yet"))
-                return (null : JsonNode)
+                return (null: JsonNode)
             }
+
         let! result = toolResult work
+
         match result with
-        | Error (McpError.TransportError msg) ->
+        | Error(McpError.TransportError msg) ->
             Assert.Contains("\"errorKind\":\"NotReady\"", msg)
             Assert.Contains("not ready", msg)
-        | Ok _ ->
-            Assert.Fail("Expected Error but got Ok")
-        | Error e ->
-            Assert.Fail($"Expected TransportError but got: {e}")
+        | Ok _ -> Assert.Fail("Expected Error but got Ok")
+        | Error e -> Assert.Fail($"Expected TransportError but got: {e}")
     }

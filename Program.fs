@@ -8,6 +8,7 @@ open System.Threading.Tasks
 open FsLangMcp.Types
 open FsLangMcp.LspBridge
 open FsLangMcp.FcsBridge
+open FsLangMcp.ProjectHealth
 open FsLangMcp.Tools
 open FsMcp.Core
 open FsMcp.Core.Validation
@@ -31,7 +32,7 @@ let private runProcess (fileName: string) (args: string list) =
     use proc = new Process(StartInfo = psi)
 
     if not (proc.Start()) then
-        invalidOp $"Unable to start process: {fileName}"
+        invalidOp $"Unable to start process: %s{fileName}"
 
     let stdout = proc.StandardOutput.ReadToEnd()
     let stderr = proc.StandardError.ReadToEnd()
@@ -40,61 +41,70 @@ let private runProcess (fileName: string) (args: string list) =
 
 let private parseProjInfoOutput (path: string) (exitCode: int) (stdout: string) (stderr: string) : JsonNode =
     if exitCode <> 0 then
-        jobj [ "error", jstr $"proj-info failed (exit {exitCode})"; "stderr", jstr stderr ]
-        :> JsonNode
+        jobj [ "error", jstr $"proj-info failed (exit %d{exitCode})"; "stderr", jstr stderr ] :> JsonNode
     elif String.IsNullOrWhiteSpace(stdout) then
         jobj [ "error", jstr "proj-info produced no output" ] :> JsonNode
     else
         let token = JsonNode.Parse(stdout)
+
         let json =
             match token with
             | :? JsonArray as arr when arr.Count > 0 ->
                 match arr.[0] with
                 | :? JsonObject as obj -> obj
-                | other -> jobj [ "warning", jstr (sprintf "unexpected element type: %s" (other.GetValueKind().ToString())) ]
+                | other ->
+                    jobj [ "warning", jstr (sprintf "unexpected element type: %s" (other.GetValueKind().ToString())) ]
             | :? JsonObject as obj -> obj
             | _ -> JsonObject()
+
         let otherOptions =
             json["OtherOptions"]
             |> Option.ofObj
-            |> Option.map (fun t -> t.Deserialize<string[]>() |> Option.ofObj |> Option.defaultValue [||])
+            |> Option.map (fun t -> t.Deserialize<string array>() |> Option.ofObj |> Option.defaultValue [||])
             |> Option.defaultValue [||]
+
         jobj
             [ "projectPath", jstr path
               "otherOptions", JsonArray(otherOptions |> Array.map jstr) :> JsonNode
               "optionsCount", jint otherOptions.Length ]
         :> JsonNode
 
-let private runProjInfoAsync (path: string) : Task<JsonNode> = task {
-    let psi = ProcessStartInfo()
-    psi.FileName <- "proj-info"
-    psi.UseShellExecute <- false
-    psi.RedirectStandardOutput <- true
-    psi.RedirectStandardError <- true
-    psi.CreateNoWindow <- true
-    psi.ArgumentList.Add("--project")
-    psi.ArgumentList.Add(path)
-    psi.ArgumentList.Add("--fcs")
-    psi.ArgumentList.Add("--serialize")
+let private runProjInfoAsync (path: string) : Task<JsonNode> =
+    task {
+        let psi = ProcessStartInfo()
+        psi.FileName <- "proj-info"
+        psi.UseShellExecute <- false
+        psi.RedirectStandardOutput <- true
+        psi.RedirectStandardError <- true
+        psi.CreateNoWindow <- true
+        psi.ArgumentList.Add("--project")
+        psi.ArgumentList.Add(path)
+        psi.ArgumentList.Add("--fcs")
+        psi.ArgumentList.Add("--serialize")
 
-    use proc = new Process(StartInfo = psi)
-    let started =
-        try
-            proc.Start()
-        with
-        | :? System.ComponentModel.Win32Exception
-        | :? System.IO.IOException ->
-            raise (FileNotFoundException "proj-info not found on PATH. Install with: dotnet tool install -g ionide.projinfo.tool")
-    if not started then
-        raise (InvalidOperationException "Unable to start proj-info process")
+        use proc = new Process(StartInfo = psi)
 
-    let stdoutTask = proc.StandardOutput.ReadToEndAsync()
-    let stderrTask  = proc.StandardError.ReadToEndAsync()
-    let! stdout = stdoutTask
-    let! stderr = stderrTask
-    do! proc.WaitForExitAsync()
-    return parseProjInfoOutput path proc.ExitCode stdout stderr
-}
+        let started =
+            try
+                proc.Start()
+            with
+            | :? System.ComponentModel.Win32Exception
+            | :? System.IO.IOException ->
+                raise (
+                    FileNotFoundException
+                        "proj-info not found on PATH. Install with: dotnet tool install -g ionide.projinfo.tool"
+                )
+
+        if not started then
+            raise (InvalidOperationException "Unable to start proj-info process")
+
+        let stdoutTask = proc.StandardOutput.ReadToEndAsync()
+        let stderrTask = proc.StandardError.ReadToEndAsync()
+        let! stdout = stdoutTask
+        let! stderr = stderrTask
+        do! proc.WaitForExitAsync()
+        return parseProjInfoOutput path proc.ExitCode stdout stderr
+    }
 
 let private readPositiveIntEnv (name: string) (defaultValue: int) =
     match Environment.GetEnvironmentVariable(name) with
@@ -107,6 +117,7 @@ let private readPositiveIntEnv (name: string) (defaultValue: int) =
 let private runLimited (gate: SemaphoreSlim) (work: unit -> Task<JsonNode>) : Task<JsonNode> =
     task {
         do! gate.WaitAsync()
+
         try
             return! work ()
         finally
@@ -114,21 +125,28 @@ let private runLimited (gate: SemaphoreSlim) (work: unit -> Task<JsonNode>) : Ta
     }
 
 let private ensureDotnetGlobalTool (toolId: string) =
-    let updateCode, _, updateErr = runProcess "dotnet" [ "tool"; "update"; "-g"; toolId ]
+    let updateCode, _, updateErr =
+        runProcess "dotnet" [ "tool"; "update"; "-g"; toolId ]
 
     if updateCode = 0 then
-        Console.Error.WriteLine($"[bootstrap] updated {toolId}")
+        Console.Error.WriteLine($"[bootstrap] updated %s{toolId}")
         true
     else
-        let installCode, _, installErr = runProcess "dotnet" [ "tool"; "install"; "-g"; toolId ]
+        let installCode, _, installErr =
+            runProcess "dotnet" [ "tool"; "install"; "-g"; toolId ]
 
         if installCode = 0 then
-            Console.Error.WriteLine($"[bootstrap] installed {toolId}")
+            Console.Error.WriteLine($"[bootstrap] installed %s{toolId}")
             true
         else
-            Console.Error.WriteLine($"[bootstrap] failed for {toolId}")
-            if not (String.IsNullOrWhiteSpace(updateErr)) then Console.Error.WriteLine(updateErr)
-            if not (String.IsNullOrWhiteSpace(installErr)) then Console.Error.WriteLine(installErr)
+            Console.Error.WriteLine($"[bootstrap] failed for %s{toolId}")
+
+            if not (String.IsNullOrWhiteSpace(updateErr)) then
+                Console.Error.WriteLine(updateErr)
+
+            if not (String.IsNullOrWhiteSpace(installErr)) then
+                Console.Error.WriteLine(installErr)
+
             false
 
 let private bootstrapTools () =
@@ -166,7 +184,7 @@ let private applyCliOverrides (argv: string array) =
                 ShowHelp
                     "Usage: fslangmcp [--project <path-to-fsproj>] [--fsac-command <cmd>] [--fsac-args \"...\"] [--bootstrap-tools]"
             | "--bootstrap-tools" -> BootstrapTools
-            | unknown -> Fail $"Unknown argument: {unknown}"
+            | unknown -> Fail $"Unknown argument: %s{unknown}"
 
     loop 0
 
@@ -175,8 +193,7 @@ let private applyCliOverrides (argv: string array) =
 [<EntryPoint>]
 let main argv =
     match applyCliOverrides argv with
-    | BootstrapTools ->
-        if bootstrapTools () then 0 else 1
+    | BootstrapTools -> if bootstrapTools () then 0 else 1
     | ShowHelp message ->
         Console.WriteLine(message)
         0
@@ -192,12 +209,12 @@ let main argv =
         let server =
             mcpServer {
                 name "fsharp-fsautocomplete"
-                version "0.2.1"
+                version "0.3.0"
 
                 tool (
                     TypedTool.define<CompletionArgs>
                         "textDocument_completion"
-                        "Proxy to fsautocomplete textDocument/completion. line/character are 0-based. Requires set_project to be called first (or --project at startup). Pass 'text' to analyze unsaved source content without writing to disk."
+                        "Raw LSP proxy to fsautocomplete textDocument/completion. Exact-position IDE primitive; requires set_project first. Prefer agent-friendly FCS/navigation tools for codebase understanding. line/character are 0-based. Pass 'text' for unsaved content."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Completion args)))
                     |> unwrapResult
                 )
@@ -205,7 +222,7 @@ let main argv =
                 tool (
                     TypedTool.define<PositionArgs>
                         "textDocument_hover"
-                        "Get hover info (type, docs) for the F# symbol at the cursor via fsautocomplete. Richer output than fcs_type_at_position but requires a loaded LSP workspace. Requires set_project first. Pass 'text' for unsaved content."
+                        "Raw LSP hover proxy. Exact cursor position required; output is IDE-shaped and can be noisy/misleading if the cursor is off by one. Requires set_project first. Prefer FCS semantic tools when available. Pass 'text' for unsaved content."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Hover args)))
                     |> unwrapResult
                 )
@@ -213,7 +230,7 @@ let main argv =
                 tool (
                     TypedTool.define<PositionArgs>
                         "textDocument_definition"
-                        "Proxy to fsautocomplete textDocument/definition. line/character are 0-based. Requires set_project to be called first (or --project at startup). Pass 'text' to analyze unsaved source content without writing to disk."
+                        "Raw LSP proxy to fsautocomplete textDocument/definition. Exact-position IDE primitive; requires set_project first. line/character are 0-based. Pass 'text' for unsaved content."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Definition args)))
                     |> unwrapResult
                 )
@@ -221,7 +238,7 @@ let main argv =
                 tool (
                     TypedTool.define<ReferencesArgs>
                         "textDocument_references"
-                        "Proxy to fsautocomplete textDocument/references. line/character are 0-based. Requires set_project to be called first (or --project at startup). Pass 'text' to analyze unsaved source content without writing to disk."
+                        "Raw LSP proxy to fsautocomplete textDocument/references. Exact-position IDE primitive; requires set_project first. For query-based agent workflows prefer project symbol-use tools. line/character are 0-based. Pass 'text' for unsaved content."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.References args)))
                     |> unwrapResult
                 )
@@ -229,7 +246,7 @@ let main argv =
                 tool (
                     TypedTool.define<WorkspaceSymbolArgs>
                         "workspace_symbol"
-                        "Proxy to fsautocomplete workspace/symbol. Requires set_project to be called first (or --project at startup)."
+                        "Raw LSP proxy to fsautocomplete workspace/symbol. Useful for quick lookup after set_project, but returns IDE-shaped results without source context."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.WorkspaceSymbol args)))
                     |> unwrapResult
                 )
@@ -237,15 +254,23 @@ let main argv =
                 tool (
                     TypedTool.define<DiagnosticsArgs>
                         "workspace_diagnostics"
-                        "Returns latest cached publishDiagnostics payload (per file or full map). Requires set_project to be called first (or --project at startup)."
+                        "Raw cached LSP publishDiagnostics payload, either for one file or all files. Requires set_project first. Use for current FSAC/compiler/analyzer diagnostics; it does not run build/tests."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Diagnostics args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FSharpCompileArgs>
+                        "fsharp_compile"
+                        "Agent-friendly validation tool wrapping fsautocomplete fsharp/compile. Requires set_project first and an explicit .fsproj path. Returns structured status, exit code when available, diagnostics count, and the raw FSAC result. Does not run dotnet test."
+                        (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Compile args)))
                     |> unwrapResult
                 )
 
                 tool (
                     TypedTool.define<SetProjectArgs>
                         "set_project"
-                        "Initialize or switch the F# project context. Must be called once before any textDocument_* or workspace_* tool will work. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load. Also clears the FCS symbol cache."
+                        "Initialize or switch the FSAC/LSP project context. Must be called before textDocument_*, workspace_*, and fsharp_compile. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load and clears FCS caches."
                         (fun args ->
                             toolResult (
                                 runLimited lspGate (fun () ->
@@ -253,14 +278,35 @@ let main argv =
                                         let! result = bridge.SetProject args
                                         fcsBridge.ClearCaches()
                                         return result
-                                    })))
+                                    })
+                            ))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<ProjectHealthArgs>
+                        "project_health"
+                        "Fast read-only preflight for one F# project. Reports whether FsLangMCP can trust semantic tooling, project options availability, source file readability, analyzer setup, test project discovery, and current LSP readiness. Does not start/switch FSAC, run compile, or run tests."
+                        (fun args ->
+                            let snapshot =
+                                { ProjectPath = bridge.CurrentProjectPath
+                                  WorkspaceRoot = bridge.CurrentWorkspaceRoot
+                                  WorkspaceReady = bridge.IsWorkspaceReady
+                                  DiagnosticsFileCount = bridge.DiagnosticsFileCount }
+
+                            let probe path =
+                                fcsBridge.ProbeProjectOptions(path) |> Async.AwaitTask
+
+                            toolResult (
+                                runLimited fcsGate (fun () -> createReport args snapshot probe |> Async.StartAsTask)
+                            ))
                     |> unwrapResult
                 )
 
                 tool (
                     TypedTool.define<FcsParseAndCheckArgs>
                         "fcs_parse_and_check_file"
-                        "FCS parse+typecheck for a file. Pass projectPath as an .fsproj, or projectOptions for explicit compiler args. Pass 'text' to analyze unsaved source content without writing to disk."
+                        "Agent-friendly FCS parse+typecheck for one file. Prefer passing projectPath (.fsproj) for accurate project context; projectOptions can override. Falls back to script inference only when no project can be resolved. Pass 'text' for unsaved content."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.ParseAndCheckFile args)))
                     |> unwrapResult
                 )
@@ -268,7 +314,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsFileSymbolsArgs>
                         "fcs_file_symbols"
-                        "FCS symbol extraction from a file (definitions by default, or all uses). Pass 'text' to analyze unsaved source content without writing to disk."
+                        "Raw FCS symbol extraction for one file. Can be noisy on large files; default returns definitions, includeAllUses returns locals/parameters/usages too. Use for diagnostics/small files until fcs_file_outline exists. Pass projectPath when possible and 'text' for unsaved content."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.FileSymbols args)))
                     |> unwrapResult
                 )
@@ -276,7 +322,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsProjectSymbolUsesArgs>
                         "fcs_project_symbol_uses"
-                        "FCS project-wide symbol use search by symbol name/fullname. Results are cached per project. Pass 'text' to analyze unsaved source content without writing to disk."
+                        "Agent-friendly FCS project-wide symbol-use search by symbol name/full name. Results are cached by resolved project options. Prefer exact=true for narrow queries. Pass projectPath when possible and 'text' for unsaved content."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.ProjectSymbolUses args)))
                     |> unwrapResult
                 )
@@ -284,7 +330,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsTypeAtPositionArgs>
                         "fcs_type_at_position"
-                        "Get the inferred F# type and symbol info at a cursor position using the compiler directly. Works without a loaded LSP workspace (no set_project needed). For better accuracy provide projectOptions (run: proj-info --project App.fsproj --fcs --serialize, use OtherOptions). Pass 'text' for unsaved content."
+                        "Low-level exact-position FCS type/symbol query. Works without LSP set_project, but requires accurate line/character and project context for good results. Prefer future symbol-at-word tools for agent workflows. Pass projectPath/projectOptions and 'text' when available."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.TypeAtPosition args)))
                     |> unwrapResult
                 )
@@ -292,7 +338,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsSignatureHelpArgs>
                         "fcs_signature_help"
-                        "Returns method signature and overloads at a cursor position. line/character are 0-based (LSP convention). Pass 'text' to analyze unsaved source content without writing to disk."
+                        "Low-level exact-position FCS signature help. Returns overloads/parameters around a call site. line/character are 0-based. Pass projectPath/projectOptions and 'text' when available."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.SignatureHelp args)))
                     |> unwrapResult
                 )
@@ -300,7 +346,7 @@ let main argv =
                 tool (
                     TypedTool.define<FormattingArgs>
                         "textDocument_formatting"
-                        "Formats F# code via fsautocomplete/Fantomas. Returns formatted text and applied edits. Requires set_project to be called first (or --project at startup). Pass 'text' to analyze unsaved source content without writing to disk."
+                        "Raw LSP formatting proxy via fsautocomplete/Fantomas. Requires set_project first. Returns formatted text and edits; it does not write to disk. Pass 'text' for unsaved content."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Formatting args)))
                     |> unwrapResult
                 )
@@ -308,7 +354,7 @@ let main argv =
                 tool (
                     TypedTool.define<CodeActionArgs>
                         "textDocument_codeAction"
-                        "Returns available code actions at a position via fsautocomplete. line/character are 0-based. Requires set_project to be called first (or --project at startup). Pass 'text' to analyze unsaved source content without writing to disk."
+                        "Raw LSP codeAction proxy at an exact position with empty diagnostic context. Requires set_project first. Useful for debugging FSAC; prefer future diagnostics-to-fix workflows for agent repairs. Pass 'text' for unsaved content."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.CodeAction args)))
                     |> unwrapResult
                 )
@@ -316,7 +362,7 @@ let main argv =
                 tool (
                     TypedTool.define<RenameArgs>
                         "textDocument_rename"
-                        "Renames a symbol at a position via fsautocomplete. line/character are 0-based. Requires set_project to be called first (or --project at startup). Pass 'text' to analyze unsaved source content without writing to disk."
+                        "Raw LSP semantic rename at an exact position. Requires set_project first. Safer than text search, but returns raw WorkspaceEdit and needs a precise target. Pass 'text' for unsaved content."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Rename args)))
                     |> unwrapResult
                 )
@@ -324,9 +370,10 @@ let main argv =
                 tool (
                     TypedTool.define<FcsGetProjectOptionsArgs>
                         "fcs_get_project_options"
-                        "Get FSharp compiler project options (OtherOptions) for a .fsproj file using proj-info. Returns the options list to use as `projectOptions` in FCS tools."
+                        "Diagnostic helper: get FSharp compiler OtherOptions for a .fsproj via proj-info. Useful when automatic project resolution fails or when passing explicit projectOptions to FCS tools."
                         (fun args ->
                             let path = args.projectPath
+
                             if String.IsNullOrWhiteSpace(path) then
                                 toolResult (Task.FromException<JsonNode>(ArgumentException "projectPath is required"))
                             else
@@ -341,5 +388,5 @@ let main argv =
             Server.run server |> fun t -> t.GetAwaiter().GetResult()
             0
         with ex ->
-            Console.Error.WriteLine($"Fatal error: {ex.Message}")
+            Console.Error.WriteLine($"Fatal error: %s{ex.Message}")
             1

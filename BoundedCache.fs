@@ -2,10 +2,10 @@ module FsLangMcp.BoundedCache
 
 /// Thread-safe FIFO-eviction bounded cache.
 /// When maxSize is reached, the oldest inserted key is evicted.
-type internal BoundedCache<'K, 'V when 'K : equality>(maxSize: int) =
+type internal BoundedCache<'K, 'V when 'K: equality>(maxSize: int) =
     let dict = System.Collections.Generic.Dictionary<'K, 'V>()
     let order = System.Collections.Generic.Queue<'K>()
-    let lockObj = obj()
+    let lockObj = obj ()
 
     member _.TryGet(key: 'K) : 'V option =
         lock lockObj (fun () ->
@@ -19,7 +19,9 @@ type internal BoundedCache<'K, 'V when 'K : equality>(maxSize: int) =
                 if dict.Count >= maxSize then
                     let oldest = order.Dequeue()
                     dict.Remove(oldest) |> ignore
+
                 order.Enqueue(key)
+
             dict[key] <- value)
 
     member _.Clear() =
