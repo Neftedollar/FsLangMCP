@@ -77,6 +77,30 @@ module internal CompileResult =
 
         status, exitCode, diagnosticsCount
 
+    let envelope backend projectPath response =
+        let compileStatus, exitCode, diagnosticsCount = classify response
+
+        jobj
+            [ "status", jstr compileStatus
+              "backend", jstr backend
+              "projectPath", jstr projectPath
+              "exitCode", exitCode |> Option.map jint |> Option.defaultValue null
+              "diagnosticsCount", diagnosticsCount |> Option.map jint |> Option.defaultValue null
+              "result", response.DeepClone() ]
+        :> JsonNode
+
+    let error backend projectPath message =
+        jobj
+            [ "status", jstr "failed"
+              "backend", jstr backend
+              "projectPath", jstr projectPath
+              "error", jstr message ]
+        :> JsonNode
+
+    let fsacCompileUnavailable (message: string) =
+        message.Contains("No method by the name 'fsharp/compile' is found.", StringComparison.OrdinalIgnoreCase)
+        || message.Contains("No method by the name \"fsharp/compile\" is found.", StringComparison.OrdinalIgnoreCase)
+
 // ─── Workspace load notification parsing ──────────────────────────────────────
 
 module internal WorkspaceNotification =
@@ -650,6 +674,61 @@ type internal FsAutoCompleteBridge() =
             else
                 let timeoutMs = args.timeoutMs |> Option.defaultValue 60000
 
+                let runDotnetBuildFallback () =
+                    task {
+                        let psi = ProcessStartInfo()
+                        psi.FileName <- "dotnet"
+                        psi.UseShellExecute <- false
+                        psi.RedirectStandardOutput <- true
+                        psi.RedirectStandardError <- true
+                        psi.CreateNoWindow <- true
+
+                        let workingDirectory =
+                            args.workspacePath
+                            |> Option.map Path.GetFullPath
+                            |> Option.defaultValue (Path.GetDirectoryName(projectPath))
+
+                        if Directory.Exists workingDirectory then
+                            psi.WorkingDirectory <- workingDirectory
+
+                        psi.ArgumentList.Add("build")
+                        psi.ArgumentList.Add(projectPath)
+                        psi.ArgumentList.Add("--no-restore")
+
+                        use proc = new Process(StartInfo = psi)
+
+                        if not (proc.Start()) then
+                            return
+                                CompileResult.error "dotnet-build-fallback" projectPath "Unable to start dotnet build."
+                        else
+                            let stdoutTask = proc.StandardOutput.ReadToEndAsync()
+                            let stderrTask = proc.StandardError.ReadToEndAsync()
+                            let waitTask = proc.WaitForExitAsync()
+                            let! completed = Task.WhenAny(waitTask, Task.Delay(timeoutMs))
+
+                            if Object.ReferenceEquals(completed, waitTask) then
+                                let! stdout = stdoutTask
+                                let! stderr = stderrTask
+
+                                let response =
+                                    jobj
+                                        [ "exitCode", jint proc.ExitCode; "stdout", jstr stdout; "stderr", jstr stderr ]
+
+                                return CompileResult.envelope "dotnet-build-fallback" projectPath response
+                            else
+                                try
+                                    if not proc.HasExited then
+                                        proc.Kill(true)
+                                with _ ->
+                                    ()
+
+                                return
+                                    CompileResult.error
+                                        "dotnet-build-fallback"
+                                        projectPath
+                                        $"dotnet build timed out after %d{timeoutMs}ms"
+                    }
+
                 let payloads =
                     [| jobj [ "Project", jstr projectPath ]
                        jobj [ "Project", jstr (toFileUri projectPath) ]
@@ -684,26 +763,9 @@ type internal FsAutoCompleteBridge() =
                     payloadIndex <- payloadIndex + 1
 
                 match compileResult with
-                | Error error ->
-                    return
-                        jobj
-                            [ "status", jstr "failed"
-                              "backend", jstr "fsautocomplete"
-                              "projectPath", jstr projectPath
-                              "error", jstr error ]
-                        :> JsonNode
-                | Ok response ->
-                    let compileStatus, exitCode, diagnosticsCount = CompileResult.classify response
-
-                    return
-                        jobj
-                            [ "status", jstr compileStatus
-                              "backend", jstr "fsautocomplete"
-                              "projectPath", jstr projectPath
-                              "exitCode", exitCode |> Option.map jint |> Option.defaultValue null
-                              "diagnosticsCount", diagnosticsCount |> Option.map jint |> Option.defaultValue null
-                              "result", response.DeepClone() ]
-                        :> JsonNode
+                | Error error when CompileResult.fsacCompileUnavailable error -> return! runDotnetBuildFallback ()
+                | Error error -> return CompileResult.error "fsautocomplete" projectPath error
+                | Ok response -> return CompileResult.envelope "fsautocomplete" projectPath response
         }
 
     member _.Diagnostics(args: DiagnosticsArgs) : Task<JsonNode> =

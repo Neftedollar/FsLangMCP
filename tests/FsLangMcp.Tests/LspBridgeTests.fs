@@ -61,3 +61,7 @@ let ``compile result classifier returns unknown for unrecognized payload`` () =
     Assert.Equal("unknown", status)
     Assert.Equal(None, exitCode)
     Assert.Equal(None, diagnosticsCount)
+
+[<Fact>]
+let ``compile result detects missing fsac compile endpoint`` () =
+    Assert.True(CompileResult.fsacCompileUnavailable "No method by the name 'fsharp/compile' is found.")
