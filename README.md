@@ -9,6 +9,24 @@ An MCP server written in F# that combines:
 
 > Work in progress: APIs and tool shapes may still change.
 
+## Changelog
+
+### 0.3.1
+
+- Updated `FSharp.Compiler.Service` to `43.12.203` and aligned the implicit `FSharp.Core` package version to `10.1.203`.
+- Centralized FCS/FSharp.Core package version settings in `Directory.Build.props`.
+- Adjusted signature-help type formatting for the latest FCS API shape.
+- Kept `fsharp_compile` on the FCS project typecheck path introduced in `0.3.0`.
+
+### 0.3.0
+
+- Added `project_health` for read-only project/tooling preflight.
+- Added `fsharp_compile` as an FCS-backed project parse+typecheck tool using `FSharpChecker.ParseAndCheckProject`.
+- Removed reliance on the unavailable `fsautocomplete 0.83` `fsharp/compile` endpoint and the `dotnet build` fallback.
+- Added F# analyzer wiring and `just analyze`.
+- Improved tool descriptions for agent-friendly FCS tools vs raw LSP proxy tools.
+- Added tests for project health, compile validation, cache behavior, and invalid compile inputs.
+
 ## Response Shape
 
 All tools return a consistent JSON envelope:
