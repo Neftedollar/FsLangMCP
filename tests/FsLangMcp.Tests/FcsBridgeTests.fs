@@ -238,6 +238,91 @@ let ``FcsBridge project symbol cache is keyed by auto-discovered project`` () : 
     }
 
 [<Fact>]
+let ``FcsBridge CompileProject succeeds through FCS project typecheck`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_compile_ok_%s{runId}")
+
+        let bridge = FcsBridge()
+
+        try
+            let _, projectPath = writeSimpleProject tempRoot "CompileOk" "compileValue"
+
+            let! result =
+                bridge.CompileProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      timeoutMs = Some 30000 }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.Equal("fcs-parse-and-check-project", result["backend"].GetValue<string>())
+            Assert.Equal("ionide-proj-info", result["optionsSource"].GetValue<string>())
+            Assert.False(result["cached"].GetValue<bool>())
+            Assert.Equal(0, result["errorCount"].GetValue<int>())
+            Assert.Null(result["exitCode"])
+
+            let! cachedResult =
+                bridge.CompileProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      timeoutMs = Some 30000 }
+                )
+
+            Assert.Equal("succeeded", cachedResult["status"].GetValue<string>())
+            Assert.True(cachedResult["cached"].GetValue<bool>())
+        finally
+            if Directory.Exists(tempRoot) then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``FcsBridge CompileProject reports FCS typecheck errors`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_compile_fail_%s{runId}")
+
+        let bridge = FcsBridge()
+
+        try
+            let sourcePath, projectPath =
+                writeSimpleProject tempRoot "CompileFail" "compileValue"
+
+            File.WriteAllText(sourcePath, "module CompileFail.Library\n\nlet broken: int = \"not an int\"\n")
+
+            let! result =
+                bridge.CompileProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      timeoutMs = Some 30000 }
+                )
+
+            Assert.Equal("failed", result["status"].GetValue<string>())
+            Assert.Equal("fcs-parse-and-check-project", result["backend"].GetValue<string>())
+            Assert.True(result["errorCount"].GetValue<int>() > 0)
+            Assert.True((result["diagnostics"] :?> JsonArray).Count > 0)
+        finally
+            if Directory.Exists(tempRoot) then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``FcsBridge CompileProject rejects non fsproj paths`` () : Task =
+    task {
+        let bridge = FcsBridge()
+
+        let! ex =
+            Assert.ThrowsAsync<ArgumentException>(fun () ->
+                bridge.CompileProject(
+                    { projectPath = Path.Combine(Path.GetTempPath(), "NotAProject.fs")
+                      workspacePath = None
+                      timeoutMs = Some 30000 }
+                ))
+
+        Assert.Contains("projectPath must point to an .fsproj file", ex.Message)
+    }
+
+[<Fact>]
 let ``fcs_file_symbols returns expected symbols from a simple module`` () : Task =
     task {
         let src =

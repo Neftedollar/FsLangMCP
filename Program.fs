@@ -262,15 +262,15 @@ let main argv =
                 tool (
                     TypedTool.define<FSharpCompileArgs>
                         "fsharp_compile"
-                        "Agent-friendly validation tool wrapping fsautocomplete fsharp/compile. Requires set_project first and an explicit .fsproj path. Returns structured status, exit code when available, diagnostics count, and the raw FSAC result. Does not run dotnet test."
-                        (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Compile args)))
+                        "Agent-friendly FCS project validation. Requires an explicit .fsproj path, loads project options through Ionide.ProjInfo, then runs FSharpChecker.ParseAndCheckProject. Does not require set_project, does not run dotnet build/test, and does not emit assemblies."
+                        (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.CompileProject args)))
                     |> unwrapResult
                 )
 
                 tool (
                     TypedTool.define<SetProjectArgs>
                         "set_project"
-                        "Initialize or switch the FSAC/LSP project context. Must be called before textDocument_*, workspace_*, and fsharp_compile. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load and clears FCS caches."
+                        "Initialize or switch the FSAC/LSP project context. Must be called before textDocument_* and workspace_* tools. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load and clears FCS caches."
                         (fun args ->
                             toolResult (
                                 runLimited lspGate (fun () ->

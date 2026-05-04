@@ -127,6 +127,17 @@ type internal FcsBridge() =
         let optionsHash = String.concat "|" projectOptions.OtherOptions
         $"%s{projectOptions.ProjectFileName}::%s{optionsHash}"
 
+    let countDiagnosticsBySeverity (diagnostics: FSharpDiagnostic array) =
+        let errors =
+            diagnostics
+            |> Array.filter (fun d -> d.Severity = FSharpDiagnosticSeverity.Error)
+
+        let warnings =
+            diagnostics
+            |> Array.filter (fun d -> d.Severity = FSharpDiagnosticSeverity.Warning)
+
+        errors.Length, warnings.Length
+
     member private _.LoadProjectOptionsFromFsproj(fsprojPath: string) : Task<FSharpProjectOptions option> =
         // Offload to thread pool — MSBuild/SDK probing is CPU+IO bound.
         // Assumption: Init.init and WorkspaceLoader do not rely on thread-local or
@@ -146,6 +157,29 @@ type internal FcsBridge() =
             with ex ->
                 Console.Error.WriteLine($"[proj-info] Failed to load %s{fsprojPath}: %s{ex.Message}")
                 None)
+
+    member private this.ResolveFsprojOptions(fsprojPath: string) : Task<FSharpProjectOptions * string> =
+        task {
+            let fullPath = normalizePath fsprojPath
+            let fsprojKey = $"fsproj::%s{fullPath}"
+
+            match optionsCache.TryGet(fsprojKey) with
+            | Some(cached, source) -> return cached, source
+            | None ->
+                let! projInfoResult = this.LoadProjectOptionsFromFsproj(fullPath)
+
+                match projInfoResult with
+                | Some projOpts ->
+                    optionsCache.Set(fsprojKey, (projOpts, "ionide-proj-info"))
+                    return projOpts, "ionide-proj-info"
+                | None ->
+                    return
+                        raise (
+                            InvalidOperationException(
+                                $"Unable to load F# project options from explicit projectPath: %s{fullPath}"
+                            )
+                        )
+        }
 
     member private this.ResolveProjectOptions
         (path: string, text: string, projectPath: string option, projectOptions: string list option)
@@ -177,40 +211,24 @@ type internal FcsBridge() =
 
                 match resolvedFsproj with
                 | Some fsprojPath ->
-                    let fsprojKey = $"fsproj::%s{fsprojPath}"
-
-                    match optionsCache.TryGet(fsprojKey) with
-                    | Some(cached, source) -> return cached, source
-                    | None ->
-                        // Try real MSBuild loading via Ionide.ProjInfo.FCS
-                        let! projInfoResult = this.LoadProjectOptionsFromFsproj(fsprojPath)
-
-                        match projInfoResult with
-                        | Some projOpts ->
-                            optionsCache.Set(fsprojKey, (projOpts, "ionide-proj-info"))
-                            return projOpts, "ionide-proj-info"
+                    try
+                        return! this.ResolveFsprojOptions(fsprojPath)
+                    with ex ->
+                        match requestedFsproj with
+                        | Some _ -> return raise ex
                         | None ->
-                            match requestedFsproj with
-                            | Some _ ->
-                                return
-                                    raise (
-                                        InvalidOperationException(
-                                            $"Unable to load F# project options from explicit projectPath: %s{fsprojPath}"
-                                        )
-                                    )
-                            | None ->
-                                // Fall back to script inference with honest labelling
-                                let sourceText = SourceText.ofString text
+                            // Fall back to script inference with honest labelling.
+                            let sourceText = SourceText.ofString text
 
-                                let! scriptOptions, _ =
-                                    checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
+                            let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
 
-                                let discovered =
-                                    { scriptOptions with
-                                        ProjectFileName = fsprojPath }
+                            let discovered =
+                                { scriptOptions with
+                                    ProjectFileName = fsprojPath }
 
-                                optionsCache.Set(fsprojKey, (discovered, "auto-discovered-script-fallback"))
-                                return discovered, "auto-discovered-script-fallback"
+                            let fsprojKey = $"fsproj::%s{fsprojPath}"
+                            optionsCache.Set(fsprojKey, (discovered, "auto-discovered-script-fallback"))
+                            return discovered, "auto-discovered-script-fallback"
                 | None ->
                     let scriptKey = $"script::%s{fullPath}"
 
@@ -272,6 +290,76 @@ type internal FcsBridge() =
                       "parseDiagnostics", JsonArray(parseDiagnostics) :> JsonNode
                       "checkDiagnostics", JsonArray(checkDiagnostics) :> JsonNode ]
                 :> JsonNode
+        }
+
+    member this.CompileProject(args: FSharpCompileArgs) : Task<JsonNode> =
+        task {
+            let projectPath = normalizePath args.projectPath
+
+            if not (String.Equals(Path.GetExtension(projectPath), ".fsproj", StringComparison.OrdinalIgnoreCase)) then
+                invalidArg (nameof args.projectPath) $"projectPath must point to an .fsproj file: %s{projectPath}"
+
+            if not (File.Exists projectPath) then
+                invalidArg (nameof args.projectPath) $"Project file does not exist: %s{projectPath}"
+
+            let timeoutMs = args.timeoutMs |> Option.defaultValue 60000
+            let! projectOptions, optionsSource = this.ResolveFsprojOptions(projectPath)
+            let cacheKey = makeResolvedProjectCacheKey projectOptions
+
+            use timeoutCts = new CancellationTokenSource(timeoutMs)
+
+            let parseAndCheckProject () =
+                Async.StartAsTask(checker.ParseAndCheckProject(projectOptions), cancellationToken = timeoutCts.Token)
+
+            try
+                let! projectResults, cached =
+                    task {
+                        match projectResultsCache.TryGet(cacheKey) with
+                        | Some existing -> return existing, true
+                        | None ->
+                            let! results = parseAndCheckProject ()
+                            projectResultsCache.Set(cacheKey, results)
+                            return results, false
+                    }
+
+                let diagnostics = projectResults.Diagnostics
+                let errorCount, warningCount = countDiagnosticsBySeverity diagnostics
+                let status = if errorCount = 0 then "succeeded" else "failed"
+
+                return
+                    jobj
+                        [ "status", jstr status
+                          "backend", jstr "fcs-parse-and-check-project"
+                          "projectPath", jstr projectPath
+                          "projectFileName", jstr projectOptions.ProjectFileName
+                          "optionsSource", jstr optionsSource
+                          "cached", jbool cached
+                          "exitCode", null
+                          "diagnosticsCount", jint diagnostics.Length
+                          "errorCount", jint errorCount
+                          "warningCount", jint warningCount
+                          "sourceFileCount", jint projectOptions.SourceFiles.Length
+                          "diagnostics", JsonArray(diagnostics |> Array.map diagnosticToJson) :> JsonNode
+                          "notes",
+                          JsonArray(
+                              [| jstr
+                                     "This is an FCS project parse+typecheck, not a dotnet build/MSBuild emit/test run." |]
+                          )
+                          :> JsonNode ]
+                    :> JsonNode
+            with
+            | :? OperationCanceledException
+            | :? TaskCanceledException ->
+                return
+                    jobj
+                        [ "status", jstr "timeout"
+                          "backend", jstr "fcs-parse-and-check-project"
+                          "projectPath", jstr projectPath
+                          "projectFileName", jstr projectOptions.ProjectFileName
+                          "optionsSource", jstr optionsSource
+                          "timeoutMs", jint timeoutMs
+                          "message", jstr $"FCS ParseAndCheckProject timed out after %d{timeoutMs}ms." ]
+                    :> JsonNode
         }
 
     member this.FileSymbols(args: FcsFileSymbolsArgs) : Task<JsonNode> =

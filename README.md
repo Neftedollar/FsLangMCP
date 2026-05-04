@@ -30,7 +30,6 @@ All tools return a consistent JSON envelope:
 - `textDocument_rename` — rename a symbol across the project
 - `workspace_symbol`
 - `workspace_diagnostics` (cache of latest `publishDiagnostics`)
-- `fsharp_compile` — structured validation via FSAC `fsharp/compile`
 - `set_project` (switch active project/workspace for LSP context)
 
 LSP positions (`line`, `character`) are **0-based**.
@@ -49,6 +48,7 @@ The `textDocument_*` and `workspace_*` tools are raw LSP/IDE-shaped proxies. The
 ### Project preflight
 
 - `project_health` — fast read-only project preflight. Reports project options availability, source file readability, analyzer setup, test project discovery, and current LSP readiness. It does not start/switch FSAC, run compile, or run tests.
+- `fsharp_compile` — FCS project validation. Loads `.fsproj` options through `Ionide.ProjInfo`, then runs `FSharpChecker.ParseAndCheckProject`. It does not require `set_project`, run `dotnet build`, emit assemblies, or run tests.
 
 ## Prerequisites
 
@@ -167,7 +167,7 @@ Typical next calls:
 - `fcs_parse_and_check_file` with `projectPath` for one file.
 - `fcs_project_symbol_uses` with `symbolQuery` for project-wide references.
 - `workspace_diagnostics` to inspect current FSAC/compiler/analyzer diagnostics.
-- `fsharp_compile` for structured compile validation through FSAC.
+- `fsharp_compile` for project-wide FCS parse+typecheck validation.
 
 For repeated multi-agent use, pass `projectPath` directly to FCS tools instead of relying on mutable LSP workspace state.
 
@@ -269,7 +269,7 @@ Notes:
 
 ## `fsharp_compile` Tool
 
-Use `fsharp_compile` after `set_project` when you want FSAC-backed structured compile validation.
+Use `fsharp_compile` when you want read-only project-wide FCS validation without running `dotnet build`.
 
 Input shape:
 
@@ -281,12 +281,11 @@ Input shape:
 }
 ```
 
-`fsharp_compile` returns a compact status plus the raw FSAC result. It does not run tests.
+`fsharp_compile` returns a compact status, diagnostic counts, and FCS diagnostics. It uses `FSharpChecker.ParseAndCheckProject`, so it checks parse/typecheck errors across the project, but it does not execute the full MSBuild build pipeline, emit an assembly, or run tests.
 
 ## Known Issues
 
 - LSP proxy tools return `{"status": "not_ready"}` if called before `fsautocomplete` has finished loading the project. `set_project` waits up to 30 seconds — if you still get `not_ready`, the project may be too large or `fsautocomplete` may have failed to start.
-- `fsharp_compile` depends on the loaded FSAC workspace and the currently installed FSAC custom endpoint behavior.
 - `project_health` v0.3 is intentionally project-focused. It does not yet inspect whole solutions or resolve ambiguous directories.
 - FCS tools fall back to script-style inference (`GetProjectOptionsFromScript`) only when neither `projectPath` nor an auto-discovered `.fsproj` is available. In that mode, diagnostics and symbol data can be incomplete for multi-project solutions.
 - `fcs_project_symbol_uses` results are cached per project. Call `set_project` to flush the cache when source files change on disk.
