@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup>
+    <FSharpCompilerServiceVersion>43.12.203</FSharpCompilerServiceVersion>
+    <FSharpCoreImplicitPackageVersion>10.1.203</FSharpCoreImplicitPackageVersion>
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1608</WarningsNotAsErrors>
+  </PropertyGroup>
+</Project>

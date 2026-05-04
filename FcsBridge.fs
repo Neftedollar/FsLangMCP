@@ -74,6 +74,10 @@ type internal FcsBridge() =
     let positionToJson (p: Position) : JsonNode =
         jobj [ "line", jint p.Line; "column", jint p.Column ] :> JsonNode
 
+    let typeName (typ: FSharpType) =
+        typ.BasicQualifiedName
+        |> Option.defaultWith (fun () -> typ.Format(FSharpDisplayContext.Empty))
+
     let diagnosticToJson (d: FSharpDiagnostic) : JsonNode =
         jobj
             [ "file", jstr (normalizePath d.FileName)
@@ -629,13 +633,13 @@ type internal FcsBridge() =
                                 |> Seq.map (fun p ->
                                     jobj
                                         [ "name", jstr (p.Name |> Option.defaultValue "")
-                                          "type", jstr p.Type.BasicQualifiedName ]
+                                          "type", jstr (typeName p.Type) ]
                                     :> JsonNode)
                                 |> Seq.toArray
 
                             let returnType =
                                 try
-                                    m.ReturnParameter.Type.BasicQualifiedName
+                                    typeName m.ReturnParameter.Type
                                 with ex ->
                                     Console.Error.WriteLine(
                                         $"[fcs_signature_help] ReturnParameter error: %s{ex.Message}"
