@@ -11,6 +11,16 @@ An MCP server written in F# that combines:
 
 ## Changelog
 
+### 0.4.0
+
+- Added agent-friendly navigation tools: `fcs_file_outline`, `fcs_project_outline`, `fcs_find_symbol`, and `fcs_symbol_at_word`.
+- Added `fsharp_project_inspect` for read-only `.fsproj` structure, compile order, references, and `.fsi`/`.fs` pairing.
+- Added shared project file filtering for generated/build/test artifacts used by project-wide scans.
+- Added `fsharp_signature_data` as a structured FSAC signature-data helper.
+- Improved `set_project` workspace selection for directories: single solutions/projects are selected explicitly, and ambiguous directories return candidates instead of guessing.
+- Removed `textDocument_hover` from the exposed MCP tool surface; use `fcs_symbol_at_word` or exact-position FCS helpers instead.
+- Bumped package/server version to `0.4.0`.
+
 ### 0.3.1
 
 - Updated `FSharp.Compiler.Service` to `43.12.203` and aligned the implicit `FSharp.Core` package version to `10.1.203`.
@@ -40,7 +50,6 @@ All tools return a consistent JSON envelope:
 ### LSP-proxy tools (via `fsautocomplete`)
 
 - `textDocument_completion`
-- `textDocument_hover`
 - `textDocument_definition`
 - `textDocument_references`
 - `textDocument_formatting` — format F# file via Fantomas (via fsautocomplete)
@@ -48,6 +57,7 @@ All tools return a consistent JSON envelope:
 - `textDocument_rename` — rename a symbol across the project
 - `workspace_symbol`
 - `workspace_diagnostics` (cache of latest `publishDiagnostics`)
+- `fsharp_signature_data` — structured FSAC signature help at an exact position
 - `set_project` (switch active project/workspace for LSP context)
 
 LSP positions (`line`, `character`) are **0-based**.
@@ -57,6 +67,10 @@ The `textDocument_*` and `workspace_*` tools are raw LSP/IDE-shaped proxies. The
 ### FCS tools (compiler semantics)
 
 - `fcs_parse_and_check_file`
+- `fcs_file_outline` — compact per-file API/navigation outline for agents
+- `fcs_project_outline` — compact project-wide outline over filtered compile files
+- `fcs_find_symbol` — grouped definitions/references with source context
+- `fcs_symbol_at_word` — tolerant symbol lookup by line + word/occurrence
 - `fcs_file_symbols`
 - `fcs_project_symbol_uses`
 - `fcs_type_at_position` — inferred F# type and symbol info at cursor (works without LSP workspace)
@@ -65,6 +79,7 @@ The `textDocument_*` and `workspace_*` tools are raw LSP/IDE-shaped proxies. The
 
 ### Project preflight
 
+- `fsharp_project_inspect` — read-only `.fsproj` inspection: compile order, references, source summary, and signature/implementation pairing.
 - `project_health` — fast read-only project preflight. Reports project options availability, source file readability, analyzer setup, test project discovery, and current LSP readiness. It does not start/switch FSAC, run compile, or run tests.
 - `fsharp_compile` — FCS project validation. Loads `.fsproj` options through `Ionide.ProjInfo`, then runs `FSharpChecker.ParseAndCheckProject`. It does not require `set_project`, run `dotnet build`, emit assemblies, or run tests.
 
@@ -183,6 +198,9 @@ Then ask for a health report:
 Typical next calls:
 
 - `fcs_parse_and_check_file` with `projectPath` for one file.
+- `fcs_file_outline` for a compact map of a file.
+- `fcs_find_symbol` when you need definitions/references plus source context.
+- `fcs_symbol_at_word` when you know the line and word but not the exact cursor column.
 - `fcs_project_symbol_uses` with `symbolQuery` for project-wide references.
 - `workspace_diagnostics` to inspect current FSAC/compiler/analyzer diagnostics.
 - `fsharp_compile` for project-wide FCS parse+typecheck validation.

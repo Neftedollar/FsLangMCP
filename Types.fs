@@ -78,7 +78,52 @@ type FcsProjectSymbolUsesArgs =
       exact: bool option
       maxResults: int option }
 
-// ─── New arg types ─────────────────────────────────────────────────────────────
+type FcsFileOutlineArgs =
+    { path: string
+      text: string option
+      projectPath: string option
+      projectOptions: string list option
+      includePrivate: bool option
+      includeLocal: bool option
+      maxResults: int option }
+
+type FcsFindSymbolArgs =
+    { path: string
+      text: string option
+      projectPath: string option
+      projectOptions: string list option
+      symbolQuery: string
+      exact: bool option
+      maxResults: int option
+      contextLines: int option
+      includeDeclaration: bool option }
+
+type FcsSymbolAtWordArgs =
+    { path: string
+      line: int
+      word: string option
+      occurrence: int option
+      text: string option
+      projectPath: string option
+      projectOptions: string list option
+      includeDocumentation: bool option }
+
+type FcsProjectOutlineArgs =
+    { projectPath: string
+      workspacePath: string option
+      includePrivate: bool option
+      includeTests: bool option
+      includeGeneratedFiles: bool option
+      maxFiles: int option
+      maxResultsPerFile: int option }
+
+type FSharpProjectInspectArgs =
+    { projectPath: string
+      workspacePath: string option
+      scope: string option
+      includeGeneratedFiles: bool option
+      includePackageDetails: bool option
+      includeResolvedOptions: bool option }
 
 type FcsTypeAtPositionArgs =
     { path: string

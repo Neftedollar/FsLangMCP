@@ -29,4 +29,5 @@ pack:
     dotnet pack FsLangMcp.fsproj --no-restore -c Debug
 
 install-local: pack
-    dotnet tool update -g fslangmcp --add-source {{tool_source}}
+    dotnet tool uninstall -g fslangmcp || true
+    dotnet tool install -g --add-source {{tool_source}} FsLangMcp

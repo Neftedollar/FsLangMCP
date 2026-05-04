@@ -9,6 +9,7 @@ open FsLangMcp.Types
 open FsLangMcp.LspBridge
 open FsLangMcp.FcsBridge
 open FsLangMcp.ProjectHealth
+open FsLangMcp.ProjectInspection
 open FsLangMcp.Tools
 open FsMcp.Core
 open FsMcp.Core.Validation
@@ -209,21 +210,13 @@ let main argv =
         let server =
             mcpServer {
                 name "fsharp-fsautocomplete"
-                version "0.3.0"
+                version "0.4.0"
 
                 tool (
                     TypedTool.define<CompletionArgs>
                         "textDocument_completion"
                         "Raw LSP proxy to fsautocomplete textDocument/completion. Exact-position IDE primitive; requires set_project first. Prefer agent-friendly FCS/navigation tools for codebase understanding. line/character are 0-based. Pass 'text' for unsaved content."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Completion args)))
-                    |> unwrapResult
-                )
-
-                tool (
-                    TypedTool.define<PositionArgs>
-                        "textDocument_hover"
-                        "Raw LSP hover proxy. Exact cursor position required; output is IDE-shaped and can be noisy/misleading if the cursor is off by one. Requires set_project first. Prefer FCS semantic tools when available. Pass 'text' for unsaved content."
-                        (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Hover args)))
                     |> unwrapResult
                 )
 
@@ -304,6 +297,14 @@ let main argv =
                 )
 
                 tool (
+                    TypedTool.define<FSharpProjectInspectArgs>
+                        "fsharp_project_inspect"
+                        "Read-only .fsproj inspection for agents. Returns project identity, compile order, package/project references, signature/implementation pairing, and shared scan filtering summary. Does not build, restore, test, edit files, or require set_project."
+                        (fun args -> toolResult (Task.FromResult(inspectProject args)))
+                    |> unwrapResult
+                )
+
+                tool (
                     TypedTool.define<FcsParseAndCheckArgs>
                         "fcs_parse_and_check_file"
                         "Agent-friendly FCS parse+typecheck for one file. Prefer passing projectPath (.fsproj) for accurate project context; projectOptions can override. Falls back to script inference only when no project can be resolved. Pass 'text' for unsaved content."
@@ -314,8 +315,16 @@ let main argv =
                 tool (
                     TypedTool.define<FcsFileSymbolsArgs>
                         "fcs_file_symbols"
-                        "Raw FCS symbol extraction for one file. Can be noisy on large files; default returns definitions, includeAllUses returns locals/parameters/usages too. Use for diagnostics/small files until fcs_file_outline exists. Pass projectPath when possible and 'text' for unsaved content."
+                        "Raw FCS symbol extraction for one file. Can be noisy on large files; default returns definitions, includeAllUses returns locals/parameters/usages too. Prefer fcs_file_outline for normal agent navigation. Pass projectPath when possible and 'text' for unsaved content."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.FileSymbols args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsFileOutlineArgs>
+                        "fcs_file_outline"
+                        "Agent-friendly compact F# outline for one file. Filters local/noisy symbols by default and returns name, kind, range, signature/type, accessibility, and declaration range. Prefer this over fcs_file_symbols for navigation."
+                        (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.FileOutline args)))
                     |> unwrapResult
                 )
 
@@ -328,9 +337,33 @@ let main argv =
                 )
 
                 tool (
+                    TypedTool.define<FcsFindSymbolArgs>
+                        "fcs_find_symbol"
+                        "Agent-friendly project-wide symbol search with grouped definitions/references and source line context. Better than chaining workspace_symbol, fcs_project_symbol_uses, and shell line reads. Pass projectPath when possible."
+                        (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.FindSymbol args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsSymbolAtWordArgs>
+                        "fcs_symbol_at_word"
+                        "Tolerant FCS symbol lookup for agent workflows. Accepts a line plus word/occurrence, finds the candidate span, and returns symbol identity, kind, type string, definition range, and optional documentation. Prefer over exact-position hover/type queries."
+                        (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.SymbolAtWord args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsProjectOutlineArgs>
+                        "fcs_project_outline"
+                        "Agent-friendly project outline over filtered compile files. Uses shared filtering to skip generated/build artifacts and returns compact per-file outlines. Use maxFiles/maxResultsPerFile on large projects."
+                        (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.ProjectOutline args)))
+                    |> unwrapResult
+                )
+
+                tool (
                     TypedTool.define<FcsTypeAtPositionArgs>
                         "fcs_type_at_position"
-                        "Low-level exact-position FCS type/symbol query. Works without LSP set_project, but requires accurate line/character and project context for good results. Prefer future symbol-at-word tools for agent workflows. Pass projectPath/projectOptions and 'text' when available."
+                        "Low-level exact-position FCS type/symbol query. Works without LSP set_project, but requires accurate line/character and project context for good results. Prefer fcs_symbol_at_word for normal agent workflows. Pass projectPath/projectOptions and 'text' when available."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.TypeAtPosition args)))
                     |> unwrapResult
                 )
@@ -340,6 +373,14 @@ let main argv =
                         "fcs_signature_help"
                         "Low-level exact-position FCS signature help. Returns overloads/parameters around a call site. line/character are 0-based. Pass projectPath/projectOptions and 'text' when available."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.SignatureHelp args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<PositionArgs>
+                        "fsharp_signature_data"
+                        "Structured FSAC signature help via fsharp/signatureData. Requires set_project and an exact call-site position. Use this when FCS fallback is insufficient or when validating FSAC's current workspace view."
+                        (fun args -> toolResult (runLimited lspGate (fun () -> bridge.SignatureData args)))
                     |> unwrapResult
                 )
 

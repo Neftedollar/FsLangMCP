@@ -13,6 +13,7 @@ open FSharp.Compiler.Text
 open FSharp.Compiler.EditorServices
 open System.Text.Json
 open System.Text.Json.Nodes
+open FsLangMcp.ProjectFiles
 open Ionide.ProjInfo
 open Ionide.ProjInfo.Types
 
@@ -114,6 +115,179 @@ type internal FcsBridge() =
               "isFromPattern", jbool symbolUse.IsFromPattern
               "isFromAttribute", jbool symbolUse.IsFromAttribute
               "symbol", symbolToJson symbolUse.Symbol ]
+        :> JsonNode
+
+    let tryDeclarationRange (symbol: FSharpSymbol) =
+        symbol.DeclarationLocation |> Option.map rangeToJson |> Option.defaultValue null
+
+    let tryReflectionStringProperty propertyName (value: obj) =
+        try
+            let property = value.GetType().GetProperty(propertyName)
+
+            if isNull property then
+                None
+            else
+                match property.GetValue(value) with
+                | null -> None
+                | propertyValue -> Some(propertyValue.ToString())
+        with _ ->
+            None
+
+    let symbolKind (symbol: FSharpSymbol) =
+        match symbol with
+        | :? FSharpEntity as entity when entity.IsNamespace -> "namespace"
+        | :? FSharpEntity as entity when entity.IsFSharpModule -> "module"
+        | :? FSharpEntity as entity when entity.IsInterface -> "interface"
+        | :? FSharpEntity as entity when entity.IsFSharpRecord -> "record"
+        | :? FSharpEntity as entity when entity.IsFSharpUnion -> "union"
+        | :? FSharpEntity as entity when entity.IsEnum -> "enum"
+        | :? FSharpEntity as entity when entity.IsDelegate -> "delegate"
+        | :? FSharpEntity as entity when entity.IsClass -> "class"
+        | :? FSharpMemberOrFunctionOrValue as memberOrValue when memberOrValue.IsConstructor -> "constructor"
+        | :? FSharpMemberOrFunctionOrValue as memberOrValue when memberOrValue.IsProperty -> "property"
+        | :? FSharpMemberOrFunctionOrValue as memberOrValue when memberOrValue.IsMember -> "member"
+        | :? FSharpMemberOrFunctionOrValue as memberOrValue when memberOrValue.IsModuleValueOrMember -> "function_or_value"
+        | :? FSharpField -> "field"
+        | _ -> symbol.GetType().Name
+
+    let symbolTypeString (symbol: FSharpSymbol) =
+        try
+            match symbol with
+            | :? FSharpMemberOrFunctionOrValue as memberOrValue -> typeName memberOrValue.FullType
+            | :? FSharpField as field -> typeName field.FieldType
+            | :? FSharpEntity as entity -> entity.DisplayName
+            | _ -> ""
+        with _ ->
+            ""
+
+    let symbolAccessibility (symbol: FSharpSymbol) =
+        symbol :> obj |> tryReflectionStringProperty "Accessibility" |> Option.map jstr |> Option.defaultValue null
+
+    let compactSymbolToJson (symbol: FSharpSymbol) =
+        jobj
+            [ "name", jstr symbol.DisplayName
+              "fullName", jstrOrNull symbol.FullName
+              "kind", jstr (symbolKind symbol)
+              "typeString", jstr (symbolTypeString symbol)
+              "accessibility", symbolAccessibility symbol
+              "declarationRange", tryDeclarationRange symbol ]
+        :> JsonNode
+
+    let isNoisyLocalSymbol (symbolUse: FSharpSymbolUse) =
+        let name = symbolUse.Symbol.DisplayName
+        let kind = symbolKind symbolUse.Symbol
+
+        String.IsNullOrWhiteSpace(name)
+        || name = "_"
+        || name = "this"
+        || String.IsNullOrWhiteSpace(symbolUse.Symbol.FullName)
+        || String.Equals(kind, "FSharpMemberOrFunctionOrValue", StringComparison.Ordinal)
+        || String.Equals(kind, "field", StringComparison.Ordinal)
+
+    let sourceLines (source: string) =
+        source.Split('\n') |> Array.map (fun line -> line.TrimEnd('\r'))
+
+    let lineContextToJson contextLines filePath startLine =
+        let contextLines = max 0 contextLines
+
+        if not (File.Exists filePath) then
+            jobj [ "lineText", jstr ""; "before", JsonArray() :> JsonNode; "after", JsonArray() :> JsonNode ]
+        else
+            let lines = File.ReadAllLines(filePath)
+            let lineIndex = max 0 (startLine - 1)
+
+            let lineText =
+                if lineIndex < lines.Length then
+                    lines[lineIndex]
+                else
+                    ""
+
+            let beforeStart = max 0 (lineIndex - contextLines)
+            let beforeEnd = lineIndex - 1
+            let afterStart = lineIndex + 1
+            let afterEnd = min (lines.Length - 1) (lineIndex + contextLines)
+
+            let indexedLine number text =
+                jobj [ "line", jint number; "text", jstr text ] :> JsonNode
+
+            let before =
+                if beforeEnd < beforeStart then
+                    [||]
+                else
+                    [| beforeStart..beforeEnd |] |> Array.map (fun idx -> indexedLine (idx + 1) lines[idx])
+
+            let after =
+                if afterEnd < afterStart then
+                    [||]
+                else
+                    [| afterStart..afterEnd |] |> Array.map (fun idx -> indexedLine (idx + 1) lines[idx])
+
+            jobj
+                [ "lineText", jstr lineText
+                  "before", JsonArray(before) :> JsonNode
+                  "after", JsonArray(after) :> JsonNode ]
+
+    let symbolMatches query exact (symbol: FSharpSymbol) =
+        let displayName = symbol.DisplayName
+        let fullName = symbol.FullName
+
+        if exact then
+            String.Equals(displayName, query, StringComparison.Ordinal)
+            || String.Equals(fullName, query, StringComparison.Ordinal)
+        else
+            displayName.Contains(query, StringComparison.OrdinalIgnoreCase)
+            || (if isNull fullName then
+                    false
+                else
+                    fullName.Contains(query, StringComparison.OrdinalIgnoreCase))
+
+    let isIdentifierChar (ch: char) =
+        Char.IsLetterOrDigit(ch) || ch = '_' || ch = '\'' || ch = '`'
+
+    let identifierSpans (lineText: string) =
+        let spans = ResizeArray<int * int * string>()
+        let mutable index = 0
+
+        while index < lineText.Length do
+            if isIdentifierChar lineText[index] then
+                let start = index
+
+                while index < lineText.Length && isIdentifierChar lineText[index] do
+                    index <- index + 1
+
+                let text = lineText.Substring(start, index - start)
+                spans.Add(start, index, text)
+            else
+                index <- index + 1
+
+        spans |> Seq.toArray
+
+    let wordSpans word (lineText: string) =
+        match word with
+        | Some query when not (String.IsNullOrWhiteSpace query) ->
+            let spans = ResizeArray<int * int * string>()
+            let mutable searchFrom = 0
+            let mutable keepSearching = true
+
+            while keepSearching && searchFrom <= lineText.Length do
+                let index = lineText.IndexOf(query, searchFrom, StringComparison.Ordinal)
+
+                if index < 0 then
+                    keepSearching <- false
+                else
+                    spans.Add(index, index + query.Length, query)
+                    searchFrom <- index + query.Length
+
+            spans |> Seq.toArray
+        | _ -> identifierSpans lineText
+
+    let candidateToJson occurrence line startColumn endColumn text =
+        jobj
+            [ "occurrence", jint occurrence
+              "line", jint line
+              "startColumn", jint startColumn
+              "endColumn", jint endColumn
+              "text", jstr text ]
         :> JsonNode
 
     // Build a stable cache key from projectPath and projectOptions list
@@ -415,6 +589,68 @@ type internal FcsBridge() =
                     :> JsonNode
         }
 
+    member this.FileOutline(args: FcsFileOutlineArgs) : Task<JsonNode> =
+        task {
+            let! path, _, optionsSource, _, parseResults, checkedResults =
+                this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
+
+            match checkedResults with
+            | None ->
+                return
+                    jobj
+                        [ "status", jstr "aborted"
+                          "file", jstr path
+                          "optionsSource", jstr optionsSource
+                          "parseHadErrors", jbool parseResults.ParseHadErrors
+                          "message", jstr "Type checking was aborted. Outline is unavailable."
+                          "parseDiagnostics",
+                          JsonArray(parseResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ]
+                    :> JsonNode
+            | Some checkResults ->
+                let includeLocal = args.includeLocal |> Option.defaultValue false
+                let includePrivate = args.includePrivate |> Option.defaultValue true
+                let maxResults = args.maxResults |> Option.defaultValue 200
+
+                let entries =
+                    checkResults.GetAllUsesOfAllSymbolsInFile()
+                    |> Seq.filter _.IsFromDefinition
+                    |> Seq.filter (fun symbolUse -> includeLocal || not (isNoisyLocalSymbol symbolUse))
+                    |> Seq.distinctBy (fun symbolUse ->
+                        symbolUse.Symbol.FullName,
+                        symbolUse.Range.StartLine,
+                        symbolUse.Range.StartColumn,
+                        symbolUse.Range.EndLine,
+                        symbolUse.Range.EndColumn)
+                    |> Seq.sortBy (fun symbolUse -> symbolUse.Range.StartLine, symbolUse.Range.StartColumn)
+                    |> Seq.truncate maxResults
+                    |> Seq.map (fun symbolUse ->
+                        jobj
+                            [ "name", jstr symbolUse.Symbol.DisplayName
+                              "fullName", jstrOrNull symbolUse.Symbol.FullName
+                              "kind", jstr (symbolKind symbolUse.Symbol)
+                              "accessibility", symbolAccessibility symbolUse.Symbol
+                              "range", rangeToJson symbolUse.Range
+                              "signature", jstr (symbolTypeString symbolUse.Symbol)
+                              "declarationRange", tryDeclarationRange symbolUse.Symbol ]
+                        :> JsonNode)
+                    |> Seq.toArray
+
+                return
+                    jobj
+                        [ "status", jstr "succeeded"
+                          "file", jstr path
+                          "optionsSource", jstr optionsSource
+                          "includePrivate", jbool includePrivate
+                          "includeLocal", jbool includeLocal
+                          "count", jint entries.Length
+                          "entries", JsonArray(entries) :> JsonNode
+                          "parseDiagnostics",
+                          JsonArray(parseResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode
+                          "checkDiagnostics",
+                          JsonArray(checkResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ]
+                    :> JsonNode
+        }
+
     member this.ProjectSymbolUses(args: FcsProjectSymbolUsesArgs) : Task<JsonNode> =
         task {
             let query = args.symbolQuery.Trim()
@@ -478,6 +714,102 @@ type internal FcsBridge() =
                       "totalProjectSymbolUses", jint allUses.Length
                       "matchedCount", jint matchedUses.Length
                       "uses", JsonArray(matchedUses) :> JsonNode
+                      "projectDiagnostics",
+                      JsonArray(projectResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ]
+                :> JsonNode
+        }
+
+    member this.FindSymbol(args: FcsFindSymbolArgs) : Task<JsonNode> =
+        task {
+            let query = args.symbolQuery.Trim()
+
+            if String.IsNullOrWhiteSpace(query) then
+                invalidArg (nameof args.symbolQuery) "symbolQuery must be non-empty."
+
+            let! _, _, optionsSource, projectOptions, _, _ =
+                this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
+
+            let cacheKey = makeResolvedProjectCacheKey projectOptions
+
+            let! projectResults, cached =
+                task {
+                    match projectResultsCache.TryGet(cacheKey) with
+                    | Some existing -> return existing, true
+                    | None ->
+                        let! results = checker.ParseAndCheckProject(projectOptions) |> asTask
+                        projectResultsCache.Set(cacheKey, results)
+                        return results, false
+                }
+
+            let exact = args.exact |> Option.defaultValue false
+            let maxResults = args.maxResults |> Option.defaultValue 500
+            let contextLines = args.contextLines |> Option.defaultValue 1
+            let includeDeclaration = args.includeDeclaration |> Option.defaultValue true
+
+            let matchedUses =
+                projectResults.GetAllUsesOfAllSymbols()
+                |> Seq.filter (fun symbolUse -> symbolMatches query exact symbolUse.Symbol)
+                |> Seq.filter (fun symbolUse -> includeDeclaration || not symbolUse.IsFromDefinition)
+                |> Seq.sortBy (fun symbolUse ->
+                    symbolUse.Symbol.FullName, symbolUse.FileName, symbolUse.Range.StartLine, symbolUse.Range.StartColumn)
+                |> Seq.truncate maxResults
+                |> Seq.toArray
+
+            let useToJson (symbolUse: FSharpSymbolUse) =
+                let context = lineContextToJson contextLines symbolUse.FileName symbolUse.Range.StartLine
+
+                jobj
+                    [ "file", jstr (normalizePath symbolUse.FileName)
+                      "range", rangeToJson symbolUse.Range
+                      "isDefinition", jbool symbolUse.IsFromDefinition
+                      "isReference", jbool symbolUse.IsFromUse
+                      "lineText", context["lineText"].DeepClone()
+                      "before", context["before"].DeepClone()
+                      "after", context["after"].DeepClone() ]
+                :> JsonNode
+
+            let groups =
+                matchedUses
+                |> Array.groupBy (fun symbolUse ->
+                    let symbol = symbolUse.Symbol
+                    let declaration =
+                        symbol.DeclarationLocation
+                        |> Option.map (fun range -> $"{normalizePath range.FileName}:{range.StartLine}:{range.StartColumn}")
+                        |> Option.defaultValue ""
+
+                    symbol.FullName, symbol.DisplayName, declaration)
+                |> Array.map (fun ((_, _, _), uses) ->
+                    let symbol = uses[0].Symbol
+
+                    let definitions =
+                        uses
+                        |> Array.filter _.IsFromDefinition
+                        |> Array.map useToJson
+
+                    let references =
+                        uses
+                        |> Array.filter (fun symbolUse -> not symbolUse.IsFromDefinition)
+                        |> Array.map useToJson
+
+                    jobj
+                        [ "symbol", compactSymbolToJson symbol
+                          "definitionCount", jint definitions.Length
+                          "referenceCount", jint references.Length
+                          "definitions", JsonArray(definitions) :> JsonNode
+                          "references", JsonArray(references) :> JsonNode ]
+                    :> JsonNode)
+
+            return
+                jobj
+                    [ "status", jstr "succeeded"
+                      "optionsSource", jstr optionsSource
+                      "projectFileName", jstr projectOptions.ProjectFileName
+                      "query", jstr query
+                      "exact", jbool exact
+                      "cached", jbool cached
+                      "matchedUseCount", jint matchedUses.Length
+                      "symbolCount", jint groups.Length
+                      "symbols", JsonArray(groups) :> JsonNode
                       "projectDiagnostics",
                       JsonArray(projectResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ]
                 :> JsonNode
@@ -573,6 +905,217 @@ type internal FcsBridge() =
                               "typeString", jstr typeString
                               "xmlDoc", jstr xmlDoc ]
                         :> JsonNode
+        }
+
+    member this.SymbolAtWord(args: FcsSymbolAtWordArgs) : Task<JsonNode> =
+        task {
+            let! path, source, optionsSource, _, _, checkedResults =
+                this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
+
+            match checkedResults with
+            | None -> return jobj [ "status", jstr "aborted"; "message", jstr "Type checking was aborted." ] :> JsonNode
+            | Some checkResults ->
+                let lines = sourceLines source
+
+                if args.line < 0 || args.line >= lines.Length then
+                    return
+                        jobj
+                            [ "status", jstr "invalid_line"
+                              "file", jstr path
+                              "line", jint args.line
+                              "lineCount", jint lines.Length ]
+                        :> JsonNode
+                else
+                    let lineText = lines[args.line]
+                    let candidates = wordSpans args.word lineText
+
+                    if candidates.Length = 0 then
+                        return
+                            jobj
+                                [ "status", jstr "no_candidate"
+                                  "file", jstr path
+                                  "line", jint args.line
+                                  "word", args.word |> Option.map jstr |> Option.defaultValue null
+                                  "lineText", jstr lineText ]
+                            :> JsonNode
+                    else
+                        let occurrence = args.occurrence |> Option.defaultValue -1
+
+                        if occurrence < 0 && candidates.Length > 1 then
+                            let candidateJson =
+                                candidates
+                                |> Array.mapi (fun index (startColumn, endColumn, text) ->
+                                    candidateToJson index args.line startColumn endColumn text)
+
+                            return
+                                jobj
+                                    [ "status", jstr "ambiguous_word"
+                                      "file", jstr path
+                                      "line", jint args.line
+                                      "word", args.word |> Option.map jstr |> Option.defaultValue null
+                                      "lineText", jstr lineText
+                                      "candidates", JsonArray(candidateJson) :> JsonNode ]
+                                :> JsonNode
+                        elif occurrence >= candidates.Length then
+                            return
+                                jobj
+                                    [ "status", jstr "invalid_occurrence"
+                                      "file", jstr path
+                                      "line", jint args.line
+                                      "occurrence", jint occurrence
+                                      "candidateCount", jint candidates.Length ]
+                                :> JsonNode
+                        else
+                            let candidateIndex = if occurrence < 0 then 0 else occurrence
+                            let startColumn, endColumn, text = candidates[candidateIndex]
+                            let fcsLine = args.line + 1
+                            let columnsToTry = [| endColumn; startColumn + 1; startColumn |] |> Array.distinct
+
+                            let symbolUse =
+                                columnsToTry
+                                |> Array.tryPick (fun column ->
+                                    checkResults.GetSymbolUseAtLocation(fcsLine, column, lineText, [ text ]))
+
+                            let toolTip =
+                                checkResults.GetToolTip(
+                                    fcsLine,
+                                    endColumn,
+                                    lineText,
+                                    [ text ],
+                                    FSharp.Compiler.Tokenization.FSharpTokenTag.IDENT
+                                )
+
+                            let typeString =
+                                match toolTip with
+                                | ToolTipText elements ->
+                                    elements
+                                    |> List.choose (fun element ->
+                                        match element with
+                                        | ToolTipElement.Group items ->
+                                            items
+                                            |> List.map (fun item ->
+                                                item.MainDescription
+                                                |> Array.map (fun tagged -> tagged.Text)
+                                                |> String.concat "")
+                                            |> Some
+                                        | _ -> None)
+                                    |> List.collect id
+                                    |> String.concat "\n"
+
+                            let documentation =
+                                if args.includeDocumentation |> Option.defaultValue false then
+                                    match toolTip with
+                                    | ToolTipText elements ->
+                                        elements
+                                        |> List.choose (fun element ->
+                                            match element with
+                                            | ToolTipElement.Group items ->
+                                                items
+                                                |> List.choose (fun item ->
+                                                    match item.XmlDoc with
+                                                    | FSharpXmlDoc.FromXmlText xmlText -> Some(xmlText.GetXmlText())
+                                                    | _ -> None)
+                                                |> Some
+                                            | _ -> None)
+                                        |> List.collect id
+                                        |> String.concat "\n"
+                                        |> jstr
+                                else
+                                    null
+
+                            match symbolUse with
+                            | None ->
+                                return
+                                    jobj
+                                        [ "status", jstr "no_symbol"
+                                          "file", jstr path
+                                          "line", jint args.line
+                                          "lineText", jstr lineText
+                                          "candidate", candidateToJson candidateIndex args.line startColumn endColumn text
+                                          "typeString", jstr typeString ]
+                                    :> JsonNode
+                            | Some symbolUse ->
+                                return
+                                    jobj
+                                        [ "status", jstr "ok"
+                                          "file", jstr path
+                                          "line", jint args.line
+                                          "lineText", jstr lineText
+                                          "optionsSource", jstr optionsSource
+                                          "candidate", candidateToJson candidateIndex args.line startColumn endColumn text
+                                          "symbolName", jstr symbolUse.Symbol.DisplayName
+                                          "fullName", jstrOrNull symbolUse.Symbol.FullName
+                                          "kind", jstr (symbolKind symbolUse.Symbol)
+                                          "typeString", jstr (if String.IsNullOrWhiteSpace(typeString) then symbolTypeString symbolUse.Symbol else typeString)
+                                          "definitionRange", tryDeclarationRange symbolUse.Symbol
+                                          "documentation", documentation ]
+                                    :> JsonNode
+        }
+
+    member this.ProjectOutline(args: FcsProjectOutlineArgs) : Task<JsonNode> =
+        task {
+            let projectPath = normalizePath args.projectPath
+
+            if not (File.Exists projectPath) then
+                invalidArg (nameof args.projectPath) $"Project file does not exist: %s{projectPath}"
+
+            let workspaceRoot =
+                args.workspacePath
+                |> Option.map Path.GetFullPath
+                |> Option.defaultValue (Path.GetDirectoryName(projectPath))
+
+            let doc =
+                match tryReadProject projectPath with
+                | Ok doc -> doc
+                | Error reason -> raise (InvalidOperationException($"Project file cannot be read: %s{reason}"))
+
+            let filterOptions =
+                { defaultFilterOptions Outline with
+                    IncludeGenerated = args.includeGeneratedFiles |> Option.defaultValue false
+                    IncludeTests = args.includeTests |> Option.defaultValue false
+                    MaxFiles = args.maxFiles }
+
+            let files = compileFiles projectPath doc
+            let filtered = filterProjectFiles workspaceRoot filterOptions files
+            let maxResultsPerFile = args.maxResultsPerFile |> Option.defaultValue 100
+            let fileEntries = ResizeArray<JsonNode>()
+
+            for file in filtered.Included do
+                let! outline =
+                    this.FileOutline(
+                        { path = file.Path
+                          text = None
+                          projectPath = Some projectPath
+                          projectOptions = None
+                          includePrivate = args.includePrivate
+                          includeLocal = Some false
+                          maxResults = Some maxResultsPerFile }
+                    )
+
+                fileEntries.Add(
+                    jobj
+                        [ "file", jstr file.Path
+                          "kind", jstr (if file.IsSignature then "signature" else "implementation")
+                          "outlineStatus", outline["status"].DeepClone()
+                          "entries",
+                          (match outline["entries"] with
+                           | null -> JsonArray() :> JsonNode
+                           | entries -> entries.DeepClone())
+                          "count",
+                          (match outline["count"] with
+                           | null -> jint 0
+                           | count -> count.DeepClone()) ]
+                    :> JsonNode
+                )
+
+            return
+                jobj
+                    [ "status", jstr "succeeded"
+                      "projectPath", jstr projectPath
+                      "workspaceRoot", jstr workspaceRoot
+                      "filterSummary", filterSummaryToJson filtered :> JsonNode
+                      "files", JsonArray(fileEntries.ToArray()) :> JsonNode ]
+                :> JsonNode
         }
 
     member _.ClearCaches() =

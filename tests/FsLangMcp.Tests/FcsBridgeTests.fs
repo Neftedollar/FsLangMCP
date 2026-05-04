@@ -125,6 +125,31 @@ let private writeSimpleProject (root: string) (projectName: string) (symbolName:
 
     sourcePath, projectPath
 
+let private writeProjectWithSource (root: string) (projectName: string) (source: string) =
+    let dir = Path.Combine(root, projectName)
+    Directory.CreateDirectory(dir) |> ignore
+
+    let sourcePath = Path.Combine(dir, "Library.fs")
+    File.WriteAllText(sourcePath, source)
+
+    let projectPath = Path.Combine(dir, $"%s{projectName}.fsproj")
+
+    File.WriteAllText(
+        projectPath,
+        String.concat
+            Environment.NewLine
+            [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+              "  <PropertyGroup>"
+              "    <TargetFramework>net10.0</TargetFramework>"
+              "  </PropertyGroup>"
+              "  <ItemGroup>"
+              "    <Compile Include=\"Library.fs\" />"
+              "  </ItemGroup>"
+              "</Project>" ]
+    )
+
+    sourcePath, projectPath
+
 [<Fact>]
 let ``fcs_parse_and_check_file succeeds on valid F# snippet`` () : Task =
     task {
@@ -398,4 +423,159 @@ let callSite = targetFunction 3 4
         finally
             if File.Exists(path) then
                 File.Delete(path)
+    }
+
+[<Fact>]
+let ``fcs_file_outline returns compact definitions without local noise`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_outline_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let sourcePath, projectPath =
+                writeProjectWithSource
+                    tempRoot
+                    "OutlineProject"
+                    "module OutlineProject.Library\n\nlet publicValue =\n    let localValue = 1\n    localValue + 1\n\ntype PublicRecord = { Name: string }\n"
+
+            let! result =
+                bridge.FileOutline(
+                    { path = sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      includePrivate = None
+                      includeLocal = Some false
+                      maxResults = Some 50 }
+                )
+
+            let entries = result["entries"] :?> JsonArray
+            let names = entries |> Seq.map (fun node -> node["name"].GetValue<string>()) |> Seq.toList
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.Contains("publicValue", names)
+            Assert.Contains("PublicRecord", names)
+            Assert.DoesNotContain("localValue", names)
+        finally
+            if Directory.Exists(tempRoot) then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``fcs_find_symbol groups definitions and references with source context`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_symbol_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let sourcePath, projectPath =
+                writeProjectWithSource
+                    tempRoot
+                    "FindSymbolProject"
+                    "module FindSymbolProject.Library\n\nlet targetValue = 41\n\nlet useValue = targetValue + 1\n"
+
+            let! result =
+                bridge.FindSymbol(
+                    { path = sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      symbolQuery = "targetValue"
+                      exact = Some true
+                      maxResults = Some 20
+                      contextLines = Some 1
+                      includeDeclaration = Some true }
+                )
+
+            let symbols = result["symbols"] :?> JsonArray
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.True(symbols.Count >= 1)
+
+            let first = symbols[0]
+            Assert.True(first["definitionCount"].GetValue<int>() >= 1)
+            Assert.True(first["referenceCount"].GetValue<int>() >= 1)
+            let firstReference = (first["references"] :?> JsonArray)[0]
+            Assert.Contains("targetValue", firstReference["lineText"].GetValue<string>())
+        finally
+            if Directory.Exists(tempRoot) then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``fcs_symbol_at_word returns ambiguity then resolves occurrence`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_symbol_at_word_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let sourcePath, projectPath =
+                writeProjectWithSource
+                    tempRoot
+                    "WordProject"
+                    "module WordProject.Library\n\nlet targetValue = 41\n\nlet useValue = targetValue + targetValue\n"
+
+            let! ambiguous =
+                bridge.SymbolAtWord(
+                    { path = sourcePath
+                      line = 4
+                      word = Some "targetValue"
+                      occurrence = None
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      includeDocumentation = Some false }
+                )
+
+            Assert.Equal("ambiguous_word", ambiguous["status"].GetValue<string>())
+            Assert.Equal(2, (ambiguous["candidates"] :?> JsonArray).Count)
+
+            let! resolved =
+                bridge.SymbolAtWord(
+                    { path = sourcePath
+                      line = 4
+                      word = Some "targetValue"
+                      occurrence = Some 0
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      includeDocumentation = Some false }
+                )
+
+            Assert.Equal("ok", resolved["status"].GetValue<string>())
+            Assert.Equal("targetValue", resolved["symbolName"].GetValue<string>())
+        finally
+            if Directory.Exists(tempRoot) then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``fcs_project_outline returns filtered per file outline`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_project_outline_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let _, projectPath = writeSimpleProject tempRoot "ProjectOutline" "projectOutlineValue"
+
+            let! result =
+                bridge.ProjectOutline(
+                    { projectPath = projectPath
+                      workspacePath = Some tempRoot
+                      includePrivate = None
+                      includeTests = None
+                      includeGeneratedFiles = None
+                      maxFiles = Some 10
+                      maxResultsPerFile = Some 50 }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.Equal(1, (result["filterSummary"]["includedFiles"]).GetValue<int>())
+            Assert.Equal(1, (result["files"] :?> JsonArray).Count)
+        finally
+            if Directory.Exists(tempRoot) then
+                Directory.Delete(tempRoot, true)
     }

@@ -4,6 +4,7 @@ open System.IO
 open System.Text.Json.Nodes
 open Xunit
 open FsLangMcp.ProjectHealth
+open FsLangMcp.ProjectInspection
 open FsLangMcp.Types
 
 let private writeProject root =
@@ -171,6 +172,33 @@ let ``project_health degrades when lsp workspace is not ready`` () =
         let result = report (healthArgs projectPath (Some root)) snapshot
 
         Assert.Equal("degraded", (result["toolingReadiness"]["status"]).GetValue<string>())
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``fsharp_project_inspect reports compile order and package references`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_inspect_%s{runId}")
+
+    try
+        let projectPath = writeProject root
+
+        let result =
+            inspectProject
+                { projectPath = projectPath
+                  workspacePath = Some root
+                  scope = None
+                  includeGeneratedFiles = None
+                  includePackageDetails = Some true
+                  includeResolvedOptions = Some false }
+
+        Assert.Equal("ok", result["status"].GetValue<string>())
+        Assert.Equal(1, (result["compileOrder"] :?> JsonArray).Count)
+        let firstCompileFile = (result["compileOrder"] :?> JsonArray)[0]
+        Assert.Equal("implementation", firstCompileFile["kind"].GetValue<string>())
+        Assert.Equal(1, (result["filterSummary"]["includedFiles"]).GetValue<int>())
+        Assert.True((result["references"]["packageReferences"] :?> JsonArray).Count >= 1)
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)

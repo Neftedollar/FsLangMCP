@@ -9,6 +9,8 @@
   <ItemGroup>
     <Compile Include="../../BoundedCache.fs" Link="BoundedCache.fs" />
     <Compile Include="../../Types.fs" Link="Types.fs" />
+    <Compile Include="../../ProjectFiles.fs" Link="ProjectFiles.fs" />
+    <Compile Include="../../ProjectInspection.fs" Link="ProjectInspection.fs" />
     <Compile Include="../../ProjectHealth.fs" Link="ProjectHealth.fs" />
     <Compile Include="../../LspBridge.fs" Link="LspBridge.fs" />
     <Compile Include="../../FcsBridge.fs" Link="FcsBridge.fs" />

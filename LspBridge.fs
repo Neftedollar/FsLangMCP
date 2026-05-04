@@ -115,6 +115,61 @@ module internal WorkspaceNotification =
 
         topLevelFinished || workspaceLoadFinished
 
+module internal WorkspaceSelection =
+    [<Struct>]
+    type CandidateKind =
+        | Solution
+        | Project
+
+    type Candidate =
+        { Kind: CandidateKind
+          Path: string }
+
+    type Selection =
+        | Selected of projectOrWorkspacePath: string * candidates: Candidate list
+        | Ambiguous of candidates: Candidate list
+
+    let private solutionFiles directory =
+        [| yield! Directory.GetFiles(directory, "*.sln", SearchOption.TopDirectoryOnly)
+           yield! Directory.GetFiles(directory, "*.slnx", SearchOption.TopDirectoryOnly) |]
+        |> Array.map Path.GetFullPath
+        |> Array.sort
+
+    let private projectFiles directory =
+        Directory.GetFiles(directory, "*.fsproj", SearchOption.TopDirectoryOnly)
+        |> Array.map Path.GetFullPath
+        |> Array.sort
+
+    let select (path: string) =
+        let fullPath = Path.GetFullPath(path)
+
+        if not (Directory.Exists fullPath) then
+            Selected(fullPath, [])
+        else
+            let solutions = solutionFiles fullPath
+
+            if solutions.Length = 1 then
+                Selected(solutions[0], [ { Kind = Solution; Path = solutions[0] } ])
+            elif solutions.Length > 1 then
+                Ambiguous(solutions |> Array.map (fun path -> { Kind = Solution; Path = path }) |> Array.toList)
+            else
+                let projects = projectFiles fullPath
+
+                if projects.Length > 1 then
+                    Ambiguous(projects |> Array.map (fun path -> { Kind = Project; Path = path }) |> Array.toList)
+                elif projects.Length = 1 then
+                    Selected(projects[0], [ { Kind = Project; Path = projects[0] } ])
+                else
+                    Selected(fullPath, [])
+
+    let candidateKindToString kind =
+        match kind with
+        | Solution -> "solution"
+        | Project -> "project"
+
+    let candidateToJson candidate =
+        jobj [ "kind", jstr (candidateKindToString candidate.Kind); "path", jstr candidate.Path ] :> JsonNode
+
 // ─── WorkspaceLoadTarget: tracks FsAutoComplete workspace load notifications ───
 
 type private WorkspaceLoadTarget(setReady: unit -> unit) =
@@ -208,6 +263,21 @@ type internal FsAutoCompleteBridge() =
     let fsacArgs () =
         Environment.GetEnvironmentVariable("FSAC_ARGS") |> Option.ofObj |> parseArgs
 
+    let explicitWorkspacePath () =
+        runtimeProjectPath
+        |> Option.filter (fun path ->
+            let ext = Path.GetExtension(path)
+
+            String.Equals(ext, ".fsproj", StringComparison.OrdinalIgnoreCase)
+            || String.Equals(ext, ".sln", StringComparison.OrdinalIgnoreCase)
+            || String.Equals(ext, ".slnx", StringComparison.OrdinalIgnoreCase))
+
+    let useAutomaticWorkspaceInit () = explicitWorkspacePath().IsNone
+
+    let markWorkspaceReady () =
+        workspaceReady <- true
+        workspaceReadyEvent.Set()
+
     member private _.StopLspUnsafe() =
         match rpc with
         | Some instance ->
@@ -263,86 +333,94 @@ type internal FsAutoCompleteBridge() =
 
     member this.SetProject(args: SetProjectArgs) : Task<JsonNode> =
         task {
-            let projectPath = Path.GetFullPath(args.projectPath)
+            let inputPath = Path.GetFullPath(args.projectPath)
 
-            if not (File.Exists(projectPath) || Directory.Exists(projectPath)) then
-                invalidArg (nameof args.projectPath) $"Path does not exist: %s{projectPath}"
+            if not (File.Exists(inputPath) || Directory.Exists(inputPath)) then
+                invalidArg (nameof args.projectPath) $"Path does not exist: %s{inputPath}"
 
-            // Detect solution files
-            let isSolution =
-                projectPath.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
-                || projectPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
+            match WorkspaceSelection.select inputPath with
+            | WorkspaceSelection.Ambiguous candidates ->
+                return
+                    jobj
+                        [ "status", jstr "ambiguous_workspace"
+                          "message", jstr "Multiple workspace candidates found. Pass an explicit .sln/.slnx/.fsproj path."
+                          "candidates",
+                          JsonArray(candidates |> List.map WorkspaceSelection.candidateToJson |> List.toArray) :> JsonNode ]
+                    :> JsonNode
+            | WorkspaceSelection.Selected(projectPath, selectionCandidates) ->
+                let isSolution =
+                    projectPath.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
+                    || projectPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
 
-            let resolvedWorkspace =
-                if isSolution then
-                    // For solution files use the solution's directory
-                    Path.GetDirectoryName(projectPath)
-                else
-                    args.workspacePath
-                    |> Option.map Path.GetFullPath
-                    |> Option.defaultWith (fun () -> resolveWorkspaceFromProjectPath projectPath)
-
-            let restartLsp = args.restartLsp |> Option.defaultValue true
-            do! gate.WaitAsync()
-
-            let capturedProjectPath, capturedWorkspaceRoot =
-                try
+                let resolvedWorkspace =
                     if isSolution then
-                        runtimeProjectPath <- None
-                        runtimeWorkspaceRoot <- Some resolvedWorkspace
+                        Path.GetDirectoryName(projectPath)
                     else
+                        args.workspacePath
+                        |> Option.map Path.GetFullPath
+                        |> Option.defaultWith (fun () -> resolveWorkspaceFromProjectPath projectPath)
+
+                let restartLsp = args.restartLsp |> Option.defaultValue true
+                do! gate.WaitAsync()
+
+                let capturedProjectPath, capturedWorkspaceRoot =
+                    try
                         runtimeProjectPath <- Some projectPath
                         runtimeWorkspaceRoot <- Some resolvedWorkspace
 
-                    Environment.SetEnvironmentVariable("FSA_PROJECT_PATH", runtimeProjectPath |> Option.defaultValue "")
-                    Environment.SetEnvironmentVariable("FSA_WORKSPACE_ROOT", resolvedWorkspace)
+                        Environment.SetEnvironmentVariable("FSA_PROJECT_PATH", runtimeProjectPath |> Option.defaultValue "")
+                        Environment.SetEnvironmentVariable("FSA_WORKSPACE_ROOT", resolvedWorkspace)
 
-                    runtimeProjectPath, resolvedWorkspace
-                with ex ->
+                        runtimeProjectPath, resolvedWorkspace
+                    with ex ->
+                        gate.Release() |> ignore
+                        reraise ()
+
+                if restartLsp then
+                    try
+                        this.StopLspUnsafe()
+                        let! _ = this.StartLspUnsafe()
+                        ()
+                    finally
+                        gate.Release() |> ignore
+                else
                     gate.Release() |> ignore
-                    reraise ()
 
-            // Call StartLspUnsafe while still holding the gate — atomic stop+start
-            if restartLsp then
-                try
-                    this.StopLspUnsafe()
-                    let! _ = this.StartLspUnsafe()
-                    ()
-                finally
-                    gate.Release() |> ignore
-            else
-                gate.Release() |> ignore
+                if restartLsp then
+                    let! ready = this.WaitForReady(TimeSpan.FromSeconds(30.0))
+                    let loadStatus = if ready then "ready" else "timeout"
 
-            // Wait for workspace to be ready outside the gate
-            if restartLsp then
-                let! ready = this.WaitForReady(TimeSpan.FromSeconds(30.0))
-                let loadStatus = if ready then "ready" else "timeout"
-
-                return
-                    jobj
-                        [ "status", jstr "ok"
-                          "result",
-                          jobj
-                              [ "projectPath", capturedProjectPath |> Option.map jstr |> Option.defaultValue null
-                                "workspaceRoot", jstr capturedWorkspaceRoot
-                                "lspRestarted", jbool restartLsp
-                                "solutionMode", jbool isSolution
-                                "workspaceLoadStatus", jstr loadStatus ]
-                          :> JsonNode ]
-                    :> JsonNode
-            else
-                return
-                    jobj
-                        [ "status", jstr "ok"
-                          "result",
-                          jobj
-                              [ "projectPath", capturedProjectPath |> Option.map jstr |> Option.defaultValue null
-                                "workspaceRoot", jstr capturedWorkspaceRoot
-                                "lspRestarted", jbool restartLsp
-                                "solutionMode", jbool isSolution
-                                "workspaceLoadStatus", jstr "not_started" ]
-                          :> JsonNode ]
-                    :> JsonNode
+                    return
+                        jobj
+                            [ "status", jstr "ok"
+                              "result",
+                              jobj
+                                  [ "projectPath", capturedProjectPath |> Option.map jstr |> Option.defaultValue null
+                                    "requestedPath", jstr inputPath
+                                    "workspaceRoot", jstr capturedWorkspaceRoot
+                                    "lspRestarted", jbool restartLsp
+                                    "solutionMode", jbool isSolution
+                                    "workspaceLoadStatus", jstr loadStatus
+                                    "workspaceCandidates",
+                                    JsonArray(selectionCandidates |> List.map WorkspaceSelection.candidateToJson |> List.toArray) :> JsonNode ]
+                              :> JsonNode ]
+                        :> JsonNode
+                else
+                    return
+                        jobj
+                            [ "status", jstr "ok"
+                              "result",
+                              jobj
+                                  [ "projectPath", capturedProjectPath |> Option.map jstr |> Option.defaultValue null
+                                    "requestedPath", jstr inputPath
+                                    "workspaceRoot", jstr capturedWorkspaceRoot
+                                    "lspRestarted", jbool restartLsp
+                                    "solutionMode", jbool isSolution
+                                    "workspaceLoadStatus", jstr "not_started"
+                                    "workspaceCandidates",
+                                    JsonArray(selectionCandidates |> List.map WorkspaceSelection.candidateToJson |> List.toArray) :> JsonNode ]
+                              :> JsonNode ]
+                        :> JsonNode
         }
 
     // StartLspUnsafe: assumes gate is already held by caller
@@ -415,12 +493,7 @@ type internal FsAutoCompleteBridge() =
             jsonRpc.AddLocalRpcTarget(new DiagnosticsTarget(diagnostics), targetOptions)
             |> ignore
 
-            jsonRpc.AddLocalRpcTarget(
-                new WorkspaceLoadTarget(fun () ->
-                    workspaceReady <- true
-                    workspaceReadyEvent.Set()),
-                targetOptions
-            )
+            jsonRpc.AddLocalRpcTarget(new WorkspaceLoadTarget(markWorkspaceReady), targetOptions)
             |> ignore
 
             jsonRpc.StartListening()
@@ -434,7 +507,7 @@ type internal FsAutoCompleteBridge() =
                       "rootUri", jstr rootUri
                       "trace", jstr "off"
                       "clientInfo", jobj [ "name", jstr "fsmcp-fsharp"; "version", jstr "0.1.0" ]
-                      "initializationOptions", jobj [ "AutomaticWorkspaceInit", jbool true ]
+                      "initializationOptions", jobj [ "AutomaticWorkspaceInit", jbool (useAutomaticWorkspaceInit ()) ]
                       "workspaceFolders",
                       JsonArray(jobj [ "uri", jstr rootUri; "name", jstr workspaceName ] :> JsonNode) :> JsonNode
                       "capabilities",
@@ -445,6 +518,20 @@ type internal FsAutoCompleteBridge() =
 
             let! _ = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("initialize", initializeParams)
             do! jsonRpc.NotifyWithParameterObjectAsync("initialized", JsonObject())
+
+            match explicitWorkspacePath () with
+            | Some workspacePath ->
+                let document = jobj [ "uri", jstr (toFileUri workspacePath) ] :> JsonNode
+                let documents = JsonArray(document)
+
+                let workspaceLoadParams =
+                    jobj
+                        [ "TextDocuments", documents.DeepClone()
+                          "textDocuments", documents.DeepClone() ]
+
+                let! _ = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("fsharp/workspaceLoad", workspaceLoadParams)
+                markWorkspaceReady ()
+            | None -> ()
 
             rpc <- Some jsonRpc
             lspProcess <- Some fsacProc
@@ -560,6 +647,14 @@ type internal FsAutoCompleteBridge() =
             args.path,
             args.text,
             "textDocument/definition",
+            fun uri -> this.PositionParams(uri, args.line, args.character)
+        )
+
+    member this.SignatureData(args: PositionArgs) =
+        this.WithDocument(
+            args.path,
+            args.text,
+            "fsharp/signatureData",
             fun uri -> this.PositionParams(uri, args.line, args.character)
         )
 
