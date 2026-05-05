@@ -17,6 +17,31 @@ type ChildProcessInfo =
       Pid: int
       RssBytes: int64 }
 
+// ─── Pure heap-JSON helper (also used by tests for the int64 round-trip) ──────
+
+/// Input record for heapJson. All byte fields are int64 to avoid truncation on
+/// >2.147 GB heaps. Exposed internally so tests can exercise it directly.
+type internal ManagedHeapInfo =
+    { TotalBytes: int64
+      Gen0Bytes: int64
+      Gen1Bytes: int64
+      Gen2Bytes: int64
+      LohBytes: int64
+      PohBytes: int64
+      Fragmentation: double }
+
+/// Converts a ManagedHeapInfo record to a JsonNode without any int truncation.
+let internal heapJson (h: ManagedHeapInfo) : JsonNode =
+    jobj
+        [ "totalBytes", jint64 h.TotalBytes
+          "gen0Bytes", jint64 h.Gen0Bytes
+          "gen1Bytes", jint64 h.Gen1Bytes
+          "gen2Bytes", jint64 h.Gen2Bytes
+          "lohBytes", jint64 h.LohBytes
+          "pohBytes", jint64 h.PohBytes
+          "fragmentation", JsonValue.Create(h.Fragmentation) :> JsonNode ]
+    :> JsonNode
+
 // ─── Snapshot functions ────────────────────────────────────────────────────────
 
 /// Reads heap sizing from GCMemoryInfo and GC APIs without triggering a collection.
@@ -63,15 +88,14 @@ let private managedHeapJson () : JsonNode =
         else
             0.0
 
-    jobj
-        [ "totalBytes", jint (int totalBytes)
-          "gen0Bytes", jint (int gen0Bytes)
-          "gen1Bytes", jint (int gen1Bytes)
-          "gen2Bytes", jint (int gen2Bytes)
-          "lohBytes", jint (int lohBytes)
-          "pohBytes", jint (int pohBytes)
-          "fragmentation", JsonValue.Create(fragmentation) :> JsonNode ]
-    :> JsonNode
+    heapJson
+        { TotalBytes = totalBytes
+          Gen0Bytes = gen0Bytes
+          Gen1Bytes = gen1Bytes
+          Gen2Bytes = gen2Bytes
+          LohBytes = lohBytes
+          PohBytes = pohBytes
+          Fragmentation = fragmentation }
 
 let private gcInfoJson () : JsonNode =
     let isServer = GCSettings.IsServerGC
@@ -112,13 +136,14 @@ let private assemblyCountJson () : JsonNode =
 
     jobj [ "loaded", jint count; "lastLoaded", jstr lastName ] :> JsonNode
 
-let private fcsStatusJson (config: FcsCheckerConfig) (checkerCacheCount: int) : JsonNode =
-    // IncrementalBuilder count is not exposed by the public FCS API.
-    // Return count: 0 and approximateBytes: null — honesty over speculation.
+let private fcsStatusJson (config: FcsCheckerConfig) : JsonNode =
+    // IncrementalBuilder count is not exposed by the public FCS API on net10.0.
+    // Count is null because FSharpChecker does not expose live builder count on net10.0.
+    // approximateBytes is null for the same reason.
     jobj
         [ "incrementalBuilders",
           jobj
-              [ "count", jint 0
+              [ "count", null
                 "approximateBytes", null ]
           :> JsonNode
           "projectCacheSize", jint config.ProjectCacheSize
@@ -156,7 +181,6 @@ let private childProcessJson (proc: Process) : JsonNode =
 let buildSnapshot
     (args: RuntimeStatusArgs)
     (config: FcsCheckerConfig)
-    (checkerCacheCount: int)
     (fsacProcess: Process option)
     : JsonNode =
 
@@ -165,7 +189,7 @@ let buildSnapshot
     let includeChildren = args.includeChildProcesses |> Option.defaultValue true
     let includePids = args.includeProcessIds |> Option.defaultValue true
 
-    let proc = Process.GetCurrentProcess()
+    use proc = Process.GetCurrentProcess()
 
     let uptimeSeconds =
         (DateTimeOffset.UtcNow - DateTimeOffset(proc.StartTime.ToUniversalTime())).TotalSeconds
@@ -199,7 +223,7 @@ let buildSnapshot
           yield "process", processPart
 
           if includeFcs then
-              yield "fcs", fcsStatusJson config checkerCacheCount
+              yield "fcs", fcsStatusJson config
 
           if includeChildren then
               yield "children", children ]

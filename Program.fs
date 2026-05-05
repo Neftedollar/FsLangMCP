@@ -433,7 +433,6 @@ let main argv =
                                     buildSnapshot
                                         args
                                         fcsBridge.CheckerConfig
-                                        fcsBridge.ProjectResultsCacheCount
                                         bridge.FsacProcess
                                 )
                             ))
