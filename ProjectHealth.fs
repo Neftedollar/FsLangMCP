@@ -233,15 +233,18 @@ let createReport
 
         match resolveHealthProjectPath args.projectPath with
         | Error reason ->
+            let blockedAxis r =
+                jobj [ "status", jstr "blocked"; "reason", jstr r ] :> JsonNode
+
             return
                 jobj
                     [ "status", jstr "ok"
                       "reportKind", jstr "project"
                       "toolingReadiness",
                       jobj
-                          [ "status", jstr "blocked"
-                            "blockers", JsonArray(jstr reason) :> JsonNode
-                            "recovery", JsonArray(jstr "Pass an explicit .fsproj path to project_health.") :> JsonNode ]
+                          [ "fcs", blockedAxis reason
+                            "lsp", blockedAxis reason
+                            "overall", jstr "blocked" ]
                       "compileStatus", jobj [ "status", jstr "not_checked" ]
                       "project",
                       jobj
@@ -251,15 +254,20 @@ let createReport
         | Ok projectPath ->
             match tryReadProject projectPath with
             | Error reason ->
+                let blockedAxis r =
+                    jobj [ "status", jstr "blocked"; "reason", jstr r ] :> JsonNode
+
+                let readReason = $"Project file cannot be read: %s{reason}"
+
                 return
                     jobj
                         [ "status", jstr "ok"
                           "reportKind", jstr "project"
                           "toolingReadiness",
                           jobj
-                              [ "status", jstr "blocked"
-                                "blockers", JsonArray(jstr $"Project file cannot be read: %s{reason}") :> JsonNode
-                                "recovery", JsonArray(jstr "Fix or restore the project file.") :> JsonNode ]
+                              [ "fcs", blockedAxis readReason
+                                "lsp", blockedAxis readReason
+                                "overall", jstr "blocked" ]
                           "compileStatus", jobj [ "status", jstr "not_checked" ]
                           "project", jobj [ "projectPath", jstr projectPath; "exists", jbool true ] ]
                     :> JsonNode
@@ -284,30 +292,53 @@ let createReport
                             return jobj [ "status", jstr "unavailable"; "reason", jstr reason ] :> JsonNode
                     }
 
-                let warnings = ResizeArray<JsonNode>()
-
-                if not lspSnapshot.WorkspaceReady then
-                    warnings.Add(jstr "LSP workspace is not initialized or not ready.")
+                let fcsWarnings = ResizeArray<JsonNode>()
 
                 if hasMissingFiles || hasUnreadableFiles then
-                    warnings.Add(jstr "Some project source files are missing or unreadable.")
+                    fcsWarnings.Add(jstr "Some project source files are missing or unreadable.")
 
                 match projectOptionsHealth["status"].GetValue<string>() with
                 | "available" -> ()
-                | _ -> warnings.Add(jstr "Project options are unavailable; semantic tools may be incomplete.")
+                | _ -> fcsWarnings.Add(jstr "Project options are unavailable; semantic tools may be incomplete.")
 
-                let readiness =
+                let fcsReadiness =
                     if hasMissingFiles || hasUnreadableFiles then
                         jobj
                             [ "status", jstr "blocked"
                               "blockers", fileSummary["missingFiles"].DeepClone()
                               "recovery", JsonArray(jstr "Restore or materialize required source files.") :> JsonNode ]
-                    elif warnings.Count > 0 then
+                    elif fcsWarnings.Count > 0 then
                         jobj
                             [ "status", jstr "degraded"
-                              "warnings", JsonArray(warnings.ToArray()) :> JsonNode ]
+                              "warnings", JsonArray(fcsWarnings.ToArray()) :> JsonNode ]
                     else
                         jobj [ "status", jstr "ready"; "warnings", JsonArray() :> JsonNode ]
+
+                let lspReadiness =
+                    if lspSnapshot.WorkspaceReady then
+                        jobj [ "status", jstr "ready" ]
+                    else
+                        jobj
+                            [ "status", jstr "not_ready"
+                              "reason",
+                              jstr
+                                  "workspace not initialized; auto-warmed on first textDocument_*/workspace_* call" ]
+
+                let fcsStatus = fcsReadiness["status"].GetValue<string>()
+                let lspStatus = lspReadiness["status"].GetValue<string>()
+
+                let overallStatus =
+                    match fcsStatus, lspStatus with
+                    | "ready",   "ready"     -> "ready"
+                    | "ready",   "not_ready" -> "fcs_only"
+                    | "blocked", _           -> "blocked"
+                    | _                      -> "degraded"
+
+                let readiness =
+                    jobj
+                        [ "fcs", fcsReadiness :> JsonNode
+                          "lsp", lspReadiness :> JsonNode
+                          "overall", jstr overallStatus ]
 
                 let analyzers = analyzerPackages doc
                 let analyzerConfigFiles = findAnalyzerConfigFiles projectDir

@@ -579,3 +579,164 @@ let ``fcs_project_outline returns filtered per file outline`` () : Task =
             if Directory.Exists(tempRoot) then
                 Directory.Delete(tempRoot, true)
     }
+
+// ─── Part A: path validation tests ────────────────────────────────────────────
+
+[<Fact>]
+let ``fcs_find_symbol returns InvalidArgument error when path is a directory`` () : Task =
+    task {
+        let bridge = FcsBridge()
+        let dir = Path.GetTempPath() // always exists as a directory
+
+        let! result =
+            bridge.FindSymbol(
+                { path = dir
+                  text = None
+                  projectPath = None
+                  projectOptions = None
+                  symbolQuery = "anySymbol"
+                  exact = Some false
+                  maxResults = Some 10
+                  contextLines = Some 0
+                  includeDeclaration = Some true }
+            )
+
+        Assert.Equal("error", result["status"].GetValue<string>())
+        Assert.Equal("InvalidArgument", result["errorKind"].GetValue<string>())
+        Assert.Contains("not a directory", result["message"].GetValue<string>())
+        Assert.Contains("fcs_find_symbol", result["message"].GetValue<string>())
+    }
+
+[<Fact>]
+let ``fcs_find_symbol returns InvalidArgument error when path does not exist`` () : Task =
+    task {
+        let bridge = FcsBridge()
+        let missing = Path.Combine(Path.GetTempPath(), $"does_not_exist_%O{Guid.NewGuid()}.fs")
+
+        let! result =
+            bridge.FindSymbol(
+                { path = missing
+                  text = None
+                  projectPath = None
+                  projectOptions = None
+                  symbolQuery = "anySymbol"
+                  exact = Some false
+                  maxResults = Some 10
+                  contextLines = Some 0
+                  includeDeclaration = Some true }
+            )
+
+        Assert.Equal("error", result["status"].GetValue<string>())
+        Assert.Equal("InvalidArgument", result["errorKind"].GetValue<string>())
+        Assert.Contains("does not exist or is not readable", result["message"].GetValue<string>())
+    }
+
+[<Fact>]
+let ``fcs_file_outline returns InvalidArgument error when path is a directory`` () : Task =
+    task {
+        let bridge = FcsBridge()
+        let dir = Path.GetTempPath()
+
+        let! result =
+            bridge.FileOutline(
+                { path = dir
+                  text = None
+                  projectPath = None
+                  projectOptions = None
+                  includePrivate = None
+                  includeLocal = None
+                  maxResults = None }
+            )
+
+        Assert.Equal("error", result["status"].GetValue<string>())
+        Assert.Equal("InvalidArgument", result["errorKind"].GetValue<string>())
+        Assert.Contains("fcs_file_outline", result["message"].GetValue<string>())
+    }
+
+[<Fact>]
+let ``fcs_file_symbols returns InvalidArgument error when path does not exist`` () : Task =
+    task {
+        let bridge = FcsBridge()
+        let missing = Path.Combine(Path.GetTempPath(), $"does_not_exist_%O{Guid.NewGuid()}.fs")
+
+        let! result =
+            bridge.FileSymbols(
+                { path = missing
+                  text = None
+                  projectPath = None
+                  projectOptions = None
+                  includeAllUses = None
+                  maxResults = None }
+            )
+
+        Assert.Equal("error", result["status"].GetValue<string>())
+        Assert.Equal("InvalidArgument", result["errorKind"].GetValue<string>())
+        Assert.Contains("fcs_file_symbols", result["message"].GetValue<string>())
+    }
+
+// ─── Regression: validateSourcePath unsaved-buffer workflow (#77 VERIFY) ─────
+
+[<Fact>]
+let ``fcs_parse_and_check_file bypasses File.Exists gate when non-empty text is supplied`` () : Task =
+    // Finding 1: a synthetic-buffer call (path does not exist on disk, text is supplied)
+    // must NOT return InvalidArgument — FCS should use the supplied text.
+    task {
+        let bridge = FcsBridge()
+        let syntheticPath = Path.Combine(Path.GetTempPath(), $"synthetic_%O{Guid.NewGuid()}.fs")
+
+        let! result =
+            bridge.ParseAndCheckFile(
+                { path = syntheticPath
+                  text = Some "module Foo\nlet x = 1"
+                  projectPath = None
+                  projectOptions = None }
+            )
+
+        // Must not return an InvalidArgument error due to the missing file.
+        let status = (result["status"]).GetValue<string>()
+        Assert.NotEqual<string>("error", status)
+    }
+
+[<Fact>]
+let ``fcs_file_outline bypasses File.Exists gate when non-empty text is supplied`` () : Task =
+    // Finding 1: directory rejection still fires even when text is supplied.
+    task {
+        let bridge = FcsBridge()
+        let syntheticPath = Path.Combine(Path.GetTempPath(), $"synthetic_%O{Guid.NewGuid()}.fs")
+
+        let! result =
+            bridge.FileOutline(
+                { path = syntheticPath
+                  text = Some "module Bar\nlet y = 2"
+                  projectPath = None
+                  projectOptions = None
+                  includePrivate = None
+                  includeLocal = None
+                  maxResults = None }
+            )
+
+        let status = (result["status"]).GetValue<string>()
+        Assert.NotEqual<string>("error", status)
+    }
+
+[<Fact>]
+let ``fcs_file_outline still rejects a directory path even when text is supplied`` () : Task =
+    // Finding 1: the directory guard must remain active even with a non-empty text buffer.
+    task {
+        let bridge = FcsBridge()
+        let dir = Path.GetTempPath()
+
+        let! result =
+            bridge.FileOutline(
+                { path = dir
+                  text = Some "module Ignored"
+                  projectPath = None
+                  projectOptions = None
+                  includePrivate = None
+                  includeLocal = None
+                  maxResults = None }
+            )
+
+        Assert.Equal("error", result["status"].GetValue<string>())
+        Assert.Equal("InvalidArgument", result["errorKind"].GetValue<string>())
+    }
