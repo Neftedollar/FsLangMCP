@@ -28,3 +28,5 @@ type internal BoundedCache<'K, 'V when 'K: equality>(maxSize: int) =
         lock lockObj (fun () ->
             dict.Clear()
             order.Clear())
+
+    member _.Count = lock lockObj (fun () -> dict.Count)

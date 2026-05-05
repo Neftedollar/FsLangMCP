@@ -159,6 +159,18 @@ type RenameArgs =
 [<CLIMutable>]
 type FcsGetProjectOptionsArgs = { projectPath: string }
 
+type FcsCheckerConfig =
+    { KeepAssemblyContents: bool
+      KeepAllBackgroundResolutions: bool
+      KeepAllBackgroundSymbolUses: bool
+      ProjectCacheSize: int }
+
+type RuntimeStatusArgs =
+    { includeFcsCacheStats: bool option
+      includeAssemblyCounts: bool option
+      includeChildProcesses: bool option
+      includeProcessIds: bool option }
+
 // ─── CLI parse result ──────────────────────────────────────────────────────────
 
 [<Struct>]

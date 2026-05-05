@@ -41,8 +41,12 @@ let private explicitFsproj (projectPath: string option) : string option =
 // ─── FcsBridge ─────────────────────────────────────────────────────────────────
 
 type internal FcsBridge() =
+    // Default FCS projectCacheSize is 3. We capture it so RuntimeStatus can report it.
+    let defaultProjectCacheSize = 3
+
     let checker =
         FSharpChecker.Create(
+            projectCacheSize = defaultProjectCacheSize,
             keepAssemblyContents = true,
             keepAllBackgroundResolutions = true,
             keepAllBackgroundSymbolUses = true
@@ -1121,6 +1125,16 @@ type internal FcsBridge() =
     member _.ClearCaches() =
         optionsCache.Clear()
         projectResultsCache.Clear()
+
+    /// Returns configuration flags captured at checker creation time, for use by RuntimeStatus.
+    member _.CheckerConfig: FcsCheckerConfig =
+        { KeepAssemblyContents = true
+          KeepAllBackgroundResolutions = true
+          KeepAllBackgroundSymbolUses = true
+          ProjectCacheSize = defaultProjectCacheSize }
+
+    /// Returns the number of entries currently held in the project-results cache.
+    member _.ProjectResultsCacheCount = projectResultsCache.Count
 
     member this.ProbeProjectOptions(fsprojPath: string) : Task<Result<string, string>> =
         task {

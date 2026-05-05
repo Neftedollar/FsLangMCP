@@ -15,6 +15,8 @@
     <Compile Include="../../LspBridge.fs" Link="LspBridge.fs" />
     <Compile Include="../../FcsBridge.fs" Link="FcsBridge.fs" />
     <Compile Include="../../Tools.fs" Link="Tools.fs" />
+    <Compile Include="../../RuntimeStatus.fs" Link="RuntimeStatus.fs" />
+    <Compile Include="RuntimeStatusTests.fs" />
     <Compile Include="TypesToolsTests.fs" />
     <Compile Include="LspBridgeTests.fs" />
     <Compile Include="ProjectFilesTests.fs" />
