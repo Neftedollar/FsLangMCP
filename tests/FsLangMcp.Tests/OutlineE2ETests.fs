@@ -213,8 +213,15 @@ let ``ProjectOutline with catastrophic-backtracking pattern completes in under 1
         let bridge = FcsBridge()
 
         try
+            // Warm up FCS: parse the project once without a filter so that
+            // projectResultsCache is populated.  FCS cold-start (JIT + project
+            // compilation) easily takes 1–2 s and must not be charged to the
+            // regex-guard measurement.
+            let! _ = bridge.ProjectOutline({ defaultArgs projectPath with maxFiles = Some 100 })
+
             // (a+)+$ is the canonical catastrophic-backtracking pattern.
             // Against a long-ish string without NonBacktracking this would hang.
+            // The FCS cache is warm, so only regex work is timed here.
             let sw = System.Diagnostics.Stopwatch.StartNew()
 
             let! result =
@@ -227,7 +234,7 @@ let ``ProjectOutline with catastrophic-backtracking pattern completes in under 1
             sw.Stop()
 
             Assert.Equal("ok", result["status"].GetValue<string>())
-            // NonBacktracking makes this instant; assert well under 1 s.
+            // NonBacktracking makes the regex portion instant; assert well under 1 s.
             Assert.True(
                 sw.Elapsed.TotalSeconds < 1.0,
                 $"Pattern (a+)+$ took {sw.Elapsed.TotalMilliseconds:F0}ms — NonBacktracking not applied?"
