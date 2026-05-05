@@ -338,3 +338,100 @@ let ``ProjectOutline cursor pagination: page-1 has nextCursor and page-2 returns
         finally
             if Directory.Exists(root) then Directory.Delete(root, true)
     }
+
+// ─── K. memberCounts replaces _summary sentinel (issue #82) ──────────────────
+//
+// In summaryOnly mode (the default), each file entry must:
+//   * carry a top-level `memberCounts` object: kind → count
+//   * NOT contain any synthetic `_summary` sentinel inside `entries`
+// The fixture files contain one module + one record + one let per file, so the
+// counts are deterministic.
+
+[<Fact>]
+let ``ProjectOutline summaryOnly emits memberCounts and drops _summary sentinel`` () : System.Threading.Tasks.Task =
+    task {
+        let projectPath, root = createFixtureProject ()
+        let bridge = FcsBridge()
+
+        try
+            let! result =
+                bridge.ProjectOutline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 100
+                        summaryOnly = Some true }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+
+            let files = filesArray result
+            Assert.True(files.Count >= 1, "Expected at least one file in outline")
+
+            for file in files |> Seq.cast<JsonNode> do
+                // memberCounts must be a non-null object.
+                let counts = file["memberCounts"]
+                Assert.NotNull(counts)
+                let countsObj = counts :?> JsonObject
+
+                // No kind in memberCounts may be the synthetic "_summary".
+                Assert.False(
+                    countsObj.ContainsKey("_summary"),
+                    "memberCounts must not contain a '_summary' kind"
+                )
+
+                // Each value must be a positive integer.
+                for kvp in countsObj do
+                    let n = kvp.Value.GetValue<int>()
+                    let kind = kvp.Key
+                    Assert.True(n > 0, $"memberCounts {kind} must be > 0, got {n}")
+
+                // entries must NOT contain the legacy _summary sentinel.
+                let entries = file["entries"] :?> JsonArray
+
+                let hasSentinel =
+                    entries
+                    |> Seq.cast<JsonNode>
+                    |> Seq.exists (fun e ->
+                        match e["kind"] with
+                        | null -> false
+                        | k -> k.GetValue<string>() = "_summary")
+
+                Assert.False(hasSentinel, "_summary sentinel must not appear in entries")
+
+                // The fixture has at least a "module" — assert that's tracked.
+                let keys =
+                    countsObj
+                    |> Seq.map _.Key
+                    |> String.concat ","
+
+                Assert.True(
+                    countsObj.ContainsKey("module"),
+                    $"Expected 'module' kind in memberCounts; got keys: {keys}"
+                )
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``ProjectOutline summaryOnly=false still emits memberCounts`` () : System.Threading.Tasks.Task =
+    task {
+        let projectPath, root = createFixtureProject ()
+        let bridge = FcsBridge()
+
+        try
+            let! result =
+                bridge.ProjectOutline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 100
+                        summaryOnly = Some false }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+
+            let files = filesArray result
+
+            for file in files |> Seq.cast<JsonNode> do
+                // memberCounts is always present so callers can rely on the shape.
+                Assert.NotNull(file["memberCounts"])
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
