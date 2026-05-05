@@ -730,7 +730,17 @@ type internal FcsBridge() =
                 }
 
             let exact = args.exact |> Option.defaultValue false
-            let maxResults = args.maxResults |> Option.defaultValue 500
+            let pageSize = args.maxResults |> Option.defaultValue 500
+
+            // ── Decode cursor (fail fast on malformed input) ───────────────────
+            let pageOffset =
+                match args.cursor with
+                | None -> 0
+                | Some cursorStr ->
+                    match Cursor.tryDecode cursorStr with
+                    | Ok payload -> payload.offset
+                    | Error reason ->
+                        invalidArg (nameof args.cursor) $"Invalid cursor: %s{reason}"
 
             let symbolMatches (symbol: FSharpSymbol) =
                 let displayName = symbol.DisplayName
@@ -748,29 +758,39 @@ type internal FcsBridge() =
 
             let allUses = projectResults.GetAllUsesOfAllSymbols()
 
-            let matchedUses =
+            // Sort once, deterministically, so cursor offsets are stable across pages.
+            let sortedMatches =
                 allUses
-                |> Seq.filter (fun symbolUse -> symbolMatches symbolUse.Symbol)
-                |> Seq.sortBy (fun symbolUse ->
+                |> Array.filter (fun symbolUse -> symbolMatches symbolUse.Symbol)
+                |> Array.sortBy (fun symbolUse ->
                     symbolUse.FileName, symbolUse.Range.StartLine, symbolUse.Range.StartColumn)
-                |> Seq.truncate maxResults
-                |> Seq.map symbolUseToJson
-                |> Seq.toArray
 
-            return
-                jobj
-                    [ "status", jstr "succeeded"
-                      "optionsSource", jstr optionsSource
-                      "projectFileName", jstr projectOptions.ProjectFileName
-                      "query", jstr query
-                      "exact", jbool exact
-                      "cached", jbool cached
-                      "totalProjectSymbolUses", jint allUses.Length
-                      "matchedCount", jint matchedUses.Length
-                      "uses", JsonArray(matchedUses) :> JsonNode
-                      "projectDiagnostics",
-                      JsonArray(projectResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ]
-                :> JsonNode
+            let totalMatched = sortedMatches.Length
+
+            let pageUses =
+                sortedMatches
+                |> Array.skip (min pageOffset totalMatched)
+                |> Array.truncate pageSize
+
+            let pageNodes = pageUses |> Array.map symbolUseToJson
+
+            let paginationFields =
+                Cursor.paginationFields "uses" totalMatched pageOffset pageSize pageUses.Length
+
+            let baseFields =
+                [ "status", jstr "succeeded"
+                  "optionsSource", jstr optionsSource
+                  "projectFileName", jstr projectOptions.ProjectFileName
+                  "query", jstr query
+                  "exact", jbool exact
+                  "cached", jbool cached
+                  "totalProjectSymbolUses", jint allUses.Length
+                  "matchedCount", jint totalMatched
+                  "uses", JsonArray(pageNodes) :> JsonNode
+                  "projectDiagnostics",
+                  JsonArray(projectResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ]
+
+            return jobj (baseFields @ paginationFields) :> JsonNode
         }
 
     member this.FindSymbol(args: FcsFindSymbolArgs) : Task<JsonNode> =
@@ -800,9 +820,19 @@ type internal FcsBridge() =
                 }
 
             let exact = args.exact |> Option.defaultValue false
-            let maxResults = args.maxResults |> Option.defaultValue 500
+            let pageSize = args.maxResults |> Option.defaultValue 500
             let contextLines = args.contextLines |> Option.defaultValue 1
             let includeDeclaration = args.includeDeclaration |> Option.defaultValue true
+
+            // ── Decode cursor (fail fast on malformed input) ───────────────────
+            let pageOffset =
+                match args.cursor with
+                | None -> 0
+                | Some cursorStr ->
+                    match Cursor.tryDecode cursorStr with
+                    | Ok payload -> payload.offset
+                    | Error reason ->
+                        invalidArg (nameof args.cursor) $"Invalid cursor: %s{reason}"
 
             let matchedUses =
                 projectResults.GetAllUsesOfAllSymbols()
@@ -810,7 +840,6 @@ type internal FcsBridge() =
                 |> Seq.filter (fun symbolUse -> includeDeclaration || not symbolUse.IsFromDefinition)
                 |> Seq.sortBy (fun symbolUse ->
                     symbolUse.Symbol.FullName, symbolUse.FileName, symbolUse.Range.StartLine, symbolUse.Range.StartColumn)
-                |> Seq.truncate maxResults
                 |> Seq.toArray
 
             let useToJson (symbolUse: FSharpSymbolUse) =
@@ -826,7 +855,10 @@ type internal FcsBridge() =
                       "after", context["after"].DeepClone() ]
                 :> JsonNode
 
-            let groups =
+            // Group by symbol identity. Then sort the groups deterministically by
+            // their key (FullName, DisplayName, declaration) so cursor offsets are
+            // stable across pages.
+            let allGroups =
                 matchedUses
                 |> Array.groupBy (fun symbolUse ->
                     let symbol = symbolUse.Symbol
@@ -836,7 +868,18 @@ type internal FcsBridge() =
                         |> Option.defaultValue ""
 
                     symbol.FullName, symbol.DisplayName, declaration)
-                |> Array.map (fun ((_, _, _), uses) ->
+                |> Array.sortBy fst
+
+            let totalGroups = allGroups.Length
+
+            let pageGroups =
+                allGroups
+                |> Array.skip (min pageOffset totalGroups)
+                |> Array.truncate pageSize
+
+            let groupNodes =
+                pageGroups
+                |> Array.map (fun (_, uses) ->
                     let symbol = uses[0].Symbol
 
                     let definitions =
@@ -857,20 +900,25 @@ type internal FcsBridge() =
                           "references", JsonArray(references) :> JsonNode ]
                     :> JsonNode)
 
-            return
-                jobj
-                    [ "status", jstr "succeeded"
-                      "optionsSource", jstr optionsSource
-                      "projectFileName", jstr projectOptions.ProjectFileName
-                      "query", jstr query
-                      "exact", jbool exact
-                      "cached", jbool cached
-                      "matchedUseCount", jint matchedUses.Length
-                      "symbolCount", jint groups.Length
-                      "symbols", JsonArray(groups) :> JsonNode
-                      "projectDiagnostics",
-                      JsonArray(projectResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ]
-                :> JsonNode
+            let paginationFields =
+                Cursor.paginationFields "symbols" totalGroups pageOffset pageSize pageGroups.Length
+
+            // matchedUseCount stays project-wide (pre-pagination) so callers see the
+            // total at a glance. Per-page counts are in totalEstimate / pageOffset.
+            let baseFields =
+                [ "status", jstr "succeeded"
+                  "optionsSource", jstr optionsSource
+                  "projectFileName", jstr projectOptions.ProjectFileName
+                  "query", jstr query
+                  "exact", jbool exact
+                  "cached", jbool cached
+                  "matchedUseCount", jint matchedUses.Length
+                  "symbolCount", jint pageGroups.Length
+                  "symbols", JsonArray(groupNodes) :> JsonNode
+                  "projectDiagnostics",
+                  JsonArray(projectResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ]
+
+            return jobj (baseFields @ paginationFields) :> JsonNode
         }
 
     member this.TypeAtPosition(args: FcsTypeAtPositionArgs) : Task<JsonNode> =
@@ -1334,7 +1382,7 @@ type internal FcsBridge() =
 
             // ── Pagination envelope ─────────────────────────────────────────────
             let paginationFields =
-                Cursor.paginationFields totalFileCount pageOffset pageSize pageFiles.Length
+                Cursor.paginationFields "files" totalFileCount pageOffset pageSize pageFiles.Length
 
             let baseFields =
                 [ "status", jstr "ok"

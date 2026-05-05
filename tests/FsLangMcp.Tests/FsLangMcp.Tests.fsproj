@@ -26,6 +26,7 @@
     <Compile Include="FcsBridgeTests.fs" />
     <Compile Include="OutlinePaginationTests.fs" />
     <Compile Include="OutlineE2ETests.fs" />
+    <Compile Include="SymbolPaginationTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
