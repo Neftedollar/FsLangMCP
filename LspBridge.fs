@@ -320,6 +320,9 @@ type internal FsAutoCompleteBridge() =
 
     member _.DiagnosticsFileCount = diagnostics.Count
 
+    /// Returns the live FSAC child process handle, or None if FSAC is not running.
+    member _.FsacProcess: Process option = lspProcess
+
     // Wait until workspaceReady is true or timeout elapses
     member _.WaitForReady(timeout: TimeSpan) : Task<bool> =
         task { return workspaceReadyEvent.Wait(timeout) }

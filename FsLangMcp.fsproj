@@ -21,6 +21,7 @@
     <Compile Include="LspBridge.fs" />
     <Compile Include="FcsBridge.fs" />
     <Compile Include="Tools.fs" />
+    <Compile Include="RuntimeStatus.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

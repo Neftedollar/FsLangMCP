@@ -170,6 +170,18 @@ type RenameArgs =
 [<CLIMutable>]
 type FcsGetProjectOptionsArgs = { projectPath: string }
 
+type FcsCheckerConfig =
+    { KeepAssemblyContents: bool
+      KeepAllBackgroundResolutions: bool
+      KeepAllBackgroundSymbolUses: bool
+      ProjectCacheSize: int }
+
+type RuntimeStatusArgs =
+    { includeFcsCacheStats: bool option
+      includeAssemblyCounts: bool option
+      includeChildProcesses: bool option
+      includeProcessIds: bool option }
+
 // ─── CLI parse result ──────────────────────────────────────────────────────────
 
 [<Struct>]
@@ -191,6 +203,7 @@ let jobj (props: (string * JsonNode) list) =
 
 let jstr (value: string) : JsonNode = JsonValue.Create(value)
 let jint (value: int) : JsonNode = JsonValue.Create(value)
+let jint64 (value: int64) : JsonNode = JsonValue.Create(value) :> JsonNode
 let jbool (value: bool) : JsonNode = JsonValue.Create(value)
 
 let toFileUri (path: string) =

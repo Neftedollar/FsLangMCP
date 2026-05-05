@@ -11,6 +11,7 @@ open FsLangMcp.FcsBridge
 open FsLangMcp.ProjectHealth
 open FsLangMcp.ProjectInspection
 open FsLangMcp.Tools
+open FsLangMcp.RuntimeStatus
 open FsMcp.Core
 open FsMcp.Core.Validation
 open FsMcp.Server
@@ -419,6 +420,22 @@ let main argv =
                                 toolResult (Task.FromException<JsonNode>(ArgumentException "projectPath is required"))
                             else
                                 toolResult (runLimited fcsGate (fun () -> runProjInfoAsync path)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<RuntimeStatusArgs>
+                        "fsharp_runtime_status"
+                        "[FCS in-process] Read-only observational snapshot of the FsLangMCP process runtime state: managed-heap sizes by generation/LOH/POH, GC collection counts, isServerGC flag, assembly load count, FCS checker configuration flags and project-results cache size, and the FSAC child-process working set. Returns numbers only — no interpretation. Never triggers a GC collection, never walks the heap, never attaches diagnostic listeners."
+                        (fun args ->
+                            toolResult (
+                                Task.FromResult(
+                                    buildSnapshot
+                                        args
+                                        fcsBridge.CheckerConfig
+                                        bridge.FsacProcess
+                                )
+                            ))
                     |> unwrapResult
                 )
 
