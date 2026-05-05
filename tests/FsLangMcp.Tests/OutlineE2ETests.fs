@@ -12,6 +12,9 @@ module FsLangMcp.Tests.OutlineE2ETests
 ///   I. Overlong filter (>1024 chars) → InvalidArgException
 ///   J. Cursor pagination round-trip: page-1 has nextCursor + truncated=true;
 ///      page-2 with that cursor returns the rest, no overlap
+///   K. memberCounts replaces _summary sentinel (issue #82): emitted in both
+///      summaryOnly modes, no synthetic kinds, exact values, filter-aware,
+///      and not shrunk by maxResultsPerFile truncation.
 
 open System
 open System.IO
@@ -335,6 +338,269 @@ let ``ProjectOutline cursor pagination: page-1 has nextCursor and page-2 returns
             // Together they cover both project files.
             let combined = Set.union page1Files page2Files
             Assert.Equal(2, combined.Count)
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
+
+// ─── K. memberCounts replaces _summary sentinel (issue #82) ──────────────────
+//
+// In summaryOnly mode (the default), each file entry must:
+//   * carry a top-level `memberCounts` object: kind → count
+//   * NOT contain any synthetic `_summary` sentinel inside `entries`
+// The fixture files contain one module + one record + one let per file, so the
+// counts are deterministic.
+
+[<Fact>]
+let ``ProjectOutline summaryOnly emits memberCounts and drops _summary sentinel`` () : System.Threading.Tasks.Task =
+    task {
+        let projectPath, root = createFixtureProject ()
+        let bridge = FcsBridge()
+
+        try
+            let! result =
+                bridge.ProjectOutline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 100
+                        summaryOnly = Some true }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+
+            let files = filesArray result
+            Assert.True(files.Count >= 1, "Expected at least one file in outline")
+
+            for file in files |> Seq.cast<JsonNode> do
+                // memberCounts must be a non-null object.
+                let counts = file["memberCounts"]
+                Assert.NotNull(counts)
+                let countsObj = counts :?> JsonObject
+
+                // No kind in memberCounts may be the synthetic "_summary".
+                Assert.False(
+                    countsObj.ContainsKey("_summary"),
+                    "memberCounts must not contain a '_summary' kind"
+                )
+
+                // Each value must be a positive integer.
+                for kvp in countsObj do
+                    let n = kvp.Value.GetValue<int>()
+                    let kind = kvp.Key
+                    Assert.True(n > 0, $"memberCounts {kind} must be > 0, got {n}")
+
+                // entries must NOT contain the legacy _summary sentinel.
+                let entries = file["entries"] :?> JsonArray
+
+                let hasSentinel =
+                    entries
+                    |> Seq.cast<JsonNode>
+                    |> Seq.exists (fun e ->
+                        match e["kind"] with
+                        | null -> false
+                        | k -> k.GetValue<string>() = "_summary")
+
+                Assert.False(hasSentinel, "_summary sentinel must not appear in entries")
+
+                // The fixture has at least a "module" — assert that's tracked.
+                let keys =
+                    countsObj
+                    |> Seq.map _.Key
+                    |> String.concat ","
+
+                Assert.True(
+                    countsObj.ContainsKey("module"),
+                    $"Expected 'module' kind in memberCounts; got keys: {keys}"
+                )
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``ProjectOutline summaryOnly=false still emits memberCounts`` () : System.Threading.Tasks.Task =
+    task {
+        let projectPath, root = createFixtureProject ()
+        let bridge = FcsBridge()
+
+        try
+            let! result =
+                bridge.ProjectOutline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 100
+                        summaryOnly = Some false }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+
+            let files = filesArray result
+
+            for file in files |> Seq.cast<JsonNode> do
+                // memberCounts is always present so callers can rely on the shape.
+                Assert.NotNull(file["memberCounts"])
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
+
+// ─── K2. Exact memberCounts values for the deterministic fixture ─────────────
+//
+// Each fixture file declares: 1 module + 1 record + 1 let-bound function. The
+// FCS outline also surfaces the record's field as kind="field" — so we assert
+// the three kinds the fixture is built around (module, record, function_or_value)
+// each have count=1. Field count is intentionally not asserted (it depends on
+// whether FCS chose to emit the field as a separate symbol use, which is an
+// FCS implementation detail outside this PR's contract).
+
+[<Fact>]
+let ``ProjectOutline summaryOnly memberCounts has module=1 record=1 function_or_value=1 per fixture file`` () : System.Threading.Tasks.Task =
+    task {
+        let projectPath, root = createFixtureProject ()
+        let bridge = FcsBridge()
+
+        try
+            let! result =
+                bridge.ProjectOutline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 100
+                        summaryOnly = Some true }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+
+            let files = filesArray result
+            Assert.Equal(2, files.Count)
+
+            for file in files |> Seq.cast<JsonNode> do
+                let countsObj = file["memberCounts"] :?> JsonObject
+                let filePath = file["file"].GetValue<string>()
+
+                let getCount (kind: string) =
+                    match countsObj.[kind] with
+                    | null -> 0
+                    | n -> n.GetValue<int>()
+
+                Assert.Equal(1, getCount "module")
+                Assert.Equal(1, getCount "record")
+                let fnCount = getCount "function_or_value"
+                let msg = sprintf "Expected function_or_value=1 for %s, got %d" filePath fnCount
+                Assert.True((fnCount = 1), msg)
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
+
+// ─── K3. Filter interaction — memberCounts uses post-filter entries ──────────
+//
+// With filter="Timer":
+//   File1: only the Timer record matches by name/signature; its module Alpha
+//          and getValue let do NOT match. So memberCounts must show record=1
+//          and must NOT show function_or_value (counting only post-filter).
+//   File2: nothing matches "Timer" — File2 may be absent from results, or
+//          present with empty memberCounts; we don't pin that here. We only
+//          assert the contract on File1.
+
+[<Fact>]
+let ``ProjectOutline summaryOnly memberCounts reflects post-filter entries`` () : System.Threading.Tasks.Task =
+    task {
+        let projectPath, root = createFixtureProject ()
+        let bridge = FcsBridge()
+
+        try
+            let! result =
+                bridge.ProjectOutline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 100
+                        summaryOnly = Some true
+                        filter = Some "Timer" }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+
+            let files = filesArray result
+
+            // Find File1 (the one whose path ends with File1.fs).
+            let file1 =
+                files
+                |> Seq.cast<JsonNode>
+                |> Seq.tryFind (fun f -> f["file"].GetValue<string>().EndsWith("File1.fs"))
+
+            Assert.True(file1.IsSome, "File1.fs must be present after filter=Timer")
+            let file1 = file1.Value
+
+            let countsObj = file1["memberCounts"] :?> JsonObject
+
+            // Pre-filter, function_or_value=1 (getValue). Post-filter ("Timer"),
+            // getValue must NOT contribute to memberCounts.
+            let hasFnOrValue =
+                countsObj.ContainsKey("function_or_value")
+                && countsObj.["function_or_value"].GetValue<int>() > 0
+
+            Assert.False(
+                hasFnOrValue,
+                "memberCounts.function_or_value must not be > 0 when filter='Timer' excludes getValue"
+            )
+
+            // The Timer record must still be counted.
+            Assert.True(countsObj.ContainsKey("record"), "record kind must remain after filter=Timer")
+            Assert.Equal(1, countsObj.["record"].GetValue<int>())
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
+
+// ─── K4. maxResultsPerFile caps entries[] but NOT memberCounts ───────────────
+//
+// memberCounts is computed over the post-filter entries before truncation, so
+// the agent sees the *real* breakdown of what the file contains even when
+// entries[] is capped. Without this contract the map degrades into a noisy
+// duplicate of `entries.length`, defeating its purpose: telling the agent
+// "this file has 50 functions you didn't see in entries[]".
+
+[<Fact>]
+let ``ProjectOutline summaryOnly maxResultsPerFile=1 caps entries but memberCounts reflects the full file`` () : System.Threading.Tasks.Task =
+    task {
+        let projectPath, root = createFixtureProject ()
+        let bridge = FcsBridge()
+
+        try
+            let! result =
+                bridge.ProjectOutline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 100
+                        summaryOnly = Some true
+                        maxResultsPerFile = Some 1 }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+
+            let files = filesArray result
+            Assert.True(files.Count >= 1, "Expected at least one file")
+
+            for file in files |> Seq.cast<JsonNode> do
+                // entries (summary view) is truncated per the cap.
+                let entries = file["entries"] :?> JsonArray
+                Assert.True(
+                    entries.Count <= 1,
+                    $"entries.Count must be <= 1 with maxResultsPerFile=1; got {entries.Count}"
+                )
+
+                // memberCounts must be non-null and reflect the *full* per-file
+                // outline, ignoring maxResultsPerFile.
+                let counts = file["memberCounts"] :?> JsonObject
+                Assert.NotNull(counts)
+
+                // Each fixture file has 1 module + 1 record + 1 let binding,
+                // and memberCounts must capture all three regardless of the
+                // entries cap.
+                Assert.True(counts.ContainsKey("module"), "module kind must be counted")
+                Assert.Equal(1, counts.["module"].GetValue<int>())
+
+                Assert.True(
+                    counts.ContainsKey("record"),
+                    "record kind must be counted even when truncated out of entries[]"
+                )
+                Assert.Equal(1, counts.["record"].GetValue<int>())
+
+                Assert.True(
+                    counts.ContainsKey("function_or_value"),
+                    "function_or_value must be counted even when truncated out of entries[]"
+                )
+                Assert.Equal(1, counts.["function_or_value"].GetValue<int>())
         finally
             if Directory.Exists(root) then Directory.Delete(root, true)
     }

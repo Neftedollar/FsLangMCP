@@ -1233,6 +1233,10 @@ type internal FcsBridge() =
             let fileEntries = ResizeArray<JsonNode>()
 
             for file in pageFiles do
+                // Fetch the full per-file outline (maxResults = None) so memberCounts
+                // can report the true totals. Truncation is applied below to the
+                // entries array only — the cap is a presentation concern, not a
+                // counting concern.
                 let! outline =
                     this.FileOutline(
                         { path = file.Path
@@ -1241,7 +1245,7 @@ type internal FcsBridge() =
                           projectOptions = None
                           includePrivate = args.includePrivate
                           includeLocal = Some false
-                          maxResults = Some maxResultsPerFile }
+                          maxResults = None }
                     )
 
                 // Pull raw entries array (may be null if outline aborted).
@@ -1253,10 +1257,11 @@ type internal FcsBridge() =
                         | :? JsonArray as arr -> arr |> Seq.cast<JsonNode> |> Seq.toArray
                         | _ -> [||]
 
-                // Apply filter BEFORE truncation, then apply per-file cap.
-                let filteredEntries =
+                // Apply filter first, keep the unbounded post-filter set so memberCounts
+                // can report the true totals; then truncate for the entries array.
+                let postFilterEntries =
                     if filterRegex.IsNone && nameContains.IsNone then
-                        rawEntries |> Array.truncate maxResultsPerFile
+                        rawEntries
                     else
                         rawEntries
                         |> Array.filter (fun entry ->
@@ -1271,24 +1276,22 @@ type internal FcsBridge() =
                                 | s -> s.GetValue<string>()
 
                             entryMatchesFilter name signature)
-                        |> Array.truncate maxResultsPerFile
 
-                // summaryOnly: strip per-member signature detail, keep headers & counts.
+                let filteredEntries = postFilterEntries |> Array.truncate maxResultsPerFile
+
+                // summaryOnly: strip per-member signature detail, keep headers; counts
+                // surface as a top-level memberCounts map per file (issue #82).
+                let containerKinds =
+                    [| "module"; "record"; "union"; "class"; "interface"; "enum"; "delegate"; "namespace" |]
+
                 let outlineEntries: JsonNode =
                     if summaryOnly then
-                        // Group by "kind" (module/record/union/class/interface) for a
-                        // compact header + member-count summary.
-                        let containerKinds =
-                            [| "module"; "record"; "union"; "class"; "interface"; "enum"; "delegate"; "namespace" |]
-
                         let topLevel =
                             filteredEntries
                             |> Array.filter (fun entry ->
                                 match entry["kind"] with
                                 | null -> false
                                 | k -> containerKinds |> Array.contains (k.GetValue<string>()))
-
-                        let memberCount = filteredEntries.Length - topLevel.Length
 
                         let summaryNodes =
                             topLevel
@@ -1306,31 +1309,42 @@ type internal FcsBridge() =
                                        | r -> r.DeepClone()) ]
                                 :> JsonNode)
 
-                        // Append a synthetic _members_count sentinel for LLM context.
-                        let withCount =
-                            Array.append
-                                summaryNodes
-                                [| jobj [ "kind", jstr "_summary"; "memberCount", jint memberCount ] :> JsonNode |]
-
-                        JsonArray(withCount) :> JsonNode
+                        JsonArray(summaryNodes) :> JsonNode
                     else
                         // Deep-clone each entry to release ownership from the source
                         // JsonArray returned by FileOutline — a JsonNode may only have
                         // one parent, so re-parenting without cloning throws.
                         JsonArray(filteredEntries |> Array.map (fun e -> e.DeepClone())) :> JsonNode
 
-                fileEntries.Add(
-                    jobj
-                        [ "file", jstr file.Path
-                          "kind", jstr (if file.IsSignature then "signature" else "implementation")
-                          "outlineStatus", outline["status"].DeepClone()
-                          "entries", outlineEntries
-                          "count",
-                          (match outline["count"] with
-                           | null -> jint 0
-                           | count -> count.DeepClone()) ]
-                    :> JsonNode
-                )
+                // memberCounts: kind → count over the unbounded post-filter set, so the
+                // map tells the agent how many of each kind the filter actually matched
+                // — independent of maxResultsPerFile, which only caps the entries array.
+                let memberCounts =
+                    let counts =
+                        postFilterEntries
+                        |> Array.choose (fun entry ->
+                            match entry["kind"] with
+                            | null -> None
+                            | k -> Some(k.GetValue<string>()))
+                        |> Array.countBy id
+                        |> Array.sortBy fst
+                        |> Array.map (fun (kind, n) -> kind, jint n)
+                        |> Array.toList
+
+                    jobj counts :> JsonNode
+
+                let fileFields =
+                    [ "file", jstr file.Path
+                      "kind", jstr (if file.IsSignature then "signature" else "implementation")
+                      "outlineStatus", outline["status"].DeepClone()
+                      "entries", outlineEntries
+                      "memberCounts", memberCounts
+                      "count",
+                      (match outline["count"] with
+                       | null -> jint 0
+                       | count -> count.DeepClone()) ]
+
+                fileEntries.Add(jobj fileFields :> JsonNode)
 
             // ── Pagination envelope ─────────────────────────────────────────────
             let paginationFields =
