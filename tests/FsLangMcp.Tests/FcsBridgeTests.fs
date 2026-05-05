@@ -569,10 +569,14 @@ let ``fcs_project_outline returns filtered per file outline`` () : Task =
                       includeTests = None
                       includeGeneratedFiles = None
                       maxFiles = Some 10
-                      maxResultsPerFile = Some 50 }
+                      maxResultsPerFile = Some 50
+                      summaryOnly = None
+                      cursor = None
+                      filter = None
+                      nameContains = None }
                 )
 
-            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.Equal("ok", result["status"].GetValue<string>())
             Assert.Equal(1, (result["filterSummary"]["includedFiles"]).GetValue<int>())
             Assert.Equal(1, (result["files"] :?> JsonArray).Count)
         finally

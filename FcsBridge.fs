@@ -14,6 +14,7 @@ open FSharp.Compiler.EditorServices
 open System.Text.Json
 open System.Text.Json.Nodes
 open FsLangMcp.ProjectFiles
+open FsLangMcp.Cursor
 open Ionide.ProjInfo
 open Ionide.ProjInfo.Types
 
@@ -1059,6 +1060,16 @@ type internal FcsBridge() =
             if not (File.Exists projectPath) then
                 invalidArg (nameof args.projectPath) $"Project file does not exist: %s{projectPath}"
 
+            // ── Decode cursor (fail fast on malformed input) ────────────────────
+            let pageOffset =
+                match args.cursor with
+                | None -> 0
+                | Some cursorStr ->
+                    match Cursor.tryDecode cursorStr with
+                    | Ok payload -> payload.offset
+                    | Error reason ->
+                        invalidArg (nameof args.cursor) $"Invalid cursor: %s{reason}"
+
             let workspaceRoot =
                 args.workspacePath
                 |> Option.map Path.GetFullPath
@@ -1069,18 +1080,74 @@ type internal FcsBridge() =
                 | Ok doc -> doc
                 | Error reason -> raise (InvalidOperationException($"Project file cannot be read: %s{reason}"))
 
+            // ── Conservative defaults (issue #78) ───────────────────────────────
+            // maxFiles=50 and maxResultsPerFile=30 keep responses within typical
+            // 25k–50k token context windows on projects up to ~50 files / 10k LOC.
+            // Callers that previously relied on the effectively-unlimited behaviour
+            // must now opt in via explicit larger values or cursor pagination.
+            let pageSize = args.maxFiles |> Option.defaultValue 50
+            let maxResultsPerFile = args.maxResultsPerFile |> Option.defaultValue 30
+            let summaryOnly = args.summaryOnly |> Option.defaultValue true
+
+            // ── Build regex / substring matchers ───────────────────────────────
+            let filterRegex =
+                match args.filter with
+                | None -> None
+                | Some pattern ->
+                    try
+                        Some(System.Text.RegularExpressions.Regex(pattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                    with ex ->
+                        invalidArg (nameof args.filter) $"Invalid filter regex: %s{ex.Message}"
+
+            let nameContains =
+                args.nameContains
+                |> Option.filter (fun lst -> not lst.IsEmpty)
+
+            // Returns true when the entry name / signature passes the filter.
+            let entryMatchesFilter (name: string) (signature: string) =
+                let matchesRegex =
+                    match filterRegex with
+                    | None -> true
+                    | Some rx -> rx.IsMatch(name) || rx.IsMatch(signature)
+
+                let matchesNameContains =
+                    match nameContains with
+                    | None -> true
+                    | Some fragments ->
+                        fragments
+                        |> List.exists (fun fragment ->
+                            name.Contains(fragment, StringComparison.OrdinalIgnoreCase)
+                            || signature.Contains(fragment, StringComparison.OrdinalIgnoreCase))
+
+                matchesRegex && matchesNameContains
+
+            // ── Enumerate all project files (no MaxFiles cap here — we page manually) ─
             let filterOptions =
                 { defaultFilterOptions Outline with
                     IncludeGenerated = args.includeGeneratedFiles |> Option.defaultValue false
                     IncludeTests = args.includeTests |> Option.defaultValue false
-                    MaxFiles = args.maxFiles }
+                    MaxFiles = None }
 
             let files = compileFiles projectPath doc
-            let filtered = filterProjectFiles workspaceRoot filterOptions files
-            let maxResultsPerFile = args.maxResultsPerFile |> Option.defaultValue 100
+
+            // Sort deterministically by path so cursor offsets are stable.
+            let allFiles =
+                filterProjectFiles workspaceRoot filterOptions files
+                |> fun result ->
+                    { result with
+                        Included = result.Included |> List.sortBy (fun f -> f.Path) }
+
+            let totalFileCount = allFiles.Included.Length
+
+            // ── Apply cursor offset then take pageSize ──────────────────────────
+            let pageFiles =
+                allFiles.Included
+                |> List.skip (min pageOffset totalFileCount)
+                |> List.truncate pageSize
+
             let fileEntries = ResizeArray<JsonNode>()
 
-            for file in filtered.Included do
+            for file in pageFiles do
                 let! outline =
                     this.FileOutline(
                         { path = file.Path
@@ -1092,15 +1159,84 @@ type internal FcsBridge() =
                           maxResults = Some maxResultsPerFile }
                     )
 
+                // Pull raw entries array (may be null if outline aborted).
+                let rawEntries: JsonNode array =
+                    match outline["entries"] with
+                    | null -> [||]
+                    | entries ->
+                        match entries with
+                        | :? JsonArray as arr -> arr |> Seq.cast<JsonNode> |> Seq.toArray
+                        | _ -> [||]
+
+                // Apply filter BEFORE truncation, then apply per-file cap.
+                let filteredEntries =
+                    if filterRegex.IsNone && nameContains.IsNone then
+                        rawEntries |> Array.truncate maxResultsPerFile
+                    else
+                        rawEntries
+                        |> Array.filter (fun entry ->
+                            let name =
+                                match entry["name"] with
+                                | null -> ""
+                                | n -> n.GetValue<string>()
+
+                            let signature =
+                                match entry["signature"] with
+                                | null -> ""
+                                | s -> s.GetValue<string>()
+
+                            entryMatchesFilter name signature)
+                        |> Array.truncate maxResultsPerFile
+
+                // summaryOnly: strip per-member signature detail, keep headers & counts.
+                let outlineEntries: JsonNode =
+                    if summaryOnly then
+                        // Group by "kind" (module/record/union/class/interface) for a
+                        // compact header + member-count summary.
+                        let containerKinds =
+                            [| "module"; "record"; "union"; "class"; "interface"; "enum"; "delegate"; "namespace" |]
+
+                        let topLevel =
+                            filteredEntries
+                            |> Array.filter (fun entry ->
+                                match entry["kind"] with
+                                | null -> false
+                                | k -> containerKinds |> Array.contains (k.GetValue<string>()))
+
+                        let memberCount = filteredEntries.Length - topLevel.Length
+
+                        let summaryNodes =
+                            topLevel
+                            |> Array.map (fun entry ->
+                                jobj
+                                    [ "name", entry["name"].DeepClone()
+                                      "kind", entry["kind"].DeepClone()
+                                      "fullName",
+                                      (match entry["fullName"] with
+                                       | null -> null
+                                       | fn -> fn.DeepClone())
+                                      "range",
+                                      (match entry["range"] with
+                                       | null -> null
+                                       | r -> r.DeepClone()) ]
+                                :> JsonNode)
+
+                        // Append a synthetic _members_count sentinel for LLM context.
+                        let withCount =
+                            Array.append
+                                summaryNodes
+                                [| jobj [ "kind", jstr "_summary"; "memberCount", jint memberCount ] :> JsonNode |]
+
+                        JsonArray(withCount) :> JsonNode
+                    else
+                        JsonArray(filteredEntries) :> JsonNode
+
                 fileEntries.Add(
                     jobj
                         [ "file", jstr file.Path
                           "kind", jstr (if file.IsSignature then "signature" else "implementation")
                           "outlineStatus", outline["status"].DeepClone()
-                          "entries",
-                          (match outline["entries"] with
-                           | null -> JsonArray() :> JsonNode
-                           | entries -> entries.DeepClone())
+                          "entries", outlineEntries
                           "count",
                           (match outline["count"] with
                            | null -> jint 0
@@ -1108,14 +1244,19 @@ type internal FcsBridge() =
                     :> JsonNode
                 )
 
-            return
-                jobj
-                    [ "status", jstr "succeeded"
-                      "projectPath", jstr projectPath
-                      "workspaceRoot", jstr workspaceRoot
-                      "filterSummary", filterSummaryToJson filtered :> JsonNode
-                      "files", JsonArray(fileEntries.ToArray()) :> JsonNode ]
-                :> JsonNode
+            // ── Pagination envelope ─────────────────────────────────────────────
+            let paginationFields =
+                Cursor.paginationFields totalFileCount pageOffset pageSize pageFiles.Length
+
+            let baseFields =
+                [ "status", jstr "ok"
+                  "projectPath", jstr projectPath
+                  "workspaceRoot", jstr workspaceRoot
+                  "summaryOnly", jbool summaryOnly
+                  "filterSummary", filterSummaryToJson allFiles :> JsonNode
+                  "files", JsonArray(fileEntries.ToArray()) :> JsonNode ]
+
+            return jobj (baseFields @ paginationFields) :> JsonNode
         }
 
     member _.ClearCaches() =
