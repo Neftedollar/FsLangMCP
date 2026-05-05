@@ -1233,6 +1233,10 @@ type internal FcsBridge() =
             let fileEntries = ResizeArray<JsonNode>()
 
             for file in pageFiles do
+                // Fetch the full per-file outline (maxResults = None) so memberCounts
+                // can report the true totals. Truncation is applied below to the
+                // entries array only — the cap is a presentation concern, not a
+                // counting concern.
                 let! outline =
                     this.FileOutline(
                         { path = file.Path
@@ -1241,7 +1245,7 @@ type internal FcsBridge() =
                           projectOptions = None
                           includePrivate = args.includePrivate
                           includeLocal = Some false
-                          maxResults = Some maxResultsPerFile }
+                          maxResults = None }
                     )
 
                 // Pull raw entries array (may be null if outline aborted).
@@ -1253,10 +1257,11 @@ type internal FcsBridge() =
                         | :? JsonArray as arr -> arr |> Seq.cast<JsonNode> |> Seq.toArray
                         | _ -> [||]
 
-                // Apply filter BEFORE truncation, then apply per-file cap.
-                let filteredEntries =
+                // Apply filter first, keep the unbounded post-filter set so memberCounts
+                // can report the true totals; then truncate for the entries array.
+                let postFilterEntries =
                     if filterRegex.IsNone && nameContains.IsNone then
-                        rawEntries |> Array.truncate maxResultsPerFile
+                        rawEntries
                     else
                         rawEntries
                         |> Array.filter (fun entry ->
@@ -1271,7 +1276,8 @@ type internal FcsBridge() =
                                 | s -> s.GetValue<string>()
 
                             entryMatchesFilter name signature)
-                        |> Array.truncate maxResultsPerFile
+
+                let filteredEntries = postFilterEntries |> Array.truncate maxResultsPerFile
 
                 // summaryOnly: strip per-member signature detail, keep headers; counts
                 // surface as a top-level memberCounts map per file (issue #82).
@@ -1310,11 +1316,12 @@ type internal FcsBridge() =
                         // one parent, so re-parenting without cloning throws.
                         JsonArray(filteredEntries |> Array.map (fun e -> e.DeepClone())) :> JsonNode
 
-                // memberCounts: kind → count. Computed from the post-filter pre-truncation
-                // list so the totals reflect what the agent could see at maxResultsPerFile=∞.
+                // memberCounts: kind → count over the unbounded post-filter set, so the
+                // map tells the agent how many of each kind the filter actually matched
+                // — independent of maxResultsPerFile, which only caps the entries array.
                 let memberCounts =
                     let counts =
-                        filteredEntries
+                        postFilterEntries
                         |> Array.choose (fun entry ->
                             match entry["kind"] with
                             | null -> None

@@ -543,18 +543,16 @@ let ``ProjectOutline summaryOnly memberCounts reflects post-filter entries`` () 
             if Directory.Exists(root) then Directory.Delete(root, true)
     }
 
-// ─── K4. maxResultsPerFile interaction with memberCounts ─────────────────────
+// ─── K4. maxResultsPerFile caps entries[] but NOT memberCounts ───────────────
 //
-// CONTRACT NOTE: the FcsBridge code comment near memberCounts claims the map
-// is computed "post-filter pre-truncation". In practice the implementation
-// applies Array.truncate maxResultsPerFile *before* counting, so the counts
-// shrink alongside `entries`. This test pins that observed behaviour so the
-// PR ships a single, internally consistent contract — drift in either
-// direction (counts becoming truncation-immune, or growing past the cap)
-// will trip this test.
+// memberCounts is computed over the post-filter entries before truncation, so
+// the agent sees the *real* breakdown of what the file contains even when
+// entries[] is capped. Without this contract the map degrades into a noisy
+// duplicate of `entries.length`, defeating its purpose: telling the agent
+// "this file has 50 functions you didn't see in entries[]".
 
 [<Fact>]
-let ``ProjectOutline summaryOnly maxResultsPerFile=1 caps both entries and memberCounts to one entry`` () : System.Threading.Tasks.Task =
+let ``ProjectOutline summaryOnly maxResultsPerFile=1 caps entries but memberCounts reflects the full file`` () : System.Threading.Tasks.Task =
     task {
         let projectPath, root = createFixtureProject ()
         let bridge = FcsBridge()
@@ -574,42 +572,35 @@ let ``ProjectOutline summaryOnly maxResultsPerFile=1 caps both entries and membe
             Assert.True(files.Count >= 1, "Expected at least one file")
 
             for file in files |> Seq.cast<JsonNode> do
-                // entries (summary view) keeps only container kinds (module,
-                // record, etc.); with maxResultsPerFile=1, only the first
-                // surviving container survives — so length is <= 1.
+                // entries (summary view) is truncated per the cap.
                 let entries = file["entries"] :?> JsonArray
                 Assert.True(
                     entries.Count <= 1,
                     $"entries.Count must be <= 1 with maxResultsPerFile=1; got {entries.Count}"
                 )
 
-                // memberCounts must be non-null.
+                // memberCounts must be non-null and reflect the *full* per-file
+                // outline, ignoring maxResultsPerFile.
                 let counts = file["memberCounts"] :?> JsonObject
                 Assert.NotNull(counts)
 
-                // The fixture's first source-order entry per file is the
-                // module declaration, so module=1 must remain.
-                Assert.True(counts.ContainsKey("module"), "module kind must remain")
+                // Each fixture file has 1 module + 1 record + 1 let binding,
+                // and memberCounts must capture all three regardless of the
+                // entries cap.
+                Assert.True(counts.ContainsKey("module"), "module kind must be counted")
                 Assert.Equal(1, counts.["module"].GetValue<int>())
 
-                // Truncation is applied before counting in the current
-                // implementation: the totals across memberCounts must equal
-                // exactly 1, matching the truncated filteredEntries set.
-                let total =
-                    counts |> Seq.sumBy (fun kvp -> kvp.Value.GetValue<int>())
-
-                Assert.Equal(1, total)
-
-                // Therefore record / function_or_value must NOT appear.
-                Assert.False(
+                Assert.True(
                     counts.ContainsKey("record"),
-                    "record kind must not appear when maxResultsPerFile=1 truncates before counting"
+                    "record kind must be counted even when truncated out of entries[]"
                 )
+                Assert.Equal(1, counts.["record"].GetValue<int>())
 
-                Assert.False(
+                Assert.True(
                     counts.ContainsKey("function_or_value"),
-                    "function_or_value must not appear when maxResultsPerFile=1 truncates before counting"
+                    "function_or_value must be counted even when truncated out of entries[]"
                 )
+                Assert.Equal(1, counts.["function_or_value"].GetValue<int>())
         finally
             if Directory.Exists(root) then Directory.Delete(root, true)
     }
