@@ -1,0 +1,24 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker-net/master/src/Stryker.Configuration/schema.json",
+  "stryker-config": {
+    "project": "FsLangMcp.fsproj",
+    "test-projects": ["tests/FsLangMcp.Tests/FsLangMcp.Tests.fsproj"],
+    "reporters": ["progress", "html", "cleartext"],
+    "thresholds": {
+      "high": 80,
+      "low": 60,
+      "break": 0
+    },
+    "mutate": [
+      "**/*.fs",
+      "!tests/**/*.fs",
+      "!**/bin/**",
+      "!**/obj/**",
+      "!**/Program.fs",
+      "!**/AssemblyInfo.fs"
+    ],
+    "mutation-level": "Standard",
+    "verbosity": "info",
+    "concurrency": 2
+  }
+}

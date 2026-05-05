@@ -217,6 +217,7 @@ just analyze
 
 - `just check` runs build + tests.
 - `just analyze` runs F# analyzers through `FSharp.Analyzers.Build`.
+- `just mutation-test` runs [Stryker.NET](https://stryker-mutator.io/docs/stryker-net/introduction/) mutation testing against `stryker-config.json`. Note: Stryker.NET officially supports C# only — see the PR introducing this target and upstream issue [stryker-net#1216](https://github.com/stryker-mutator/stryker-net/issues/1216) for the current state of F# support.
 
 The repository currently wires:
 

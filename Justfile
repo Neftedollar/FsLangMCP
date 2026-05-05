@@ -31,3 +31,9 @@ pack:
 install-local: pack
     dotnet tool uninstall -g fslangmcp || true
     dotnet tool install -g --add-source {{tool_source}} FsLangMcp
+
+# Run Stryker.NET mutation testing using stryker-config.json.
+# Note: Stryker.NET officially supports C# only; F# support is not guaranteed.
+# Pass extra args via STRYKER_ARGS, e.g. `STRYKER_ARGS="--mutate Cursor.fs" just mutation-test`.
+mutation-test: tool-restore
+    dotnet stryker $STRYKER_ARGS

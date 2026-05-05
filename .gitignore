@@ -5,3 +5,5 @@ nupkg/
 .claude/
 tests/*/bin/
 tests/*/obj/
+StrykerOutput/
+.stryker-tmp/
