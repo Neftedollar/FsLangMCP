@@ -84,7 +84,9 @@ let ``project_health blocks missing explicit fsproj`` () =
     let result = report args snapshot
 
     Assert.Equal("ok", (result["status"]).GetValue<string>())
-    Assert.Equal("blocked", (result["toolingReadiness"]["status"]).GetValue<string>())
+    Assert.Equal("blocked", (result["toolingReadiness"]["overall"]).GetValue<string>())
+    Assert.Equal("blocked", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
+    Assert.Equal("blocked", (result["toolingReadiness"]["lsp"]["status"]).GetValue<string>())
 
 [<Fact>]
 let ``project_health blocks directory with multiple fsproj files`` () =
@@ -98,8 +100,9 @@ let ``project_health blocks directory with multiple fsproj files`` () =
 
         let result = report (healthArgs root (Some root)) (readySnapshot root root)
 
-        Assert.Equal("blocked", (result["toolingReadiness"]["status"]).GetValue<string>())
-        Assert.Contains("Multiple .fsproj", ((result["toolingReadiness"]["blockers"])[0]).GetValue<string>())
+        Assert.Equal("blocked", (result["toolingReadiness"]["overall"]).GetValue<string>())
+        Assert.Equal("blocked", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
+        Assert.Contains("Multiple .fsproj", ((result["toolingReadiness"]["fcs"]["reason"]).GetValue<string>()))
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
@@ -222,6 +225,91 @@ let ``fsharp_project_inspect reports compile order and package references`` () =
         Assert.Equal("implementation", firstCompileFile["kind"].GetValue<string>())
         Assert.Equal(1, (result["filterSummary"]["includedFiles"]).GetValue<int>())
         Assert.True((result["references"]["packageReferences"] :?> JsonArray).Count >= 1)
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+// ─── Regression tests for VERIFY findings on #77 (closes #81) ────────────────
+
+[<Fact>]
+let ``project_health emits nested fcs/lsp/overall shape when project path does not exist`` () =
+    // Finding 2: early-exit paths must emit the same nested toolingReadiness shape as the
+    // success path, not the old flat {status, blockers, recovery} shape.
+    let runId = System.Guid.NewGuid().ToString("N")
+    let missingProject = Path.Combine(Path.GetTempPath(), $"missing_%s{runId}.fsproj")
+
+    let args = healthArgs missingProject None
+    let snapshot = readySnapshot missingProject (Path.GetTempPath())
+    let result = report args snapshot
+
+    Assert.Equal("ok", (result["status"]).GetValue<string>())
+    Assert.Equal("blocked", (result["toolingReadiness"]["overall"]).GetValue<string>())
+    Assert.Equal("blocked", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
+    Assert.Equal("blocked", (result["toolingReadiness"]["lsp"]["status"]).GetValue<string>())
+    // The flat shape keys must NOT be present at the toolingReadiness root
+    Assert.Null(result["toolingReadiness"]["blockers"])
+    Assert.Null(result["toolingReadiness"]["status"])
+
+[<Fact>]
+let ``overallStatus is blocked when fcs is blocked and lsp is ready`` () =
+    // Finding 3: "blocked" FCS axis must propagate to "blocked" overall, not "degraded".
+    let runId = System.Guid.NewGuid().ToString("N")
+
+    let root =
+        Path.Combine(Path.GetTempPath(), $"fslangmcp_health_fcs_blocked_%s{runId}")
+
+    try
+        // Create a project with a missing compile file so fcs status = "blocked".
+        let projectPath = writeProject root
+        File.Delete(Path.Combine(root, "Library.fs"))
+
+        let result =
+            report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
+
+        Assert.Equal("blocked", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
+        Assert.Equal("ready",   (result["toolingReadiness"]["lsp"]["status"]).GetValue<string>())
+        Assert.Equal("blocked", (result["toolingReadiness"]["overall"]).GetValue<string>())
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``overallStatus is fcs_only when fcs is ready and lsp is not_ready`` () =
+    // Finding 3: fcs=ready + lsp=not_ready must yield "fcs_only" (not "degraded" or "ready").
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_fcs_only_%s{runId}")
+
+    try
+        let projectPath = writeProject root
+
+        let snapshot =
+            { ProjectPath = Some projectPath
+              WorkspaceRoot = Some root
+              WorkspaceReady = false
+              DiagnosticsFileCount = 0 }
+
+        let result = report (healthArgs projectPath (Some root)) snapshot
+
+        Assert.Equal("ready",     (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
+        Assert.Equal("not_ready", (result["toolingReadiness"]["lsp"]["status"]).GetValue<string>())
+        Assert.Equal("fcs_only",  (result["toolingReadiness"]["overall"]).GetValue<string>())
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``overallStatus is ready when both fcs and lsp are ready`` () =
+    // Finding 3: "ready" + "ready" must yield "ready".
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_both_%s{runId}")
+
+    try
+        let projectPath = writeProject root
+        let result = report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
+
+        Assert.Equal("ready", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
+        Assert.Equal("ready", (result["toolingReadiness"]["lsp"]["status"]).GetValue<string>())
+        Assert.Equal("ready", (result["toolingReadiness"]["overall"]).GetValue<string>())
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)

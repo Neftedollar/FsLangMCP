@@ -233,15 +233,18 @@ let createReport
 
         match resolveHealthProjectPath args.projectPath with
         | Error reason ->
+            let blockedAxis r =
+                jobj [ "status", jstr "blocked"; "reason", jstr r ] :> JsonNode
+
             return
                 jobj
                     [ "status", jstr "ok"
                       "reportKind", jstr "project"
                       "toolingReadiness",
                       jobj
-                          [ "status", jstr "blocked"
-                            "blockers", JsonArray(jstr reason) :> JsonNode
-                            "recovery", JsonArray(jstr "Pass an explicit .fsproj path to project_health.") :> JsonNode ]
+                          [ "fcs", blockedAxis reason
+                            "lsp", blockedAxis reason
+                            "overall", jstr "blocked" ]
                       "compileStatus", jobj [ "status", jstr "not_checked" ]
                       "project",
                       jobj
@@ -251,15 +254,20 @@ let createReport
         | Ok projectPath ->
             match tryReadProject projectPath with
             | Error reason ->
+                let blockedAxis r =
+                    jobj [ "status", jstr "blocked"; "reason", jstr r ] :> JsonNode
+
+                let readReason = $"Project file cannot be read: %s{reason}"
+
                 return
                     jobj
                         [ "status", jstr "ok"
                           "reportKind", jstr "project"
                           "toolingReadiness",
                           jobj
-                              [ "status", jstr "blocked"
-                                "blockers", JsonArray(jstr $"Project file cannot be read: %s{reason}") :> JsonNode
-                                "recovery", JsonArray(jstr "Fix or restore the project file.") :> JsonNode ]
+                              [ "fcs", blockedAxis readReason
+                                "lsp", blockedAxis readReason
+                                "overall", jstr "blocked" ]
                           "compileStatus", jobj [ "status", jstr "not_checked" ]
                           "project", jobj [ "projectPath", jstr projectPath; "exists", jbool true ] ]
                     :> JsonNode
@@ -321,9 +329,10 @@ let createReport
 
                 let overallStatus =
                     match fcsStatus, lspStatus with
-                    | "ready", "ready" -> "ready"
-                    | ("ready" | "degraded"), _ when fcsStatus <> "blocked" -> "fcs_only"
-                    | _ -> "degraded"
+                    | "ready",   "ready"     -> "ready"
+                    | "ready",   "not_ready" -> "fcs_only"
+                    | "blocked", _           -> "blocked"
+                    | _                      -> "degraded"
 
                 let readiness =
                     jobj

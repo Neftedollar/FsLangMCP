@@ -291,9 +291,12 @@ type internal FcsBridge() =
         :> JsonNode
 
     // Validate that a 'path' argument points to an existing source file, not a directory.
+    // When the caller supplies a non-empty 'text' buffer the file does not need to
+    // exist on disk — we still reject directories (the actual papercut from #77).
     // Returns Some errorNode when validation fails; None when the path is acceptable.
-    let validateSourcePath (toolName: string) (path: string) : JsonNode option =
+    let validateSourcePath (toolName: string) (text: string option) (path: string) : JsonNode option =
         let fullPath = normalizePath path
+        let hasText = text |> Option.exists (fun t -> t <> "")
 
         if Directory.Exists(fullPath) then
             Some(
@@ -305,7 +308,7 @@ type internal FcsBridge() =
                           $"%s{toolName} expects 'path' to be a source file (.fs/.fsi), not a directory. To search project-wide, pass any source file in the project as 'path' and the .fsproj as 'projectPath'." ]
                 :> JsonNode
             )
-        elif not (File.Exists(fullPath)) then
+        elif not hasText && not (File.Exists(fullPath)) then
             Some(
                 jobj
                     [ "status", jstr "error"
@@ -467,7 +470,7 @@ type internal FcsBridge() =
 
     member this.ParseAndCheckFile(args: FcsParseAndCheckArgs) : Task<JsonNode> =
         task {
-            match validateSourcePath "fcs_parse_and_check_file" args.path with
+            match validateSourcePath "fcs_parse_and_check_file" args.text args.path with
             | Some err -> return err
             | None ->
 
@@ -572,7 +575,7 @@ type internal FcsBridge() =
 
     member this.FileSymbols(args: FcsFileSymbolsArgs) : Task<JsonNode> =
         task {
-            match validateSourcePath "fcs_file_symbols" args.path with
+            match validateSourcePath "fcs_file_symbols" args.text args.path with
             | Some err -> return err
             | None ->
 
@@ -625,7 +628,7 @@ type internal FcsBridge() =
 
     member this.FileOutline(args: FcsFileOutlineArgs) : Task<JsonNode> =
         task {
-            match validateSourcePath "fcs_file_outline" args.path with
+            match validateSourcePath "fcs_file_outline" args.text args.path with
             | Some err -> return err
             | None ->
 
@@ -696,7 +699,7 @@ type internal FcsBridge() =
             if String.IsNullOrWhiteSpace(query) then
                 invalidArg (nameof args.symbolQuery) "symbolQuery must be non-empty."
 
-            match validateSourcePath "fcs_project_symbol_uses" args.path with
+            match validateSourcePath "fcs_project_symbol_uses" args.text args.path with
             | Some err -> return err
             | None ->
 
@@ -768,7 +771,7 @@ type internal FcsBridge() =
             if String.IsNullOrWhiteSpace(query) then
                 invalidArg (nameof args.symbolQuery) "symbolQuery must be non-empty."
 
-            match validateSourcePath "fcs_find_symbol" args.path with
+            match validateSourcePath "fcs_find_symbol" args.text args.path with
             | Some err -> return err
             | None ->
 
@@ -863,7 +866,7 @@ type internal FcsBridge() =
 
     member this.TypeAtPosition(args: FcsTypeAtPositionArgs) : Task<JsonNode> =
         task {
-            match validateSourcePath "fcs_type_at_position" args.path with
+            match validateSourcePath "fcs_type_at_position" args.text args.path with
             | Some err -> return err
             | None ->
 
@@ -959,7 +962,7 @@ type internal FcsBridge() =
 
     member this.SymbolAtWord(args: FcsSymbolAtWordArgs) : Task<JsonNode> =
         task {
-            match validateSourcePath "fcs_symbol_at_word" args.path with
+            match validateSourcePath "fcs_symbol_at_word" args.text args.path with
             | Some err -> return err
             | None ->
 
@@ -1284,7 +1287,7 @@ type internal FcsBridge() =
 
     member this.SignatureHelp(args: FcsSignatureHelpArgs) : Task<JsonNode> =
         task {
-            match validateSourcePath "fcs_signature_help" args.path with
+            match validateSourcePath "fcs_signature_help" args.text args.path with
             | Some err -> return err
             | None ->
 

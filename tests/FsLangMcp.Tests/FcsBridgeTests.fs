@@ -673,3 +673,70 @@ let ``fcs_file_symbols returns InvalidArgument error when path does not exist`` 
         Assert.Equal("InvalidArgument", result["errorKind"].GetValue<string>())
         Assert.Contains("fcs_file_symbols", result["message"].GetValue<string>())
     }
+
+// ─── Regression: validateSourcePath unsaved-buffer workflow (#77 VERIFY) ─────
+
+[<Fact>]
+let ``fcs_parse_and_check_file bypasses File.Exists gate when non-empty text is supplied`` () : Task =
+    // Finding 1: a synthetic-buffer call (path does not exist on disk, text is supplied)
+    // must NOT return InvalidArgument — FCS should use the supplied text.
+    task {
+        let bridge = FcsBridge()
+        let syntheticPath = Path.Combine(Path.GetTempPath(), $"synthetic_%O{Guid.NewGuid()}.fs")
+
+        let! result =
+            bridge.ParseAndCheckFile(
+                { path = syntheticPath
+                  text = Some "module Foo\nlet x = 1"
+                  projectPath = None
+                  projectOptions = None }
+            )
+
+        // Must not return an InvalidArgument error due to the missing file.
+        let status = (result["status"]).GetValue<string>()
+        Assert.NotEqual<string>("error", status)
+    }
+
+[<Fact>]
+let ``fcs_file_outline bypasses File.Exists gate when non-empty text is supplied`` () : Task =
+    // Finding 1: directory rejection still fires even when text is supplied.
+    task {
+        let bridge = FcsBridge()
+        let syntheticPath = Path.Combine(Path.GetTempPath(), $"synthetic_%O{Guid.NewGuid()}.fs")
+
+        let! result =
+            bridge.FileOutline(
+                { path = syntheticPath
+                  text = Some "module Bar\nlet y = 2"
+                  projectPath = None
+                  projectOptions = None
+                  includePrivate = None
+                  includeLocal = None
+                  maxResults = None }
+            )
+
+        let status = (result["status"]).GetValue<string>()
+        Assert.NotEqual<string>("error", status)
+    }
+
+[<Fact>]
+let ``fcs_file_outline still rejects a directory path even when text is supplied`` () : Task =
+    // Finding 1: the directory guard must remain active even with a non-empty text buffer.
+    task {
+        let bridge = FcsBridge()
+        let dir = Path.GetTempPath()
+
+        let! result =
+            bridge.FileOutline(
+                { path = dir
+                  text = Some "module Ignored"
+                  projectPath = None
+                  projectOptions = None
+                  includePrivate = None
+                  includeLocal = None
+                  maxResults = None }
+            )
+
+        Assert.Equal("error", result["status"].GetValue<string>())
+        Assert.Equal("InvalidArgument", result["errorKind"].GetValue<string>())
+    }
