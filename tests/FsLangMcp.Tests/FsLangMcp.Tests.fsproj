@@ -10,6 +10,7 @@
     <Compile Include="../../BoundedCache.fs" Link="BoundedCache.fs" />
     <Compile Include="../../Types.fs" Link="Types.fs" />
     <Compile Include="../../ProjectFiles.fs" Link="ProjectFiles.fs" />
+    <Compile Include="../../Cursor.fs" Link="Cursor.fs" />
     <Compile Include="../../ProjectInspection.fs" Link="ProjectInspection.fs" />
     <Compile Include="../../ProjectHealth.fs" Link="ProjectHealth.fs" />
     <Compile Include="../../LspBridge.fs" Link="LspBridge.fs" />
@@ -21,6 +22,8 @@
     <Compile Include="ProjectHealthTests.fs" />
     <Compile Include="BoundedCacheTests.fs" />
     <Compile Include="FcsBridgeTests.fs" />
+    <Compile Include="OutlinePaginationTests.fs" />
+    <Compile Include="OutlineE2ETests.fs" />
   </ItemGroup>
 
   <ItemGroup>

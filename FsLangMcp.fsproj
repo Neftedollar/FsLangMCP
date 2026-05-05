@@ -15,6 +15,7 @@
     <Compile Include="BoundedCache.fs" />
     <Compile Include="Types.fs" />
     <Compile Include="ProjectFiles.fs" />
+    <Compile Include="Cursor.fs" />
     <Compile Include="ProjectInspection.fs" />
     <Compile Include="ProjectHealth.fs" />
     <Compile Include="LspBridge.fs" />

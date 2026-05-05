@@ -114,8 +114,19 @@ type FcsProjectOutlineArgs =
       includePrivate: bool option
       includeTests: bool option
       includeGeneratedFiles: bool option
+      /// Maximum number of files to include in one page. Default: 50.
       maxFiles: int option
-      maxResultsPerFile: int option }
+      /// Maximum number of symbol entries per file. Default: 30.
+      maxResultsPerFile: int option
+      /// When true (default), return module/type headers + member counts only.
+      /// Set to false to get full per-member signatures (legacy behaviour).
+      summaryOnly: bool option
+      /// Opaque pagination cursor returned by a prior call. Agents must not construct this.
+      cursor: string option
+      /// Regex applied to member names/signatures before truncation.
+      filter: string option
+      /// OR-joined substring list applied to member names before truncation.
+      nameContains: string list option }
 
 type FSharpProjectInspectArgs =
     { projectPath: string
