@@ -290,6 +290,32 @@ type internal FcsBridge() =
               "text", jstr text ]
         :> JsonNode
 
+    // Validate that a 'path' argument points to an existing source file, not a directory.
+    // Returns Some errorNode when validation fails; None when the path is acceptable.
+    let validateSourcePath (toolName: string) (path: string) : JsonNode option =
+        let fullPath = normalizePath path
+
+        if Directory.Exists(fullPath) then
+            Some(
+                jobj
+                    [ "status", jstr "error"
+                      "errorKind", jstr "InvalidArgument"
+                      "message",
+                      jstr
+                          $"%s{toolName} expects 'path' to be a source file (.fs/.fsi), not a directory. To search project-wide, pass any source file in the project as 'path' and the .fsproj as 'projectPath'." ]
+                :> JsonNode
+            )
+        elif not (File.Exists(fullPath)) then
+            Some(
+                jobj
+                    [ "status", jstr "error"
+                      "errorKind", jstr "InvalidArgument"
+                      "message", jstr $"%s{toolName}: path does not exist or is not readable: %s{fullPath}" ]
+                :> JsonNode
+            )
+        else
+            None
+
     // Build a stable cache key from projectPath and projectOptions list
     let makeCacheKey (projectPath: string option) (projectOptions: string list option) =
         let pp = projectPath |> Option.defaultValue ""
@@ -441,6 +467,10 @@ type internal FcsBridge() =
 
     member this.ParseAndCheckFile(args: FcsParseAndCheckArgs) : Task<JsonNode> =
         task {
+            match validateSourcePath "fcs_parse_and_check_file" args.path with
+            | Some err -> return err
+            | None ->
+
             let! path, _, optionsSource, projectOptions, parseResults, checkedResults =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
 
@@ -542,6 +572,10 @@ type internal FcsBridge() =
 
     member this.FileSymbols(args: FcsFileSymbolsArgs) : Task<JsonNode> =
         task {
+            match validateSourcePath "fcs_file_symbols" args.path with
+            | Some err -> return err
+            | None ->
+
             let! path, _, optionsSource, _, parseResults, checkedResults =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
 
@@ -591,6 +625,10 @@ type internal FcsBridge() =
 
     member this.FileOutline(args: FcsFileOutlineArgs) : Task<JsonNode> =
         task {
+            match validateSourcePath "fcs_file_outline" args.path with
+            | Some err -> return err
+            | None ->
+
             let! path, _, optionsSource, _, parseResults, checkedResults =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
 
@@ -657,6 +695,10 @@ type internal FcsBridge() =
 
             if String.IsNullOrWhiteSpace(query) then
                 invalidArg (nameof args.symbolQuery) "symbolQuery must be non-empty."
+
+            match validateSourcePath "fcs_project_symbol_uses" args.path with
+            | Some err -> return err
+            | None ->
 
             let! _, _, optionsSource, projectOptions, _, _ =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
@@ -725,6 +767,10 @@ type internal FcsBridge() =
 
             if String.IsNullOrWhiteSpace(query) then
                 invalidArg (nameof args.symbolQuery) "symbolQuery must be non-empty."
+
+            match validateSourcePath "fcs_find_symbol" args.path with
+            | Some err -> return err
+            | None ->
 
             let! _, _, optionsSource, projectOptions, _, _ =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
@@ -817,6 +863,10 @@ type internal FcsBridge() =
 
     member this.TypeAtPosition(args: FcsTypeAtPositionArgs) : Task<JsonNode> =
         task {
+            match validateSourcePath "fcs_type_at_position" args.path with
+            | Some err -> return err
+            | None ->
+
             let! path, source, optionsSource, _, _, checkedResults =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
 
@@ -909,6 +959,10 @@ type internal FcsBridge() =
 
     member this.SymbolAtWord(args: FcsSymbolAtWordArgs) : Task<JsonNode> =
         task {
+            match validateSourcePath "fcs_symbol_at_word" args.path with
+            | Some err -> return err
+            | None ->
+
             let! path, source, optionsSource, _, _, checkedResults =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
 
@@ -1230,6 +1284,10 @@ type internal FcsBridge() =
 
     member this.SignatureHelp(args: FcsSignatureHelpArgs) : Task<JsonNode> =
         task {
+            match validateSourcePath "fcs_signature_help" args.path with
+            | Some err -> return err
+            | None ->
+
             let! path, source, optionsSource, _, _, checkedResults =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
 

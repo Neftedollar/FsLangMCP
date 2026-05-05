@@ -65,7 +65,8 @@ let ``project_health reports source files and analyzer setup`` () =
             report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
 
         Assert.Equal("ok", (result["status"]).GetValue<string>())
-        Assert.Equal("ready", (result["toolingReadiness"]["status"]).GetValue<string>())
+        Assert.Equal("ready", (result["toolingReadiness"]["overall"]).GetValue<string>())
+        Assert.Equal("ready", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
         Assert.Equal(1, (result["files"]["sourceFileCount"]).GetValue<int>())
         Assert.Equal("analyzers_configured", (result["analyzers"]["status"]).GetValue<string>())
         Assert.Equal("available", (result["projectOptions"]["status"]).GetValue<string>())
@@ -117,7 +118,7 @@ let ``project_health blocks missing compile file`` () =
         let result =
             report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
 
-        Assert.Equal("blocked", (result["toolingReadiness"]["status"]).GetValue<string>())
+        Assert.Equal("blocked", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
         Assert.Equal(1, (result["files"]["missingFiles"]).AsArray().Count)
     finally
         if Directory.Exists root then
@@ -149,14 +150,15 @@ let ``project_health reports no analyzers as capability fact`` () =
         let result =
             report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
 
-        Assert.Equal("ready", (result["toolingReadiness"]["status"]).GetValue<string>())
+        Assert.Equal("ready", (result["toolingReadiness"]["overall"]).GetValue<string>())
+        Assert.Equal("ready", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
         Assert.Equal("no_analyzers_configured", (result["analyzers"]["status"]).GetValue<string>())
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
 
 [<Fact>]
-let ``project_health degrades when lsp workspace is not ready`` () =
+let ``project_health reports fcs_only overall when lsp workspace is not ready but fcs is fine`` () =
     let runId = System.Guid.NewGuid().ToString("N")
     let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_lsp_%s{runId}")
 
@@ -171,7 +173,28 @@ let ``project_health degrades when lsp workspace is not ready`` () =
 
         let result = report (healthArgs projectPath (Some root)) snapshot
 
-        Assert.Equal("degraded", (result["toolingReadiness"]["status"]).GetValue<string>())
+        // FCS axis is healthy; LSP not ready — overall should be fcs_only (not degraded)
+        Assert.Equal("fcs_only", (result["toolingReadiness"]["overall"]).GetValue<string>())
+        Assert.Equal("ready", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
+        Assert.Equal("not_ready", (result["toolingReadiness"]["lsp"]["status"]).GetValue<string>())
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health reports ready overall when both fcs and lsp are ready`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_both_ready_%s{runId}")
+
+    try
+        let projectPath = writeProject root
+
+        let result =
+            report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
+
+        Assert.Equal("ready", (result["toolingReadiness"]["overall"]).GetValue<string>())
+        Assert.Equal("ready", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
+        Assert.Equal("ready", (result["toolingReadiness"]["lsp"]["status"]).GetValue<string>())
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
