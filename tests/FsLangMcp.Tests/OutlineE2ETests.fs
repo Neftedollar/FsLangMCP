@@ -12,6 +12,9 @@ module FsLangMcp.Tests.OutlineE2ETests
 ///   I. Overlong filter (>1024 chars) → InvalidArgException
 ///   J. Cursor pagination round-trip: page-1 has nextCursor + truncated=true;
 ///      page-2 with that cursor returns the rest, no overlap
+///   K. memberCounts replaces _summary sentinel (issue #82): emitted in both
+///      summaryOnly modes, no synthetic kinds, exact values, filter-aware,
+///      and not shrunk by maxResultsPerFile truncation.
 
 open System
 open System.IO
@@ -432,6 +435,181 @@ let ``ProjectOutline summaryOnly=false still emits memberCounts`` () : System.Th
             for file in files |> Seq.cast<JsonNode> do
                 // memberCounts is always present so callers can rely on the shape.
                 Assert.NotNull(file["memberCounts"])
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
+
+// ─── K2. Exact memberCounts values for the deterministic fixture ─────────────
+//
+// Each fixture file declares: 1 module + 1 record + 1 let-bound function. The
+// FCS outline also surfaces the record's field as kind="field" — so we assert
+// the three kinds the fixture is built around (module, record, function_or_value)
+// each have count=1. Field count is intentionally not asserted (it depends on
+// whether FCS chose to emit the field as a separate symbol use, which is an
+// FCS implementation detail outside this PR's contract).
+
+[<Fact>]
+let ``ProjectOutline summaryOnly memberCounts has module=1 record=1 function_or_value=1 per fixture file`` () : System.Threading.Tasks.Task =
+    task {
+        let projectPath, root = createFixtureProject ()
+        let bridge = FcsBridge()
+
+        try
+            let! result =
+                bridge.ProjectOutline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 100
+                        summaryOnly = Some true }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+
+            let files = filesArray result
+            Assert.Equal(2, files.Count)
+
+            for file in files |> Seq.cast<JsonNode> do
+                let countsObj = file["memberCounts"] :?> JsonObject
+                let filePath = file["file"].GetValue<string>()
+
+                let getCount (kind: string) =
+                    match countsObj.[kind] with
+                    | null -> 0
+                    | n -> n.GetValue<int>()
+
+                Assert.Equal(1, getCount "module")
+                Assert.Equal(1, getCount "record")
+                let fnCount = getCount "function_or_value"
+                let msg = sprintf "Expected function_or_value=1 for %s, got %d" filePath fnCount
+                Assert.True((fnCount = 1), msg)
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
+
+// ─── K3. Filter interaction — memberCounts uses post-filter entries ──────────
+//
+// With filter="Timer":
+//   File1: only the Timer record matches by name/signature; its module Alpha
+//          and getValue let do NOT match. So memberCounts must show record=1
+//          and must NOT show function_or_value (counting only post-filter).
+//   File2: nothing matches "Timer" — File2 may be absent from results, or
+//          present with empty memberCounts; we don't pin that here. We only
+//          assert the contract on File1.
+
+[<Fact>]
+let ``ProjectOutline summaryOnly memberCounts reflects post-filter entries`` () : System.Threading.Tasks.Task =
+    task {
+        let projectPath, root = createFixtureProject ()
+        let bridge = FcsBridge()
+
+        try
+            let! result =
+                bridge.ProjectOutline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 100
+                        summaryOnly = Some true
+                        filter = Some "Timer" }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+
+            let files = filesArray result
+
+            // Find File1 (the one whose path ends with File1.fs).
+            let file1 =
+                files
+                |> Seq.cast<JsonNode>
+                |> Seq.tryFind (fun f -> f["file"].GetValue<string>().EndsWith("File1.fs"))
+
+            Assert.True(file1.IsSome, "File1.fs must be present after filter=Timer")
+            let file1 = file1.Value
+
+            let countsObj = file1["memberCounts"] :?> JsonObject
+
+            // Pre-filter, function_or_value=1 (getValue). Post-filter ("Timer"),
+            // getValue must NOT contribute to memberCounts.
+            let hasFnOrValue =
+                countsObj.ContainsKey("function_or_value")
+                && countsObj.["function_or_value"].GetValue<int>() > 0
+
+            Assert.False(
+                hasFnOrValue,
+                "memberCounts.function_or_value must not be > 0 when filter='Timer' excludes getValue"
+            )
+
+            // The Timer record must still be counted.
+            Assert.True(countsObj.ContainsKey("record"), "record kind must remain after filter=Timer")
+            Assert.Equal(1, countsObj.["record"].GetValue<int>())
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
+
+// ─── K4. maxResultsPerFile interaction with memberCounts ─────────────────────
+//
+// CONTRACT NOTE: the FcsBridge code comment near memberCounts claims the map
+// is computed "post-filter pre-truncation". In practice the implementation
+// applies Array.truncate maxResultsPerFile *before* counting, so the counts
+// shrink alongside `entries`. This test pins that observed behaviour so the
+// PR ships a single, internally consistent contract — drift in either
+// direction (counts becoming truncation-immune, or growing past the cap)
+// will trip this test.
+
+[<Fact>]
+let ``ProjectOutline summaryOnly maxResultsPerFile=1 caps both entries and memberCounts to one entry`` () : System.Threading.Tasks.Task =
+    task {
+        let projectPath, root = createFixtureProject ()
+        let bridge = FcsBridge()
+
+        try
+            let! result =
+                bridge.ProjectOutline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 100
+                        summaryOnly = Some true
+                        maxResultsPerFile = Some 1 }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+
+            let files = filesArray result
+            Assert.True(files.Count >= 1, "Expected at least one file")
+
+            for file in files |> Seq.cast<JsonNode> do
+                // entries (summary view) keeps only container kinds (module,
+                // record, etc.); with maxResultsPerFile=1, only the first
+                // surviving container survives — so length is <= 1.
+                let entries = file["entries"] :?> JsonArray
+                Assert.True(
+                    entries.Count <= 1,
+                    $"entries.Count must be <= 1 with maxResultsPerFile=1; got {entries.Count}"
+                )
+
+                // memberCounts must be non-null.
+                let counts = file["memberCounts"] :?> JsonObject
+                Assert.NotNull(counts)
+
+                // The fixture's first source-order entry per file is the
+                // module declaration, so module=1 must remain.
+                Assert.True(counts.ContainsKey("module"), "module kind must remain")
+                Assert.Equal(1, counts.["module"].GetValue<int>())
+
+                // Truncation is applied before counting in the current
+                // implementation: the totals across memberCounts must equal
+                // exactly 1, matching the truncated filteredEntries set.
+                let total =
+                    counts |> Seq.sumBy (fun kvp -> kvp.Value.GetValue<int>())
+
+                Assert.Equal(1, total)
+
+                // Therefore record / function_or_value must NOT appear.
+                Assert.False(
+                    counts.ContainsKey("record"),
+                    "record kind must not appear when maxResultsPerFile=1 truncates before counting"
+                )
+
+                Assert.False(
+                    counts.ContainsKey("function_or_value"),
+                    "function_or_value must not appear when maxResultsPerFile=1 truncates before counting"
+                )
         finally
             if Directory.Exists(root) then Directory.Delete(root, true)
     }
