@@ -65,8 +65,8 @@ let ``project_health reports source files and analyzer setup`` () =
             report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
 
         Assert.Equal("ok", (result["status"]).GetValue<string>())
-        Assert.Equal("ready", (result["toolingReadiness"]["overall"]).GetValue<string>())
-        Assert.Equal("ready", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
+        Assert.Equal("ready", ((result["toolingReadiness"])["overall"]).GetValue<string>())
+        Assert.Equal("ready", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
         Assert.Equal(1, (result["files"]["sourceFileCount"]).GetValue<int>())
         Assert.Equal("analyzers_configured", (result["analyzers"]["status"]).GetValue<string>())
         Assert.Equal("available", (result["projectOptions"]["status"]).GetValue<string>())
@@ -84,9 +84,9 @@ let ``project_health blocks missing explicit fsproj`` () =
     let result = report args snapshot
 
     Assert.Equal("ok", (result["status"]).GetValue<string>())
-    Assert.Equal("blocked", (result["toolingReadiness"]["overall"]).GetValue<string>())
-    Assert.Equal("blocked", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
-    Assert.Equal("blocked", (result["toolingReadiness"]["lsp"]["status"]).GetValue<string>())
+    Assert.Equal("blocked", ((result["toolingReadiness"])["overall"]).GetValue<string>())
+    Assert.Equal("blocked", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
+    Assert.Equal("blocked", (((result["toolingReadiness"])["lsp"])["status"]).GetValue<string>())
 
 [<Fact>]
 let ``project_health blocks directory with multiple fsproj files`` () =
@@ -100,9 +100,9 @@ let ``project_health blocks directory with multiple fsproj files`` () =
 
         let result = report (healthArgs root (Some root)) (readySnapshot root root)
 
-        Assert.Equal("blocked", (result["toolingReadiness"]["overall"]).GetValue<string>())
-        Assert.Equal("blocked", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
-        Assert.Contains("Multiple .fsproj", ((result["toolingReadiness"]["fcs"]["reason"]).GetValue<string>()))
+        Assert.Equal("blocked", ((result["toolingReadiness"])["overall"]).GetValue<string>())
+        Assert.Equal("blocked", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
+        Assert.Contains("Multiple .fsproj", ((((result["toolingReadiness"])["fcs"])["reason"]).GetValue<string>()))
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
@@ -121,7 +121,7 @@ let ``project_health blocks missing compile file`` () =
         let result =
             report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
 
-        Assert.Equal("blocked", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
+        Assert.Equal("blocked", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
         Assert.Equal(1, (result["files"]["missingFiles"]).AsArray().Count)
     finally
         if Directory.Exists root then
@@ -153,8 +153,8 @@ let ``project_health reports no analyzers as capability fact`` () =
         let result =
             report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
 
-        Assert.Equal("ready", (result["toolingReadiness"]["overall"]).GetValue<string>())
-        Assert.Equal("ready", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
+        Assert.Equal("ready", ((result["toolingReadiness"])["overall"]).GetValue<string>())
+        Assert.Equal("ready", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
         Assert.Equal("no_analyzers_configured", (result["analyzers"]["status"]).GetValue<string>())
     finally
         if Directory.Exists root then
@@ -177,9 +177,9 @@ let ``project_health reports fcs_only overall when lsp workspace is not ready bu
         let result = report (healthArgs projectPath (Some root)) snapshot
 
         // FCS axis is healthy; LSP not ready — overall should be fcs_only (not degraded)
-        Assert.Equal("fcs_only", (result["toolingReadiness"]["overall"]).GetValue<string>())
-        Assert.Equal("ready", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
-        Assert.Equal("not_ready", (result["toolingReadiness"]["lsp"]["status"]).GetValue<string>())
+        Assert.Equal("fcs_only", ((result["toolingReadiness"])["overall"]).GetValue<string>())
+        Assert.Equal("ready", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
+        Assert.Equal("not_ready", (((result["toolingReadiness"])["lsp"])["status"]).GetValue<string>())
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
@@ -195,9 +195,9 @@ let ``project_health reports ready overall when both fcs and lsp are ready`` () 
         let result =
             report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
 
-        Assert.Equal("ready", (result["toolingReadiness"]["overall"]).GetValue<string>())
-        Assert.Equal("ready", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
-        Assert.Equal("ready", (result["toolingReadiness"]["lsp"]["status"]).GetValue<string>())
+        Assert.Equal("ready", ((result["toolingReadiness"])["overall"]).GetValue<string>())
+        Assert.Equal("ready", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
+        Assert.Equal("ready", (((result["toolingReadiness"])["lsp"])["status"]).GetValue<string>())
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
@@ -243,9 +243,9 @@ let ``project_health emits nested fcs/lsp/overall shape when project path does n
     let result = report args snapshot
 
     Assert.Equal("ok", (result["status"]).GetValue<string>())
-    Assert.Equal("blocked", (result["toolingReadiness"]["overall"]).GetValue<string>())
-    Assert.Equal("blocked", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
-    Assert.Equal("blocked", (result["toolingReadiness"]["lsp"]["status"]).GetValue<string>())
+    Assert.Equal("blocked", ((result["toolingReadiness"])["overall"]).GetValue<string>())
+    Assert.Equal("blocked", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
+    Assert.Equal("blocked", (((result["toolingReadiness"])["lsp"])["status"]).GetValue<string>())
     // The flat shape keys must NOT be present at the toolingReadiness root
     Assert.Null(result["toolingReadiness"]["blockers"])
     Assert.Null(result["toolingReadiness"]["status"])
@@ -266,9 +266,9 @@ let ``overallStatus is blocked when fcs is blocked and lsp is ready`` () =
         let result =
             report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
 
-        Assert.Equal("blocked", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
-        Assert.Equal("ready",   (result["toolingReadiness"]["lsp"]["status"]).GetValue<string>())
-        Assert.Equal("blocked", (result["toolingReadiness"]["overall"]).GetValue<string>())
+        Assert.Equal("blocked", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
+        Assert.Equal("ready",   (((result["toolingReadiness"])["lsp"])["status"]).GetValue<string>())
+        Assert.Equal("blocked", ((result["toolingReadiness"])["overall"]).GetValue<string>())
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
@@ -290,9 +290,9 @@ let ``overallStatus is fcs_only when fcs is ready and lsp is not_ready`` () =
 
         let result = report (healthArgs projectPath (Some root)) snapshot
 
-        Assert.Equal("ready",     (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
-        Assert.Equal("not_ready", (result["toolingReadiness"]["lsp"]["status"]).GetValue<string>())
-        Assert.Equal("fcs_only",  (result["toolingReadiness"]["overall"]).GetValue<string>())
+        Assert.Equal("ready",     (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
+        Assert.Equal("not_ready", (((result["toolingReadiness"])["lsp"])["status"]).GetValue<string>())
+        Assert.Equal("fcs_only",  ((result["toolingReadiness"])["overall"]).GetValue<string>())
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
@@ -307,9 +307,9 @@ let ``overallStatus is ready when both fcs and lsp are ready`` () =
         let projectPath = writeProject root
         let result = report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
 
-        Assert.Equal("ready", (result["toolingReadiness"]["fcs"]["status"]).GetValue<string>())
-        Assert.Equal("ready", (result["toolingReadiness"]["lsp"]["status"]).GetValue<string>())
-        Assert.Equal("ready", (result["toolingReadiness"]["overall"]).GetValue<string>())
+        Assert.Equal("ready", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
+        Assert.Equal("ready", (((result["toolingReadiness"])["lsp"])["status"]).GetValue<string>())
+        Assert.Equal("ready", ((result["toolingReadiness"])["overall"]).GetValue<string>())
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
