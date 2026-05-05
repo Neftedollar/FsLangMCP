@@ -23,6 +23,7 @@
     <Compile Include="BoundedCacheTests.fs" />
     <Compile Include="FcsBridgeTests.fs" />
     <Compile Include="OutlinePaginationTests.fs" />
+    <Compile Include="OutlineE2ETests.fs" />
   </ItemGroup>
 
   <ItemGroup>

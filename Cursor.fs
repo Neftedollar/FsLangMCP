@@ -36,7 +36,7 @@ let tryDecode (cursor: string) : Result<CursorPayload, string> =
         try
             let bytes = Convert.FromBase64String(cursor)
             let json = Encoding.UTF8.GetString(bytes)
-            let doc = JsonDocument.Parse(json)
+            use doc = JsonDocument.Parse(json)
             let root = doc.RootElement
 
             match root.TryGetProperty("offset") with

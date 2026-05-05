@@ -1094,8 +1094,24 @@ type internal FcsBridge() =
                 match args.filter with
                 | None -> None
                 | Some pattern ->
+                    if pattern.Length > 1024 then
+                        invalidArg (nameof args.filter) $"filter pattern must not exceed 1024 characters (got {pattern.Length})"
+
                     try
-                        Some(System.Text.RegularExpressions.Regex(pattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                        // NonBacktracking eliminates catastrophic-backtracking risk for
+                        // user-supplied patterns like (a+)+$. A 250ms timeout is a belt-
+                        // and-suspenders guard; NonBacktracking should never time out.
+                        let opts =
+                            System.Text.RegularExpressions.RegexOptions.NonBacktracking
+                            ||| System.Text.RegularExpressions.RegexOptions.IgnoreCase
+
+                        Some(
+                            System.Text.RegularExpressions.Regex(
+                                pattern,
+                                opts,
+                                TimeSpan.FromMilliseconds 250.0
+                            )
+                        )
                     with ex ->
                         invalidArg (nameof args.filter) $"Invalid filter regex: %s{ex.Message}"
 
@@ -1108,7 +1124,11 @@ type internal FcsBridge() =
                 let matchesRegex =
                     match filterRegex with
                     | None -> true
-                    | Some rx -> rx.IsMatch(name) || rx.IsMatch(signature)
+                    | Some rx ->
+                        try
+                            rx.IsMatch(name) || rx.IsMatch(signature)
+                        with
+                        | :? System.Text.RegularExpressions.RegexMatchTimeoutException -> false
 
                 let matchesNameContains =
                     match nameContains with
@@ -1229,7 +1249,10 @@ type internal FcsBridge() =
 
                         JsonArray(withCount) :> JsonNode
                     else
-                        JsonArray(filteredEntries) :> JsonNode
+                        // Deep-clone each entry to release ownership from the source
+                        // JsonArray returned by FileOutline — a JsonNode may only have
+                        // one parent, so re-parenting without cloning throws.
+                        JsonArray(filteredEntries |> Array.map (fun e -> e.DeepClone())) :> JsonNode
 
                 fileEntries.Add(
                     jobj
