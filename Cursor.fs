@@ -58,8 +58,11 @@ let tryDecode (cursor: string) : Result<CursorPayload, string> =
 open FsLangMcp.Types
 
 /// Build the cursor-aware pagination envelope fields.
+/// `unitName` names the paginated unit ("files", "uses", "symbols", …) and is
+/// surfaced inside `totalEstimate` so callers can self-describe their page shape.
 /// Returns a list of (name, JsonNode) pairs to be merged into the tool response object.
 let paginationFields
+    (unitName: string)
     (totalCount: int)
     (pageOffset: int)
     (pageSize: int)
@@ -74,6 +77,6 @@ let paginationFields
 
     [ "truncated", jbool isTruncated
       "nextCursor", nextCursorNode
-      "totalEstimate", jobj [ "files", jint totalCount ]
+      "totalEstimate", jobj [ unitName, jint totalCount ]
       "pageOffset", jint pageOffset
       "pageSize", jint pageSize ]

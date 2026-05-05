@@ -237,7 +237,8 @@ let ``FcsBridge project symbol cache is keyed by auto-discovered project`` () : 
                       projectOptions = None
                       symbolQuery = "onlyInProjectA"
                       exact = Some true
-                      maxResults = Some 10 }
+                      maxResults = Some 10
+                      cursor = None }
                 )
 
             let! resultB =
@@ -248,7 +249,8 @@ let ``FcsBridge project symbol cache is keyed by auto-discovered project`` () : 
                       projectOptions = None
                       symbolQuery = "onlyInProjectB"
                       exact = Some true
-                      maxResults = Some 10 }
+                      maxResults = Some 10
+                      cursor = None }
                 )
 
             Assert.Equal("succeeded", resultA["status"].GetValue<string>())
@@ -486,7 +488,8 @@ let ``fcs_find_symbol groups definitions and references with source context`` ()
                       exact = Some true
                       maxResults = Some 20
                       contextLines = Some 1
-                      includeDeclaration = Some true }
+                      includeDeclaration = Some true
+                      cursor = None }
                 )
 
             let symbols = result["symbols"] :?> JsonArray
@@ -602,7 +605,8 @@ let ``fcs_find_symbol returns InvalidArgument error when path is a directory`` (
                   exact = Some false
                   maxResults = Some 10
                   contextLines = Some 0
-                  includeDeclaration = Some true }
+                  includeDeclaration = Some true
+                  cursor = None }
             )
 
         Assert.Equal("error", result["status"].GetValue<string>())
@@ -627,7 +631,8 @@ let ``fcs_find_symbol returns InvalidArgument error when path does not exist`` (
                   exact = Some false
                   maxResults = Some 10
                   contextLines = Some 0
-                  includeDeclaration = Some true }
+                  includeDeclaration = Some true
+                  cursor = None }
             )
 
         Assert.Equal("error", result["status"].GetValue<string>())

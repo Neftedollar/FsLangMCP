@@ -107,7 +107,7 @@ let ``tryDecode returns Error when offset is a string`` () =
 
 [<Fact>]
 let ``paginationFields truncated=false when all items fit on one page`` () =
-    let fields = paginationFields 10 0 50 10
+    let fields = paginationFields "files" 10 0 50 10
     let dict = fields |> Map.ofList
 
     let truncated = dict["truncated"].GetValue<bool>()
@@ -115,7 +115,7 @@ let ``paginationFields truncated=false when all items fit on one page`` () =
 
 [<Fact>]
 let ``paginationFields truncated=true when more items remain`` () =
-    let fields = paginationFields 100 0 50 50
+    let fields = paginationFields "files" 100 0 50 50
     let dict = fields |> Map.ofList
 
     let truncated = dict["truncated"].GetValue<bool>()
@@ -123,14 +123,14 @@ let ``paginationFields truncated=true when more items remain`` () =
 
 [<Fact>]
 let ``paginationFields nextCursor is null when not truncated`` () =
-    let fields = paginationFields 10 0 50 10
+    let fields = paginationFields "files" 10 0 50 10
     let dict = fields |> Map.ofList
 
     Assert.Null(dict["nextCursor"])
 
 [<Fact>]
 let ``paginationFields nextCursor is a non-null string when truncated`` () =
-    let fields = paginationFields 100 0 50 50
+    let fields = paginationFields "files" 100 0 50 50
     let dict = fields |> Map.ofList
 
     let cursor = dict["nextCursor"]
@@ -141,7 +141,7 @@ let ``paginationFields nextCursor is a non-null string when truncated`` () =
 [<Fact>]
 let ``paginationFields nextCursor offset equals pageOffset plus pageCount`` () =
     // First page: offset 0, size 50, got 50 items
-    let fields = paginationFields 120 0 50 50
+    let fields = paginationFields "files" 120 0 50 50
     let dict = fields |> Map.ofList
     let cursorStr = dict["nextCursor"].GetValue<string>()
 
@@ -152,7 +152,7 @@ let ``paginationFields nextCursor offset equals pageOffset plus pageCount`` () =
 [<Fact>]
 let ``paginationFields second page cursor offset advances correctly`` () =
     // Second page: offset 50, pageSize 50, got 50 → expect cursor at 100
-    let fields = paginationFields 150 50 50 50
+    let fields = paginationFields "files" 150 50 50 50
     let dict = fields |> Map.ofList
     let cursorStr = dict["nextCursor"].GetValue<string>()
 
@@ -162,11 +162,26 @@ let ``paginationFields second page cursor offset advances correctly`` () =
 
 [<Fact>]
 let ``paginationFields totalEstimate files equals totalCount`` () =
-    let fields = paginationFields 87 0 50 50
+    let fields = paginationFields "files" 87 0 50 50
     let dict = fields |> Map.ofList
     let totalEstimate = dict["totalEstimate"]
     let filesCount = totalEstimate["files"].GetValue<int>()
     Assert.Equal(87, filesCount)
+
+[<Fact>]
+let ``paginationFields totalEstimate uses caller's unitName`` () =
+    // Each tool paginates a different unit ("uses", "symbols", …); the helper
+    // must surface the unit caller passed in.
+    let fields = paginationFields "uses" 42 0 10 10
+    let dict = fields |> Map.ofList
+    let totalEstimate = dict["totalEstimate"]
+    Assert.Equal(42, totalEstimate["uses"].GetValue<int>())
+    Assert.Null(totalEstimate["files"])
+
+    let fields2 = paginationFields "symbols" 7 0 10 7
+    let dict2 = fields2 |> Map.ofList
+    let totalEstimate2 = dict2["totalEstimate"]
+    Assert.Equal(7, totalEstimate2["symbols"].GetValue<int>())
 
 // ─── D. Filter regex matching (isolated helper simulation) ────────────────────
 

@@ -76,7 +76,10 @@ type FcsProjectSymbolUsesArgs =
       projectOptions: string list option
       symbolQuery: string
       exact: bool option
-      maxResults: int option }
+      /// Maximum uses returned per page. Default: 500.
+      maxResults: int option
+      /// Opaque cursor from a prior call's `nextCursor`. Omit for the first page.
+      cursor: string option }
 
 type FcsFileOutlineArgs =
     { path: string
@@ -94,9 +97,12 @@ type FcsFindSymbolArgs =
       projectOptions: string list option
       symbolQuery: string
       exact: bool option
+      /// Maximum symbol groups returned per page. Default: 500.
       maxResults: int option
       contextLines: int option
-      includeDeclaration: bool option }
+      includeDeclaration: bool option
+      /// Opaque cursor from a prior call's `nextCursor`. Omit for the first page.
+      cursor: string option }
 
 type FcsSymbolAtWordArgs =
     { path: string
