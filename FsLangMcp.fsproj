@@ -35,8 +35,8 @@
       <IncludeAssets>build</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="FsMcp.Server" Version="1.0.1" />
-    <PackageReference Include="FsMcp.TaskApi" Version="1.0.1" />
+    <PackageReference Include="FsMcp.Server" Version="1.1.1" />
+    <PackageReference Include="FsMcp.TaskApi" Version="1.1.1" />
     <PackageReference Include="G-Research.FSharp.Analyzers" Version="0.22.0" GeneratePathProperty="true">
       <IncludeAssets>analyzers</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
