@@ -835,11 +835,15 @@ type internal FsAutoCompleteBridge() =
             args.text,
             "textDocument/codeAction",
             fun uri ->
-                let pos = jobj [ "line", jint args.line; "character", jint args.character ]
+                // Each JsonNode has a single Parent reference; assigning the same instance
+                // as both `start` and `end` raises InvalidOperationException at the second
+                // attach. Build two distinct position nodes.
+                let posNode () =
+                    jobj [ "line", jint args.line; "character", jint args.character ] :> JsonNode
 
                 jobj
                     [ "textDocument", jobj [ "uri", jstr uri ]
-                      "range", jobj [ "start", pos :> JsonNode; "end", pos :> JsonNode ]
+                      "range", jobj [ "start", posNode (); "end", posNode () ]
                       "context", jobj [ "diagnostics", JsonArray() :> JsonNode ] ]
         )
 
