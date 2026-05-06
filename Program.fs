@@ -55,7 +55,8 @@ let private parseProjInfoOutput (path: string) (exitCode: int) (stdout: string) 
                 match arr.[0] with
                 | :? JsonObject as obj -> obj
                 | other ->
-                    jobj [ "warning", jstr (sprintf "unexpected element type: %s" (other.GetValueKind().ToString())) ]
+                    let kind = other.GetValueKind()
+                    jobj [ "warning", jstr (sprintf "unexpected element type: %s" (kind.ToString())) ]
             | :? JsonObject as obj -> obj
             | _ -> JsonObject()
 
