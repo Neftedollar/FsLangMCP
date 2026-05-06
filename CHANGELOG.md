@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-05-06
+
+### Fixed
+
+- **`textDocument_codeAction` no longer raises `InvalidOperationException` on every call.** `LspBridge.CodeAction` was attaching the same `JsonNode` instance as both `range.start` and `range.end` of the request payload — the second attach failed because each `JsonNode` has a single `Parent`. Build two distinct position nodes. Originally caught in PR #43; landed in #98. (P1)
+- **`Cursor.tryDecode` returns a structured `Error` for non-object JSON payloads** (`[]`, `[1,2,3]`, `"x"`, `42`, `true`, `null`) instead of escaping as `InvalidOperationException`. Originally caught in PR #84; landed in #98.
+- **`fcs_project_outline` rejects pathological pagination args up front.** `maxFiles=0` previously emitted empty pages with `truncated=true` and a non-advancing `nextCursor` — a non-terminating loop for cursor-following clients. `maxResultsPerFile<0` was similarly silent. Both now raise `ArgumentException` immediately. Originally caught in PR #84; landed in #98.
+- **`validateSourcePath` accepts `text = Some ""` as a valid unsaved-buffer state** instead of forcing `File.Exists` on the path. Restores the new-empty-file editor flow. Originally caught in PR #83; landed in #98.
+- **`fsharp_runtime_status` survives concurrent FSAC restarts.** `Process.HasExited` could throw if the handle was disposed by a parallel `set_project` / stop. Wrapped in a small live-check helper that treats any read failure as "no live child", returning an empty `children` list rather than failing the whole diagnostic call. Originally caught in PR #85; landed in #98.
+- **`publish.yml` `workflow_dispatch` fails fast on non-tag refs.** Manual dispatches from the default branch produced `PackageVersion = "main"` and an opaque `dotnet pack` failure several minutes into the run. An early guard step now refuses anything that isn't a `v*` tag. Originally caught in PR #89; landed in #98.
+
+### Changed
+
+- **Test project layout: linked-source `<Compile Include="../../*.fs">` → `<ProjectReference>`** with `[<assembly: InternalsVisibleTo("FsLangMcp.Tests")>]` baked into the production fsproj (per ADR-0001 in #95, implemented in #97). Closes the linked-source incidents that affected Stryker (#88) and the XPlat Code Coverage collector (#92). User-facing impact: the published nupkg now carries an `InternalsVisibleTo` metadata attribute referencing the test assembly — informational, no behavior change. Coverage gate recalibrated 70% → 55% to reflect the genuine production-only baseline (the pre-migration 78% was inflated by self-instrumented test code).
+
 ## [0.5.1] - 2026-05-06
 
 ### Changed
@@ -75,6 +90,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Earlier releases (0.2.0, 0.3.0, 0.3.1, 0.4.0) shipped without tags;
   backfilling them would point at synthetic refs.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.5.2
 [0.5.1]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.5.1
 [0.5.0]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.5.0
