@@ -30,17 +30,15 @@ jobs:
         run: dotnet build FsLangMcp.slnx --no-restore --configuration Release --warnaserror
 
       - name: Test (with coverage)
-        # coverlet.msbuild with IncludeTestAssembly=true is required because this project
-        # compiles source files directly into the test assembly via linked <Compile> items
-        # (no separate app dll exists for the XPlat collector to instrument).
+        # coverlet.msbuild instruments FsLangMcp.dll via the ProjectReference graph (ADR-0001).
+        # IncludeTestAssembly is no longer needed — prod and test code are in separate assemblies.
         run: |
           dotnet test FsLangMcp.slnx --no-build --no-restore --configuration Release \
             /p:CollectCoverage=true \
             /p:CoverletOutputFormat=cobertura \
-            /p:CoverletOutput=./coverage/ \
-            /p:IncludeTestAssembly=true
+            /p:CoverletOutput=./coverage/
 
-      - name: Coverage gate (≥ 70% line)
+      - name: Coverage gate (≥ 55% line)
         run: |
           set -e
           # Find the cobertura xml produced by coverlet.msbuild
@@ -52,9 +50,13 @@ jobs:
           LINE_RATE=$(grep -oP 'line-rate="[0-9.]+"' "$COVERAGE_FILE" | head -1 | grep -oP '[0-9.]+')
           PERCENT=$(awk -v r="$LINE_RATE" 'BEGIN{printf "%.1f", r*100}')
           echo "Line coverage: ${PERCENT}%"
-          # Fail if < 70.0
-          awk -v r="$LINE_RATE" 'BEGIN{exit !(r >= 0.70)}' || {
-            echo "::error::Coverage ${PERCENT}% < 70% threshold"; exit 1
+          # Threshold recalibrated to 55% after ADR-0001 migration: the old 70% gate was measuring
+          # FsLangMcp.Tests.dll (which included production source via linked <Compile> items), so
+          # test-file lines were counted as covered. The new gate measures FsLangMcp.dll only.
+          # Raising the threshold is a separate follow-up once LspBridge.fs and Program.fs
+          # get integration test coverage.
+          awk -v r="$LINE_RATE" 'BEGIN{exit !(r >= 0.55)}' || {
+            echo "::error::Coverage ${PERCENT}% < 55% threshold"; exit 1
           }
 
       - name: Upload coverage artifact
