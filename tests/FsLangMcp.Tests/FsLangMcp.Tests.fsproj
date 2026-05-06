@@ -25,6 +25,7 @@
     <Compile Include="BoundedCacheTests.fs" />
     <Compile Include="FcsBridgeTests.fs" />
     <Compile Include="OutlinePaginationTests.fs" />
+    <Compile Include="CursorPropertyTests.fs" />
     <Compile Include="OutlineE2ETests.fs" />
     <Compile Include="SymbolPaginationTests.fs" />
   </ItemGroup>
@@ -59,6 +60,7 @@
       <IncludeAssets>build; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
+    <PackageReference Include="FsCheck.Xunit" Version="3.3.3" />
   </ItemGroup>
 
 </Project>
