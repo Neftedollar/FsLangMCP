@@ -124,6 +124,15 @@ Environment fallbacks still work:
 - `FSAC_ARGS`
 - `FSA_PROJECT_PATH`
 
+### Garbage collector — tuned for stdio servers
+
+FsLangMCP ships with **Workstation GC + Concurrent GC** baked in via `runtimeconfig.template.json`. This is the recommended profile for stdio MCP servers per [FsMcp's runtime tuning guide](https://github.com/Neftedollar/FsMcp/blob/main/docs/runtime-tuning.md): an FCS workload is bursty (load → idle → next request), and Server GC's "don't release until OS pressure" produces alarming RSS growth on dev laptops that won't trigger pressure events.
+
+Operators can override at the env-var level if needed (env always wins over `runtimeconfig`):
+
+- `DOTNET_gcServer=1` — opt back into Server GC (higher throughput, holds memory longer)
+- `DOTNET_GCHeapHardLimitPercent=0xA` — cap heap at 10% of RAM (works with either GC mode)
+
 ## MCP Stdio Config (Installed Tool)
 
 ```json

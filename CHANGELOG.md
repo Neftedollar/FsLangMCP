@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Bumped `FsMcp.Server` and `FsMcp.TaskApi` from 1.0.1 to 1.1.1.** No source changes required; build passes with 0 warnings at WarningLevel 5. New surface in 1.1.x (resources/subscribe, subscribeToolsChanged, HTTP RunSessionHandler) is not consumed by FsLangMCP — our tool list is static and we run on stdio only.
+- **Workstation GC + Concurrent GC defaults** baked into the published tool via `runtimeconfig.template.json`. Aligned with FsMcp 1.1.0's runtime-tuning guide for stdio servers. Operators can override with `DOTNET_gcServer=1` if they want Server GC. Reduces apparent RSS growth on dev laptops without affecting throughput at typical agent request rates.
+
 ## [0.5.0] - 2026-05-06
 
 ### Added
