@@ -29,5 +29,38 @@ jobs:
       - name: Build
         run: dotnet build FsLangMcp.slnx --no-restore --configuration Release --warnaserror
 
-      - name: Test
-        run: dotnet test FsLangMcp.slnx --no-build --no-restore --configuration Release
+      - name: Test (with coverage)
+        # coverlet.msbuild with IncludeTestAssembly=true is required because this project
+        # compiles source files directly into the test assembly via linked <Compile> items
+        # (no separate app dll exists for the XPlat collector to instrument).
+        run: |
+          dotnet test FsLangMcp.slnx --no-build --no-restore --configuration Release \
+            /p:CollectCoverage=true \
+            /p:CoverletOutputFormat=cobertura \
+            /p:CoverletOutput=./coverage/ \
+            /p:IncludeTestAssembly=true
+
+      - name: Coverage gate (≥ 70% line)
+        run: |
+          set -e
+          # Find the cobertura xml produced by coverlet.msbuild
+          COVERAGE_FILE=$(find . -name 'coverage.cobertura.xml' | head -1)
+          if [ -z "$COVERAGE_FILE" ]; then
+            echo "::error::No coverage file produced"; exit 1
+          fi
+          # Extract line-rate (decimal 0..1) from the root <coverage> element
+          LINE_RATE=$(grep -oP 'line-rate="[0-9.]+"' "$COVERAGE_FILE" | head -1 | grep -oP '[0-9.]+')
+          PERCENT=$(awk -v r="$LINE_RATE" 'BEGIN{printf "%.1f", r*100}')
+          echo "Line coverage: ${PERCENT}%"
+          # Fail if < 70.0
+          awk -v r="$LINE_RATE" 'BEGIN{exit !(r >= 0.70)}' || {
+            echo "::error::Coverage ${PERCENT}% < 70% threshold"; exit 1
+          }
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-cobertura
+          path: '**/coverage.cobertura.xml'
+          if-no-files-found: warn

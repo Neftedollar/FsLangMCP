@@ -5,3 +5,6 @@ nupkg/
 .claude/
 tests/*/bin/
 tests/*/obj/
+coverage*/
+tests/*/coverage*/
+CoverletSourceRootsMapping_*
