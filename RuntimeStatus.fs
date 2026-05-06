@@ -208,10 +208,17 @@ let buildSnapshot
 
     let processPart: JsonNode = jobj processFields
 
+    // p.HasExited can throw if the Process handle has been disposed by a concurrent
+    // SetProject / StopLspUnsafe between when fsacProcess was sampled and now. Treat
+    // any failure to read the handle as "no live child" rather than letting the
+    // diagnostics tool fail with an infra error during FSAC restarts.
+    let isLive (p: Process) =
+        try not p.HasExited with _ -> false
+
     let children: JsonNode =
         if includeChildren then
             match fsacProcess with
-            | Some p when not p.HasExited ->
+            | Some p when isLive p ->
                 let childJson = childProcessJson p
                 JsonArray(childJson)
             | _ -> JsonArray()
