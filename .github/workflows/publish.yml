@@ -1,9 +1,18 @@
-# Publishes the NuGet package when a version tag (v*) is pushed.
-# Required: set NUGET_API_KEY in repo Settings → Secrets → Actions
+# Publishes the NuGet package on a v* tag push (or manual dispatch).
+#
+# Auth: NuGet Trusted Publishing via OIDC (NuGet/login@v1) — no long-lived
+# API keys. Configured at https://www.nuget.org/account/trusted-publishing
+# for repository Neftedollar/FsLangMCP, workflow publish.yml, environment
+# `release`. Pattern mirrors Neftedollar/FsMcp's publish flow.
+#
+# Version source of truth is the git tag: PackageVersion is overridden at
+# pack time from the tag name (v0.5.0 → 0.5.0), so patch releases can ship
+# by tag alone without touching FsLangMcp.fsproj.
 
 name: Publish NuGet
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
@@ -11,27 +20,62 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    concurrency:
-      group: nuget-publish
-      cancel-in-progress: false
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: "10.0.x"
+          dotnet-version: 10.0.x
 
       - name: Restore
-        run: dotnet restore
+        run: dotnet restore FsLangMcp.slnx
 
       - name: Build
-        run: dotnet build --configuration Release --no-restore
+        run: dotnet build FsLangMcp.slnx --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test FsLangMcp.slnx --configuration Release --no-build
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Pack
-        run: dotnet pack --configuration Release --no-build
+        run: |
+          dotnet pack FsLangMcp.fsproj \
+            --configuration Release \
+            --no-build \
+            -p:PackageVersion=${{ steps.version.outputs.VERSION }} \
+            -o ./nupkgs
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuget-packages
+          path: ./nupkgs/*.nupkg
+          if-no-files-found: error
+
+      - name: NuGet login (Trusted Publishing)
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: Neftedollar
 
       - name: Push to NuGet
-        run: dotnet nuget push "nupkg/*.nupkg" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+        run: |
+          dotnet nuget push "./nupkgs/*.nupkg" \
+            --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: ./nupkgs/*.nupkg
