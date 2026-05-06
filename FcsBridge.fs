@@ -611,11 +611,12 @@ type internal FcsBridge() =
                     checkResults.GetAllUsesOfAllSymbolsInFile()
                     |> Seq.filter (fun symbolUse -> includeAllUses || symbolUse.IsFromDefinition)
                     |> Seq.distinctBy (fun symbolUse ->
+                        let r = symbolUse.Range
                         symbolUse.Symbol.FullName,
-                        symbolUse.Range.StartLine,
-                        symbolUse.Range.StartColumn,
-                        symbolUse.Range.EndLine,
-                        symbolUse.Range.EndColumn)
+                        r.StartLine,
+                        r.StartColumn,
+                        r.EndLine,
+                        r.EndColumn)
                     |> Seq.truncate maxResults
                     |> Seq.map symbolUseToJson
                     |> Seq.toArray
@@ -666,12 +667,15 @@ type internal FcsBridge() =
                     |> Seq.filter _.IsFromDefinition
                     |> Seq.filter (fun symbolUse -> includeLocal || not (isNoisyLocalSymbol symbolUse))
                     |> Seq.distinctBy (fun symbolUse ->
+                        let r = symbolUse.Range
                         symbolUse.Symbol.FullName,
-                        symbolUse.Range.StartLine,
-                        symbolUse.Range.StartColumn,
-                        symbolUse.Range.EndLine,
-                        symbolUse.Range.EndColumn)
-                    |> Seq.sortBy (fun symbolUse -> symbolUse.Range.StartLine, symbolUse.Range.StartColumn)
+                        r.StartLine,
+                        r.StartColumn,
+                        r.EndLine,
+                        r.EndColumn)
+                    |> Seq.sortBy (fun symbolUse ->
+                        let r = symbolUse.Range
+                        r.StartLine, r.StartColumn)
                     |> Seq.truncate maxResults
                     |> Seq.map (fun symbolUse ->
                         jobj
@@ -763,7 +767,8 @@ type internal FcsBridge() =
                 allUses
                 |> Array.filter (fun symbolUse -> symbolMatches symbolUse.Symbol)
                 |> Array.sortBy (fun symbolUse ->
-                    symbolUse.FileName, symbolUse.Range.StartLine, symbolUse.Range.StartColumn)
+                    let r = symbolUse.Range
+                    symbolUse.FileName, r.StartLine, r.StartColumn)
 
             let totalMatched = sortedMatches.Length
 
@@ -839,15 +844,17 @@ type internal FcsBridge() =
                 |> Seq.filter (fun symbolUse -> symbolMatches query exact symbolUse.Symbol)
                 |> Seq.filter (fun symbolUse -> includeDeclaration || not symbolUse.IsFromDefinition)
                 |> Seq.sortBy (fun symbolUse ->
-                    symbolUse.Symbol.FullName, symbolUse.FileName, symbolUse.Range.StartLine, symbolUse.Range.StartColumn)
+                    let r = symbolUse.Range
+                    symbolUse.Symbol.FullName, symbolUse.FileName, r.StartLine, r.StartColumn)
                 |> Seq.toArray
 
             let useToJson (symbolUse: FSharpSymbolUse) =
-                let context = lineContextToJson contextLines symbolUse.FileName symbolUse.Range.StartLine
+                let r = symbolUse.Range
+                let context = lineContextToJson contextLines symbolUse.FileName r.StartLine
 
                 jobj
                     [ "file", jstr (normalizePath symbolUse.FileName)
-                      "range", rangeToJson symbolUse.Range
+                      "range", rangeToJson r
                       "isDefinition", jbool symbolUse.IsFromDefinition
                       "isReference", jbool symbolUse.IsFromUse
                       "lineText", context["lineText"].DeepClone()

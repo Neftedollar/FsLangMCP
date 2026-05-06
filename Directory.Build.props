@@ -2,6 +2,8 @@
   <PropertyGroup>
     <FSharpCompilerServiceVersion>43.12.203</FSharpCompilerServiceVersion>
     <FSharpCoreImplicitPackageVersion>10.1.203</FSharpCoreImplicitPackageVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningLevel>5</WarningLevel>
     <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1608</WarningsNotAsErrors>
   </PropertyGroup>
 </Project>
