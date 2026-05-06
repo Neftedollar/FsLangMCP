@@ -604,3 +604,47 @@ let ``ProjectOutline summaryOnly maxResultsPerFile=1 caps entries but memberCoun
         finally
             if Directory.Exists(root) then Directory.Delete(root, true)
     }
+
+// ─── L. Reject pathological pagination args (regression test for review feedback)
+//
+// maxFiles=0 would return empty pages with truncated=true and a nextCursor whose
+// offset never advances — a non-terminating loop for cursor-following clients.
+// ProjectOutline must reject this up front rather than emit a malformed envelope.
+
+[<Fact>]
+let ``ProjectOutline rejects maxFiles=0 with InvalidArgException`` () : System.Threading.Tasks.Task =
+    task {
+        let projectPath, root = createFixtureProject ()
+        let bridge = FcsBridge()
+
+        try
+            let! ex =
+                Assert.ThrowsAsync<ArgumentException>(fun () ->
+                    bridge.ProjectOutline({ defaultArgs projectPath with maxFiles = Some 0 })
+                    :> System.Threading.Tasks.Task)
+
+            Assert.Contains("maxFiles", ex.Message)
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``ProjectOutline rejects negative maxResultsPerFile`` () : System.Threading.Tasks.Task =
+    task {
+        let projectPath, root = createFixtureProject ()
+        let bridge = FcsBridge()
+
+        try
+            let! ex =
+                Assert.ThrowsAsync<ArgumentException>(fun () ->
+                    bridge.ProjectOutline(
+                        { defaultArgs projectPath with
+                            maxFiles = Some 10
+                            maxResultsPerFile = Some -1 }
+                    )
+                    :> System.Threading.Tasks.Task)
+
+            Assert.Contains("maxResultsPerFile", ex.Message)
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }

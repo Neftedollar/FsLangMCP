@@ -305,7 +305,10 @@ type internal FcsBridge() =
     // Returns Some errorNode when validation fails; None when the path is acceptable.
     let validateSourcePath (toolName: string) (text: string option) (path: string) : JsonNode option =
         let fullPath = normalizePath path
-        let hasText = text |> Option.exists (fun t -> t <> "")
+        // The tool contract says supplying `text` carries unsaved buffer content; a new
+        // empty file is a valid editor state. Treat any Some _ — including Some "" — as
+        // a provided buffer; only None means "no buffer, must exist on disk".
+        let hasText = text |> Option.isSome
 
         if Directory.Exists(fullPath) then
             Some(
@@ -1206,7 +1209,17 @@ type internal FcsBridge() =
             // Callers that previously relied on the effectively-unlimited behaviour
             // must now opt in via explicit larger values or cursor pagination.
             let pageSize = args.maxFiles |> Option.defaultValue 50
+
+            // pageSize=0 would emit empty pages with truncated=true and a nextCursor
+            // whose offset never advances — a non-terminating loop for cursor-following
+            // clients. Reject up front.
+            if pageSize < 1 then
+                invalidArg (nameof args.maxFiles) $"maxFiles must be >= 1 (got {pageSize})"
+
             let maxResultsPerFile = args.maxResultsPerFile |> Option.defaultValue 30
+
+            if maxResultsPerFile < 0 then
+                invalidArg (nameof args.maxResultsPerFile) $"maxResultsPerFile must be >= 0 (got {maxResultsPerFile})"
             let summaryOnly = args.summaryOnly |> Option.defaultValue true
 
             // ── Build regex / substring matchers ───────────────────────────────
