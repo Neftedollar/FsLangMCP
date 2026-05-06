@@ -4,10 +4,13 @@ module FsLangMcp.Tests.CursorPropertyTests
 /// and rejection of malformed inputs. These complement the example tests in
 /// OutlinePaginationTests.fs by exploring boundary cases via random generation.
 
+open System
+open System.Text
 open System.Text.Json.Nodes
 open FsCheck
 open FsCheck.Xunit
 open FsCheck.FSharp
+open global.Xunit
 open FsLangMcp.Cursor
 
 // ─── Round-trip ───────────────────────────────────────────────────────────────
@@ -85,3 +88,25 @@ let ``paginationFields: totalEstimate carries the caller-supplied unitName``
     let m = fields |> Map.ofList
     let totalEstimate = m.["totalEstimate"]
     totalEstimate.[unit].GetValue<int>() = total
+
+// ─── Non-object cursor payloads (regression test for review feedback) ────────
+//
+// `tryDecode` previously called `root.TryGetProperty("offset")` without ensuring
+// root.ValueKind = Object. For Base64 payloads decoding to valid non-object JSON
+// (arrays, scalars), TryGetProperty throws InvalidOperationException — bypassing
+// the Result-based error path. These tests pin the structured-error contract.
+
+let private encodeRaw (json: string) =
+    Convert.ToBase64String(Encoding.UTF8.GetBytes(json))
+
+[<Theory>]
+[<InlineData("[]")>]
+[<InlineData("[1,2,3]")>]
+[<InlineData("\"x\"")>]
+[<InlineData("42")>]
+[<InlineData("true")>]
+[<InlineData("null")>]
+let ``tryDecode rejects non-object JSON payloads with a structured Error`` (json: string) =
+    match tryDecode (encodeRaw json) with
+    | Error _ -> ()
+    | Ok _ -> Assert.Fail($"Expected Error for non-object payload {json}")

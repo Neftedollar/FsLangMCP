@@ -26,6 +26,17 @@ jobs:
       id-token: write
 
     steps:
+      - name: Guard — refuse non-tag refs
+        # workflow_dispatch defaults to running against the default branch, where
+        # GITHUB_REF_NAME = "main". The pack step below derives PackageVersion from
+        # ${GITHUB_REF_NAME#v}, which would emit "main" — not a valid NuGet version.
+        # Force callers to dispatch against an explicit v* tag (UI: "Use workflow from"
+        # → "Tags" → vX.Y.Z) or push a tag.
+        if: ${{ github.ref_type != 'tag' || !startsWith(github.ref_name, 'v') }}
+        run: |
+          echo "::error::This workflow must run against a v* tag. Got ref_type=${{ github.ref_type }} ref_name=${{ github.ref_name }}."
+          exit 1
+
       - uses: actions/checkout@v6
 
       - name: Setup .NET
