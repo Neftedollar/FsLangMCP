@@ -39,6 +39,12 @@ let tryDecode (cursor: string) : Result<CursorPayload, string> =
             use doc = JsonDocument.Parse(json)
             let root = doc.RootElement
 
+            // TryGetProperty throws InvalidOperationException unless the root is an
+            // object. Reject arrays / scalars with a structured Error rather than letting
+            // the exception escape and surface as an unexpected server error.
+            if root.ValueKind <> JsonValueKind.Object then
+                Error "cursor payload must be a JSON object"
+            else
             match root.TryGetProperty("offset") with
             | true, offsetEl ->
                 match offsetEl.ValueKind with
