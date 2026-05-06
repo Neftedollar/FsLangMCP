@@ -7,16 +7,10 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="../../BoundedCache.fs" Link="BoundedCache.fs" />
-    <Compile Include="../../Types.fs" Link="Types.fs" />
-    <Compile Include="../../ProjectFiles.fs" Link="ProjectFiles.fs" />
-    <Compile Include="../../Cursor.fs" Link="Cursor.fs" />
-    <Compile Include="../../ProjectInspection.fs" Link="ProjectInspection.fs" />
-    <Compile Include="../../ProjectHealth.fs" Link="ProjectHealth.fs" />
-    <Compile Include="../../LspBridge.fs" Link="LspBridge.fs" />
-    <Compile Include="../../FcsBridge.fs" Link="FcsBridge.fs" />
-    <Compile Include="../../Tools.fs" Link="Tools.fs" />
-    <Compile Include="../../RuntimeStatus.fs" Link="RuntimeStatus.fs" />
+    <ProjectReference Include="../../FsLangMcp.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Compile Include="VerifyModuleInitializer.fs" />
     <Compile Include="RuntimeStatusTests.fs" />
     <Compile Include="TypesToolsTests.fs" />
@@ -54,9 +48,9 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <!-- coverlet.msbuild instruments the test assembly (which directly compiles the source files
-         via linked <Compile> items). IncludeTestAssembly=true is required because FsLangMcp.Tests.dll
-         contains both the production and test code — there is no separate app dll. -->
+    <!-- coverlet.msbuild instruments FsLangMcp.dll (referenced via <ProjectReference>).
+         The default behaviour — exclude the test assembly from coverage — is correct now that
+         prod and test code live in separate assemblies (per ADR-0001). -->
     <PackageReference Include="coverlet.msbuild" Version="10.0.*">
       <IncludeAssets>build; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>

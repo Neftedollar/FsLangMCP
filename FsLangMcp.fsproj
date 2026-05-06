@@ -30,6 +30,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>FsLangMcp.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="FSharp.Compiler.Service" Version="$(FSharpCompilerServiceVersion)" />
     <PackageReference Include="FSharp.Analyzers.Build" Version="0.5.*">
       <IncludeAssets>build</IncludeAssets>
