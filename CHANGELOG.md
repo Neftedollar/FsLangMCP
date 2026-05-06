@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-06
+
+### Changed
+
+- **Workstation GC + Concurrent GC defaults** baked into the published tool via `runtimeconfig.template.json`. The default Server GC commits memory aggressively and only releases under OS pressure — a poor fit for stdio MCP servers, which are bursty (load → idle → next FCS request) and rarely trigger pressure events on dev laptops. Workstation GC returns committed memory promptly while idle, dramatically reducing apparent RSS growth without measurable throughput impact at typical agent request rates. Operators can opt back into Server GC with `DOTNET_gcServer=1` (env always wins over `runtimeconfig`). Aligned with [FsMcp 1.1.0's runtime-tuning guide](https://github.com/Neftedollar/FsMcp/blob/main/docs/runtime-tuning.md).
+- **Bumped `FsMcp.Server` and `FsMcp.TaskApi` from 1.0.1 to 1.1.1.** No source changes required; build passes with 0 warnings at WarningLevel 5. New surface in 1.1.x (resources/subscribe, subscribeToolsChanged, HTTP RunSessionHandler) is not consumed by FsLangMCP — our tool list is static and we run on stdio only.
+
 ## [0.5.0] - 2026-05-06
 
 ### Added
@@ -68,5 +75,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Earlier releases (0.2.0, 0.3.0, 0.3.1, 0.4.0) shipped without tags;
   backfilling them would point at synthetic refs.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.5.1
 [0.5.0]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.5.0
