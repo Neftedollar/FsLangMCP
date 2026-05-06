@@ -52,6 +52,13 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
+    <!-- coverlet.msbuild instruments the test assembly (which directly compiles the source files
+         via linked <Compile> items). IncludeTestAssembly=true is required because FsLangMcp.Tests.dll
+         contains both the production and test code — there is no separate app dll. -->
+    <PackageReference Include="coverlet.msbuild" Version="10.0.0">
+      <IncludeAssets>build; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
   </ItemGroup>
 
 </Project>
