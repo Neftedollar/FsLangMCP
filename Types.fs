@@ -7,6 +7,7 @@ open System.Text.Json.Nodes
 
 // ─── Tool error DU ─────────────────────────────────────────────────────────────
 
+[<NoComparison>]
 type ToolError =
     | InvalidArgs of string
     | NotReady of string
