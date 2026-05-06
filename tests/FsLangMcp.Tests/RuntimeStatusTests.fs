@@ -1,10 +1,41 @@
 module FsLangMcp.Tests.RuntimeStatusTests
 
+// ─── Snapshot-test pattern (Verify.Xunit) ────────────────────────────────────
+//
+// Several tests below use Verify (snapshot / approval testing) instead of a
+// hand-walked tree of `Assert.NotNull(node …)` calls. Each snapshot covers the
+// full shape of the `runtime_status` JSON payload (or a focused slice of it),
+// which catches regressions in any field — including ones the test author did
+// not anticipate.
+//
+// How snapshots work
+//   • Each `Verifier.Verify(...)` call produces a `*.received.txt` (or .json)
+//     and diffs it against the matching `*.verified.txt`/`*.verified.json`.
+//   • Volatile fields (PIDs, byte counts, GC counters, uptime, …) are scrubbed
+//     by `VerifyModuleInitializer.fs` so they don't cause false diffs.
+//
+// Approving a new / changed snapshot
+//   1. Run the failing test once. Verify writes `<TestName>.received.<ext>`
+//      next to the source file.
+//   2. Inspect the diff — is the change intentional? If yes:
+//        mv <TestName>.received.<ext> <TestName>.verified.<ext>
+//      and commit the .verified.* file.
+//   3. If a *new* field is volatile, add a scrubber to VerifyModuleInitializer
+//      rather than baking the changing value into the snapshot.
+//
+// Adding a snapshot test
+//   • Make the test return `Task` and call `Verifier.Verify(jsonString,
+//     extension = "json").ToTask()`. xUnit will await the task.
+//   • For sub-trees, snapshot just the slice you care about so the snapshot
+//     stays focused (see `…fcs slice…` etc. below).
+
 open System
 open System.Diagnostics
 open System.Text.Json
 open System.Text.Json.Nodes
+open System.Threading.Tasks
 open Xunit
+open VerifyXunit
 open FsLangMcp.Types
 open FsLangMcp.RuntimeStatus
 
@@ -56,6 +87,10 @@ let private getIntAt (parent: JsonNode) (key: string) : int =
 let private getBoolAt (parent: JsonNode) (key: string) : bool =
     parent[key].GetValue<bool>()
 
+let private prettyJson (node: JsonNode) : string =
+    let opts = JsonSerializerOptions(WriteIndented = true)
+    node.ToJsonString(opts)
+
 // ─── Group A: output shape with default args ──────────────────────────────────
 
 [<Fact>]
@@ -63,16 +98,14 @@ let ``buildSnapshot with default args returns status ok`` () =
     let result = buildSnapshot defaultArgs defaultConfig None
     Assert.Equal("ok", getStr result "status")
 
+// Snapshot test: covers the entire default-args shape including process,
+// managedHeap, gcInfo, assemblies, pid, fcs, children. Replaces seven
+// hand-written `Assert.NotNull(node …)` "presence" tests.
 [<Fact>]
-let ``buildSnapshot with default args includes process block`` () =
+let ``buildSnapshot with default args matches snapshot`` () : Task =
     let result = buildSnapshot defaultArgs defaultConfig None
-    Assert.NotNull(node result "process")
-
-[<Fact>]
-let ``buildSnapshot process block includes managedHeap`` () =
-    let result = buildSnapshot defaultArgs defaultConfig None
-    let proc = node result "process"
-    Assert.NotNull(node proc "managedHeap")
+    VerifyModuleInitializer.init ()
+    Verifier.Verify(prettyJson result, extension = "json").ToTask() :> Task
 
 [<Fact>]
 let ``buildSnapshot managedHeap has expected numeric fields`` () =
@@ -94,12 +127,6 @@ let ``buildSnapshot managedHeap has fragmentation between 0 and 1`` () =
     let fragNode = node heap "fragmentation"
     let frag: double = fragNode.GetValue()
     Assert.True(frag >= 0.0 && frag <= 1.0, $"fragmentation should be in [0,1], got {frag}")
-
-[<Fact>]
-let ``buildSnapshot process block includes gcInfo`` () =
-    let result = buildSnapshot defaultArgs defaultConfig None
-    let proc = node result "process"
-    Assert.NotNull(node proc "gcInfo")
 
 [<Fact>]
 let ``buildSnapshot gcInfo has isServerGc field`` () =
@@ -134,12 +161,6 @@ let ``buildSnapshot gcInfo totalAllocated is non-negative`` () =
     Assert.True(allocated >= 0L)
 
 [<Fact>]
-let ``buildSnapshot process block includes assemblies by default`` () =
-    let result = buildSnapshot defaultArgs defaultConfig None
-    let proc = node result "process"
-    Assert.NotNull(node proc "assemblies")
-
-[<Fact>]
 let ``buildSnapshot assemblies loaded count is positive`` () =
     let result = buildSnapshot defaultArgs defaultConfig None
     let proc = node result "process"
@@ -148,22 +169,11 @@ let ``buildSnapshot assemblies loaded count is positive`` () =
     Assert.True(loaded > 0, $"Loaded assembly count should be > 0, got {loaded}")
 
 [<Fact>]
-let ``buildSnapshot process block includes pid by default`` () =
-    let result = buildSnapshot defaultArgs defaultConfig None
-    let proc = node result "process"
-    Assert.NotNull(node proc "pid")
-
-[<Fact>]
 let ``buildSnapshot pid matches current process`` () =
     let result = buildSnapshot defaultArgs defaultConfig None
     let proc = node result "process"
     let pid = getIntAt proc "pid"
     Assert.Equal(Environment.ProcessId, pid)
-
-[<Fact>]
-let ``buildSnapshot includes fcs block by default`` () =
-    let result = buildSnapshot defaultArgs defaultConfig None
-    Assert.NotNull(node result "fcs")
 
 [<Fact>]
 let ``buildSnapshot fcs has projectCacheSize matching config`` () =
@@ -212,11 +222,6 @@ let ``buildSnapshot fcs incrementalBuilders approximateBytes is null`` () =
     let approx = node builders "approximateBytes"
     Assert.Null(approx)
 
-[<Fact>]
-let ``buildSnapshot includes children array by default`` () =
-    let result = buildSnapshot defaultArgs defaultConfig None
-    Assert.NotNull(node result "children")
-
 // ─── Group B: no-FSAC case → children is empty array ────────────────────────
 
 [<Fact>]
@@ -240,11 +245,16 @@ let ``includeFcsCacheStats false omits fcs block`` () =
     let result = buildSnapshot args defaultConfig None
     Assert.Null(node result "fcs")
 
+// Snapshot test: replaces `Assert.NotNull(node result "fcs")` with a structural
+// assertion of the entire fcs slice (incrementalBuilders, projectCacheSize,
+// checker flags). Catches regressions in any fcs-block field.
 [<Fact>]
-let ``includeFcsCacheStats true includes fcs block`` () =
+let ``includeFcsCacheStats true matches fcs slice snapshot`` () : Task =
     let args = { defaultArgs with includeFcsCacheStats = Some true }
     let result = buildSnapshot args defaultConfig None
-    Assert.NotNull(node result "fcs")
+    let fcs = node result "fcs"
+    VerifyModuleInitializer.init ()
+    Verifier.Verify(prettyJson fcs, extension = "json").ToTask() :> Task
 
 [<Fact>]
 let ``includeAssemblyCounts false omits assemblies from process block`` () =
@@ -253,12 +263,16 @@ let ``includeAssemblyCounts false omits assemblies from process block`` () =
     let proc = node result "process"
     Assert.Null(node proc "assemblies")
 
+// Snapshot test: replaces `Assert.NotNull(node proc "assemblies")` with a
+// structural assertion of the assemblies slice.
 [<Fact>]
-let ``includeAssemblyCounts true includes assemblies in process block`` () =
+let ``includeAssemblyCounts true matches assemblies slice snapshot`` () : Task =
     let args = { defaultArgs with includeAssemblyCounts = Some true }
     let result = buildSnapshot args defaultConfig None
     let proc = node result "process"
-    Assert.NotNull(node proc "assemblies")
+    let assemblies = node proc "assemblies"
+    VerifyModuleInitializer.init ()
+    Verifier.Verify(prettyJson assemblies, extension = "json").ToTask() :> Task
 
 [<Fact>]
 let ``includeChildProcesses false omits children block`` () =
@@ -266,11 +280,17 @@ let ``includeChildProcesses false omits children block`` () =
     let result = buildSnapshot args defaultConfig None
     Assert.Null(node result "children")
 
+// Snapshot test: replaces `Assert.NotNull(node result "children")` with a
+// structural assertion of the children array. With no FSAC process supplied,
+// the array is empty — but the snapshot is still meaningful: it asserts the
+// array shape (not a string, not null).
 [<Fact>]
-let ``includeChildProcesses true includes children block`` () =
+let ``includeChildProcesses true matches children slice snapshot`` () : Task =
     let args = { defaultArgs with includeChildProcesses = Some true }
     let result = buildSnapshot args defaultConfig None
-    Assert.NotNull(node result "children")
+    let children = node result "children"
+    VerifyModuleInitializer.init ()
+    Verifier.Verify(prettyJson children, extension = "json").ToTask() :> Task
 
 [<Fact>]
 let ``includeProcessIds false omits pid from process block`` () =
@@ -279,12 +299,15 @@ let ``includeProcessIds false omits pid from process block`` () =
     let proc = node result "process"
     Assert.Null(node proc "pid")
 
+// Snapshot test: replaces `Assert.NotNull(node proc "pid")` with a structural
+// snapshot of the process block including the pid (scrubbed to <pid>).
 [<Fact>]
-let ``includeProcessIds true includes pid in process block`` () =
+let ``includeProcessIds true matches process slice snapshot`` () : Task =
     let args = { defaultArgs with includeProcessIds = Some true }
     let result = buildSnapshot args defaultConfig None
     let proc = node result "process"
-    Assert.NotNull(node proc "pid")
+    VerifyModuleInitializer.init ()
+    Verifier.Verify(prettyJson proc, extension = "json").ToTask() :> Task
 
 // ─── Group D: structural sanity ───────────────────────────────────────────────
 
@@ -309,8 +332,13 @@ let ``buildSnapshot projectCacheSize reflects config value`` () =
     let size = getIntAt fcs "projectCacheSize"
     Assert.Equal(5, size)
 
+// Snapshot test for the all-flags-false minimal case. Replaces two
+// `Assert.NotNull(node proc …)` calls (managedHeap / gcInfo) with a structural
+// snapshot of the entire result. Companion `Assert.Null` checks below remain
+// — they assert *absence* of optional blocks, which the snapshot also covers,
+// but the explicit asserts document the contract for readers.
 [<Fact>]
-let ``buildSnapshot all flags false still returns status ok with minimal process block`` () =
+let ``buildSnapshot all flags false matches minimal snapshot`` () : Task =
     let args =
         { includeFcsCacheStats = Some false
           includeAssemblyCounts = Some false
@@ -319,12 +347,12 @@ let ``buildSnapshot all flags false still returns status ok with minimal process
 
     let result = buildSnapshot args defaultConfig None
     Assert.Equal("ok", getStr result "status")
-    // managedHeap and gcInfo are always present
-    let proc = node result "process"
-    Assert.NotNull(node proc "managedHeap")
-    Assert.NotNull(node proc "gcInfo")
     // optional blocks should be absent
     Assert.Null(node result "fcs")
     Assert.Null(node result "children")
+    let proc = node result "process"
     Assert.Null(node proc "assemblies")
     Assert.Null(node proc "pid")
+    // managedHeap and gcInfo are always present — snapshot pins their shape
+    VerifyModuleInitializer.init ()
+    Verifier.Verify(prettyJson result, extension = "json").ToTask() :> Task

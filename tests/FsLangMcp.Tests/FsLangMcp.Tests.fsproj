@@ -17,6 +17,7 @@
     <Compile Include="../../FcsBridge.fs" Link="FcsBridge.fs" />
     <Compile Include="../../Tools.fs" Link="Tools.fs" />
     <Compile Include="../../RuntimeStatus.fs" Link="RuntimeStatus.fs" />
+    <Compile Include="VerifyModuleInitializer.fs" />
     <Compile Include="RuntimeStatusTests.fs" />
     <Compile Include="TypesToolsTests.fs" />
     <Compile Include="LspBridgeTests.fs" />
@@ -61,6 +62,7 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="FsCheck.Xunit" Version="3.3.*" />
+    <PackageReference Include="Verify.Xunit" Version="31.12.*" />
   </ItemGroup>
 
 </Project>

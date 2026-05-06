@@ -1,0 +1,12 @@
+﻿{
+  "incrementalBuilders": {
+    "count": null,
+    "approximateBytes": null
+  },
+  "projectCacheSize": 3,
+  "checker": {
+    "keepAssemblyContents": true,
+    "keepAllBackgroundResolutions": true,
+    "keepAllBackgroundSymbolUses": true
+  }
+}
