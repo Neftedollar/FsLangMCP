@@ -1,6 +1,7 @@
 # FsLangMCP (F# + FsMcp + FsAutoComplete + FCS)
 
 [![CI](https://github.com/Neftedollar/FsLangMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/Neftedollar/FsLangMCP/actions/workflows/ci.yml)
+[![NuGet](https://img.shields.io/nuget/v/FsLangMcp.svg)](https://www.nuget.org/packages/FsLangMcp/)
 
 An MCP server written in F# that combines:
 
@@ -85,7 +86,16 @@ dotnet tool restore
 
 ## Install As Dotnet Tool
 
-From this repo:
+### From NuGet (recommended)
+
+```bash
+dotnet tool install -g FsLangMcp
+fslangmcp --bootstrap-tools
+```
+
+Update later with `dotnet tool update -g FsLangMcp`.
+
+### From source (developing FsLangMCP itself)
 
 ```bash
 dotnet pack -c Release
