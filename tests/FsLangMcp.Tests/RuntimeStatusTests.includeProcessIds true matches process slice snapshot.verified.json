@@ -1,0 +1,27 @@
+﻿{
+  "uptimeSeconds": <number>,
+  "managedHeap": {
+    "totalBytes": <number>,
+    "gen0Bytes": <number>,
+    "gen1Bytes": <number>,
+    "gen2Bytes": <number>,
+    "lohBytes": <number>,
+    "pohBytes": <number>,
+    "fragmentation": <number>
+  },
+  "gcInfo": {
+    "isServerGc": <bool>,
+    "totalCollections": {
+      "gen0": <number>,
+      "gen1": <number>,
+      "gen2": <number>
+    },
+    "totalAllocated": <number>,
+    "lastTrigger": "<gen>"
+  },
+  "assemblies": {
+    "loaded": <number>,
+    "lastLoaded": "<assembly>"
+  },
+  "pid": <pid>
+}

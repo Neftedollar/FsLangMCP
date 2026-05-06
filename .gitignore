@@ -8,3 +8,8 @@ tests/*/obj/
 coverage*/
 tests/*/coverage*/
 CoverletSourceRootsMapping_*
+
+# Verify (snapshot testing): *.received.* are produced when a snapshot diverges
+# from its *.verified.* baseline. Reviewed locally, then either approved
+# (renamed to .verified.*) or the test is fixed. Never committed.
+*.received.*
