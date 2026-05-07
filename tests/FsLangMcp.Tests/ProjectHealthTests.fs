@@ -229,6 +229,150 @@ let ``fsharp_project_inspect reports compile order and package references`` () =
         if Directory.Exists root then
             Directory.Delete(root, true)
 
+// ─── .sln / .slnx as projectPath ─────────────────────────────────────────────
+
+[<Fact>]
+let ``project_health accepts .slnx path and resolves to the single fsproj inside`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_slnx_%s{runId}")
+
+    try
+        let projectPath = writeProject root
+        let slnxPath = Path.Combine(root, "Solution.slnx")
+
+        File.WriteAllText(
+            slnxPath,
+            String.concat
+                "\n"
+                [ "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                  "<Solution>"
+                  "  <Project Path=\"Library.fsproj\" />"
+                  "</Solution>" ])
+
+        let result = report (healthArgs slnxPath (Some root)) (readySnapshot projectPath root)
+
+        Assert.Equal("ok", (result["status"]).GetValue<string>())
+        Assert.Equal("ready", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health accepts .sln path and resolves to the single fsproj inside`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_sln_%s{runId}")
+
+    try
+        let projectPath = writeProject root
+        let slnPath = Path.Combine(root, "Solution.sln")
+
+        File.WriteAllText(
+            slnPath,
+            String.concat
+                "\n"
+                [ "Microsoft Visual Studio Solution File, Format Version 12.00"
+                  "Project(\"{F2A71F9B-5D33-465A-A702-920D77279786}\") = \"Library\", \"Library.fsproj\", \"{00000000-0000-0000-0000-000000000001}\""
+                  "EndProject" ])
+
+        let result = report (healthArgs slnPath (Some root)) (readySnapshot projectPath root)
+
+        Assert.Equal("ok", (result["status"]).GetValue<string>())
+        Assert.Equal("ready", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health blocks .slnx with multiple fsproj files`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_slnx_multi_%s{runId}")
+
+    try
+        Directory.CreateDirectory(root) |> ignore
+        File.WriteAllText(Path.Combine(root, "A.fsproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+        File.WriteAllText(Path.Combine(root, "B.fsproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+        let slnxPath = Path.Combine(root, "Solution.slnx")
+
+        File.WriteAllText(
+            slnxPath,
+            String.concat
+                "\n"
+                [ "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                  "<Solution>"
+                  "  <Project Path=\"A.fsproj\" />"
+                  "  <Project Path=\"B.fsproj\" />"
+                  "</Solution>" ])
+
+        let snapshot =
+            { ProjectPath = None; WorkspaceRoot = Some root; WorkspaceReady = true; DiagnosticsFileCount = 0 }
+
+        let result = report (healthArgs slnxPath None) snapshot
+
+        Assert.Equal("blocked", ((result["toolingReadiness"])["overall"]).GetValue<string>())
+        Assert.Contains("Multiple .fsproj", (((result["toolingReadiness"])["fcs"])["reason"]).GetValue<string>())
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health blocks .sln with multiple fsproj files`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_sln_multi_%s{runId}")
+
+    try
+        Directory.CreateDirectory(root) |> ignore
+        File.WriteAllText(Path.Combine(root, "A.fsproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+        File.WriteAllText(Path.Combine(root, "B.fsproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+        let slnPath = Path.Combine(root, "Solution.sln")
+
+        File.WriteAllText(
+            slnPath,
+            String.concat
+                "\n"
+                [ "Microsoft Visual Studio Solution File, Format Version 12.00"
+                  "Project(\"{F2A71F9B-5D33-465A-A702-920D77279786}\") = \"A\", \"A.fsproj\", \"{00000000-0000-0000-0000-000000000001}\""
+                  "EndProject"
+                  "Project(\"{F2A71F9B-5D33-465A-A702-920D77279786}\") = \"B\", \"B.fsproj\", \"{00000000-0000-0000-0000-000000000002}\""
+                  "EndProject" ])
+
+        let snapshot =
+            { ProjectPath = None; WorkspaceRoot = Some root; WorkspaceReady = true; DiagnosticsFileCount = 0 }
+
+        let result = report (healthArgs slnPath None) snapshot
+
+        Assert.Equal("blocked", ((result["toolingReadiness"])["overall"]).GetValue<string>())
+        Assert.Contains("Multiple .fsproj", (((result["toolingReadiness"])["fcs"])["reason"]).GetValue<string>())
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``workspacePath pointing to a slnx file is normalized to its parent directory`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_slnx_ws_%s{runId}")
+
+    try
+        let projectPath = writeProject root
+        let slnxPath = Path.Combine(root, "Solution.slnx")
+
+        File.WriteAllText(
+            slnxPath,
+            String.concat
+                "\n"
+                [ "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                  "<Solution>"
+                  "  <Project Path=\"Library.fsproj\" />"
+                  "</Solution>" ])
+
+        let result =
+            report (healthArgs projectPath (Some slnxPath)) (readySnapshot projectPath root)
+
+        let workspaceRoot = (result["workspace"]["workspaceRoot"]).GetValue<string>()
+        Assert.Equal(root, workspaceRoot)
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
 // ─── Regression tests for VERIFY findings on #77 (closes #81) ────────────────
 
 [<Fact>]
