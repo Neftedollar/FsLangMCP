@@ -53,6 +53,8 @@
     </PackageReference>
     <PackageReference Include="Ionide.ProjInfo.FCS" Version="0.74.*" />
     <PackageReference Include="StreamJsonRpc" Version="2.24.*" />
+    <!-- override transitive 1.0.2 from StreamJsonRpc (GHSA-2cwq-pwfr-wcw3) -->
+    <PackageReference Include="Nerdbank.MessagePack" Version="1.1.62" />
   </ItemGroup>
 
 </Project>
