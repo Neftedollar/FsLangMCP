@@ -14,6 +14,10 @@ An MCP server written in F# that combines:
 
 See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
+## Agent integration
+
+Building multi-agent F# workflows with Claude Code, Cursor, Copilot CLI, or Codex? See [`AGENT_INTEGRATION.md`](AGENT_INTEGRATION.md) for the recommended tool-discipline patterns, subagent brief template, and UX-feedback routing process refined across ~12 production subagent sessions.
+
 ## Response Shape
 
 All tools return a consistent JSON envelope:
