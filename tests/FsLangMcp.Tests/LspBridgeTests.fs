@@ -126,3 +126,63 @@ let ``assessSymbolIndex treats non-array responses as ready regardless of timing
     let ready = ValueSome(now.AddSeconds(-1.0))
 
     Assert.True(assessSymbolIndex response ready now (TimeSpan.FromSeconds 3.0))
+
+[<Fact>]
+let ``diagnosticsResponseForFile builds status+lspState+count+result`` () =
+    let payload: JsonNode = JsonArray() :> JsonNode
+    let result = diagnosticsResponseForFile true 5 payload
+
+    Assert.Equal("ok", result["status"].GetValue<string>())
+    Assert.Equal("ready", result["lspState"].GetValue<string>())
+    Assert.Equal(5, result["diagnosticsFileCount"].GetValue<int>())
+    Assert.NotNull(result["result"])
+
+[<Fact>]
+let ``diagnosticsResponseForFile reports warming when workspace not ready`` () =
+    let payload: JsonNode = JsonArray() :> JsonNode
+    let result = diagnosticsResponseForFile false 0 payload
+
+    Assert.Equal("warming", result["lspState"].GetValue<string>())
+    Assert.Equal(0, result["diagnosticsFileCount"].GetValue<int>())
+
+[<Fact>]
+let ``diagnosticsResponseForWorkspace reports warming and zero count during warmup`` () =
+    let root = JsonObject()
+    let result = diagnosticsResponseForWorkspace false 0 root
+
+    Assert.Equal("ok", result["status"].GetValue<string>())
+    Assert.Equal("warming", result["lspState"].GetValue<string>())
+    Assert.Equal(0, result["diagnosticsFileCount"].GetValue<int>())
+
+[<Fact>]
+let ``diagnosticsResponseForWorkspace exposes all collected file payloads`` () =
+    let root = JsonObject()
+    root["file:///a.fs"] <- JsonArray() :> JsonNode
+    root["file:///b.fs"] <- JsonArray() :> JsonNode
+    let result = diagnosticsResponseForWorkspace true 2 root
+
+    Assert.Equal("ready", result["lspState"].GetValue<string>())
+    Assert.Equal(2, result["diagnosticsFileCount"].GetValue<int>())
+    Assert.NotNull(result["result"]["file:///a.fs"])
+    Assert.NotNull(result["result"]["file:///b.fs"])
+
+[<Fact>]
+let ``workspaceSymbolResponse flags symbolIndexReady=false for empty result inside warmup window`` () =
+    let response: JsonNode = JsonArray() :> JsonNode
+    let now = DateTimeOffset.UtcNow
+    let ready = ValueSome(now.AddSeconds(-1.0))
+    let result = workspaceSymbolResponse response ready now (TimeSpan.FromSeconds 3.0)
+
+    Assert.Equal("ok", result["status"].GetValue<string>())
+    Assert.Equal("ready", result["lspState"].GetValue<string>())
+    Assert.False(result["symbolIndexReady"].GetValue<bool>())
+
+[<Fact>]
+let ``workspaceSymbolResponse flags symbolIndexReady=true for non-empty result`` () =
+    let response: JsonNode = JsonArray(JsonValue.Create("hit") :> JsonNode) :> JsonNode
+    let now = DateTimeOffset.UtcNow
+    let ready = ValueSome(now.AddSeconds(-1.0))
+    let result = workspaceSymbolResponse response ready now (TimeSpan.FromSeconds 3.0)
+
+    Assert.True(result["symbolIndexReady"].GetValue<bool>())
+    Assert.NotNull(result["result"])

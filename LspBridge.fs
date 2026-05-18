@@ -206,6 +206,45 @@ module internal LspResponseShape =
             | ValueNone -> false
         | _ -> true
 
+    /// Builds the workspace_diagnostics response payload for a single file.
+    let diagnosticsResponseForFile (workspaceReady: bool) (diagnosticsCount: int) (filePayload: JsonNode) : JsonNode =
+        jobj
+            [ "status", jstr "ok"
+              "lspState", jstr (lspStateString workspaceReady)
+              "diagnosticsFileCount", jint diagnosticsCount
+              "result", filePayload ]
+        :> JsonNode
+
+    /// Builds the workspace_diagnostics response payload for the whole workspace.
+    let diagnosticsResponseForWorkspace
+        (workspaceReady: bool)
+        (diagnosticsCount: int)
+        (allPayloads: JsonObject)
+        : JsonNode =
+        jobj
+            [ "status", jstr "ok"
+              "lspState", jstr (lspStateString workspaceReady)
+              "diagnosticsFileCount", jint diagnosticsCount
+              "result", allPayloads :> JsonNode ]
+        :> JsonNode
+
+    /// Builds the workspace_symbol response payload, deciding symbolIndexReady
+    /// from response shape + warmup timing.
+    let workspaceSymbolResponse
+        (response: JsonNode)
+        (workspaceReadyAt: DateTimeOffset voption)
+        (now: DateTimeOffset)
+        (warmupWindow: TimeSpan)
+        : JsonNode =
+        let symbolIndexReady = assessSymbolIndex response workspaceReadyAt now warmupWindow
+
+        jobj
+            [ "status", jstr "ok"
+              "lspState", jstr "ready"
+              "symbolIndexReady", jbool symbolIndexReady
+              "result", response ]
+        :> JsonNode
+
 // ─── FsAutoCompleteBridge ──────────────────────────────────────────────────────
 
 type internal FsAutoCompleteBridge() =
@@ -716,20 +755,12 @@ type internal FsAutoCompleteBridge() =
                 let parameters = jobj [ "query", jstr args.query ]
                 let! response = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("workspace/symbol", parameters)
 
-                let symbolIndexReady =
-                    LspResponseShape.assessSymbolIndex
+                return
+                    LspResponseShape.workspaceSymbolResponse
                         response
                         workspaceReadyAt
                         DateTimeOffset.UtcNow
                         (TimeSpan.FromSeconds 3.0)
-
-                return
-                    jobj
-                        [ "status", jstr "ok"
-                          "lspState", jstr "ready"
-                          "symbolIndexReady", jbool symbolIndexReady
-                          "result", response ]
-                    :> JsonNode
         }
 
     member _.Diagnostics(args: DiagnosticsArgs) : Task<JsonNode> =
@@ -739,32 +770,19 @@ type internal FsAutoCompleteBridge() =
                 | true, payload -> payload.DeepClone()
                 | false, _ -> JsonArray() :> JsonNode
 
-            let lspState = LspResponseShape.lspStateString workspaceReady
-
             match args.path with
             | Some path ->
                 let uri = toFileUri path
 
                 return
-                    jobj
-                        [ "status", jstr "ok"
-                          "lspState", jstr lspState
-                          "diagnosticsFileCount", jint diagnostics.Count
-                          "result", resolveByUri uri ]
-                    :> JsonNode
+                    LspResponseShape.diagnosticsResponseForFile workspaceReady diagnostics.Count (resolveByUri uri)
             | None ->
                 let root = JsonObject()
 
                 for KeyValue(uri, payload) in diagnostics do
                     root[uri] <- payload.DeepClone()
 
-                return
-                    jobj
-                        [ "status", jstr "ok"
-                          "lspState", jstr lspState
-                          "diagnosticsFileCount", jint diagnostics.Count
-                          "result", root :> JsonNode ]
-                    :> JsonNode
+                return LspResponseShape.diagnosticsResponseForWorkspace workspaceReady diagnostics.Count root
         }
 
     member this.Formatting(args: FormattingArgs) : Task<JsonNode> =
