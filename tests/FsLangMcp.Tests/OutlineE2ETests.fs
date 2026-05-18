@@ -78,7 +78,7 @@ let processData (x: int) = x * 2
     projectPath, root
 
 let private defaultArgs projectPath : FcsProjectOutlineArgs =
-    { projectPath = projectPath
+    { projectPath = Some projectPath
       workspacePath = None
       includePrivate = None
       includeTests = None

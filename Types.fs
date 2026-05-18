@@ -46,12 +46,12 @@ type SetProjectArgs =
       restartLsp: bool option }
 
 type FSharpCompileArgs =
-    { projectPath: string
+    { projectPath: string option
       workspacePath: string option
       timeoutMs: int option }
 
 type ProjectHealthArgs =
-    { projectPath: string
+    { projectPath: string option
       workspacePath: string option
       scope: string option
       compileCheck: string option }
@@ -76,6 +76,24 @@ type FcsProjectSymbolUsesArgs =
       projectPath: string option
       projectOptions: string list option
       symbolQuery: string
+      exact: bool option
+      /// Maximum uses returned per page. Default: 500.
+      maxResults: int option
+      /// Opaque cursor from a prior call's `nextCursor`. Omit for the first page.
+      cursor: string option }
+
+type FcsFindMemberUsagesArgs =
+    { /// Type that declares the member. Match against DisplayName (e.g. "Style")
+      /// or FullName (e.g. "MyApp.Theme.Style").
+      typeName: string
+      /// Member name (DisplayName), e.g. "Foreground" or "GetForeground".
+      memberName: string
+      /// File path used to derive project context when projectPath is absent.
+      path: string option
+      text: string option
+      projectPath: string option
+      projectOptions: string list option
+      /// When true, typeName / memberName must match exactly. Default: false (substring match).
       exact: bool option
       /// Maximum uses returned per page. Default: 500.
       maxResults: int option
@@ -116,7 +134,7 @@ type FcsSymbolAtWordArgs =
       includeDocumentation: bool option }
 
 type FcsProjectOutlineArgs =
-    { projectPath: string
+    { projectPath: string option
       workspacePath: string option
       includePrivate: bool option
       includeTests: bool option
@@ -136,7 +154,7 @@ type FcsProjectOutlineArgs =
       nameContains: string list option }
 
 type FSharpProjectInspectArgs =
-    { projectPath: string
+    { projectPath: string option
       workspacePath: string option
       scope: string option
       includeGeneratedFiles: bool option
@@ -175,7 +193,7 @@ type RenameArgs =
       text: string option }
 
 [<CLIMutable>]
-type FcsGetProjectOptionsArgs = { projectPath: string }
+type FcsGetProjectOptionsArgs = { projectPath: string option }
 
 type FcsCheckerConfig =
     { KeepAssemblyContents: bool

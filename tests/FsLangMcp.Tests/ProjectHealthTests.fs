@@ -38,7 +38,7 @@ let private writeProject root =
     projectPath
 
 let private healthArgs projectPath workspacePath =
-    { projectPath = projectPath
+    { projectPath = Some projectPath
       workspacePath = workspacePath
       scope = None
       compileCheck = None }
@@ -212,7 +212,7 @@ let ``fsharp_project_inspect reports compile order and package references`` () =
 
         let result =
             inspectProject
-                { projectPath = projectPath
+                { projectPath = Some projectPath
                   workspacePath = Some root
                   scope = None
                   includeGeneratedFiles = None
@@ -454,6 +454,56 @@ let ``overallStatus is ready when both fcs and lsp are ready`` () =
         Assert.Equal("ready", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
         Assert.Equal("ready", (((result["toolingReadiness"])["lsp"])["status"]).GetValue<string>())
         Assert.Equal("ready", ((result["toolingReadiness"])["overall"]).GetValue<string>())
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+// ─── projectPath optional after set_project (#105) ───────────────────────────
+
+[<Fact>]
+let ``project_health blocks with clear message when projectPath is None and no fallback`` () =
+    let args: ProjectHealthArgs =
+        { projectPath = None
+          workspacePath = None
+          scope = None
+          compileCheck = None }
+
+    // Bridge fallback is applied in Program.fs; createReport sees whatever the
+    // handler passes through. None here simulates "no set_project, no explicit
+    // projectPath" — the failure mode that #105 is designed to produce a clear
+    // error for.
+    let snapshot =
+        { ProjectPath = None
+          WorkspaceRoot = None
+          WorkspaceReady = false
+          DiagnosticsFileCount = 0 }
+
+    let result = report args snapshot
+
+    Assert.Equal("blocked", ((result["toolingReadiness"])["overall"]).GetValue<string>())
+    let reason = (((result["toolingReadiness"])["fcs"])["reason"]).GetValue<string>()
+    Assert.Contains("projectPath is required", reason)
+    Assert.Contains("set_project", reason)
+
+[<Fact>]
+let ``project_health succeeds when projectPath is Some valid fsproj`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_opt_%s{runId}")
+
+    try
+        let projectPath = writeProject root
+        // Caller in Program.fs would have applied bridge fallback; here we just
+        // verify that the explicit form still works.
+        let args =
+            { projectPath = Some projectPath
+              workspacePath = Some root
+              scope = None
+              compileCheck = None }
+
+        let result = report args (readySnapshot projectPath root)
+
+        Assert.Equal("ok", (result["status"]).GetValue<string>())
+        Assert.Equal("ready", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)

@@ -257,8 +257,12 @@ let main argv =
                 tool (
                     TypedTool.define<FSharpCompileArgs>
                         "fsharp_compile"
-                        "[FCS in-process] Agent-friendly FCS project validation. Requires an explicit .fsproj path, loads project options through Ionide.ProjInfo, then runs FSharpChecker.ParseAndCheckProject. Does not require set_project, does not run dotnet build/test, and does not emit assemblies."
-                        (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.CompileProject args)))
+                        "[FCS in-process] Agent-friendly FCS project validation. Loads project options through Ionide.ProjInfo, then runs FSharpChecker.ParseAndCheckProject. projectPath is optional after set_project (falls back to the active project); pass it explicitly for a different .fsproj. Does not run dotnet build/test, does not emit assemblies."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.CompileProject args)))
                     |> unwrapResult
                 )
 
@@ -312,8 +316,11 @@ let main argv =
                 tool (
                     TypedTool.define<ProjectHealthArgs>
                         "project_health"
-                        "[FCS in-process] Fast read-only preflight for one F# project. Reports whether FsLangMCP can trust semantic tooling, project options availability, source file readability, analyzer setup, test project discovery, and current LSP readiness. Does not start/switch FSAC, run compile, or run tests."
+                        "[FCS in-process] Fast read-only preflight for one F# project. Reports whether FsLangMCP can trust semantic tooling, project options availability, source file readability, analyzer setup, test project discovery, and current LSP readiness. projectPath is optional after set_project (falls back to the active project); pass it explicitly to inspect a different .fsproj/.sln/.slnx. Does not start/switch FSAC, run compile, or run tests."
                         (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
                             let snapshot =
                                 { ProjectPath = bridge.CurrentProjectPath
                                   WorkspaceRoot = bridge.CurrentWorkspaceRoot
@@ -332,8 +339,12 @@ let main argv =
                 tool (
                     TypedTool.define<FSharpProjectInspectArgs>
                         "fsharp_project_inspect"
-                        "[FCS in-process] Read-only .fsproj inspection for agents. Returns project identity, compile order, package/project references, signature/implementation pairing, and shared scan filtering summary. Does not build, restore, test, edit files, or require set_project."
-                        (fun args -> toolResult (Task.FromResult(inspectProject args)))
+                        "[FCS in-process] Read-only .fsproj inspection for agents. Returns project identity, compile order, package/project references, signature/implementation pairing, and shared scan filtering summary. projectPath is optional after set_project (falls back to the active project); pass it explicitly to inspect a different .fsproj. Does not build, restore, test, edit files."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (Task.FromResult(inspectProject args)))
                     |> unwrapResult
                 )
 
@@ -370,6 +381,18 @@ let main argv =
                 )
 
                 tool (
+                    TypedTool.define<FcsFindMemberUsagesArgs>
+                        "fcs_find_member_usages"
+                        "[FCS in-process] Find all usage sites of a member declared on a specific type — resolves via FCS so dotted access (x.Foo), pipeline application, and overload resolution are handled correctly (unlike a textual rg). Pass typeName (DisplayName e.g. 'Style' or FullName e.g. 'MyApp.Theme.Style') and memberName. typeName matching uses exact DisplayName equality (so 'Style' won't match 'StyleSheet'); with exact=false the FullName may match at segment boundaries ('Theme.Style' yes, 'Theme.StyleSheet' no). projectPath is optional after set_project; pass path/text for unsaved buffers."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.FindMemberUsages args)))
+                    |> unwrapResult
+                )
+
+                tool (
                     TypedTool.define<FcsFindSymbolArgs>
                         "fcs_find_symbol"
                         "[FCS in-process] Agent-friendly project-wide symbol search with grouped definitions/references and source line context. Better than chaining workspace_symbol, fcs_project_symbol_uses, and shell line reads. Pass projectPath when possible."
@@ -388,8 +411,12 @@ let main argv =
                 tool (
                     TypedTool.define<FcsProjectOutlineArgs>
                         "fcs_project_outline"
-                        "[FCS in-process] Agent-friendly project outline over filtered compile files. Uses shared filtering to skip generated/build artifacts and returns compact per-file outlines. Use maxFiles/maxResultsPerFile on large projects."
-                        (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.ProjectOutline args)))
+                        "[FCS in-process] Agent-friendly project outline over filtered compile files. Uses shared filtering to skip generated/build artifacts and returns compact per-file outlines. projectPath is optional after set_project (falls back to the active project); pass it explicitly for a different .fsproj. Use maxFiles/maxResultsPerFile on large projects."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.ProjectOutline args)))
                     |> unwrapResult
                 )
 
@@ -444,14 +471,22 @@ let main argv =
                 tool (
                     TypedTool.define<FcsGetProjectOptionsArgs>
                         "fcs_get_project_options"
-                        "[FCS in-process] Diagnostic helper: get FSharp compiler OtherOptions for a .fsproj via proj-info. Useful when automatic project resolution fails or when passing explicit projectOptions to FCS tools."
+                        "[FCS in-process] Diagnostic helper: get FSharp compiler OtherOptions for a .fsproj via proj-info. projectPath is optional after set_project (falls back to the active project); pass it explicitly to inspect a different one."
                         (fun args ->
-                            let path = args.projectPath
+                            let resolved =
+                                args.projectPath
+                                |> Option.orElse bridge.CurrentProjectPath
+                                |> Option.filter (System.String.IsNullOrWhiteSpace >> not)
 
-                            if String.IsNullOrWhiteSpace(path) then
-                                toolResult (Task.FromException<JsonNode>(ArgumentException "projectPath is required"))
-                            else
-                                toolResult (runLimited fcsGate (fun () -> runProjInfoAsync path)))
+                            match resolved with
+                            | None ->
+                                toolResult (
+                                    Task.FromException<JsonNode>(
+                                        ArgumentException
+                                            "projectPath is required. Either pass it explicitly or call set_project first to establish a default."
+                                    )
+                                )
+                            | Some path -> toolResult (runLimited fcsGate (fun () -> runProjInfoAsync path)))
                     |> unwrapResult
                 )
 

@@ -81,27 +81,35 @@ let internal tryReadProject (projectPath: string) =
     with ex ->
         Error ex.Message
 
-let internal resolveProjectPath (inputPath: string) =
-    let fullPath = Path.GetFullPath(inputPath)
+let internal resolveProjectPath (input: string option) =
+    match input with
+    | None ->
+        Error
+            "projectPath is required. Either pass it explicitly or call set_project first to establish a default."
+    | Some path when System.String.IsNullOrWhiteSpace path ->
+        Error
+            "projectPath must not be empty. Either pass a .fsproj path or call set_project first to establish a default."
+    | Some path ->
+        let fullPath = Path.GetFullPath(path)
 
-    if
-        File.Exists fullPath
-        && Path.GetExtension(fullPath).Equals(".fsproj", StringComparison.OrdinalIgnoreCase)
-    then
-        Ok fullPath
-    elif Directory.Exists fullPath then
-        let projects =
-            Directory.GetFiles(fullPath, "*.fsproj", SearchOption.TopDirectoryOnly)
-            |> Array.map Path.GetFullPath
+        if
+            File.Exists fullPath
+            && Path.GetExtension(fullPath).Equals(".fsproj", StringComparison.OrdinalIgnoreCase)
+        then
+            Ok fullPath
+        elif Directory.Exists fullPath then
+            let projects =
+                Directory.GetFiles(fullPath, "*.fsproj", SearchOption.TopDirectoryOnly)
+                |> Array.map Path.GetFullPath
 
-        match projects with
-        | [| one |] -> Ok one
-        | [||] -> Error $"No .fsproj found in directory: %s{fullPath}"
-        | many ->
-            let names = many |> Array.map Path.GetFileName |> String.concat ", "
-            Error $"Multiple .fsproj files found in directory; pass one explicitly: %s{names}"
-    else
-        Error $"Project path does not exist or is not an .fsproj: %s{fullPath}"
+            match projects with
+            | [| one |] -> Ok one
+            | [||] -> Error $"No .fsproj found in directory: %s{fullPath}"
+            | many ->
+                let names = many |> Array.map Path.GetFileName |> String.concat ", "
+                Error $"Multiple .fsproj files found in directory; pass one explicitly: %s{names}"
+        else
+            Error $"Project path does not exist or is not an .fsproj: %s{fullPath}"
 
 let internal isFsFile (path: string) =
     let ext = Path.GetExtension(path)

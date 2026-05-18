@@ -57,7 +57,10 @@ let inspectProject (args: FSharpProjectInspectArgs) : JsonNode =
         jobj
             [ "status", jstr "error"
               "message", jstr reason
-              "projectPath", jstr (Path.GetFullPath(args.projectPath)) ]
+              "projectPath",
+              args.projectPath
+              |> Option.map (Path.GetFullPath >> jstr)
+              |> Option.defaultValue null ]
         :> JsonNode
     | Ok projectPath ->
         match tryReadProject projectPath with

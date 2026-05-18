@@ -227,7 +227,7 @@ let ``FcsProjectOutlineArgs all optional fields default to None`` () =
     // It acts as a compile-time guard: if a required field were accidentally added
     // without a default, this would fail to compile.
     let args: FcsProjectOutlineArgs =
-        { projectPath = "/some/project.fsproj"
+        { projectPath = Some "/some/project.fsproj"
           workspacePath = None
           includePrivate = None
           includeTests = None
@@ -239,7 +239,7 @@ let ``FcsProjectOutlineArgs all optional fields default to None`` () =
           filter = None
           nameContains = None }
 
-    Assert.Equal("/some/project.fsproj", args.projectPath)
+    Assert.Equal(Some "/some/project.fsproj", args.projectPath)
     Assert.True(args.summaryOnly.IsNone, "summaryOnly should be None (uses runtime default)")
     Assert.True(args.maxFiles.IsNone, "maxFiles should be None (uses runtime default of 50)")
     Assert.True(args.maxResultsPerFile.IsNone, "maxResultsPerFile should be None (runtime default 30)")
@@ -250,7 +250,7 @@ let ``FcsProjectOutlineArgs all optional fields default to None`` () =
 [<Fact>]
 let ``FcsProjectOutlineArgs accepts explicit values for all new fields`` () =
     let args: FcsProjectOutlineArgs =
-        { projectPath = "/some/project.fsproj"
+        { projectPath = Some "/some/project.fsproj"
           workspacePath = None
           includePrivate = Some true
           includeTests = Some false
@@ -273,7 +273,7 @@ let ``FcsProjectOutlineArgs accepts explicit values for all new fields`` () =
 let ``cursor stored in FcsProjectOutlineArgs round-trips correctly`` () =
     let cursorStr = encode 42
     let args: FcsProjectOutlineArgs =
-        { projectPath = "/p.fsproj"
+        { projectPath = Some "/p.fsproj"
           workspacePath = None
           includePrivate = None
           includeTests = None

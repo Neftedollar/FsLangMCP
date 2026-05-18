@@ -517,7 +517,13 @@ type internal FcsBridge() =
 
     member this.CompileProject(args: FSharpCompileArgs) : Task<JsonNode> =
         task {
-            let projectPath = normalizePath args.projectPath
+            let projectPath =
+                match args.projectPath with
+                | Some p when not (String.IsNullOrWhiteSpace p) -> normalizePath p
+                | _ ->
+                    invalidArg
+                        (nameof args.projectPath)
+                        "projectPath is required. Either pass it explicitly or call set_project first to establish a default."
 
             if not (String.Equals(Path.GetExtension(projectPath), ".fsproj", StringComparison.OrdinalIgnoreCase)) then
                 invalidArg (nameof args.projectPath) $"projectPath must point to an .fsproj file: %s{projectPath}"
@@ -790,6 +796,163 @@ type internal FcsBridge() =
                   "optionsSource", jstr optionsSource
                   "projectFileName", jstr projectOptions.ProjectFileName
                   "query", jstr query
+                  "exact", jbool exact
+                  "cached", jbool cached
+                  "totalProjectSymbolUses", jint allUses.Length
+                  "matchedCount", jint totalMatched
+                  "uses", JsonArray(pageNodes) :> JsonNode
+                  "projectDiagnostics",
+                  JsonArray(projectResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ]
+
+            return jobj (baseFields @ paginationFields) :> JsonNode
+        }
+
+    member this.FindMemberUsages(args: FcsFindMemberUsagesArgs) : Task<JsonNode> =
+        task {
+            let typeName = args.typeName.Trim()
+            let memberName = args.memberName.Trim()
+
+            if String.IsNullOrWhiteSpace typeName then
+                invalidArg (nameof args.typeName) "typeName must be non-empty."
+
+            if String.IsNullOrWhiteSpace memberName then
+                invalidArg (nameof args.memberName) "memberName must be non-empty."
+
+            // Resolve project options either via a file context (PrepareCheckContext)
+            // or directly from projectPath (.fsproj). The former gives accurate
+            // single-file-aware options; the latter is enough for project-wide queries.
+            let! optionsSource, projectOptions =
+                task {
+                    match args.path with
+                    | Some path when not (String.IsNullOrWhiteSpace path) ->
+                        let! _, _, src, opts, _, _ =
+                            this.PrepareCheckContext(path, args.text, args.projectPath, args.projectOptions)
+
+                        return src, opts
+                    | _ ->
+                        match args.projectPath with
+                        | Some p when not (String.IsNullOrWhiteSpace p) ->
+                            let! opts, src = this.ResolveFsprojOptions(normalizePath p)
+                            return src, opts
+                        | _ ->
+                            return
+                                invalidArg
+                                    (nameof args.projectPath)
+                                    "Either 'path' or 'projectPath' must be provided (or call set_project first)."
+                }
+
+            let cacheKey = makeResolvedProjectCacheKey projectOptions
+
+            let! projectResults, cached =
+                task {
+                    match projectResultsCache.TryGet(cacheKey) with
+                    | Some existing -> return existing, true
+                    | None ->
+                        let! results = checker.ParseAndCheckProject(projectOptions) |> asTask
+                        projectResultsCache.Set(cacheKey, results)
+                        return results, false
+                }
+
+            let exact = args.exact |> Option.defaultValue false
+            let pageSize = args.maxResults |> Option.defaultValue 500
+
+            let pageOffset =
+                match args.cursor with
+                | None -> 0
+                | Some cursorStr ->
+                    match Cursor.tryDecode cursorStr with
+                    | Ok payload -> payload.offset
+                    | Error reason -> invalidArg (nameof args.cursor) $"Invalid cursor: %s{reason}"
+
+            // Predicates: a symbol use qualifies if its symbol is a member of an
+            // entity matching typeName, AND the symbol's own DisplayName matches
+            // memberName.
+            //
+            // typeName matching:
+            //   exact=true  → DisplayName == typeName OR FullName == typeName
+            //   exact=false → DisplayName == typeName (exact, avoids `Style`
+            //                 false-matching `StyleSheet`) OR FullName contains
+            //                 typeName (allows namespace-qualified queries like
+            //                 "MyApp.Theme.Style").
+            //
+            // memberName matching follows the standard exact-or-substring rule.
+            let matchesText (candidate: string) (target: string) =
+                if isNull candidate then
+                    false
+                elif exact then
+                    String.Equals(candidate, target, StringComparison.Ordinal)
+                else
+                    candidate.Contains(target, StringComparison.OrdinalIgnoreCase)
+
+            // FullName ends with `.typeName` at a segment boundary, or equals typeName outright.
+            // Rejects `Theme.StyleSheet` for typeName="Style" while accepting `Theme.Style`.
+            let fullNameEndsAtBoundary (fullName: string) =
+                String.Equals(fullName, typeName, StringComparison.Ordinal)
+                || (fullName.EndsWith(typeName, StringComparison.Ordinal)
+                    && fullName.Length > typeName.Length
+                    && fullName[fullName.Length - typeName.Length - 1] = '.')
+
+            let matchesTypeName (entity: FSharpEntity) =
+                let displayOk =
+                    String.Equals(entity.DisplayName, typeName, StringComparison.Ordinal)
+
+                let fullName = entity.FullName
+
+                let fullOk =
+                    if isNull fullName then
+                        false
+                    elif exact then
+                        String.Equals(fullName, typeName, StringComparison.Ordinal)
+                    else
+                        fullNameEndsAtBoundary fullName
+
+                displayOk || fullOk
+
+            let memberFilter (symbolUse: FSharpSymbolUse) : bool =
+                match symbolUse.Symbol with
+                | :? FSharpMemberOrFunctionOrValue as m when m.IsMember ->
+                    let nameOk = matchesText m.DisplayName memberName
+
+                    let typeOk =
+                        try
+                            // FCS occasionally throws on synthetic / anonymous-record /
+                            // closure-captured entities; treat as non-match.
+                            match m.DeclaringEntity with
+                            | Some e -> matchesTypeName e
+                            | None -> false
+                        with _ ->
+                            false
+
+                    nameOk && typeOk
+                | _ -> false
+
+            let allUses = projectResults.GetAllUsesOfAllSymbols()
+
+            let sortedMatches =
+                allUses
+                |> Array.filter memberFilter
+                |> Array.sortBy (fun symbolUse ->
+                    let r = symbolUse.Range
+                    symbolUse.FileName, r.StartLine, r.StartColumn)
+
+            let totalMatched = sortedMatches.Length
+
+            let pageUses =
+                sortedMatches
+                |> Array.skip (min pageOffset totalMatched)
+                |> Array.truncate pageSize
+
+            let pageNodes = pageUses |> Array.map symbolUseToJson
+
+            let paginationFields =
+                Cursor.paginationFields "uses" totalMatched pageOffset pageSize pageUses.Length
+
+            let baseFields =
+                [ "status", jstr "succeeded"
+                  "optionsSource", jstr optionsSource
+                  "projectFileName", jstr projectOptions.ProjectFileName
+                  "typeName", jstr typeName
+                  "memberName", jstr memberName
                   "exact", jbool exact
                   "cached", jbool cached
                   "totalProjectSymbolUses", jint allUses.Length
@@ -1178,7 +1341,13 @@ type internal FcsBridge() =
 
     member this.ProjectOutline(args: FcsProjectOutlineArgs) : Task<JsonNode> =
         task {
-            let projectPath = normalizePath args.projectPath
+            let projectPath =
+                match args.projectPath with
+                | Some p when not (String.IsNullOrWhiteSpace p) -> normalizePath p
+                | _ ->
+                    invalidArg
+                        (nameof args.projectPath)
+                        "projectPath is required. Either pass it explicitly or call set_project first to establish a default."
 
             if not (File.Exists projectPath) then
                 invalidArg (nameof args.projectPath) $"Project file does not exist: %s{projectPath}"

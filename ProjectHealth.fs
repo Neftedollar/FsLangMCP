@@ -209,22 +209,30 @@ let private pickSingleFsproj (projects: string array) (sourcePath: string) =
         let names = many |> Array.map Path.GetFileName |> String.concat ", "
         Error $"Multiple .fsproj files found; pass one explicitly: %s{names}"
 
-let private resolveHealthProjectPath (inputPath: string) =
-    let fullPath = Path.GetFullPath(inputPath)
-    let ext = Path.GetExtension(fullPath)
+let private resolveHealthProjectPath (input: string option) =
+    match input with
+    | None ->
+        Error
+            "projectPath is required. Either pass it (a .fsproj, .sln, .slnx, or directory) or call set_project first to establish a default."
+    | Some path when System.String.IsNullOrWhiteSpace path ->
+        Error
+            "projectPath must not be empty. Pass a .fsproj/.sln/.slnx path or call set_project first."
+    | Some inputPath ->
+        let fullPath = Path.GetFullPath(inputPath)
+        let ext = Path.GetExtension(fullPath)
 
-    if File.Exists fullPath && ext.Equals(".fsproj", StringComparison.OrdinalIgnoreCase) then
-        Ok fullPath
-    elif File.Exists fullPath && ext.Equals(".slnx", StringComparison.OrdinalIgnoreCase) then
-        FsLangMcp.ProjectFiles.SolutionParsing.fsprojsFromSlnx fullPath |> pickSingleFsproj <| fullPath
-    elif File.Exists fullPath && ext.Equals(".sln", StringComparison.OrdinalIgnoreCase) then
-        FsLangMcp.ProjectFiles.SolutionParsing.fsprojsFromSln fullPath |> pickSingleFsproj <| fullPath
-    elif Directory.Exists fullPath then
-        Directory.GetFiles(fullPath, "*.fsproj", SearchOption.TopDirectoryOnly)
-        |> Array.map Path.GetFullPath
-        |> pickSingleFsproj <| fullPath
-    else
-        Error "project_health expects a .fsproj, .sln, .slnx path, or a directory containing exactly one .fsproj."
+        if File.Exists fullPath && ext.Equals(".fsproj", StringComparison.OrdinalIgnoreCase) then
+            Ok fullPath
+        elif File.Exists fullPath && ext.Equals(".slnx", StringComparison.OrdinalIgnoreCase) then
+            FsLangMcp.ProjectFiles.SolutionParsing.fsprojsFromSlnx fullPath |> pickSingleFsproj <| fullPath
+        elif File.Exists fullPath && ext.Equals(".sln", StringComparison.OrdinalIgnoreCase) then
+            FsLangMcp.ProjectFiles.SolutionParsing.fsprojsFromSln fullPath |> pickSingleFsproj <| fullPath
+        elif Directory.Exists fullPath then
+            Directory.GetFiles(fullPath, "*.fsproj", SearchOption.TopDirectoryOnly)
+            |> Array.map Path.GetFullPath
+            |> pickSingleFsproj <| fullPath
+        else
+            Error "project_health expects a .fsproj, .sln, .slnx path, or a directory containing exactly one .fsproj."
 
 let createReport
     (args: ProjectHealthArgs)
@@ -251,7 +259,10 @@ let createReport
                       "compileStatus", jobj [ "status", jstr "not_checked" ]
                       "project",
                       jobj
-                          [ "projectPath", jstr (Path.GetFullPath(args.projectPath))
+                          [ "projectPath",
+                            args.projectPath
+                            |> Option.map (Path.GetFullPath >> jstr)
+                            |> Option.defaultValue null
                             "exists", jbool false ] ]
                 :> JsonNode
         | Ok projectPath ->

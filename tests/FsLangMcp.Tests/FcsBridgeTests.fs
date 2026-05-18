@@ -277,7 +277,7 @@ let ``FcsBridge CompileProject succeeds through FCS project typecheck`` () : Tas
 
             let! result =
                 bridge.CompileProject(
-                    { projectPath = projectPath
+                    { projectPath = Some projectPath
                       workspacePath = None
                       timeoutMs = Some 30000 }
                 )
@@ -291,7 +291,7 @@ let ``FcsBridge CompileProject succeeds through FCS project typecheck`` () : Tas
 
             let! cachedResult =
                 bridge.CompileProject(
-                    { projectPath = projectPath
+                    { projectPath = Some projectPath
                       workspacePath = None
                       timeoutMs = Some 30000 }
                 )
@@ -319,7 +319,7 @@ let ``FcsBridge CompileProject reports FCS typecheck errors`` () : Task =
 
             let! result =
                 bridge.CompileProject(
-                    { projectPath = projectPath
+                    { projectPath = Some projectPath
                       workspacePath = None
                       timeoutMs = Some 30000 }
                 )
@@ -341,7 +341,7 @@ let ``FcsBridge CompileProject rejects non fsproj paths`` () : Task =
         let! ex =
             Assert.ThrowsAsync<ArgumentException>(fun () ->
                 bridge.CompileProject(
-                    { projectPath = Path.Combine(Path.GetTempPath(), "NotAProject.fs")
+                    { projectPath = Some(Path.Combine(Path.GetTempPath(), "NotAProject.fs"))
                       workspacePath = None
                       timeoutMs = Some 30000 }
                 ))
@@ -566,7 +566,7 @@ let ``fcs_project_outline returns filtered per file outline`` () : Task =
 
             let! result =
                 bridge.ProjectOutline(
-                    { projectPath = projectPath
+                    { projectPath = Some projectPath
                       workspacePath = Some tempRoot
                       includePrivate = None
                       includeTests = None
@@ -748,4 +748,299 @@ let ``fcs_file_outline still rejects a directory path even when text is supplied
 
         Assert.Equal("error", result["status"].GetValue<string>())
         Assert.Equal("InvalidArgument", result["errorKind"].GetValue<string>())
+    }
+
+// ─── FindMemberUsages (#107) ──────────────────────────────────────────────────
+
+let private styleProjectSource =
+    String.concat
+        "\n"
+        [ "module Theme.Style"
+          ""
+          "type Style ="
+          "    { fg: string }"
+          ""
+          "    member this.Foreground = this.fg"
+          ""
+          "    member this.GetForeground () = this.fg"
+          ""
+          "let private sample = { fg = \"blue\" }"
+          ""
+          "let a = sample.Foreground"
+          ""
+          "let b = sample.Foreground"
+          ""
+          "let c = sample.GetForeground ()" ]
+
+[<Fact>]
+let ``FindMemberUsages returns call sites for a record member`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_member_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let sourcePath, projectPath =
+                writeProjectWithSource tempRoot "ThemeStyle" styleProjectSource
+
+            let! result =
+                bridge.FindMemberUsages(
+                    { typeName = "Style"
+                      memberName = "Foreground"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      exact = Some true
+                      maxResults = Some 100
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            // Definition + 2 usages — exact count depends on FCS reporting style,
+            // but it must be > 0 and not include GetForeground sites.
+            Assert.True(result["matchedCount"].GetValue<int>() >= 2)
+
+            let uses = result["uses"] :?> JsonArray
+
+            for use_ in uses do
+                Assert.Equal("Foreground", (use_["symbol"]["displayName"]).GetValue<string>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``FindMemberUsages returns zero matches for unknown member`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_member_none_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let sourcePath, projectPath =
+                writeProjectWithSource tempRoot "ThemeStyle2" styleProjectSource
+
+            let! result =
+                bridge.FindMemberUsages(
+                    { typeName = "Style"
+                      memberName = "NonExistentMember"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      exact = Some true
+                      maxResults = Some 100
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.Equal(0, result["matchedCount"].GetValue<int>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``FindMemberUsages distinguishes between members on the same type`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_member_two_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let sourcePath, projectPath =
+                writeProjectWithSource tempRoot "ThemeStyle3" styleProjectSource
+
+            // Foreground (property) — used twice in source
+            let! fgResult =
+                bridge.FindMemberUsages(
+                    { typeName = "Style"
+                      memberName = "Foreground"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      exact = Some true
+                      maxResults = Some 100
+                      cursor = None }
+                )
+
+            // GetForeground (method) — used once
+            let! getFgResult =
+                bridge.FindMemberUsages(
+                    { typeName = "Style"
+                      memberName = "GetForeground"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      exact = Some true
+                      maxResults = Some 100
+                      cursor = None }
+                )
+
+            Assert.True(fgResult["matchedCount"].GetValue<int>() >= 2)
+            Assert.True(getFgResult["matchedCount"].GetValue<int>() >= 1)
+
+            // Crucially, asking for "Foreground" (exact) must NOT match GetForeground sites.
+            // The two queries return disjoint use sets; no use in fgResult.uses can be GetForeground.
+            let fgUses = fgResult["uses"] :?> JsonArray
+
+            for use_ in fgUses do
+                let displayName = (use_["symbol"]["displayName"]).GetValue<string>()
+                Assert.NotEqual<string>("GetForeground", displayName)
+                Assert.Equal("Foreground", displayName)
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``FindMemberUsages errors when neither path nor projectPath provided`` () : Task =
+    task {
+        let bridge = FcsBridge()
+
+        let! ex =
+            Assert.ThrowsAsync<ArgumentException>(fun () ->
+                bridge.FindMemberUsages(
+                    { typeName = "Style"
+                      memberName = "Foreground"
+                      path = None
+                      text = None
+                      projectPath = None
+                      projectOptions = None
+                      exact = Some true
+                      maxResults = Some 10
+                      cursor = None }
+                ))
+
+        Assert.Contains("projectPath", ex.Message)
+    }
+
+[<Fact>]
+let ``FindMemberUsages paginates via cursor`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_member_paginate_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let sourcePath, projectPath =
+                writeProjectWithSource tempRoot "ThemeStylePage" styleProjectSource
+
+            // Page size = 1; the fixture has at least 2 Foreground uses.
+            let! page1 =
+                bridge.FindMemberUsages(
+                    { typeName = "Style"
+                      memberName = "Foreground"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      exact = Some true
+                      maxResults = Some 1
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", page1["status"].GetValue<string>())
+            Assert.Equal(1, ((page1["uses"]) :?> JsonArray).Count)
+
+            let nextCursor = page1["nextCursor"]
+            Assert.NotNull(nextCursor)
+            let cursorStr = nextCursor.GetValue<string>()
+            Assert.False(System.String.IsNullOrWhiteSpace cursorStr)
+
+            // Second page returns the remaining use(s).
+            let! page2 =
+                bridge.FindMemberUsages(
+                    { typeName = "Style"
+                      memberName = "Foreground"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      exact = Some true
+                      maxResults = Some 1
+                      cursor = Some cursorStr }
+                )
+
+            Assert.Equal("succeeded", page2["status"].GetValue<string>())
+            Assert.True(((page2["uses"]) :?> JsonArray).Count >= 1)
+
+            // The two pages return different use sites (different ranges).
+            let getStart (page: JsonNode) =
+                let u = ((page["uses"]) :?> JsonArray)[0]
+                let r = u["range"]
+                (r["startLine"].GetValue<int>(), r["startColumn"].GetValue<int>())
+
+            Assert.NotEqual(getStart page1, getStart page2)
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``FindMemberUsages substring typeName does not false-match siblings sharing a prefix`` () : Task =
+    // Regression for review note: with exact=false, typeName="Style" should NOT
+    // match members declared on a *different* type whose DisplayName starts with
+    // "Style" (e.g. StyleSheet). DisplayName matching is exact even when
+    // exact=false; substring is only applied to FullName.
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_member_prefix_%s{runId}")
+        let bridge = FcsBridge()
+
+        let source =
+            String.concat
+                "\n"
+                [ "module Theme.Mixed"
+                  ""
+                  "type Style ="
+                  "    { fg: string }"
+                  "    member this.Foreground = this.fg"
+                  ""
+                  "type StyleSheet ="
+                  "    { rules: int }"
+                  "    member this.Foreground = this.rules"
+                  ""
+                  "let s1 = { fg = \"x\" }"
+                  "let s2 = { rules = 1 }"
+                  ""
+                  "let a = s1.Foreground"
+                  "let b = s2.Foreground" ]
+
+        try
+            let sourcePath, projectPath =
+                writeProjectWithSource tempRoot "ThemeMixed" source
+
+            let! result =
+                bridge.FindMemberUsages(
+                    { typeName = "Style"
+                      memberName = "Foreground"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      exact = Some false // substring mode — the dangerous one
+                      maxResults = Some 100
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+
+            // The s2.Foreground use is on StyleSheet, not Style. Querying with
+            // typeName="Style" + exact=false should *not* pull in StyleSheet sites.
+            //
+            // FCS reports each use along with its symbol. We can't introspect the
+            // declaring type from the JSON, so instead assert by sheer count: the
+            // s1 fixture contributes 1 definition + 1 use = 2 matches; StyleSheet
+            // (if leaked) would push this above. Combined with the previous test
+            // verifying exact-match correctness, this guards the substring-typeName
+            // regression flagged in review.
+            let matched = result["matchedCount"].GetValue<int>()
+            Assert.True(matched <= 3, $"expected ≤3 Style.Foreground matches, got {matched} (StyleSheet leakage)")
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
     }
