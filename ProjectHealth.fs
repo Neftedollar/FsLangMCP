@@ -201,46 +201,6 @@ let private findAnalyzerConfigFiles (projectDir: string) =
         let path = Path.Combine(projectDir, fileName)
         if File.Exists path then Some path else None)
 
-let private fsprojsFromSln (slnPath: string) =
-    let slnDir = Path.GetDirectoryName(slnPath)
-
-    File.ReadAllLines(slnPath)
-    |> Array.choose (fun line ->
-        let trimmed = line.TrimStart()
-
-        if trimmed.StartsWith("Project(", StringComparison.OrdinalIgnoreCase) then
-            let parts = trimmed.Split('"')
-            // Project("{type}") = "Name", "relative\path.fsproj", "{guid}"
-            // indices:   1              3         5
-            if parts.Length > 5 && parts[5].EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
-                let normalized = parts[5].Replace('\\', Path.DirectorySeparatorChar)
-                let full = Path.GetFullPath(Path.Combine(slnDir, normalized))
-                if File.Exists full then Some full else None
-            else
-                None
-        else
-            None)
-
-let private fsprojsFromSlnx (slnxPath: string) =
-    let slnxDir = Path.GetDirectoryName(slnxPath)
-
-    try
-        let doc = XDocument.Load(slnxPath)
-
-        doc.Descendants(xname "Project")
-        |> Seq.choose (fun el ->
-            attr "Path" el
-            |> Option.filter (fun p -> p.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase))
-            |> Option.map (fun p ->
-                let normalized =
-                    p.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar)
-
-                Path.GetFullPath(Path.Combine(slnxDir, normalized))))
-        |> Seq.filter File.Exists
-        |> Seq.toArray
-    with _ ->
-        [||]
-
 let private pickSingleFsproj (projects: string array) (sourcePath: string) =
     match projects with
     | [| one |] -> Ok one
@@ -256,9 +216,9 @@ let private resolveHealthProjectPath (inputPath: string) =
     if File.Exists fullPath && ext.Equals(".fsproj", StringComparison.OrdinalIgnoreCase) then
         Ok fullPath
     elif File.Exists fullPath && ext.Equals(".slnx", StringComparison.OrdinalIgnoreCase) then
-        fsprojsFromSlnx fullPath |> pickSingleFsproj <| fullPath
+        FsLangMcp.ProjectFiles.SolutionParsing.fsprojsFromSlnx fullPath |> pickSingleFsproj <| fullPath
     elif File.Exists fullPath && ext.Equals(".sln", StringComparison.OrdinalIgnoreCase) then
-        fsprojsFromSln fullPath |> pickSingleFsproj <| fullPath
+        FsLangMcp.ProjectFiles.SolutionParsing.fsprojsFromSln fullPath |> pickSingleFsproj <| fullPath
     elif Directory.Exists fullPath then
         Directory.GetFiles(fullPath, "*.fsproj", SearchOption.TopDirectoryOnly)
         |> Array.map Path.GetFullPath

@@ -265,13 +265,44 @@ let main argv =
                 tool (
                     TypedTool.define<SetProjectArgs>
                         "set_project"
-                        "[FSAC] Initialize or switch the FSAC/LSP project context. Must be called before textDocument_* and workspace_* tools. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load and clears FCS caches."
+                        "[FSAC] Initialize or switch the FSAC/LSP project context. Must be called before textDocument_* and workspace_* tools. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load and clears FCS caches. Response includes loadedProjects (.fsproj paths discovered) and readiness (lsp / projectOptions / symbolIndex flags)."
                         (fun args ->
                             toolResult (
                                 runLimited lspGate (fun () ->
                                     task {
                                         let! result = bridge.SetProject args
                                         fcsBridge.ClearCaches()
+
+                                        // Enrich readiness.projectOptions by probing the first loaded .fsproj.
+                                        // Bridge cannot do this itself (no FCS handle); we own that wiring here.
+                                        match result["result"] with
+                                        | :? JsonObject as resultObj ->
+                                            let probeTarget =
+                                                match resultObj["loadedProjects"] with
+                                                | :? JsonArray as arr when arr.Count > 0 ->
+                                                    match arr[0] with
+                                                    | null -> None
+                                                    | node ->
+                                                        let v = node.GetValue<string>()
+                                                        if System.String.IsNullOrWhiteSpace v then None else Some v
+                                                | _ -> None
+
+                                            match probeTarget with
+                                            | Some path ->
+                                                let! probe = fcsBridge.ProbeProjectOptions path
+
+                                                let ok =
+                                                    match probe with
+                                                    | Ok _ -> true
+                                                    | Error _ -> false
+
+                                                match resultObj["readiness"] with
+                                                | :? JsonObject as readinessObj ->
+                                                    readinessObj["projectOptions"] <- jbool ok
+                                                | _ -> ()
+                                            | None -> ()
+                                        | _ -> ()
+
                                         return result
                                     })
                             ))

@@ -186,3 +186,133 @@ let ``workspaceSymbolResponse flags symbolIndexReady=true for non-empty result``
 
     Assert.True(result["symbolIndexReady"].GetValue<bool>())
     Assert.NotNull(result["result"])
+
+// ─── SolutionParsing ──────────────────────────────────────────────────────────
+
+open FsLangMcp.ProjectFiles.SolutionParsing
+
+[<Fact>]
+let ``listProjects returns the single fsproj when given a fsproj path`` () =
+    let runId = Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"sp_fsproj_%s{runId}")
+
+    try
+        Directory.CreateDirectory(root) |> ignore
+        let fsproj = Path.Combine(root, "App.fsproj")
+        File.WriteAllText(fsproj, "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+
+        let result = listProjects fsproj
+
+        Assert.Equal(1, result.Length)
+        Assert.Equal(Path.GetFullPath fsproj, result[0])
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``listProjects returns all fsproj entries from slnx`` () =
+    let runId = Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"sp_slnx_%s{runId}")
+
+    try
+        Directory.CreateDirectory(root) |> ignore
+        File.WriteAllText(Path.Combine(root, "A.fsproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+        File.WriteAllText(Path.Combine(root, "B.fsproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+        let slnx = Path.Combine(root, "S.slnx")
+
+        File.WriteAllText(
+            slnx,
+            String.concat
+                "\n"
+                [ "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                  "<Solution>"
+                  "  <Project Path=\"A.fsproj\" />"
+                  "  <Project Path=\"B.fsproj\" />"
+                  "</Solution>" ])
+
+        let result = listProjects slnx |> Array.sort
+
+        Assert.Equal(2, result.Length)
+        Assert.EndsWith("A.fsproj", result[0])
+        Assert.EndsWith("B.fsproj", result[1])
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``listProjects returns all fsproj entries from sln`` () =
+    let runId = Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"sp_sln_%s{runId}")
+
+    try
+        Directory.CreateDirectory(root) |> ignore
+        File.WriteAllText(Path.Combine(root, "A.fsproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+        File.WriteAllText(Path.Combine(root, "B.fsproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+        let sln = Path.Combine(root, "S.sln")
+
+        File.WriteAllText(
+            sln,
+            String.concat
+                "\n"
+                [ "Microsoft Visual Studio Solution File, Format Version 12.00"
+                  "Project(\"{F2A71F9B-5D33-465A-A702-920D77279786}\") = \"A\", \"A.fsproj\", \"{00000000-0000-0000-0000-000000000001}\""
+                  "EndProject"
+                  "Project(\"{F2A71F9B-5D33-465A-A702-920D77279786}\") = \"B\", \"B.fsproj\", \"{00000000-0000-0000-0000-000000000002}\""
+                  "EndProject" ])
+
+        let result = listProjects sln |> Array.sort
+
+        Assert.Equal(2, result.Length)
+        Assert.EndsWith("A.fsproj", result[0])
+        Assert.EndsWith("B.fsproj", result[1])
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``listProjects returns empty for non-existent path`` () =
+    let result = listProjects "/nonexistent/path/Foo.fsproj"
+    Assert.Empty(result)
+
+[<Fact>]
+let ``listProjects returns empty for unsupported extension`` () =
+    let runId = Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"sp_unknown_%s{runId}")
+
+    try
+        Directory.CreateDirectory(root) |> ignore
+        let path = Path.Combine(root, "Foo.txt")
+        File.WriteAllText(path, "hello")
+        Assert.Empty(listProjects path)
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``listProjects skips fsproj entries that don't exist on disk`` () =
+    let runId = Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"sp_skip_%s{runId}")
+
+    try
+        Directory.CreateDirectory(root) |> ignore
+        // Only A.fsproj exists; B.fsproj does not.
+        File.WriteAllText(Path.Combine(root, "A.fsproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+        let slnx = Path.Combine(root, "S.slnx")
+
+        File.WriteAllText(
+            slnx,
+            String.concat
+                "\n"
+                [ "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                  "<Solution>"
+                  "  <Project Path=\"A.fsproj\" />"
+                  "  <Project Path=\"Missing.fsproj\" />"
+                  "</Solution>" ])
+
+        let result = listProjects slnx
+
+        Assert.Equal(1, result.Length)
+        Assert.EndsWith("A.fsproj", result[0])
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)

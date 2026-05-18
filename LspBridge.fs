@@ -273,6 +273,9 @@ type internal FsAutoCompleteBridge() =
     let mutable workspaceReadyAt: DateTimeOffset voption = ValueNone
 
     [<VolatileField>]
+    let mutable symbolIndexEverWarmed = false
+
+    [<VolatileField>]
     let mutable stderrPump: Task option = None
 
     let parseArgs (raw: string option) =
@@ -375,6 +378,7 @@ type internal FsAutoCompleteBridge() =
         diagnostics.Clear()
         workspaceReady <- false
         workspaceReadyAt <- ValueNone
+        symbolIndexEverWarmed <- false
         workspaceReadyEvent.Reset()
 
     member _.DiagnosticsStore = diagnostics
@@ -384,6 +388,8 @@ type internal FsAutoCompleteBridge() =
     member _.CurrentWorkspaceRoot = runtimeWorkspaceRoot
 
     member _.IsWorkspaceReady = workspaceReady
+
+    member _.IsSymbolIndexReady = symbolIndexEverWarmed
 
     member _.DiagnosticsFileCount = diagnostics.Count
 
@@ -456,9 +462,23 @@ type internal FsAutoCompleteBridge() =
                 else
                     gate.Release() |> ignore
 
+                let loadedProjects =
+                    FsLangMcp.ProjectFiles.SolutionParsing.listProjects projectPath
+
+                let loadedProjectsNode =
+                    JsonArray(loadedProjects |> Array.map jstr) :> JsonNode
+
                 if restartLsp then
                     let! ready = this.WaitForReady(TimeSpan.FromSeconds(30.0))
                     let loadStatus = if ready then "ready" else "timeout"
+
+                    let readinessNode =
+                        jobj
+                            [ "lsp", jbool ready
+                              // projectOptions is enriched by the caller in Program.fs (Bridge has no FCS handle).
+                              "projectOptions", jbool false
+                              "symbolIndex", jbool symbolIndexEverWarmed ]
+                        :> JsonNode
 
                     return
                         jobj
@@ -471,11 +491,20 @@ type internal FsAutoCompleteBridge() =
                                     "lspRestarted", jbool restartLsp
                                     "solutionMode", jbool isSolution
                                     "workspaceLoadStatus", jstr loadStatus
+                                    "loadedProjects", loadedProjectsNode
+                                    "readiness", readinessNode
                                     "workspaceCandidates",
                                     JsonArray(selectionCandidates |> List.map WorkspaceSelection.candidateToJson |> List.toArray) :> JsonNode ]
                               :> JsonNode ]
                         :> JsonNode
                 else
+                    let readinessNode =
+                        jobj
+                            [ "lsp", jbool workspaceReady
+                              "projectOptions", jbool false
+                              "symbolIndex", jbool symbolIndexEverWarmed ]
+                        :> JsonNode
+
                     return
                         jobj
                             [ "status", jstr "ok"
@@ -487,6 +516,8 @@ type internal FsAutoCompleteBridge() =
                                     "lspRestarted", jbool restartLsp
                                     "solutionMode", jbool isSolution
                                     "workspaceLoadStatus", jstr "not_started"
+                                    "loadedProjects", loadedProjectsNode
+                                    "readiness", readinessNode
                                     "workspaceCandidates",
                                     JsonArray(selectionCandidates |> List.map WorkspaceSelection.candidateToJson |> List.toArray) :> JsonNode ]
                               :> JsonNode ]
@@ -754,6 +785,11 @@ type internal FsAutoCompleteBridge() =
                 // No document sync needed — just invoke directly, no gate
                 let parameters = jobj [ "query", jstr args.query ]
                 let! response = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("workspace/symbol", parameters)
+
+                // First non-empty response is the signal that the symbol index has warmed.
+                match response with
+                | :? JsonArray as arr when arr.Count > 0 -> symbolIndexEverWarmed <- true
+                | _ -> ()
 
                 return
                     LspResponseShape.workspaceSymbolResponse

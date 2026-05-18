@@ -285,3 +285,75 @@ let internal filterSummaryToJson (filtered: FilteredProjectFiles) =
           "excludedFiles", jint filtered.Excluded.Length
           "exclusionsByReason", jobj reasonCounts
           "truncated", jbool filtered.Truncated ]
+
+// ─── SolutionParsing ──────────────────────────────────────────────────────────
+// Extracts .fsproj paths from .sln / .slnx files. Pure functions, no IO beyond
+// reading the solution file.
+
+module internal SolutionParsing =
+    let private xname localName = XName.Get(localName)
+
+    let private attr (name: string) (element: XElement) =
+        match element.Attribute(xname name) with
+        | null -> None
+        | value -> Some value.Value
+
+    /// Parses an .sln file and returns absolute paths of .fsproj entries that exist on disk.
+    let fsprojsFromSln (slnPath: string) : string array =
+        let slnDir = Path.GetDirectoryName(slnPath)
+
+        File.ReadAllLines(slnPath)
+        |> Array.choose (fun line ->
+            let trimmed = line.TrimStart()
+
+            if trimmed.StartsWith("Project(", StringComparison.OrdinalIgnoreCase) then
+                let parts = trimmed.Split('"')
+                // Project("{type}") = "Name", "relative\path.fsproj", "{guid}"
+                // indices:   1              3         5
+                if parts.Length > 5 && parts[5].EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
+                    let normalized = parts[5].Replace('\\', Path.DirectorySeparatorChar)
+                    let full = Path.GetFullPath(Path.Combine(slnDir, normalized))
+                    if File.Exists full then Some full else None
+                else
+                    None
+            else
+                None)
+
+    /// Parses an .slnx file and returns absolute paths of .fsproj entries that exist on disk.
+    let fsprojsFromSlnx (slnxPath: string) : string array =
+        let slnxDir = Path.GetDirectoryName(slnxPath)
+
+        try
+            let doc = XDocument.Load(slnxPath)
+
+            doc.Descendants(xname "Project")
+            |> Seq.choose (fun el ->
+                attr "Path" el
+                |> Option.filter (fun p -> p.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase))
+                |> Option.map (fun p ->
+                    let normalized =
+                        p.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar)
+
+                    Path.GetFullPath(Path.Combine(slnxDir, normalized))))
+            |> Seq.filter File.Exists
+            |> Seq.toArray
+        with _ ->
+            [||]
+
+    /// Lists .fsproj files referenced by the given workspace target. For a direct
+    /// .fsproj path, returns [path]. For .sln / .slnx, returns all .fsproj entries
+    /// that exist on disk. For any other path, returns an empty array.
+    let listProjects (workspacePath: string) : string array =
+        if not (File.Exists workspacePath) then
+            [||]
+        else
+            let ext = Path.GetExtension(workspacePath)
+
+            if String.Equals(ext, ".fsproj", StringComparison.OrdinalIgnoreCase) then
+                [| Path.GetFullPath(workspacePath) |]
+            elif String.Equals(ext, ".slnx", StringComparison.OrdinalIgnoreCase) then
+                fsprojsFromSlnx workspacePath
+            elif String.Equals(ext, ".sln", StringComparison.OrdinalIgnoreCase) then
+                fsprojsFromSln workspacePath
+            else
+                [||]
