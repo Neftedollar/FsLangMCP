@@ -183,6 +183,29 @@ type private WorkspaceLoadTarget(setReady: unit -> unit) =
     [<JsonRpcMethod("fsharp/workspaceLoad", UseSingleObjectParameterDeserialization = true)>]
     member _.WorkspaceLoad(payload: JsonElement) = notifyIfReady payload
 
+// ─── LspResponseShape (pure response builders, testable) ──────────────────────
+
+module internal LspResponseShape =
+    /// Maps the workspace-ready flag to the public lspState string.
+    let lspStateString (workspaceReady: bool) : string =
+        if workspaceReady then "ready" else "warming"
+
+    /// Decides whether the symbol index should be considered ready.
+    /// Empty results within `warmupWindow` after workspaceReady=true are treated
+    /// as "still indexing" so callers can distinguish them from "no matches".
+    let assessSymbolIndex
+        (response: JsonNode)
+        (workspaceReadyAt: DateTimeOffset voption)
+        (now: DateTimeOffset)
+        (warmupWindow: TimeSpan)
+        : bool =
+        match response with
+        | :? JsonArray as arr when arr.Count = 0 ->
+            match workspaceReadyAt with
+            | ValueSome readyAt -> now - readyAt > warmupWindow
+            | ValueNone -> false
+        | _ -> true
+
 // ─── FsAutoCompleteBridge ──────────────────────────────────────────────────────
 
 type internal FsAutoCompleteBridge() =
@@ -693,18 +716,12 @@ type internal FsAutoCompleteBridge() =
                 let parameters = jobj [ "query", jstr args.query ]
                 let! response = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("workspace/symbol", parameters)
 
-                // Empty array shortly after ready is suspicious — the symbol index
-                // may still be building. Surface this so callers can distinguish
-                // "no matches" from "not yet indexed".
                 let symbolIndexReady =
-                    match response with
-                    | :? JsonArray as arr when arr.Count = 0 ->
-                        match workspaceReadyAt with
-                        | ValueSome readyAt ->
-                            let elapsed = DateTimeOffset.UtcNow - readyAt
-                            elapsed > TimeSpan.FromSeconds 3.0
-                        | ValueNone -> false
-                    | _ -> true
+                    LspResponseShape.assessSymbolIndex
+                        response
+                        workspaceReadyAt
+                        DateTimeOffset.UtcNow
+                        (TimeSpan.FromSeconds 3.0)
 
                 return
                     jobj
@@ -722,7 +739,7 @@ type internal FsAutoCompleteBridge() =
                 | true, payload -> payload.DeepClone()
                 | false, _ -> JsonArray() :> JsonNode
 
-            let lspState = if workspaceReady then "ready" else "warming"
+            let lspState = LspResponseShape.lspStateString workspaceReady
 
             match args.path with
             | Some path ->

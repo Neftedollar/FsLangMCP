@@ -73,3 +73,56 @@ let ``workspace selection prefers single solution over directory auto selection`
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
+
+// ─── LspResponseShape (response building, pure) ──────────────────────────────
+
+open System.Text.Json.Nodes
+open FsLangMcp.LspBridge.LspResponseShape
+
+[<Fact>]
+let ``lspStateString maps true to ready`` () =
+    Assert.Equal("ready", lspStateString true)
+
+[<Fact>]
+let ``lspStateString maps false to warming`` () =
+    Assert.Equal("warming", lspStateString false)
+
+[<Fact>]
+let ``assessSymbolIndex is true for any non-empty response`` () =
+    let response: JsonNode = JsonArray(JsonValue.Create("a") :> JsonNode) :> JsonNode
+    let now = DateTimeOffset.UtcNow
+    let ready = ValueSome(now.AddSeconds(-10.0))
+
+    Assert.True(assessSymbolIndex response ready now (TimeSpan.FromSeconds 3.0))
+
+[<Fact>]
+let ``assessSymbolIndex is true for empty response when workspaceReadyAt is None`` () =
+    // Defensive fallback — if we never observed ready, don't claim the index is warming
+    let response: JsonNode = JsonArray() :> JsonNode
+    let now = DateTimeOffset.UtcNow
+
+    Assert.False(assessSymbolIndex response ValueNone now (TimeSpan.FromSeconds 3.0))
+
+[<Fact>]
+let ``assessSymbolIndex is false for empty response within warmup window`` () =
+    let response: JsonNode = JsonArray() :> JsonNode
+    let now = DateTimeOffset.UtcNow
+    let ready = ValueSome(now.AddSeconds(-1.0))
+
+    Assert.False(assessSymbolIndex response ready now (TimeSpan.FromSeconds 3.0))
+
+[<Fact>]
+let ``assessSymbolIndex is true for empty response after warmup window elapsed`` () =
+    let response: JsonNode = JsonArray() :> JsonNode
+    let now = DateTimeOffset.UtcNow
+    let ready = ValueSome(now.AddSeconds(-10.0))
+
+    Assert.True(assessSymbolIndex response ready now (TimeSpan.FromSeconds 3.0))
+
+[<Fact>]
+let ``assessSymbolIndex treats non-array responses as ready regardless of timing`` () =
+    let response: JsonNode = JsonObject() :> JsonNode
+    let now = DateTimeOffset.UtcNow
+    let ready = ValueSome(now.AddSeconds(-1.0))
+
+    Assert.True(assessSymbolIndex response ready now (TimeSpan.FromSeconds 3.0))
