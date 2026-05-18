@@ -365,7 +365,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsTypeAtPositionArgs>
                         "fcs_type_at_position"
-                        "[FCS in-process] Low-level exact-position FCS type/symbol query. Works without LSP set_project, but requires accurate line/character and project context for good results. Prefer fcs_symbol_at_word for normal agent workflows. Pass projectPath/projectOptions and 'text' when available."
+                        "[FCS in-process] Low-level exact-position FCS type/symbol query. Requires accurate line/character AND project context — without a prior set_project (or an explicit projectPath/projectOptions) types are often unresolved. The file at 'path' must exist on disk (not yet-to-be-created). Prefer fcs_symbol_at_word for normal agent workflows."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.TypeAtPosition args)))
                     |> unwrapResult
                 )

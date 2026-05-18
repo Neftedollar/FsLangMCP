@@ -208,6 +208,9 @@ type internal FsAutoCompleteBridge() =
     let mutable workspaceReady = false
 
     [<VolatileField>]
+    let mutable workspaceReadyAt: DateTimeOffset voption = ValueNone
+
+    [<VolatileField>]
     let mutable stderrPump: Task option = None
 
     let parseArgs (raw: string option) =
@@ -276,6 +279,7 @@ type internal FsAutoCompleteBridge() =
 
     let markWorkspaceReady () =
         workspaceReady <- true
+        workspaceReadyAt <- ValueSome DateTimeOffset.UtcNow
         workspaceReadyEvent.Set()
 
     member private _.StopLspUnsafe() =
@@ -308,6 +312,7 @@ type internal FsAutoCompleteBridge() =
         documents.Clear()
         diagnostics.Clear()
         workspaceReady <- false
+        workspaceReadyAt <- ValueNone
         workspaceReadyEvent.Reset()
 
     member _.DiagnosticsStore = diagnostics
@@ -687,7 +692,27 @@ type internal FsAutoCompleteBridge() =
                 // No document sync needed — just invoke directly, no gate
                 let parameters = jobj [ "query", jstr args.query ]
                 let! response = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("workspace/symbol", parameters)
-                return jobj [ "status", jstr "ok"; "result", response ] :> JsonNode
+
+                // Empty array shortly after ready is suspicious — the symbol index
+                // may still be building. Surface this so callers can distinguish
+                // "no matches" from "not yet indexed".
+                let symbolIndexReady =
+                    match response with
+                    | :? JsonArray as arr when arr.Count = 0 ->
+                        match workspaceReadyAt with
+                        | ValueSome readyAt ->
+                            let elapsed = DateTimeOffset.UtcNow - readyAt
+                            elapsed > TimeSpan.FromSeconds 3.0
+                        | ValueNone -> false
+                    | _ -> true
+
+                return
+                    jobj
+                        [ "status", jstr "ok"
+                          "lspState", jstr "ready"
+                          "symbolIndexReady", jbool symbolIndexReady
+                          "result", response ]
+                    :> JsonNode
         }
 
     member _.Diagnostics(args: DiagnosticsArgs) : Task<JsonNode> =
@@ -697,17 +722,32 @@ type internal FsAutoCompleteBridge() =
                 | true, payload -> payload.DeepClone()
                 | false, _ -> JsonArray() :> JsonNode
 
+            let lspState = if workspaceReady then "ready" else "warming"
+
             match args.path with
             | Some path ->
                 let uri = toFileUri path
-                return jobj [ "status", jstr "ok"; "result", resolveByUri uri ] :> JsonNode
+
+                return
+                    jobj
+                        [ "status", jstr "ok"
+                          "lspState", jstr lspState
+                          "diagnosticsFileCount", jint diagnostics.Count
+                          "result", resolveByUri uri ]
+                    :> JsonNode
             | None ->
                 let root = JsonObject()
 
                 for KeyValue(uri, payload) in diagnostics do
                     root[uri] <- payload.DeepClone()
 
-                return jobj [ "status", jstr "ok"; "result", root :> JsonNode ] :> JsonNode
+                return
+                    jobj
+                        [ "status", jstr "ok"
+                          "lspState", jstr lspState
+                          "diagnosticsFileCount", jint diagnostics.Count
+                          "result", root :> JsonNode ]
+                    :> JsonNode
         }
 
     member this.Formatting(args: FormattingArgs) : Task<JsonNode> =
