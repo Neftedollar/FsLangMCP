@@ -144,6 +144,34 @@ let private projectReferencesCurrentProject
 
     String.Equals(resolved, currentProjectPath, StringComparison.OrdinalIgnoreCase)
 
+// ─── Test project detection and build metadata ────────────────────────────────
+// Known test-framework package prefixes (case-insensitive).
+// Note: "Microsoft.NET.Test.Sdk" alone does NOT make a project a test project —
+// it is a transport package, not a test framework.
+let private testFrameworkPackages =
+    [ "xunit.v3",               "xunit"
+      "xunit",                  "xunit"
+      "nunit3testadapter",      "nunit"
+      "nunit",                  "nunit"
+      "expecto",                "expecto" ]
+
+/// Return the canonical framework label for a PackageReference id, or None if it
+/// is not a test-framework package.
+let private tryMapTestFramework (packageId: string) =
+    testFrameworkPackages
+    |> List.tryPick (fun (prefix, label) ->
+        if packageId.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) then Some label
+        else None)
+
+/// Collect distinct test-framework labels referenced by the project.
+let private detectTestFrameworks (doc: XDocument) =
+    doc.Descendants(xname "PackageReference")
+    |> Seq.choose (fun p ->
+        attr "Include" p
+        |> Option.bind tryMapTestFramework)
+    |> Seq.distinct
+    |> Seq.toArray
+
 let private looksLikeTestProject (doc: XDocument) =
     boolProperty "IsTestProject" doc = Some true
     || doc.Descendants(xname "PackageReference")
@@ -153,6 +181,101 @@ let private looksLikeTestProject (doc: XDocument) =
                id.Contains("xunit", StringComparison.OrdinalIgnoreCase)
                || id.Contains("nunit", StringComparison.OrdinalIgnoreCase)
                || id.Contains("expecto", StringComparison.OrdinalIgnoreCase)))
+
+/// Count test-method attribute occurrences in a source file. Best-effort regex
+/// scan — no dotnet test invocation. Matches both bare names and namespace-qualified
+/// variants, plus the trailing "Attribute" suffix (so `[<Xunit.FactAttribute>]`
+/// counts the same as `[<Fact>]`). NUnit's `[<Test>]` / `[<TestCase>]` are also
+/// counted; Expecto's tests are not attribute-driven, so they will read as 0
+/// for an Expecto-only project — caller should treat that as "n/a" rather than
+/// "no tests" when testFrameworks contains "expecto".
+let private countTestAttributesInFile (filePath: string) =
+    try
+        let source = File.ReadAllText(filePath)
+        // `(?:[\w.]+\.)?` allows an optional qualifier (e.g. `Xunit.`)
+        // `Attribute` suffix is optional. `[^\]]*` swallows any constructor args.
+        let pattern =
+            """\[<(?:[\w.]+\.)?(?:Fact|Theory|Test|TestCase|TestMethod)(?:Attribute)?(?:[^\]]*)?>\]"""
+
+        System.Text.RegularExpressions.Regex.Matches(source, pattern).Count
+    with _ ->
+        0
+
+/// Find the most-recently-written .dll under bin/ whose basename matches the
+/// project name (case-insensitive). Returns absolute path or None.
+/// Best-effort glob — projects with custom OutputPath may not be found; acceptable for v0.8.0.
+let private findLatestBuildArtifact (projectDir: string) (projectName: string) =
+    let separator: string = string Path.DirectorySeparatorChar
+    let binSegment = $"%s{separator}bin%s{separator}"
+
+    try
+        Directory.EnumerateFiles(projectDir, "*.dll", SearchOption.AllDirectories)
+        |> Seq.filter (fun p ->
+            p.Contains(binSegment, StringComparison.OrdinalIgnoreCase)
+            && String.Equals(
+                Path.GetFileNameWithoutExtension(p),
+                projectName,
+                StringComparison.OrdinalIgnoreCase))
+        |> Seq.sortByDescending (fun p -> File.GetLastWriteTimeUtc(p))
+        |> Seq.tryHead
+    with _ ->
+        None
+
+/// Build the test-discovery + last-build JSON sub-object for one project.
+let private testProjectInfo
+    (projectPath: string)
+    (doc: XDocument)
+    (compiledFiles: (string * string * string option) list)
+    : JsonNode =
+    let projectDir = Path.GetDirectoryName(projectPath)
+
+    // Prefer the .fsproj's `<AssemblyName>` over the file basename — they differ
+    // in plenty of real projects. Fallback chain: AssemblyName → file basename.
+    let assemblyBasename =
+        childValue "AssemblyName" doc
+        |> Option.defaultValue (Path.GetFileNameWithoutExtension(projectPath))
+
+    let frameworks = detectTestFrameworks doc
+    let isTest     = frameworks.Length > 0
+
+    // Count test attributes only when this is a recognised test project.
+    // Best-effort: read each compile source; sum [<Fact>] + [<Theory>] occurrences.
+    let testCountNode : JsonNode =
+        if not isTest then
+            null
+        else
+            let total =
+                compiledFiles
+                |> List.sumBy (fun (path, _, _) -> countTestAttributesInFile path)
+            JsonValue.Create(total)
+
+    let frameworkArray =
+        JsonArray(frameworks |> Array.map jstr) :> JsonNode
+
+    let latestArtifact = findLatestBuildArtifact projectDir assemblyBasename
+
+    let lastBuildSucceeded : JsonNode =
+        match latestArtifact with
+        | Some _ -> JsonValue.Create(true)
+        | None   -> null
+
+    let lastBuildAt : JsonNode =
+        match latestArtifact with
+        | Some p -> jstr (File.GetLastWriteTimeUtc(p).ToString("o"))
+        | None   -> null
+
+    let binaryOutputPath : JsonNode =
+        match latestArtifact with
+        | Some p -> jstr p
+        | None   -> null
+
+    jobj
+        [ "isTestProject",    JsonValue.Create(isTest) :> JsonNode
+          "testFrameworks",   frameworkArray
+          "testCount",        testCountNode
+          "lastBuildSucceeded", lastBuildSucceeded
+          "lastBuildAt",      lastBuildAt
+          "binaryOutputPath", binaryOutputPath ]
 
 let private discoverTestProjects (workspaceRoot: string) (currentProjectPath: string) =
     if not (Directory.Exists workspaceRoot) then
@@ -297,6 +420,7 @@ let createReport
 
                 let files = compileFiles projectPath doc
                 let fileSummary = sourceSummary files
+                let testInfo = testProjectInfo projectPath doc files
                 let hasMissingFiles = fileSummary["missingFiles"].AsArray().Count > 0
                 let hasUnreadableFiles = fileSummary["unreadableFiles"].AsArray().Count > 0
 
@@ -405,7 +529,13 @@ let createReport
                                 "targetFramework",
                                 childValue "TargetFramework" doc |> Option.map jstr |> Option.defaultValue null
                                 "targetFrameworks",
-                                childValue "TargetFrameworks" doc |> Option.map jstr |> Option.defaultValue null ]
+                                childValue "TargetFrameworks" doc |> Option.map jstr |> Option.defaultValue null
+                                "isTestProject",    testInfo["isTestProject"].DeepClone()
+                                "testFrameworks",   testInfo["testFrameworks"].DeepClone()
+                                "testCount",        (let n = testInfo["testCount"] in if isNull n then null else n.DeepClone())
+                                "lastBuildSucceeded", (let n = testInfo["lastBuildSucceeded"] in if isNull n then null else n.DeepClone())
+                                "lastBuildAt",      (let n = testInfo["lastBuildAt"] in if isNull n then null else n.DeepClone())
+                                "binaryOutputPath", (let n = testInfo["binaryOutputPath"] in if isNull n then null else n.DeepClone()) ]
                           "workspace",
                           jobj
                               [ "workspaceRoot", jstr workspaceRoot

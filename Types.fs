@@ -91,6 +91,22 @@ type FcsProjectSymbolUsesArgs =
       /// Opaque cursor from a prior call's `nextCursor`. Omit for the first page.
       cursor: string option }
 
+type FcsRecordFieldAuditArgs =
+    { /// Record type name. Matched against FSharpEntity.DisplayName (e.g. "TraderRole")
+      /// or FullName ending at a segment boundary (e.g. "LlmTrader.Domain.Ports.TraderRole").
+      typeName: string
+      /// Field name on the record, e.g. "Propose". Exact-match against FSharpField.Name.
+      fieldName: string
+      /// File context used to derive project options when projectPath is absent.
+      path: string option
+      text: string option
+      projectPath: string option
+      projectOptions: string list option
+      /// Maximum sites returned per page. Default 200, hard ceiling 1000.
+      maxResults: int option
+      /// Opaque cursor from a prior call's `nextCursor`. Omit for the first page.
+      cursor: string option }
+
 type FcsFindMemberUsagesArgs =
     { /// Type that declares the member. Match against DisplayName (e.g. "Style")
       /// or FullName (e.g. "MyApp.Theme.Style").
@@ -129,6 +145,10 @@ type FcsFindSymbolArgs =
       maxResults: int option
       contextLines: int option
       includeDeclaration: bool option
+      /// When true, include Info/Hint severity diagnostics in projectDiagnostics.
+      /// Default false — reduces noise like FS3520 XML-comment chatter that
+      /// drowns out actionable warnings. (#116)
+      includeInfo: bool option
       /// Opaque cursor from a prior call's `nextCursor`. Omit for the first page.
       cursor: string option }
 
@@ -246,6 +266,17 @@ type FcsCheckerConfig =
       KeepAllBackgroundResolutions: bool
       KeepAllBackgroundSymbolUses: bool
       ProjectCacheSize: int }
+
+type FcsMakeInternalVisibleArgs =
+    { /// File containing the declaration. Must exist on disk; pass `text` for
+      /// unsaved buffers.
+      path: string
+      /// 0-based line (LSP convention).
+      line: int
+      /// 0-based column.
+      character: int
+      text: string option
+      projectPath: string option }
 
 [<CLIMutable>]
 type FslangmcpVersionArgs =

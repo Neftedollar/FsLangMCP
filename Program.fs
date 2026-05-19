@@ -447,9 +447,33 @@ let main argv =
                 )
 
                 tool (
+                    TypedTool.define<FcsMakeInternalVisibleArgs>
+                        "fcs_make_internal_visible"
+                        "[FCS in-process] Drops the `private` keyword from a let / let rec / module / module rec / type / member / val / new / static / abstract / override declaration at the given (line, character) — Variant A of #118. Uses FCS only to confirm the position resolves to a real symbol (not a comment); the text scan is authoritative for locating the `private` token. Returns a workspace edit { status: 'ok', edits: [{ range, newText: '' }], appliedPreview, originalLineText } — does NOT write the file. When the position has no symbol OR the line has no recognized `private` modifier, returns { status: 'no_action', reason }. Variant B (auto-add InternalsVisibleTo on the test project) is a planned follow-up."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.MakeInternalVisible args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsRecordFieldAuditArgs>
+                        "fcs_record_field_audit"
+                        "[FCS in-process] Find every construction site for a record field, covering both `{ Field = expr; ... }` literal form AND `{ existing with Field = expr }` update form. Complements `fcs_find_symbol`/`textDocument_references`, which look up the *type name* and miss field-set uses — the gap that LlmTrader's port-record widening refactors keep tripping over. Pass typeName (DisplayName e.g. 'TraderRole' OR segment-boundary FullName e.g. 'LlmTrader.Domain.Ports.TraderRole') and fieldName (exact, case-sensitive). Each site reports file, range, form ('literal' | 'with-update' | 'unknown' via a line-text heuristic — false positives possible if a comment contains ' with '), and 2 lines of source context. Paginated; default 200, max 1000. projectPath is optional after set_project."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.RecordFieldAudit args)))
+                    |> unwrapResult
+                )
+
+                tool (
                     TypedTool.define<FcsFindSymbolArgs>
                         "fcs_find_symbol"
-                        "[FCS in-process] Agent-friendly project-wide symbol search with grouped definitions/references and source line context. Better than chaining workspace_symbol, fcs_project_symbol_uses, and shell line reads. Pass projectPath when possible."
+                        "[FCS in-process] Agent-friendly project-wide symbol search with grouped definitions/references and source line context. Better than chaining workspace_symbol, fcs_project_symbol_uses, and shell line reads. Pass projectPath when possible. Caveat: misses record-field-set construction sites — for those, use fcs_record_field_audit. The projectDiagnostics field is SCOPED: only diagnostics for files that contain a match for `symbolQuery` are returned, and Info/Hint severity is filtered out by default. Set includeInfo=true to see Info/Hint chatter (e.g. FS3520 XML-comment notes)."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.FindSymbol args)))
                     |> unwrapResult
                 )

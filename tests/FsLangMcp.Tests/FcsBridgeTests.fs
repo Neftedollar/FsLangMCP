@@ -489,6 +489,7 @@ let ``fcs_find_symbol groups definitions and references with source context`` ()
                       maxResults = Some 20
                       contextLines = Some 1
                       includeDeclaration = Some true
+                      includeInfo = None
                       cursor = None }
                 )
 
@@ -606,6 +607,7 @@ let ``fcs_find_symbol returns InvalidArgument error when path is a directory`` (
                   maxResults = Some 10
                   contextLines = Some 0
                   includeDeclaration = Some true
+                  includeInfo = None
                   cursor = None }
             )
 
@@ -632,6 +634,7 @@ let ``fcs_find_symbol returns InvalidArgument error when path does not exist`` (
                   maxResults = Some 10
                   contextLines = Some 0
                   includeDeclaration = Some true
+                  includeInfo = None
                   cursor = None }
             )
 
@@ -1587,4 +1590,517 @@ let ``NugetTypes does not match System.* assemblies for packageId='System'`` () 
         // exactly one match — not the dozens you'd see under reverse-prefix matching.
         let matched = result["matchedAssemblies"] :?> JsonArray
         Assert.True(matched.Count <= 1, $"Expected at most 1 'System' assembly, got %d{matched.Count}")
+    }
+
+// ─── fcs_make_internal_visible (#118) ────────────────────────────────────────
+
+[<Fact>]
+let ``MakeInternalVisible drops 'private' from a let binding`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_miv_let_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // line 0: module ...
+            // line 1: (blank)
+            // line 2: let private foo = 1
+            let src = "module MivLet.Library\n\nlet private foo = 1\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "MivLet" src
+
+            // Position the cursor on "foo" — character 12 = 'f' in "let private foo = 1".
+            // 0..3 "let ", 4..10 "private", 11 " ", 12 "f"
+            let! result =
+                bridge.MakeInternalVisible(
+                    { path = sourcePath
+                      line = 2
+                      character = 12
+                      text = None
+                      projectPath = Some projectPath }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+            let preview = result["appliedPreview"].GetValue<string>()
+            Assert.Equal("let foo = 1", preview)
+
+            let edits = result["edits"] :?> JsonArray
+            Assert.Equal(1, edits.Count)
+            let editEntry = edits[0]
+            let range = editEntry["range"]
+            // The removed span is the leading space + "private" (8 chars: " private").
+            Assert.Equal(3, range["startColumn"].GetValue<int>())
+            Assert.Equal(11, range["endColumn"].GetValue<int>())
+            Assert.Equal(2, range["startLine"].GetValue<int>())
+            Assert.Equal(2, range["endLine"].GetValue<int>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``MakeInternalVisible drops 'private' from a let rec binding`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_miv_letrec_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // line 2: let rec private go n = if n = 0 then 0 else go (n - 1)
+            let src = "module MivLetRec.Library\n\nlet rec private go n = if n = 0 then 0 else go (n - 1)\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "MivLetRec" src
+
+            // character 16 = 'g' in "let rec private go" — 0..3 "let ", 4..6 "rec", 7 " ", 8..14 "private", 15 " ", 16 "g"
+            let! result =
+                bridge.MakeInternalVisible(
+                    { path = sourcePath
+                      line = 2
+                      character = 16
+                      text = None
+                      projectPath = Some projectPath }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+            let preview = result["appliedPreview"].GetValue<string>()
+            Assert.Contains("let rec go", preview)
+            Assert.DoesNotContain("private", preview)
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``MakeInternalVisible returns no_action when line has no 'private' modifier`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_miv_nopriv_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let src = "module MivNoPriv.Library\n\nlet foo = 1\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "MivNoPriv" src
+
+            let! result =
+                bridge.MakeInternalVisible(
+                    { path = sourcePath
+                      line = 2
+                      character = 4
+                      text = None
+                      projectPath = Some projectPath }
+                )
+
+            Assert.Equal("no_action", result["status"].GetValue<string>())
+            Assert.Contains("No `private` modifier", result["reason"].GetValue<string>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``MakeInternalVisible returns no_action when position has no symbol`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_miv_nosym_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // Cursor on an empty line — no symbol present.
+            let src = "module MivNoSym.Library\n\n\nlet private foo = 1\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "MivNoSym" src
+
+            let! result =
+                bridge.MakeInternalVisible(
+                    { path = sourcePath
+                      line = 2 // the blank line
+                      character = 0
+                      text = None
+                      projectPath = Some projectPath }
+                )
+
+            Assert.Equal("no_action", result["status"].GetValue<string>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``MakeInternalVisible handles attribute prefix on the same line`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_miv_attr_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // The very pattern used by FsLangMcp's own xunit fixtures.
+            let src = "module MivAttr.Library\n\n[<System.Obsolete>] let private foo = 1\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "MivAttr" src
+
+            // character anywhere on the `let private foo = 1` part — pick a column
+            // far enough right to be safely past the attribute block.
+            let! result =
+                bridge.MakeInternalVisible(
+                    { path = sourcePath
+                      line = 2
+                      character = 35
+                      text = None
+                      projectPath = Some projectPath }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+            let preview = result["appliedPreview"].GetValue<string>()
+            Assert.DoesNotContain("private", preview)
+            Assert.Contains("[<System.Obsolete>]", preview)
+            Assert.Contains("let foo = 1", preview)
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``MakeInternalVisible does not match the 'privately' identifier`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_miv_boundary_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // "privately" should NOT trip the " private" token boundary check.
+            let src = "module MivBoundary.Library\n\nlet privately = 1\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "MivBoundary" src
+
+            let! result =
+                bridge.MakeInternalVisible(
+                    { path = sourcePath
+                      line = 2
+                      character = 5
+                      text = None
+                      projectPath = Some projectPath }
+                )
+
+            Assert.Equal("no_action", result["status"].GetValue<string>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+// ─── fcs_find_symbol projectDiagnostics scoping (#116) ───────────────────────
+
+[<Fact>]
+let ``FindSymbol projectDiagnostics is scoped to matched files`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_fs_scope_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // Two-file project. SymbolA exists only in fileA; fileB is unrelated.
+            let dir = Path.Combine(tempRoot, "FsScope")
+            Directory.CreateDirectory(dir) |> ignore
+            let fileAPath = Path.Combine(dir, "LibA.fs")
+            let fileBPath = Path.Combine(dir, "LibB.fs")
+            File.WriteAllText(fileAPath, "module FsScope.LibA\n\nlet symbolA = 1\n")
+            File.WriteAllText(fileBPath, "module FsScope.LibB\n\nlet symbolB = 2\n")
+
+            let projectPath = Path.Combine(dir, "FsScope.fsproj")
+
+            File.WriteAllText(
+                projectPath,
+                String.concat
+                    Environment.NewLine
+                    [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+                      "  <PropertyGroup>"
+                      "    <TargetFramework>net10.0</TargetFramework>"
+                      "  </PropertyGroup>"
+                      "  <ItemGroup>"
+                      "    <Compile Include=\"LibA.fs\" />"
+                      "    <Compile Include=\"LibB.fs\" />"
+                      "  </ItemGroup>"
+                      "</Project>" ]
+            )
+
+            let! result =
+                bridge.FindSymbol(
+                    { path = fileAPath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      symbolQuery = "symbolA"
+                      exact = Some true
+                      maxResults = Some 10
+                      contextLines = Some 0
+                      includeDeclaration = Some true
+                      includeInfo = None
+                      cursor = None }
+            )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.Equal("matched-files", result["projectDiagnosticsScope"].GetValue<string>())
+            Assert.False(result["includeInfo"].GetValue<bool>())
+
+            // Scoped to files that contain matches for "symbolA": fileA only, not fileB.
+            // For a clean project, the diagnostics array is empty — main contract is
+            // it shouldn't contain entries from fileB.
+            let diags = result["projectDiagnostics"] :?> JsonArray
+
+            for i in 0 .. diags.Count - 1 do
+                let d = diags[i]
+                let file = d["file"].GetValue<string>()
+                Assert.DoesNotContain("LibB.fs", file)
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``FindSymbol includeInfo=true echoes flag and preserves scoping`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_fs_info_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let sourcePath, projectPath =
+                writeProjectWithSource
+                    tempRoot
+                    "FsInfo"
+                    "module FsInfo.Library\n\nlet value = 1\n"
+
+            let! result =
+                bridge.FindSymbol(
+                    { path = sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      symbolQuery = "value"
+                      exact = Some true
+                      maxResults = Some 10
+                      contextLines = Some 0
+                      includeDeclaration = Some true
+                      includeInfo = Some true
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.True(result["includeInfo"].GetValue<bool>())
+            Assert.Equal("matched-files", result["projectDiagnosticsScope"].GetValue<string>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+// ─── fcs_record_field_audit (#114) ────────────────────────────────────────────
+
+[<Fact>]
+let ``RecordFieldAudit finds literal { Field = expr } construction site`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_rfa_lit_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let src =
+                String.concat
+                    "\n"
+                    [ "module RfaLit.Library"
+                      ""
+                      "type MyRole = { Propose: int -> int }"
+                      ""
+                      "let stub: MyRole = { Propose = fun x -> x + 1 }"
+                      "" ]
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "RfaLit" src
+
+            let! result =
+                bridge.RecordFieldAudit(
+                    { typeName = "MyRole"
+                      fieldName = "Propose"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      maxResults = Some 10
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.True(result["matchedCount"].GetValue<int>() >= 1, "Expected at least one matched site")
+            let sites = result["sites"] :?> JsonArray
+            Assert.True(sites.Count >= 1)
+            let firstSite = sites[0]
+            let firstForm = firstSite["form"].GetValue<string>()
+            Assert.Equal("literal", firstForm)
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``RecordFieldAudit detects with-update form from surrounding text`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_rfa_with_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let src =
+                String.concat
+                    "\n"
+                    [ "module RfaWith.Library"
+                      ""
+                      "type MyRole = { Propose: int -> int; Other: int }"
+                      ""
+                      "let base1: MyRole = { Propose = id; Other = 0 }"
+                      "let updated = { base1 with Propose = fun x -> x * 2 }"
+                      "" ]
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "RfaWith" src
+
+            let! result =
+                bridge.RecordFieldAudit(
+                    { typeName = "MyRole"
+                      fieldName = "Propose"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      maxResults = Some 10
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            let sites = result["sites"] :?> JsonArray
+            // We expect at least 2 Propose sites (literal + with-update).
+            Assert.True(sites.Count >= 2, $"Expected >=2 sites, got %d{sites.Count}")
+            // At least one site must be detected as with-update.
+            let forms =
+                [ for i in 0 .. sites.Count - 1 ->
+                      let s = sites[i]
+                      s["form"].GetValue<string>() ]
+
+            Assert.Contains("with-update", forms)
+            Assert.Contains("literal", forms)
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``RecordFieldAudit returns zero sites when typeName does not match any record`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_rfa_notype_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let src =
+                String.concat
+                    "\n"
+                    [ "module RfaNoType.Library"
+                      ""
+                      "type Real = { Field: int }"
+                      "let r: Real = { Field = 1 }"
+                      "" ]
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "RfaNoType" src
+
+            let! result =
+                bridge.RecordFieldAudit(
+                    { typeName = "Nonexistent"
+                      fieldName = "Field"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      maxResults = None
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.Equal(0, result["matchedCount"].GetValue<int>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``RecordFieldAudit returns zero sites when fieldName is not a field on the type`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_rfa_nofield_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let src =
+                String.concat
+                    "\n"
+                    [ "module RfaNoField.Library"
+                      ""
+                      "type Real = { Field: int }"
+                      "let r: Real = { Field = 1 }"
+                      "" ]
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "RfaNoField" src
+
+            let! result =
+                bridge.RecordFieldAudit(
+                    { typeName = "Real"
+                      fieldName = "MissingField"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      maxResults = None
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.Equal(0, result["matchedCount"].GetValue<int>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``RecordFieldAudit returns invalid_args for empty typeName`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.RecordFieldAudit(
+                { typeName = "   "
+                  fieldName = "Foo"
+                  path = None
+                  text = None
+                  projectPath = Some projectPath
+                  projectOptions = None
+                  maxResults = None
+                  cursor = None }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("typename", (result["message"].GetValue<string>()).ToLowerInvariant())
+    }
+
+[<Fact>]
+let ``RecordFieldAudit returns invalid_args for empty fieldName`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.RecordFieldAudit(
+                { typeName = "Anything"
+                  fieldName = ""
+                  path = None
+                  text = None
+                  projectPath = Some projectPath
+                  projectOptions = None
+                  maxResults = None
+                  cursor = None }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("fieldname", (result["message"].GetValue<string>()).ToLowerInvariant())
     }

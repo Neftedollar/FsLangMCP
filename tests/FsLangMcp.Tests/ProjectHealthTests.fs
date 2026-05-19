@@ -507,3 +507,162 @@ let ``project_health succeeds when projectPath is Some valid fsproj`` () =
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
+
+// ─── Test-discovery + build metadata fields (#117) ───────────────────────────
+
+/// Write a non-test project (no test-framework PackageReference) to a temp dir.
+let private writeNonTestProject (root: string) =
+    Directory.CreateDirectory(root) |> ignore
+    File.WriteAllText(Path.Combine(root, "Library.fs"), "module Library\n\nlet value = 42\n")
+    let projectPath = Path.Combine(root, "Library.fsproj")
+    File.WriteAllText(
+        projectPath,
+        String.concat "\n"
+            [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+              "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+              "  <ItemGroup><Compile Include=\"Library.fs\" /></ItemGroup>"
+              "</Project>" ])
+    projectPath
+
+/// Write an xUnit test project with one [<Fact>] and one [<Theory>] test to a temp dir.
+let private writeXunitTestProject (root: string) (sourceContent: string) =
+    Directory.CreateDirectory(root) |> ignore
+    File.WriteAllText(Path.Combine(root, "Tests.fs"), sourceContent)
+    let projectPath = Path.Combine(root, "Tests.fsproj")
+    File.WriteAllText(
+        projectPath,
+        String.concat "\n"
+            [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+              "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+              "  <ItemGroup><Compile Include=\"Tests.fs\" /></ItemGroup>"
+              "  <ItemGroup>"
+              "    <PackageReference Include=\"xunit\" Version=\"2.9.0\" />"
+              "    <PackageReference Include=\"Microsoft.NET.Test.Sdk\" Version=\"17.12.0\" />"
+              "  </ItemGroup>"
+              "</Project>" ])
+    projectPath
+
+[<Fact>]
+let ``project_health non-test project reports isTestProject false and testCount null`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_nontestproj_%s{runId}")
+    try
+        let projectPath = writeNonTestProject root
+        let result = report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
+        let proj = result["project"]
+
+        Assert.False(proj["isTestProject"].GetValue<bool>())
+        // testFrameworks should be an empty array
+        let frameworks = proj["testFrameworks"] :?> JsonArray
+        Assert.Equal(0, frameworks.Count)
+        // testCount must be null for a non-test project
+        Assert.Null(proj["testCount"])
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health xunit test project with one Fact reports isTestProject true testCount 1`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_xunit1_%s{runId}")
+    let source =
+        String.concat "\n"
+            [ "module Tests"
+              "open Xunit"
+              "[<Fact>]"
+              "let testA () = Assert.True(true)" ]
+    try
+        let projectPath = writeXunitTestProject root source
+        let result = report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
+        let proj = result["project"]
+
+        Assert.True(proj["isTestProject"].GetValue<bool>())
+        Assert.Equal(1, proj["testCount"].GetValue<int>())
+        let frameworks = proj["testFrameworks"] :?> JsonArray
+        Assert.Equal(1, frameworks.Count)
+        Assert.Equal("xunit", frameworks[0].GetValue<string>())
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health xunit project with Theory increments testCount`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_xunittheory_%s{runId}")
+    let source =
+        String.concat "\n"
+            [ "module Tests"
+              "open Xunit"
+              "[<Fact>]"
+              "let testA () = Assert.True(true)"
+              "[<Theory>]"
+              "[<InlineData(1)>]"
+              "let testB (x: int) = Assert.True(x > 0)" ]
+    try
+        let projectPath = writeXunitTestProject root source
+        let result = report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
+        let proj = result["project"]
+
+        Assert.True(proj["isTestProject"].GetValue<bool>())
+        // One [<Fact>] + one [<Theory>] = 2
+        Assert.Equal(2, proj["testCount"].GetValue<int>())
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health reports binaryOutputPath null when bin dir is empty`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_nobin_%s{runId}")
+    try
+        let projectPath = writeNonTestProject root
+        // Ensure no bin/ directory exists under the project
+        let binDir = Path.Combine(root, "bin")
+        if Directory.Exists binDir then Directory.Delete(binDir, true)
+
+        let result = report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
+        let proj = result["project"]
+
+        Assert.Null(proj["binaryOutputPath"])
+        Assert.Null(proj["lastBuildSucceeded"])
+        Assert.Null(proj["lastBuildAt"])
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health reports binaryOutputPath when matching dll exists under bin`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_withbin_%s{runId}")
+    try
+        let projectPath = writeNonTestProject root
+        // Manually place a .dll under bin/Release/net10.0 to simulate a build artifact
+        let artifactDir = Path.Combine(root, "bin", "Release", "net10.0")
+        Directory.CreateDirectory(artifactDir) |> ignore
+        let dllPath = Path.Combine(artifactDir, "Library.dll")
+        File.WriteAllBytes(dllPath, [||])
+
+        let result = report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
+        let proj = result["project"]
+
+        Assert.True(proj["lastBuildSucceeded"].GetValue<bool>())
+        Assert.NotNull(proj["lastBuildAt"])
+        Assert.Equal(dllPath, proj["binaryOutputPath"].GetValue<string>())
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health new fields present on success path for any project`` () =
+    // Verifies that every successful project_health response includes the six new fields.
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_fields_present_%s{runId}")
+    try
+        let projectPath = writeProject root   // uses existing writeProject (has Ionide.Analyzers)
+        let result = report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
+        let proj = result["project"].AsObject()
+
+        Assert.NotNull(proj["isTestProject"])
+        Assert.NotNull(proj["testFrameworks"])
+        // testCount may be null (non-test project) — check the key is present in the object
+        Assert.True(proj.ContainsKey("testCount"))
+        Assert.True(proj.ContainsKey("lastBuildSucceeded"))
+        Assert.True(proj.ContainsKey("lastBuildAt"))
+        Assert.True(proj.ContainsKey("binaryOutputPath"))
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)

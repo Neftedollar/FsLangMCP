@@ -89,6 +89,7 @@ let private findSymbolArgs sourcePath query : FcsFindSymbolArgs =
       maxResults = Some 500
       contextLines = Some 0
       includeDeclaration = Some true
+      includeInfo = None
       cursor = None }
 
 // ─── ProjectSymbolUses: pagination envelope present ───────────────────────────

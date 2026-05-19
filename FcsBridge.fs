@@ -1264,6 +1264,238 @@ type internal FcsBridge() =
             return jobj (baseFields @ paginationFields) :> JsonNode
         }
 
+    /// Finds every record-construction site for `typeName.fieldName`, covering
+    /// both `{ Field = expr; ... }` literal form AND `{ x with Field = expr }`
+    /// update form. Solves the gap where `fcs_find_symbol`/`textDocument_references`
+    /// look up the *type name* and miss field-set uses — confirmed on
+    /// LlmTrader's `TraderRole.Propose` (28 caller sites) and `RiskDebatorRole`.
+    /// See #114.
+    member this.RecordFieldAudit(args: FcsRecordFieldAuditArgs) : Task<JsonNode> =
+        task {
+            let typeName = (args.typeName |> Option.ofObj |> Option.defaultValue "").Trim()
+            let fieldName = (args.fieldName |> Option.ofObj |> Option.defaultValue "").Trim()
+
+            if String.IsNullOrWhiteSpace typeName then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr "typeName must be non-empty" ]
+                    :> JsonNode
+            else if String.IsNullOrWhiteSpace fieldName then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr "fieldName must be non-empty" ]
+                    :> JsonNode
+            else
+
+            // Resolve project options either via path or projectPath, matching
+            // FindMemberUsages's resolution path so callers see the same fallback
+            // semantics across both record/member audit tools.
+            let! optionsSource, projectOptions =
+                task {
+                    match args.path with
+                    | Some path when not (String.IsNullOrWhiteSpace path) ->
+                        let! _, _, src, opts, _, _ =
+                            this.PrepareCheckContext(path, args.text, args.projectPath, args.projectOptions)
+
+                        return src, opts
+                    | _ ->
+                        match args.projectPath with
+                        | Some p when not (String.IsNullOrWhiteSpace p) ->
+                            let! opts, src = this.ResolveFsprojOptions(normalizePath p)
+                            return src, opts
+                        | _ ->
+                            return
+                                invalidArg
+                                    (nameof args.projectPath)
+                                    "Either 'path' or 'projectPath' must be provided (or call set_project first)."
+                }
+
+            let cacheKey = makeResolvedProjectCacheKey projectOptions
+
+            let! projectResults, cached =
+                task {
+                    match projectResultsCache.TryGet(cacheKey) with
+                    | Some existing -> return existing, true
+                    | None ->
+                        let! results = checker.ParseAndCheckProject(projectOptions) |> asTask
+                        projectResultsCache.Set(cacheKey, results)
+                        return results, false
+                }
+
+            let requested = defaultArg args.maxResults 200
+            let pageSize = min (max 1 requested) 1000
+
+            let pageOffsetResult =
+                match args.cursor with
+                | None -> Ok 0
+                | Some cursorStr ->
+                    match Cursor.tryDecode cursorStr with
+                    | Ok payload -> Ok payload.offset
+                    | Error reason -> Error reason
+
+            match pageOffsetResult with
+            | Error reason ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr $"Invalid cursor: %s{reason}" ]
+                    :> JsonNode
+            | Ok pageOffset ->
+
+            // typeName matching for the declaring entity: same exact-DisplayName-OR-
+            // segment-boundary-FullName logic as FindMemberUsages, so users get the
+            // same semantics across both tools.
+            let fullNameEndsAtBoundary (fullName: string) =
+                String.Equals(fullName, typeName, StringComparison.Ordinal)
+                || (fullName.EndsWith(typeName, StringComparison.Ordinal)
+                    && fullName.Length > typeName.Length
+                    && fullName[fullName.Length - typeName.Length - 1] = '.')
+
+            let matchesDeclaringEntity (entity: FSharpEntity) =
+                let displayOk =
+                    String.Equals(entity.DisplayName, typeName, StringComparison.Ordinal)
+
+                let fullName = entity.FullName
+
+                let fullOk =
+                    if isNull fullName then
+                        false
+                    else
+                        fullNameEndsAtBoundary fullName
+
+                displayOk || fullOk
+
+            // A record-field SymbolUse is a write site if the symbol is an
+            // FSharpField whose declaring entity matches typeName and whose Name
+            // matches fieldName. FCS reports both reads and writes through the
+            // same use; we exclude IsFromDefinition (the field's declaration in
+            // the record type itself).
+            let fieldFilter (symbolUse: FSharpSymbolUse) : bool =
+                if symbolUse.IsFromDefinition then
+                    false
+                else
+                    match symbolUse.Symbol with
+                    | :? FSharpField as field ->
+                        try
+                            let nameOk =
+                                String.Equals(field.Name, fieldName, StringComparison.Ordinal)
+
+                            let typeOk =
+                                let declaring = field.DeclaringEntity
+
+                                match declaring with
+                                | Some e -> matchesDeclaringEntity e
+                                | None -> false
+
+                            nameOk && typeOk
+                        with _ ->
+                            // FCS occasionally throws on synthetic / anonymous-record fields;
+                            // treat as non-match rather than letting the whole audit fail.
+                            false
+                    | _ -> false
+
+            let allUses = projectResults.GetAllUsesOfAllSymbols()
+
+            let sortedMatches =
+                allUses
+                |> Array.filter fieldFilter
+                |> Array.sortBy (fun symbolUse ->
+                    let r = symbolUse.Range
+                    symbolUse.FileName, r.StartLine, r.StartColumn)
+
+            let totalMatched = sortedMatches.Length
+
+            let pageUses =
+                sortedMatches
+                |> Array.skip (min pageOffset totalMatched)
+                |> Array.truncate pageSize
+
+            // Pre-compute lines from args.text when it matches an audit site's
+            // file — so an unsaved-buffer caller gets form classification from
+            // their edited content, not from the stale on-disk version.
+            let unsavedLinesByPath =
+                match args.path, args.text with
+                | Some p, Some t when not (String.IsNullOrWhiteSpace t) ->
+                    Some(normalizePath p, t.Split('\n'))
+                | _ -> None
+
+            // Determine literal vs with-update form by inspecting the source line
+            // around the field-name use. Heuristic: look for ` with ` in the line
+            // itself or up to 2 preceding lines (record-update expressions often
+            // span lines, with the ` with ` keyword on a different line than the
+            // field name). False positives possible if the comment text contains
+            // " with " — accept the false-positive rate for v0.8.0 simplicity.
+            //
+            // Reads from args.text when the use's file path matches; otherwise
+            // falls back to on-disk read. Honest about staleness for unsaved buffers.
+            let formOf (symbolUse: FSharpSymbolUse) =
+                try
+                    let lines =
+                        match unsavedLinesByPath with
+                        | Some(textPath, textLines) when
+                            String.Equals(
+                                normalizePath symbolUse.FileName,
+                                textPath,
+                                StringComparison.Ordinal
+                            )
+                            ->
+                            Some textLines
+                        | _ ->
+                            if File.Exists symbolUse.FileName then
+                                Some(File.ReadAllLines(symbolUse.FileName))
+                            else
+                                None
+
+                    match lines with
+                    | None -> "unknown"
+                    | Some lines ->
+                        let r = symbolUse.Range
+                        let startIdx = max 0 (r.StartLine - 3)
+                        let endIdx = min (lines.Length - 1) (r.StartLine - 1)
+
+                        let mutable foundWith = false
+
+                        for i in startIdx..endIdx do
+                            if not foundWith && lines[i].Contains(" with ") then
+                                foundWith <- true
+
+                        if foundWith then "with-update" else "literal"
+                with _ ->
+                    "unknown"
+
+            let siteToJson (symbolUse: FSharpSymbolUse) =
+                let r = symbolUse.Range
+                let context = lineContextToJson 2 symbolUse.FileName r.StartLine
+                let form = formOf symbolUse
+
+                jobj
+                    [ "file", jstr (normalizePath symbolUse.FileName)
+                      "range", rangeToJson r
+                      "form", jstr form
+                      "context", context ]
+                :> JsonNode
+
+            let pageNodes = pageUses |> Array.map siteToJson
+
+            let paginationFields =
+                Cursor.paginationFields "sites" totalMatched pageOffset pageSize pageUses.Length
+
+            let baseFields =
+                [ "status", jstr "succeeded"
+                  "optionsSource", jstr optionsSource
+                  "projectFileName", jstr projectOptions.ProjectFileName
+                  "typeName", jstr typeName
+                  "fieldName", jstr fieldName
+                  "cached", jbool cached
+                  "totalProjectSymbolUses", jint allUses.Length
+                  "matchedCount", jint totalMatched
+                  "sites", JsonArray(pageNodes) :> JsonNode ]
+
+            return jobj (baseFields @ paginationFields) :> JsonNode
+        }
+
     member this.FindSymbol(args: FcsFindSymbolArgs) : Task<JsonNode> =
         task {
             let query = args.symbolQuery.Trim()
@@ -1376,8 +1608,34 @@ type internal FcsBridge() =
             let paginationFields =
                 Cursor.paginationFields "symbols" totalGroups pageOffset pageSize pageGroups.Length
 
-            // matchedUseCount stays project-wide (pre-pagination) so callers see the
-            // total at a glance. Per-page counts are in totalEstimate / pageOffset.
+            // ── projectDiagnostics scoping (#116) ─────────────────────────────
+            // Default: only return diagnostics for files that actually contain a
+            // match for the queried symbol, AND drop Info/Hint severity. The
+            // reporter on #100 got unrelated FS3520 XML-comment chatter in the
+            // response which drowned out signal. `includeInfo=true` restores
+            // Info/Hint when callers want the full payload.
+            let includeInfo = defaultArg args.includeInfo false
+
+            let matchedFileSet =
+                matchedUses
+                |> Array.map (fun u -> normalizePath u.FileName)
+                |> Set.ofArray
+
+            let scopedDiagnostics =
+                projectResults.Diagnostics
+                |> Array.filter (fun d ->
+                    let fileOk =
+                        // Empty matchedFileSet → no scope, no relevant diagnostics.
+                        not matchedFileSet.IsEmpty
+                        && matchedFileSet.Contains(normalizePath d.FileName)
+
+                    let severityOk =
+                        includeInfo
+                        || d.Severity = FSharpDiagnosticSeverity.Error
+                        || d.Severity = FSharpDiagnosticSeverity.Warning
+
+                    fileOk && severityOk)
+
             let baseFields =
                 [ "status", jstr "succeeded"
                   "optionsSource", jstr optionsSource
@@ -1386,10 +1644,13 @@ type internal FcsBridge() =
                   "exact", jbool exact
                   "cached", jbool cached
                   "matchedUseCount", jint matchedUses.Length
+                  "matchedFileCount", jint matchedFileSet.Count
                   "symbolCount", jint pageGroups.Length
+                  "includeInfo", jbool includeInfo
                   "symbols", JsonArray(groupNodes) :> JsonNode
+                  "projectDiagnosticsScope", jstr "matched-files"
                   "projectDiagnostics",
-                  JsonArray(projectResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ]
+                  JsonArray(scopedDiagnostics |> Array.map diagnosticToJson) :> JsonNode ]
 
             return jobj (baseFields @ paginationFields) :> JsonNode
         }
@@ -1546,6 +1807,160 @@ type internal FcsBridge() =
                               "typeString", jstr typeString
                               "xmlDoc", jstr xmlDoc ]
                         :> JsonNode
+        }
+
+    // ── Locate the " private" keyword span on a line, only when it follows a
+    // recognized declaration keyword (let / let rec / module / module rec /
+    // type / member / val / new / static / abstract / override) AND is NOT
+    // inside a line comment. Returns the (startColumn, endColumn) range to
+    // delete. The leading space before "private" is included in the range; the
+    // trailing space before the identifier is preserved. Returns None when no
+    // matching " private" token is found on the line.
+    member private _.FindPrivateSpan(rawLine: string) : (int * int) option =
+        let privateKw = " private"
+
+        // Comment boundary: if "//" appears before the candidate position, this
+        // " private" is inside a comment — refuse to edit.
+        let commentStart =
+            let idx = rawLine.IndexOf("//", StringComparison.Ordinal)
+            if idx < 0 then rawLine.Length else idx
+
+        let mutable idx = 0
+        let mutable found = None
+
+        while idx <= rawLine.Length - privateKw.Length && found.IsNone do
+            let pos = rawLine.IndexOf(privateKw, idx, StringComparison.Ordinal)
+
+            if pos < 0 || pos >= commentStart then
+                idx <- rawLine.Length
+            else
+                let afterPos = pos + privateKw.Length
+
+                // Token boundary: " private" must be followed by whitespace or EOL,
+                // not by another letter (would be "privateer" / "privately" etc.).
+                let isWordBoundary =
+                    afterPos >= rawLine.Length
+                    || rawLine[afterPos] = ' '
+                    || rawLine[afterPos] = '\t'
+
+                if isWordBoundary then
+                    // Strip leading whitespace, then peel off any number of
+                    // `[<...>]` attribute blocks (each optionally followed by
+                    // whitespace). `[<Fact>] let private foo = 1` must match
+                    // `let` after the attribute is removed.
+                    let mutable before = rawLine.Substring(0, pos).TrimStart()
+
+                    let mutable keepStripping = true
+
+                    while keepStripping
+                          && before.StartsWith("[<", StringComparison.Ordinal) do
+                        match before.IndexOf(">]", StringComparison.Ordinal) with
+                        | -1 -> keepStripping <- false
+                        | endIdx -> before <- before.Substring(endIdx + 2).TrimStart()
+
+                    let recognised =
+                        [ "let rec"; "let"; "module rec"; "module"; "type"; "member"; "val"; "new"
+                          "static member"; "static"; "abstract member"; "abstract"; "override" ]
+                        |> List.exists (fun kw ->
+                            before = kw
+                            || before.StartsWith(kw + " ", StringComparison.Ordinal)
+                            || before.StartsWith(kw + "\t", StringComparison.Ordinal))
+
+                    if recognised then
+                        // Drop [pos, afterPos) — the leading space + "private".
+                        // The space after "private" (at afterPos) is preserved so the
+                        // remaining text reads `let foo = …` not `letfoo = …`.
+                        found <- Some(pos, afterPos)
+
+                idx <- pos + 1
+
+        found
+
+    // Synchronous core extracted from the task{} body to keep the F# state
+    // machine compilable (avoids FS3511 on long branches in task computation
+    // expressions).
+    member private this.BuildMakeInternalVisibleResult
+        (path: string, args: FcsMakeInternalVisibleArgs, source: string, checkResults: FSharpCheckFileResults)
+        : JsonNode =
+
+        let noAction reason =
+            jobj
+                [ "status", jstr "no_action"
+                  "file", jstr path
+                  "reason", jstr reason ]
+            :> JsonNode
+
+        let fcsLine = args.line + 1
+        let lines = source.Split('\n')
+
+        let lineText =
+            if fcsLine >= 1 && fcsLine <= lines.Length then
+                lines[fcsLine - 1].TrimEnd('\r')
+            else
+                ""
+
+        // We do NOT use FCS GetSymbolUseAtLocation for the "is there a symbol
+        // here" guard — it proved unreliable for module-level let bindings (FCS
+        // returns None at the identifier column in test fixtures). FindPrivateSpan
+        // is authoritative: it requires (a) a recognized declaration keyword
+        // before " private", and (b) the " private" must not be inside a line
+        // comment. That covers the failure modes we care about (comments, free
+        // text) and avoids the FCS predicate brittleness.
+        let _ = checkResults // retained for future extensions; not consulted here
+
+        if String.IsNullOrWhiteSpace lineText then
+            noAction
+                $"Line %d{args.line} is empty. Move the cursor to the declaration's line."
+        else
+            match this.FindPrivateSpan(lineText) with
+            | None ->
+                noAction
+                    $"No `private` modifier found on line %d{args.line}. Either the declaration is on a different line, or it is already not private."
+            | Some(startCol, endCol) ->
+                let appliedPreview =
+                    lineText.Substring(0, startCol) + lineText.Substring(endCol)
+
+                let editRange =
+                    jobj
+                        [ "startLine", jint args.line
+                          "startColumn", jint startCol
+                          "endLine", jint args.line
+                          "endColumn", jint endCol ]
+                    :> JsonNode
+
+                let edit = jobj [ "range", editRange; "newText", jstr "" ] :> JsonNode
+
+                jobj
+                    [ "status", jstr "ok"
+                      "file", jstr path
+                      "edits", JsonArray([| edit |]) :> JsonNode
+                      "appliedPreview", jstr appliedPreview
+                      "originalLineText", jstr lineText ]
+                :> JsonNode
+
+    /// Returns a workspace edit that drops the `private` keyword from a
+    /// declaration at the given position. Uses FCS only to confirm there IS a
+    /// symbol at the position (so we don't strip text inside a comment),
+    /// then scans the line for ` private` following a recognized declaration
+    /// keyword and returns the edit range. Variant A of #118.
+    member this.MakeInternalVisible(args: FcsMakeInternalVisibleArgs) : Task<JsonNode> =
+        task {
+            match validateSourcePath "fcs_make_internal_visible" args.text args.path with
+            | Some err -> return err
+            | None ->
+
+            let! path, source, _, _, _, checkedResults =
+                this.PrepareCheckContext(args.path, args.text, args.projectPath, None)
+
+            return
+                match checkedResults with
+                | None ->
+                    jobj
+                        [ "status", jstr "aborted"
+                          "message", jstr "Type checking was aborted." ]
+                    :> JsonNode
+                | Some checkResults ->
+                    this.BuildMakeInternalVisibleResult(path, args, source, checkResults)
         }
 
     member this.SymbolAtWord(args: FcsSymbolAtWordArgs) : Task<JsonNode> =
