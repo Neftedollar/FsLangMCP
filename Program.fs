@@ -209,10 +209,20 @@ let main argv =
         use fcsGate = new SemaphoreSlim(readPositiveIntEnv "FSLANGMCP_MAX_CONCURRENT_FCS" 2)
         use lspGate = new SemaphoreSlim(readPositiveIntEnv "FSLANGMCP_MAX_CONCURRENT_LSP" 1)
 
+        let versionResponse: Task<JsonNode> =
+            task {
+                return
+                    jobj
+                        [ "status", jstr "ok"
+                          "fslangmcpVersion", jstr FsLangMcp.Version.current
+                          "productName", jstr FsLangMcp.Version.productName ]
+                    :> JsonNode
+            }
+
         let server =
             mcpServer {
                 name "fsharp-fsautocomplete"
-                version "0.4.0"
+                version FsLangMcp.Version.current
 
                 tool (
                     TypedTool.define<CompletionArgs>
@@ -531,6 +541,14 @@ let main argv =
                                     )
                                 )
                             | Some path -> toolResult (runLimited fcsGate (fun () -> runProjInfoAsync path)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FslangmcpVersionArgs>
+                        "fslangmcp_version"
+                        "[meta] Returns the installed FsLangMCP product version and name. Zero-arg (pass {}). Same value is also surfaced in the set_project response (fslangmcpVersion field) and the fsharp_runtime_status response. Use this tool when filing UX feedback so reports can be matched to a specific release of the MCP server. Pure: no project context required, no side effects, no caches read."
+                        (fun _ -> toolResult versionResponse)
                     |> unwrapResult
                 )
 

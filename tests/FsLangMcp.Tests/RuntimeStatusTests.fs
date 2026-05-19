@@ -356,3 +356,26 @@ let ``buildSnapshot all flags false matches minimal snapshot`` () : Task =
     // managedHeap and gcInfo are always present — snapshot pins their shape
     VerifyModuleInitializer.init ()
     Verifier.Verify(prettyJson result, extension = "json").ToTask() :> Task
+
+// ─── Group E: fslangmcpVersion exposure (#119) ────────────────────────────────
+
+[<Fact>]
+let ``Version.current is a non-empty SemVer-like string`` () =
+    let v = FsLangMcp.Version.current
+    Assert.False(System.String.IsNullOrWhiteSpace(v), "Version.current must not be empty")
+    // No "+commit" suffix should leak through — Version.fs strips it.
+    Assert.DoesNotContain("+", v)
+    // Three numeric segments minimum (Major.Minor.Patch).
+    let parts = v.Split('.')
+    Assert.True(parts.Length >= 3, $"Expected at least 3 SemVer segments, got '{v}'")
+
+[<Fact>]
+let ``Version.productName is non-empty`` () =
+    let p = FsLangMcp.Version.productName
+    Assert.False(System.String.IsNullOrWhiteSpace(p), "Version.productName must not be empty")
+
+[<Fact>]
+let ``buildSnapshot surfaces fslangmcpVersion at top level`` () =
+    let result = buildSnapshot defaultArgs defaultConfig None
+    let surfaced = getStr result "fslangmcpVersion"
+    Assert.Equal(FsLangMcp.Version.current, surfaced)

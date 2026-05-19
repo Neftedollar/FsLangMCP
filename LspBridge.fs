@@ -18,7 +18,11 @@ type private LspDocumentState =
     { mutable Version: int
       mutable Text: string }
 
-type private DiagnosticsTarget(store: ConcurrentDictionary<string, JsonNode>) =
+type private DiagnosticsTarget
+    (
+        store: ConcurrentDictionary<string, JsonNode>,
+        analyzedAt: ConcurrentDictionary<string, DateTimeOffset>
+    ) =
     [<JsonRpcMethod("textDocument/publishDiagnostics", UseSingleObjectParameterDeserialization = true)>]
     member _.PublishDiagnostics(payload: JsonObject) =
         let uriToken = payload["uri"]
@@ -32,6 +36,11 @@ type private DiagnosticsTarget(store: ConcurrentDictionary<string, JsonNode>) =
                     JsonArray() :> JsonNode
                 else
                     diagnostics.DeepClone()
+
+            // Record when FSAC last reported diagnostics for this URI. Surfaced in
+            // workspace_diagnostics responses so callers can detect stale "all clean"
+            // results after an edit (#115).
+            analyzedAt[uri] <- DateTimeOffset.UtcNow
 
 // ─── Workspace load notification parsing ──────────────────────────────────────
 
@@ -313,25 +322,47 @@ module internal LspResponseShape =
             | ValueNone -> false
         | _ -> true
 
-    /// Builds the workspace_diagnostics response payload for a single file.
-    let diagnosticsResponseForFile (workspaceReady: bool) (diagnosticsCount: int) (filePayload: JsonNode) : JsonNode =
-        jobj
-            [ "status", jstr "ok"
-              "lspState", jstr (lspStateString workspaceReady)
-              "diagnosticsFileCount", jint diagnosticsCount
-              "result", filePayload ]
-        :> JsonNode
+    /// Formats a UTC DateTimeOffset as an ISO-8601 "Z"-suffixed string for JSON
+    /// surfacing. Returns null when the value is absent so JSON encodes `null`.
+    let timestampJson (timestamp: DateTimeOffset option) : JsonNode =
+        match timestamp with
+        | Some t -> jstr (t.ToUniversalTime().ToString("O"))
+        | None -> null
 
-    /// Builds the workspace_diagnostics response payload for the whole workspace.
-    let diagnosticsResponseForWorkspace
+    /// Builds the workspace_diagnostics response payload for a single file.
+    /// `analyzedAt` is when FSAC last pushed diagnostics for this URI (or None
+    /// when FSAC has not yet reported on it).
+    let diagnosticsResponseForFile
         (workspaceReady: bool)
         (diagnosticsCount: int)
-        (allPayloads: JsonObject)
+        (filePayload: JsonNode)
+        (analyzedAt: DateTimeOffset option)
         : JsonNode =
         jobj
             [ "status", jstr "ok"
               "lspState", jstr (lspStateString workspaceReady)
               "diagnosticsFileCount", jint diagnosticsCount
+              "analyzedAt", timestampJson analyzedAt
+              "result", filePayload ]
+        :> JsonNode
+
+    /// Builds the workspace_diagnostics response payload for the whole workspace.
+    /// `mostRecentAnalyzedAt` is the max analyzedAt across all stored files —
+    /// useful as a coarse "freshness floor". `analyzedAtByUri` carries per-URI
+    /// timestamps so callers can spot individual stale files.
+    let diagnosticsResponseForWorkspace
+        (workspaceReady: bool)
+        (diagnosticsCount: int)
+        (allPayloads: JsonObject)
+        (mostRecentAnalyzedAt: DateTimeOffset option)
+        (analyzedAtByUri: JsonObject)
+        : JsonNode =
+        jobj
+            [ "status", jstr "ok"
+              "lspState", jstr (lspStateString workspaceReady)
+              "diagnosticsFileCount", jint diagnosticsCount
+              "mostRecentAnalyzedAt", timestampJson mostRecentAnalyzedAt
+              "analyzedAtByUri", analyzedAtByUri :> JsonNode
               "result", allPayloads :> JsonNode ]
         :> JsonNode
 
@@ -358,6 +389,10 @@ type internal FsAutoCompleteBridge() =
     let gate = new SemaphoreSlim(1, 1)
     let documents = ConcurrentDictionary<string, LspDocumentState>()
     let diagnostics = ConcurrentDictionary<string, JsonNode>()
+    // Tracks when FSAC last pushed diagnostics for each URI. Surfaced via
+    // `analyzedAt` / `analyzedAtByUri` / `mostRecentAnalyzedAt` in workspace_diagnostics
+    // responses (#115) so callers can self-check freshness after an edit.
+    let diagnosticsAnalyzedAt = ConcurrentDictionary<string, DateTimeOffset>()
 
     [<VolatileField>]
     let mutable rpc: JsonRpc option = None
@@ -592,7 +627,8 @@ type internal FsAutoCompleteBridge() =
                             [ "status", jstr "ok"
                               "result",
                               jobj
-                                  [ "projectPath", capturedProjectPath |> Option.map jstr |> Option.defaultValue null
+                                  [ "fslangmcpVersion", jstr FsLangMcp.Version.current
+                                    "projectPath", capturedProjectPath |> Option.map jstr |> Option.defaultValue null
                                     "requestedPath", jstr inputPath
                                     "workspaceRoot", jstr capturedWorkspaceRoot
                                     "lspRestarted", jbool restartLsp
@@ -617,7 +653,8 @@ type internal FsAutoCompleteBridge() =
                             [ "status", jstr "ok"
                               "result",
                               jobj
-                                  [ "projectPath", capturedProjectPath |> Option.map jstr |> Option.defaultValue null
+                                  [ "fslangmcpVersion", jstr FsLangMcp.Version.current
+                                    "projectPath", capturedProjectPath |> Option.map jstr |> Option.defaultValue null
                                     "requestedPath", jstr inputPath
                                     "workspaceRoot", jstr capturedWorkspaceRoot
                                     "lspRestarted", jbool restartLsp
@@ -698,7 +735,7 @@ type internal FsAutoCompleteBridge() =
             let jsonRpc = new JsonRpc(handler)
             let targetOptions = JsonRpcTargetOptions(AllowNonPublicInvocation = true)
 
-            jsonRpc.AddLocalRpcTarget(new DiagnosticsTarget(diagnostics), targetOptions)
+            jsonRpc.AddLocalRpcTarget(new DiagnosticsTarget(diagnostics, diagnosticsAnalyzedAt), targetOptions)
             |> ignore
 
             jsonRpc.AddLocalRpcTarget(new WorkspaceLoadTarget(markWorkspaceReady), targetOptions)
@@ -920,15 +957,26 @@ type internal FsAutoCompleteBridge() =
                 | true, payload -> payload.DeepClone()
                 | false, _ -> JsonArray() :> JsonNode
 
+            let analyzedAtForUri (uri: string) =
+                match diagnosticsAnalyzedAt.TryGetValue(uri) with
+                | true, ts -> Some ts
+                | false, _ -> None
+
             match args.path with
             | Some path ->
                 let uri = toFileUri path
                 let payload = resolveByUri uri |> applySeverity
+                let analyzedAt = analyzedAtForUri uri
 
                 return
-                    LspResponseShape.diagnosticsResponseForFile workspaceReady diagnostics.Count payload
+                    LspResponseShape.diagnosticsResponseForFile
+                        workspaceReady
+                        diagnostics.Count
+                        payload
+                        analyzedAt
             | None ->
                 let root = JsonObject()
+                let analyzedAtByUri = JsonObject()
 
                 let globMatches (uri: string) =
                     match args.fileGlob with
@@ -943,9 +991,26 @@ type internal FsAutoCompleteBridge() =
                         // the user asked for errors-only and a file only has warnings.
                         match severityFilter, filtered with
                         | Some _, (:? JsonArray as arr) when arr.Count = 0 -> ()
-                        | _ -> root[uri] <- filtered
+                        | _ ->
+                            root[uri] <- filtered
 
-                return LspResponseShape.diagnosticsResponseForWorkspace workspaceReady diagnostics.Count root
+                            match analyzedAtForUri uri with
+                            | Some ts -> analyzedAtByUri[uri] <- jstr (ts.ToUniversalTime().ToString("O"))
+                            | None -> analyzedAtByUri[uri] <- null
+
+                let mostRecent =
+                    if diagnosticsAnalyzedAt.IsEmpty then
+                        None
+                    else
+                        diagnosticsAnalyzedAt.Values |> Seq.max |> Some
+
+                return
+                    LspResponseShape.diagnosticsResponseForWorkspace
+                        workspaceReady
+                        diagnostics.Count
+                        root
+                        mostRecent
+                        analyzedAtByUri
         }
 
     member this.Formatting(args: FormattingArgs) : Task<JsonNode> =

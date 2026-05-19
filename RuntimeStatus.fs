@@ -227,6 +227,7 @@ let buildSnapshot
 
     let topFields =
         [ yield "status", jstr "ok"
+          yield "fslangmcpVersion", jstr FsLangMcp.Version.current
           yield "process", processPart
 
           if includeFcs then

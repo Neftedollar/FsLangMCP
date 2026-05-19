@@ -1,5 +1,6 @@
 ﻿{
   "status": "ok",
+  "fslangmcpVersion": "<version>",
   "process": {
     "uptimeSeconds": <number>,
     "managedHeap": {

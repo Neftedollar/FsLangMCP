@@ -247,6 +247,11 @@ type FcsCheckerConfig =
       KeepAllBackgroundSymbolUses: bool
       ProjectCacheSize: int }
 
+[<CLIMutable>]
+type FslangmcpVersionArgs =
+    { /// Reserved for forward compat — currently no fields are read.
+      _placeholder: bool option }
+
 type RuntimeStatusArgs =
     { includeFcsCacheStats: bool option
       includeAssemblyCounts: bool option

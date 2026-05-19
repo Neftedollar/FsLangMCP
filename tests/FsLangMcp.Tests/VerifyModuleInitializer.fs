@@ -87,4 +87,10 @@ let init () : unit =
             // ── isServerGc bool ─────────────────────────────────────────────
             // Server GC vs Workstation GC depends on runtimeconfig at the test
             // runner level. Scrub to keep snapshots portable across CI / dev.
-            addRegexScrubber "\"isServerGc\": (true|false)" "\"isServerGc\": <bool>")
+            addRegexScrubber "\"isServerGc\": (true|false)" "\"isServerGc\": <bool>"
+
+            // ── fslangmcpVersion ────────────────────────────────────────────
+            // Read from AssemblyInformationalVersion — changes every release.
+            // Snapshots stay portable across bumps; non-emptiness is asserted by
+            // a separate non-snapshot test in RuntimeStatusTests.
+            addRegexScrubber "\"fslangmcpVersion\": \"[^\"]*\"" "\"fslangmcpVersion\": \"<version>\"")

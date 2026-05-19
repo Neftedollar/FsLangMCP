@@ -130,41 +130,64 @@ let ``assessSymbolIndex treats non-array responses as ready regardless of timing
 [<Fact>]
 let ``diagnosticsResponseForFile builds status+lspState+count+result`` () =
     let payload: JsonNode = JsonArray() :> JsonNode
-    let result = diagnosticsResponseForFile true 5 payload
+    let result = diagnosticsResponseForFile true 5 payload None
 
     Assert.Equal("ok", result["status"].GetValue<string>())
     Assert.Equal("ready", result["lspState"].GetValue<string>())
     Assert.Equal(5, result["diagnosticsFileCount"].GetValue<int>())
     Assert.NotNull(result["result"])
+    Assert.Null(result["analyzedAt"])
 
 [<Fact>]
 let ``diagnosticsResponseForFile reports warming when workspace not ready`` () =
     let payload: JsonNode = JsonArray() :> JsonNode
-    let result = diagnosticsResponseForFile false 0 payload
+    let result = diagnosticsResponseForFile false 0 payload None
 
     Assert.Equal("warming", result["lspState"].GetValue<string>())
     Assert.Equal(0, result["diagnosticsFileCount"].GetValue<int>())
 
 [<Fact>]
+let ``diagnosticsResponseForFile surfaces analyzedAt timestamp when present`` () =
+    let payload: JsonNode = JsonArray() :> JsonNode
+    let ts = DateTimeOffset.Parse("2026-05-19T10:00:00Z")
+    let result = diagnosticsResponseForFile true 1 payload (Some ts)
+
+    let surfaced = result["analyzedAt"].GetValue<string>()
+    Assert.Contains("2026-05-19", surfaced)
+
+[<Fact>]
 let ``diagnosticsResponseForWorkspace reports warming and zero count during warmup`` () =
     let root = JsonObject()
-    let result = diagnosticsResponseForWorkspace false 0 root
+    let result = diagnosticsResponseForWorkspace false 0 root None (JsonObject())
 
     Assert.Equal("ok", result["status"].GetValue<string>())
     Assert.Equal("warming", result["lspState"].GetValue<string>())
     Assert.Equal(0, result["diagnosticsFileCount"].GetValue<int>())
+    Assert.Null(result["mostRecentAnalyzedAt"])
 
 [<Fact>]
 let ``diagnosticsResponseForWorkspace exposes all collected file payloads`` () =
     let root = JsonObject()
     root["file:///a.fs"] <- JsonArray() :> JsonNode
     root["file:///b.fs"] <- JsonArray() :> JsonNode
-    let result = diagnosticsResponseForWorkspace true 2 root
+    let result = diagnosticsResponseForWorkspace true 2 root None (JsonObject())
 
     Assert.Equal("ready", result["lspState"].GetValue<string>())
     Assert.Equal(2, result["diagnosticsFileCount"].GetValue<int>())
     Assert.NotNull(result["result"]["file:///a.fs"])
     Assert.NotNull(result["result"]["file:///b.fs"])
+
+[<Fact>]
+let ``diagnosticsResponseForWorkspace surfaces per-URI analyzedAt + mostRecentAnalyzedAt`` () =
+    let root = JsonObject()
+    root["file:///a.fs"] <- JsonArray() :> JsonNode
+    let ts = DateTimeOffset.Parse("2026-05-19T10:00:00Z")
+    let analyzedAt = JsonObject()
+    analyzedAt["file:///a.fs"] <- JsonValue.Create(ts.ToUniversalTime().ToString("O")) :> JsonNode
+    let result = diagnosticsResponseForWorkspace true 1 root (Some ts) analyzedAt
+
+    Assert.NotNull(result["analyzedAtByUri"]["file:///a.fs"])
+    Assert.Contains("2026-05-19", result["mostRecentAnalyzedAt"].GetValue<string>())
 
 [<Fact>]
 let ``workspaceSymbolResponse flags symbolIndexReady=false for empty result inside warmup window`` () =
@@ -423,7 +446,7 @@ let ``diagnosticsResponseForFile preserves payload when no severity filter`` () 
         )
         :> JsonNode
 
-    let result = diagnosticsResponseForFile true 1 payload
+    let result = diagnosticsResponseForFile true 1 payload None
     let resultArr = (result["result"]) :?> JsonArray
 
     Assert.Equal(2, resultArr.Count)
@@ -441,7 +464,7 @@ let ``diagnosticsResponseForFile with pre-filtered severity payload reflects fil
         :> JsonNode
 
     let filtered = filterDiagnosticsBySeverity 1 raw
-    let result = diagnosticsResponseForFile true 1 filtered
+    let result = diagnosticsResponseForFile true 1 filtered None
     let resultArr = (result["result"]) :?> JsonArray
 
     Assert.Equal(1, resultArr.Count)
@@ -453,7 +476,7 @@ let ``diagnosticsResponseForWorkspace with empty filtered files yields empty res
     // filtering. We exercise the builder with an already-empty root to verify the
     // outer shape is still well-formed.
     let root = JsonObject()
-    let result = diagnosticsResponseForWorkspace true 0 root
+    let result = diagnosticsResponseForWorkspace true 0 root None (JsonObject())
 
     Assert.Equal("ready", result["lspState"].GetValue<string>())
     Assert.Equal(0, result["diagnosticsFileCount"].GetValue<int>())
