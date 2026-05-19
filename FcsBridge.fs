@@ -195,6 +195,119 @@ type internal FcsBridge() =
               "declarationRange", tryDeclarationRange symbol ]
         :> JsonNode
 
+    // ─── Helpers for referenced-assembly traversal (F-3) ─────────────────────────
+
+    let entityKindString (entity: FSharpEntity) : string =
+        try
+            if entity.IsNamespace then "namespace"
+            elif entity.IsFSharpModule then "module"
+            elif entity.IsInterface then "interface"
+            elif entity.IsFSharpRecord then "record"
+            elif entity.IsFSharpUnion then "union"
+            elif entity.IsEnum then "enum"
+            elif entity.IsDelegate then "delegate"
+            elif entity.IsValueType then "struct"
+            elif entity.IsClass then "class"
+            elif entity.IsArrayType then "array"
+            elif entity.IsFSharpAbbreviation then "abbreviation"
+            else "type"
+        with _ ->
+            "type"
+
+    let rec walkEntities (entity: FSharpEntity) : seq<FSharpEntity> =
+        seq {
+            yield entity
+
+            let nested =
+                try
+                    Some entity.NestedEntities
+                with _ ->
+                    None
+
+            match nested with
+            | Some nested ->
+                for child in nested do
+                    yield! walkEntities child
+            | None -> ()
+        }
+
+    let allEntitiesFromAssembly (asm: FSharpAssembly) : seq<FSharpEntity> =
+        try
+            asm.Contents.Entities |> Seq.collect walkEntities
+        with _ ->
+            Seq.empty
+
+    let assemblyMatchesPackageId (asm: FSharpAssembly) (packageId: string) =
+        // Exact SimpleName match only (case-insensitive). We intentionally reject prefix
+        // matching in both directions: "System" must NOT match every System.* assembly,
+        // and "Newtonsoft.Json.Schema" must NOT silently fall back to "Newtonsoft.Json".
+        // If a NuGet package ships multiple assemblies, callers should query each
+        // assembly by its actual SimpleName.
+        let pkgLower = packageId.ToLowerInvariant()
+
+        try
+            let simple =
+                asm.SimpleName
+                |> Option.ofObj
+                |> Option.map (fun s -> s.ToLowerInvariant())
+                |> Option.defaultValue ""
+
+            simple = pkgLower
+        with _ ->
+            false
+
+    let isObsoleteEntity (entity: FSharpEntity) =
+        try
+            entity.Attributes
+            |> Seq.exists (fun a ->
+                try
+                    let typeName = a.AttributeType.FullName
+
+                    not (isNull typeName)
+                    && (typeName = "System.ObsoleteAttribute"
+                        || typeName.EndsWith(".ObsoleteAttribute", StringComparison.Ordinal))
+                with _ ->
+                    false)
+        with _ ->
+            false
+
+    let entityAccessibilityString (entity: FSharpEntity) : string =
+        try
+            let acc = entity.Accessibility
+
+            if acc.IsPrivate then "private"
+            elif acc.IsInternal then "internal"
+            elif acc.IsPublic then "public"
+            else "unknown"
+        with _ ->
+            "unknown"
+
+    let referencedEntityToJson (asmName: string) (entity: FSharpEntity) : JsonNode =
+        let displayName =
+            try
+                entity.DisplayName
+            with _ ->
+                try
+                    entity.LogicalName
+                with _ ->
+                    "<unknown>"
+
+        let fullName =
+            try
+                if isNull entity.FullName then null
+                else jstr entity.FullName
+            with _ ->
+                null
+
+        jobj
+            [ "displayName", jstr displayName
+              "fullName", fullName
+              "assembly", jstr asmName
+              "kind", jstr (entityKindString entity)
+              "accessibility", jstr (entityAccessibilityString entity)
+              "isObsolete", jbool (isObsoleteEntity entity) ]
+        :> JsonNode
+
     let isNoisyLocalSymbol (symbolUse: FSharpSymbolUse) =
         let name = symbolUse.Symbol.DisplayName
         let kind = symbolKind symbolUse.Symbol
@@ -566,6 +679,105 @@ type internal FcsBridge() =
                       "parseDiagnostics", JsonArray(parseDiagnostics) :> JsonNode
                       "checkDiagnostics", JsonArray(checkDiagnostics) :> JsonNode ]
                 :> JsonNode
+        }
+
+    /// Compile an arbitrary F# snippet against the loaded project's references.
+    /// Writes the content to a temp file, splices it into the project's SourceFiles
+    /// without mutating the cached project options, and returns FCS diagnostics.
+    /// Useful for "does F# 9 accept this signature?" / "does this .fsi sketch reference
+    /// only existing types?" probes without spinning up dotnet build.
+    member this.ValidateSnippet(args: FcsValidateSnippetArgs) : Task<JsonNode> =
+        task {
+            if isNull args.content then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr "content is required" ]
+                    :> JsonNode
+            else
+
+            let mode =
+                args.mode
+                |> Option.map (fun m -> m.ToLowerInvariant())
+                |> Option.defaultValue "fs"
+
+            if mode <> "fs" && mode <> "fsi" then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr $"mode must be 'fs' or 'fsi' (got '{mode}')" ]
+                    :> JsonNode
+            else
+
+            match args.projectPath with
+            | None ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr
+                              "projectPath is required (or call set_project first to set the active project)" ]
+                    :> JsonNode
+            | Some fsproj ->
+                let! options, optionsSource = this.ResolveFsprojOptions(fsproj)
+
+                let ext = if mode = "fsi" then ".fsi" else ".fs"
+
+                let snippetFile =
+                    Path.Combine(Path.GetTempPath(), $"fslangmcp_snippet_{Guid.NewGuid():N}{ext}")
+
+                try
+                    File.WriteAllText(snippetFile, args.content)
+
+                    // Splice snippet at the end of SourceFiles WITHOUT writing back to cache.
+                    // The original cached options stay unchanged for future calls.
+                    let modifiedOptions =
+                        { options with
+                            SourceFiles = Array.append options.SourceFiles [| snippetFile |] }
+
+                    let sourceText = SourceText.ofString args.content
+
+                    let! parseResults, checkAnswer =
+                        checker.ParseAndCheckFileInProject(snippetFile, 0, sourceText, modifiedOptions)
+                        |> asTask
+
+                    let parseDiagnostics = parseResults.Diagnostics
+
+                    let checkDiagnostics, checkSucceeded =
+                        match checkAnswer with
+                        | FSharpCheckFileAnswer.Succeeded r -> r.Diagnostics, true
+                        | FSharpCheckFileAnswer.Aborted -> [||], false
+
+                    let allDiagnostics = Array.append parseDiagnostics checkDiagnostics
+
+                    let errorCount =
+                        allDiagnostics
+                        |> Array.filter (fun d -> d.Severity = FSharpDiagnosticSeverity.Error)
+                        |> Array.length
+
+                    let warningCount =
+                        allDiagnostics
+                        |> Array.filter (fun d -> d.Severity = FSharpDiagnosticSeverity.Warning)
+                        |> Array.length
+
+                    return
+                        jobj
+                            [ "status", jstr (if checkSucceeded then "succeeded" else "aborted")
+                              "mode", jstr mode
+                              "projectFileName", jstr options.ProjectFileName
+                              "optionsSource", jstr optionsSource
+                              "parseHadErrors", jbool parseResults.ParseHadErrors
+                              "errorCount", jint errorCount
+                              "warningCount", jint warningCount
+                              "totalDiagnostics", jint allDiagnostics.Length
+                              "diagnostics", JsonArray(allDiagnostics |> Array.map diagnosticToJson) :> JsonNode ]
+                        :> JsonNode
+                finally
+                    try
+                        if File.Exists snippetFile then
+                            File.Delete snippetFile
+                    with _ ->
+                        ()
         }
 
     member this.ParseAndCheckFile(args: FcsParseAndCheckArgs) : Task<JsonNode> =
@@ -1194,82 +1406,140 @@ type internal FcsBridge() =
             match checkedResults with
             | None -> return jobj [ "status", jstr "aborted"; "message", jstr "Type checking was aborted." ] :> JsonNode
             | Some checkResults ->
-                // FCS uses 1-based lines; assume input is 0-based (LSP convention)
-                let fcsLine = args.line + 1
-                let fcsCol = args.character
-
-                // Get the line text for FCS APIs
+                // FCS uses 1-based lines; tool contract is 0-based (LSP convention).
                 let lines = source.Split('\n')
 
-                let lineText =
-                    if fcsLine - 1 < lines.Length then
+                let lineTextAt (fcsLine: int) =
+                    if fcsLine >= 1 && fcsLine <= lines.Length then
                         lines[fcsLine - 1].TrimEnd('\r')
                     else
                         ""
 
-                let symbolUse = checkResults.GetSymbolUseAtLocation(fcsLine, fcsCol, lineText, [])
+                let extractTypeAndDoc (toolTip: ToolTipText) =
+                    let typeString =
+                        match toolTip with
+                        | ToolTipText elements ->
+                            elements
+                            |> List.choose (fun el ->
+                                match el with
+                                | ToolTipElement.Group items ->
+                                    items
+                                    |> List.map (fun item ->
+                                        item.MainDescription
+                                        |> Array.map (fun tagged -> tagged.Text)
+                                        |> String.concat "")
+                                    |> Some
+                                | _ -> None)
+                            |> List.collect id
+                            |> String.concat "\n"
 
-                let toolTip =
-                    checkResults.GetToolTip(
-                        fcsLine,
-                        fcsCol,
-                        lineText,
-                        [],
-                        FSharp.Compiler.Tokenization.FSharpTokenTag.IDENT
-                    )
+                    let xmlDoc =
+                        match toolTip with
+                        | ToolTipText elements ->
+                            elements
+                            |> List.choose (fun el ->
+                                match el with
+                                | ToolTipElement.Group items ->
+                                    items
+                                    |> List.choose (fun item ->
+                                        match item.XmlDoc with
+                                        | FSharpXmlDoc.FromXmlText xmlText -> Some(xmlText.GetXmlText())
+                                        | _ -> None)
+                                    |> Some
+                                | _ -> None)
+                            |> List.collect id
+                            |> String.concat "\n"
 
-                let typeString =
-                    match toolTip with
-                    | ToolTipText elements ->
-                        elements
-                        |> List.choose (fun el ->
-                            match el with
-                            | ToolTipElement.Group items ->
-                                items
-                                |> List.map (fun item ->
-                                    item.MainDescription
-                                    |> Array.map (fun tagged -> tagged.Text)
-                                    |> String.concat "")
-                                |> Some
-                            | _ -> None)
-                        |> List.collect id
-                        |> String.concat "\n"
+                    typeString, xmlDoc
 
-                let xmlDoc =
-                    match toolTip with
-                    | ToolTipText elements ->
-                        elements
-                        |> List.choose (fun el ->
-                            match el with
-                            | ToolTipElement.Group items ->
-                                items
-                                |> List.choose (fun item ->
-                                    match item.XmlDoc with
-                                    | FSharpXmlDoc.FromXmlText xmlText -> Some(xmlText.GetXmlText())
-                                    | _ -> None)
-                                |> Some
-                            | _ -> None)
-                        |> List.collect id
-                        |> String.concat "\n"
+                let tryAt (fcsLine: int) (fcsCol: int) =
+                    let lt = lineTextAt fcsLine
 
-                match symbolUse with
+                    if fcsLine < 1 || fcsLine > lines.Length || fcsCol < 0 || fcsCol > lt.Length then
+                        None
+                    else
+                        match checkResults.GetSymbolUseAtLocation(fcsLine, fcsCol, lt, []) with
+                        | None -> None
+                        | Some su ->
+                            let toolTip =
+                                checkResults.GetToolTip(
+                                    fcsLine,
+                                    fcsCol,
+                                    lt,
+                                    [],
+                                    FSharp.Compiler.Tokenization.FSharpTokenTag.IDENT
+                                )
+
+                            Some(su, toolTip)
+
+                let exactFcsLine = args.line + 1
+                let exactFcsCol = args.character
+                let fuzzy = defaultArg args.fuzzy false
+
+                // Generate (Δline, Δcol) offsets ordered by distance.
+                // Line shifts are penalized 2× (line errors are more disruptive than column drift).
+                let candidates =
+                    if fuzzy then
+                        seq {
+                            for dl in -2 .. 2 do
+                                for dc in -5 .. 5 do
+                                    yield dl, dc, (abs dl) * 2 + (abs dc)
+                        }
+                        |> Seq.sortBy (fun (_, _, score) -> score)
+                        |> Seq.toList
+                    else
+                        [ 0, 0, 0 ]
+
+                let resolved =
+                    candidates
+                    |> List.tryPick (fun (dl, dc, _) ->
+                        match tryAt (exactFcsLine + dl) (exactFcsCol + dc) with
+                        | None -> None
+                        | Some(su, tt) -> Some(dl, dc, su, tt))
+
+                match resolved with
                 | None ->
+                    let lineText = lineTextAt exactFcsLine
+
+                    let surrounding =
+                        JsonArray(
+                            [| for delta in -1 .. 1 ->
+                                   let candidateLine = args.line + delta
+                                   let lt = lineTextAt (candidateLine + 1)
+
+                                   jobj [ "line", jint candidateLine; "text", jstr lt ]
+                                   :> JsonNode |]
+                        )
+
+                    let hint =
+                        "No symbol at this position. Compare requestedLine.text vs your expected line — "
+                        + "if you used 1-based line numbers (e.g. from Read), try line - 1. "
+                        + "Set fuzzy=true to snap to the nearest symbol within ±2 lines / ±5 cols."
+
                     return
                         jobj
                             [ "status", jstr "no_symbol"
-                              "message", jstr "No symbol at this position"
+                              "message", jstr hint
                               "file", jstr path
                               "line", jint args.line
                               "character", jint args.character
-                              "typeString", jstr typeString ]
+                              "lineText", jstr lineText
+                              "surroundingLines", (surrounding :> JsonNode)
+                              "fuzzy", jbool fuzzy ]
                         :> JsonNode
-                | Some su ->
+                | Some(dl, dc, su, toolTip) ->
+                    let typeString, xmlDoc = extractTypeAndDoc toolTip
+                    let snapped = dl <> 0 || dc <> 0
+
                     return
                         jobj
                             [ "status", jstr "ok"
                               "file", jstr path
                               "line", jint args.line
                               "character", jint args.character
+                              "resolvedLine", jint (args.line + dl)
+                              "resolvedCharacter", jint (args.character + dc)
+                              "fuzzySnap", jbool snapped
                               "optionsSource", jstr optionsSource
                               "symbolName", jstr su.Symbol.DisplayName
                               "fullName", jstrOrNull su.Symbol.FullName
@@ -1682,6 +1952,238 @@ type internal FcsBridge() =
                   "summaryOnly", jbool summaryOnly
                   "filterSummary", filterSummaryToJson allFiles :> JsonNode
                   "files", JsonArray(fileEntries.ToArray()) :> JsonNode ]
+
+            return jobj (baseFields @ paginationFields) :> JsonNode
+        }
+
+    /// Resolve project options + ensure ParseAndCheckProject results are available.
+    /// Shared by referenced-assembly tools (F-3).
+    member private this.EnsureProjectResults
+        (projectPath: string option)
+        : Task<FSharpCheckProjectResults * FSharpProjectOptions * string> =
+        task {
+            match projectPath with
+            | None ->
+                return
+                    raise (
+                        InvalidOperationException(
+                            "projectPath is required (or call set_project first to set the active project)"
+                        )
+                    )
+            | Some fsproj ->
+                let! options, optionsSource = this.ResolveFsprojOptions(fsproj)
+                let cacheKey = makeResolvedProjectCacheKey options
+
+                let! results =
+                    task {
+                        match projectResultsCache.TryGet(cacheKey) with
+                        | Some existing -> return existing
+                        | None ->
+                            let! fresh = checker.ParseAndCheckProject(options) |> asTask
+                            projectResultsCache.Set(cacheKey, fresh)
+                            return fresh
+                    }
+
+                return results, options, optionsSource
+        }
+
+    /// Search across referenced-assembly types by substring on DisplayName/FullName.
+    /// Powers the "find the Spectre.Console.Cell internal type" use case (F-3).
+    member this.ReferencedSymbols(args: FcsReferencedSymbolsArgs) : Task<JsonNode> =
+        task {
+            let query = (args.query |> Option.ofObj |> Option.defaultValue "").Trim()
+
+            if String.IsNullOrWhiteSpace(query) then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr "query must be non-empty" ]
+                    :> JsonNode
+            else if args.projectPath.IsNone then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr
+                              "projectPath is required (or call set_project first to set the active project)" ]
+                    :> JsonNode
+            else
+
+            let includeNonPublic = defaultArg args.includeNonPublic false
+            let requested = defaultArg args.maxResults 200
+            let pageSize = min (max 1 requested) 1000
+
+            let pageOffsetResult =
+                match args.cursor with
+                | None -> Ok 0
+                | Some cursorStr ->
+                    match Cursor.tryDecode cursorStr with
+                    | Ok payload -> Ok payload.offset
+                    | Error reason -> Error reason
+
+            match pageOffsetResult with
+            | Error reason ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr $"Invalid cursor: %s{reason}" ]
+                    :> JsonNode
+            | Ok pageOffset ->
+
+            let! results, options, optionsSource = this.EnsureProjectResults args.projectPath
+
+            let assemblies =
+                try
+                    results.ProjectContext.GetReferencedAssemblies()
+                with _ ->
+                    []
+
+            let queryLower = query.ToLowerInvariant()
+
+            let matchesQuery (entity: FSharpEntity) =
+                let displayName =
+                    try entity.DisplayName |> Option.ofObj |> Option.defaultValue "" with _ -> ""
+                let fullName =
+                    try entity.FullName |> Option.ofObj |> Option.defaultValue "" with _ -> ""
+
+                displayName.ToLowerInvariant().Contains(queryLower)
+                || fullName.ToLowerInvariant().Contains(queryLower)
+
+            let passesAccessibility (entity: FSharpEntity) =
+                if includeNonPublic then
+                    true
+                else
+                    let acc = entityAccessibilityString entity
+                    acc = "public" || acc = "unknown"
+
+            let allMatches =
+                seq {
+                    for asm in assemblies do
+                        let asmName =
+                            try asm.SimpleName |> Option.ofObj |> Option.defaultValue "" with _ -> ""
+
+                        for entity in allEntitiesFromAssembly asm do
+                            if matchesQuery entity && passesAccessibility entity then
+                                yield referencedEntityToJson asmName entity
+                }
+                |> Seq.toArray
+
+            let pageEntries =
+                allMatches
+                |> Array.skip (min pageOffset allMatches.Length)
+                |> Array.truncate pageSize
+
+            let baseFields =
+                [ "status", jstr "ok"
+                  "query", jstr query
+                  "projectFileName", jstr options.ProjectFileName
+                  "optionsSource", jstr optionsSource
+                  "includeNonPublic", jbool includeNonPublic
+                  "assemblyCount", jint (List.length assemblies)
+                  "results", JsonArray(pageEntries) :> JsonNode ]
+
+            let paginationFields =
+                Cursor.paginationFields "symbols" allMatches.Length pageOffset pageSize pageEntries.Length
+
+            return jobj (baseFields @ paginationFields) :> JsonNode
+        }
+
+    /// Enumerate types exported by one referenced assembly (matched by package id ≈ SimpleName).
+    /// Powers the "what types does this NuGet package expose" use case (F-3).
+    member this.NugetTypes(args: FcsNugetTypesArgs) : Task<JsonNode> =
+        task {
+            let packageId = (args.packageId |> Option.ofObj |> Option.defaultValue "").Trim()
+
+            if String.IsNullOrWhiteSpace(packageId) then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr "packageId must be non-empty" ]
+                    :> JsonNode
+            else if args.projectPath.IsNone then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr
+                              "projectPath is required (or call set_project first to set the active project)" ]
+                    :> JsonNode
+            else
+
+            let includeNonPublic = defaultArg args.includeNonPublic false
+            let requested = defaultArg args.maxResults 500
+            let pageSize = min (max 1 requested) 2000
+
+            let pageOffsetResult =
+                match args.cursor with
+                | None -> Ok 0
+                | Some cursorStr ->
+                    match Cursor.tryDecode cursorStr with
+                    | Ok payload -> Ok payload.offset
+                    | Error reason -> Error reason
+
+            match pageOffsetResult with
+            | Error reason ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr $"Invalid cursor: %s{reason}" ]
+                    :> JsonNode
+            | Ok pageOffset ->
+
+            let! results, options, optionsSource = this.EnsureProjectResults args.projectPath
+
+            let assemblies =
+                try
+                    results.ProjectContext.GetReferencedAssemblies()
+                with _ ->
+                    []
+
+            let matchingAssemblies =
+                assemblies
+                |> List.filter (fun asm -> assemblyMatchesPackageId asm packageId)
+
+            let matchedAssemblyNames =
+                matchingAssemblies
+                |> List.map (fun asm ->
+                    try asm.SimpleName |> Option.ofObj |> Option.defaultValue "" with _ -> "")
+                |> List.filter (fun s -> s <> "")
+
+            let passesAccessibility (entity: FSharpEntity) =
+                if includeNonPublic then
+                    true
+                else
+                    let acc = entityAccessibilityString entity
+                    acc = "public" || acc = "unknown"
+
+            let allEntities =
+                seq {
+                    for asm in matchingAssemblies do
+                        let asmName =
+                            try asm.SimpleName |> Option.ofObj |> Option.defaultValue "" with _ -> ""
+
+                        for entity in allEntitiesFromAssembly asm do
+                            if passesAccessibility entity then
+                                yield referencedEntityToJson asmName entity
+                }
+                |> Seq.toArray
+
+            let pageEntries =
+                allEntities
+                |> Array.skip (min pageOffset allEntities.Length)
+                |> Array.truncate pageSize
+
+            let baseFields =
+                [ "status", jstr "ok"
+                  "packageId", jstr packageId
+                  "matchedAssemblies", JsonArray(matchedAssemblyNames |> List.map jstr |> List.toArray) :> JsonNode
+                  "projectFileName", jstr options.ProjectFileName
+                  "optionsSource", jstr optionsSource
+                  "includeNonPublic", jbool includeNonPublic
+                  "results", JsonArray(pageEntries) :> JsonNode ]
+
+            let paginationFields =
+                Cursor.paginationFields "types" allEntities.Length pageOffset pageSize pageEntries.Length
 
             return jobj (baseFields @ paginationFields) :> JsonNode
         }

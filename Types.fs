@@ -176,7 +176,44 @@ type FcsTypeAtPositionArgs =
       character: int
       text: string option
       projectPath: string option
-      projectOptions: string list option }
+      projectOptions: string list option
+      /// When true and the exact (line, character) misses, snap to the nearest
+      /// symbol within ±2 lines / ±5 columns and return its type info plus the
+      /// resolved coordinates. Default false (exact-position behavior).
+      fuzzy: bool option }
+
+type FcsReferencedSymbolsArgs =
+    { /// Substring matched against DisplayName / FullName (case-insensitive).
+      query: string
+      /// .fsproj for type context. Falls back to active set_project.
+      projectPath: string option
+      /// When true, include `private` / `internal` symbols. Default false.
+      includeNonPublic: bool option
+      /// Maximum entries per page. Default 200, hard ceiling 1000.
+      maxResults: int option
+      /// Opaque cursor from a prior call's `nextCursor`. Omit for first page.
+      cursor: string option }
+
+type FcsNugetTypesArgs =
+    { /// Package id (matched against referenced assembly SimpleName, case-insensitive).
+      /// Example: "Spectre.Console", "Newtonsoft.Json", "System.Text.Json".
+      packageId: string
+      projectPath: string option
+      /// When true, include `private` / `internal` types. Default false.
+      includeNonPublic: bool option
+      /// Maximum entries per page. Default 500, hard ceiling 2000.
+      maxResults: int option
+      cursor: string option }
+
+type FcsValidateSnippetArgs =
+    { /// F# source text to validate against the project's references.
+      content: string
+      /// "fs" (default) or "fsi". Affects how FCS parses the snippet — pick "fsi"
+      /// when validating a signature-file sketch.
+      mode: string option
+      /// .fsproj to use as the type-context. Falls back to the active set_project
+      /// when absent. Required to resolve types declared in the project itself.
+      projectPath: string option }
 
 type FcsSignatureHelpArgs =
     { path: string

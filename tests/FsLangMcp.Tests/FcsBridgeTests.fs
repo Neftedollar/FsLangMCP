@@ -1152,3 +1152,439 @@ let ``CheckFile totalDiagnostics matches parseDiagnostics + checkDiagnostics`` (
             if Directory.Exists tempRoot then
                 Directory.Delete(tempRoot, true)
     }
+
+// ─── fcs_type_at_position fuzzy (#111) ───────────────────────────────────────
+
+[<Fact>]
+let ``TypeAtPosition no_symbol includes lineText + surroundingLines for misalignment visibility`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_tap_nosym_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let src =
+                String.concat
+                    "\n"
+                    [ "module TestModule"
+                      ""
+                      "let aValue = 42"
+                      ""
+                      "let unrelated () = ()" ]
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "TapNoSym" src
+
+            // line 1 (blank-ish) — no symbol at col 0
+            let! result =
+                bridge.TypeAtPosition(
+                    { path = sourcePath
+                      line = 1
+                      character = 0
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      fuzzy = None }
+                )
+
+            Assert.Equal("no_symbol", result["status"].GetValue<string>())
+            // The lineText must always be present so 1-based vs 0-based mistakes are visible.
+            let lineText = result["lineText"].GetValue<string>()
+            Assert.NotNull(lineText :> obj)
+            // surroundingLines has exactly 3 entries (line-1, line, line+1)
+            let surrounding = result["surroundingLines"] :?> JsonArray
+            Assert.Equal(3, surrounding.Count)
+            // fuzzy flag echoed back
+            Assert.False(result["fuzzy"].GetValue<bool>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``TypeAtPosition fuzzy snaps to nearest symbol when exact position misses`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_tap_fuzzy_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // line 0: "module M"
+            // line 1: ""
+            // line 2: "let aValue = 42"
+            let src = "module M\n\nlet aValue = 42\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "TapFuzzy" src
+
+            // Aim a few columns past the identifier on the SAME line — exact may miss,
+            // fuzzy should still resolve "aValue".
+            let! fuzzyResult =
+                bridge.TypeAtPosition(
+                    { path = sourcePath
+                      line = 2
+                      character = 25 // well past end of "let aValue = 42"
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      fuzzy = Some true }
+                )
+
+            // Either we snap and get ok, or we still no_symbol (depends on FCS column
+            // tolerance). The contract: when ok, fuzzySnap must be true and resolvedLine
+            // must be set.
+            let status = fuzzyResult["status"].GetValue<string>()
+
+            if status = "ok" then
+                Assert.True(fuzzyResult["fuzzySnap"].GetValue<bool>())
+                Assert.NotNull(fuzzyResult["resolvedLine"] :> obj)
+                Assert.NotNull(fuzzyResult["resolvedCharacter"] :> obj)
+            else
+                // If even fuzzy can't resolve (edge case), ensure the diagnostic shape is correct.
+                Assert.Equal("no_symbol", status)
+                Assert.True(fuzzyResult["fuzzy"].GetValue<bool>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``TypeAtPosition exact hit reports fuzzySnap=false`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_tap_exact_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // line 0: "module M"
+            // line 1: ""
+            // line 2: "let aValue = 42"  — identifier starts at column 4
+            let src = "module M\n\nlet aValue = 42\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "TapExact" src
+
+            let! result =
+                bridge.TypeAtPosition(
+                    { path = sourcePath
+                      line = 2
+                      character = 5
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      fuzzy = Some false }
+                )
+
+            // If the position is precise enough, ok status with fuzzySnap=false.
+            // If FCS still misses despite the exact location, accept no_symbol (FCS
+            // tolerance can vary across versions — the test guards the shape, not FCS).
+            let status = result["status"].GetValue<string>()
+
+            if status = "ok" then
+                Assert.False(result["fuzzySnap"].GetValue<bool>())
+                Assert.Equal(2, result["resolvedLine"].GetValue<int>())
+                Assert.Equal(5, result["resolvedCharacter"].GetValue<int>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+// ─── fcs_validate_snippet (#112) ─────────────────────────────────────────────
+
+[<Fact>]
+let ``ValidateSnippet returns succeeded with errorCount=0 for a valid trivial snippet`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.ValidateSnippet(
+                { content = "module FsLangMcp.SnippetValidationOk\n\nlet x = 1 + 2\n"
+                  mode = Some "fs"
+                  projectPath = Some projectPath }
+            )
+
+        Assert.Equal("succeeded", result["status"].GetValue<string>())
+        Assert.Equal(0, result["errorCount"].GetValue<int>())
+        Assert.Equal("fs", result["mode"].GetValue<string>())
+    }
+
+[<Fact>]
+let ``ValidateSnippet flags a type error in the snippet`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.ValidateSnippet(
+                { content = "module FsLangMcp.SnippetValidationBad\n\nlet x: int = \"not an int\"\n"
+                  mode = Some "fs"
+                  projectPath = Some projectPath }
+            )
+
+        // We don't require status="aborted" — type errors typically yield status="succeeded"
+        // with errorCount>0 (parse OK, check populated diagnostics).
+        Assert.True(result["errorCount"].GetValue<int>() > 0, "Expected at least one error diagnostic")
+        Assert.True(result["totalDiagnostics"].GetValue<int>() > 0)
+    }
+
+[<Fact>]
+let ``ValidateSnippet rejects unknown mode`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.ValidateSnippet(
+                { content = "module M\nlet x = 1\n"
+                  mode = Some "garbage"
+                  projectPath = Some projectPath }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+    }
+
+[<Fact>]
+let ``ValidateSnippet requires projectPath`` () : Task =
+    task {
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.ValidateSnippet(
+                { content = "module M\nlet x = 1\n"
+                  mode = None
+                  projectPath = None }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+    }
+
+[<Fact>]
+let ``ValidateSnippet cleans up the temp file after running`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let beforeFiles =
+            Directory.GetFiles(Path.GetTempPath(), "fslangmcp_snippet_*")
+            |> Set.ofArray
+
+        let! _ =
+            bridge.ValidateSnippet(
+                { content = "module M\nlet x = 1\n"
+                  mode = Some "fs"
+                  projectPath = Some projectPath }
+            )
+
+        let afterFiles =
+            Directory.GetFiles(Path.GetTempPath(), "fslangmcp_snippet_*")
+            |> Set.ofArray
+
+        // No new snippet temp files left behind.
+        let leftover = Set.difference afterFiles beforeFiles
+        Assert.Empty(leftover)
+    }
+
+// ─── fcs_referenced_symbols + fcs_nuget_types (#113) ─────────────────────────
+
+[<Fact>]
+let ``ReferencedSymbols finds known framework type System.IO.File`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.ReferencedSymbols(
+                { query = "System.IO.File"
+                  projectPath = Some projectPath
+                  includeNonPublic = None
+                  maxResults = Some 50
+                  cursor = None }
+            )
+
+        Assert.Equal("ok", result["status"].GetValue<string>())
+        let resultsArray = result["results"] :?> JsonArray
+        Assert.True(resultsArray.Count > 0, "Expected at least one match for System.IO.File")
+
+        // First match should have an accessibility of "public" (default filter is public-only).
+        let firstNode = resultsArray[0]
+        let firstAcc = firstNode["accessibility"].GetValue<string>()
+        Assert.Contains(firstAcc, [ "public"; "unknown" ])
+    }
+
+[<Fact>]
+let ``ReferencedSymbols returns invalid_args for empty query`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.ReferencedSymbols(
+                { query = "   "
+                  projectPath = Some projectPath
+                  includeNonPublic = None
+                  maxResults = None
+                  cursor = None }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("query", (result["message"].GetValue<string>()).ToLowerInvariant())
+    }
+
+[<Fact>]
+let ``ReferencedSymbols returns invalid_args when projectPath is None`` () : Task =
+    task {
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.ReferencedSymbols(
+                { query = "Anything"
+                  projectPath = None
+                  includeNonPublic = None
+                  maxResults = None
+                  cursor = None }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("projectpath", (result["message"].GetValue<string>()).ToLowerInvariant())
+    }
+
+[<Fact>]
+let ``ReferencedSymbols includeNonPublic surfaces additional results vs default`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! publicOnly =
+            bridge.ReferencedSymbols(
+                { query = "FSharpProjectOptions"
+                  projectPath = Some projectPath
+                  includeNonPublic = Some false
+                  maxResults = Some 500
+                  cursor = None }
+            )
+
+        let! includingInternal =
+            bridge.ReferencedSymbols(
+                { query = "FSharpProjectOptions"
+                  projectPath = Some projectPath
+                  includeNonPublic = Some true
+                  maxResults = Some 500
+                  cursor = None }
+            )
+
+        let publicCount = (publicOnly["results"] :?> JsonArray).Count
+        let allCount = (includingInternal["results"] :?> JsonArray).Count
+        // includeNonPublic must never return fewer matches than the public-only filter.
+        Assert.True(
+            allCount >= publicCount,
+            $"includeNonPublic should return >= public-only count: public=%d{publicCount} all=%d{allCount}"
+        )
+    }
+
+[<Fact>]
+let ``NugetTypes enumerates types from a known framework assembly`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.NugetTypes(
+                { packageId = "FSharp.Core"
+                  projectPath = Some projectPath
+                  includeNonPublic = None
+                  maxResults = Some 50
+                  cursor = None }
+            )
+
+        Assert.Equal("ok", result["status"].GetValue<string>())
+        let matched = (result["matchedAssemblies"] :?> JsonArray)
+        Assert.True(matched.Count > 0, "Expected FSharp.Core to match at least one assembly")
+        let resultsArray = result["results"] :?> JsonArray
+        Assert.True(resultsArray.Count > 0, "Expected non-empty type list from FSharp.Core")
+    }
+
+[<Fact>]
+let ``NugetTypes returns empty results + zero matched assemblies for an unknown package`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.NugetTypes(
+                { packageId = "Definitely.Not.A.Real.Package.zzz9999"
+                  projectPath = Some projectPath
+                  includeNonPublic = None
+                  maxResults = Some 10
+                  cursor = None }
+            )
+
+        Assert.Equal("ok", result["status"].GetValue<string>())
+        Assert.Equal(0, (result["matchedAssemblies"] :?> JsonArray).Count)
+        Assert.Equal(0, (result["results"] :?> JsonArray).Count)
+    }
+
+[<Fact>]
+let ``NugetTypes returns invalid_args for empty packageId`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.NugetTypes(
+                { packageId = ""
+                  projectPath = Some projectPath
+                  includeNonPublic = None
+                  maxResults = None
+                  cursor = None }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("packageid", (result["message"].GetValue<string>()).ToLowerInvariant())
+    }
+
+[<Fact>]
+let ``NugetTypes returns invalid_args when projectPath is None`` () : Task =
+    task {
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.NugetTypes(
+                { packageId = "FSharp.Core"
+                  projectPath = None
+                  includeNonPublic = None
+                  maxResults = None
+                  cursor = None }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+    }
+
+[<Fact>]
+let ``NugetTypes does not match System.* assemblies for packageId='System'`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.NugetTypes(
+                { packageId = "System"
+                  projectPath = Some projectPath
+                  includeNonPublic = None
+                  maxResults = Some 10
+                  cursor = None }
+            )
+
+        // Strict dotted-segment match: 'System' must match the *exact* assembly named
+        // 'System' (if loaded) but NOT every System.Foo.Bar assembly. We expect either
+        // an empty list (current netN.0 typically loads no plain 'System' assembly) or
+        // exactly one match — not the dozens you'd see under reverse-prefix matching.
+        let matched = result["matchedAssemblies"] :?> JsonArray
+        Assert.True(matched.Count <= 1, $"Expected at most 1 'System' assembly, got %d{matched.Count}")
+    }

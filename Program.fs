@@ -365,6 +365,42 @@ let main argv =
                 )
 
                 tool (
+                    TypedTool.define<FcsReferencedSymbolsArgs>
+                        "fcs_referenced_symbols"
+                        "[FCS in-process] Search across the project's *referenced* assemblies (NuGet + framework) for types whose DisplayName or FullName contains the query (case-insensitive). Complements workspace_symbol (project-local) — use this when you need 'is there a public/internal Cell type in Spectre.Console?' or 'what IBuilder interfaces are reachable from this project?'. Each result reports assembly, kind (class/interface/struct/enum/record/union/module/...), accessibility (public/internal/private/unknown), and isObsolete. Set includeNonPublic=true to see internals. Lazy: first call triggers ParseAndCheckProject if not warm. Paginated; default 200, max 1000. Cursor stability: best-effort — if the project's references change between calls, the offset may shift; treat the cursor as ephemeral."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.ReferencedSymbols args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsNugetTypesArgs>
+                        "fcs_nuget_types"
+                        "[FCS in-process] Enumerate all types exported by one referenced assembly, matched by EXACT SimpleName (case-insensitive). Examples: packageId='Spectre.Console' resolves to assembly Spectre.Console only — NOT Spectre.Console.Cli. packageId='System' resolves to the literal 'System' assembly only — NOT every System.* assembly. When a NuGet package ships multiple assemblies, call this tool once per assembly name. Each entry reports displayName, fullName, kind, accessibility, isObsolete. Use this to survey a NuGet package's surface before writing wrapper code, or to confirm whether a third-party type is internal. Set includeNonPublic=true to surface internals. Paginated; default 500, max 2000. Falls back to active set_project when projectPath is omitted. Returns matchedAssemblies=[] when no assembly matches — does NOT silently fall back to a less-specific assembly. To discover assembly names, use fcs_referenced_symbols with a partial query first."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.NugetTypes args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsValidateSnippetArgs>
+                        "fcs_validate_snippet"
+                        "[FCS in-process] Compile an arbitrary F# snippet (.fs or .fsi mode) against the loaded project's references without modifying the project on disk. Writes the snippet to a uniquely-named file under the OS temp dir, splices it into a fresh copy of project options (cached options not mutated), runs ParseAndCheckFileInProject, and deletes the temp file before returning. Returns FCS diagnostics + errorCount/warningCount. Use this to validate a signature shape (e.g. 'does F# accept exception internal X of T in a .fsi?') or check that a draft type uses only existing project/NuGet types — much faster than scaffolding a scratch .fsproj. projectPath falls back to the active set_project. Caveats: (1) an .fsi snippet without a paired .fs implementation will likely produce 'signature has no implementation' errors — to validate just signature syntax, prefer mode='fs' with the signature wrapped in 'module M = ...'. (2) the snippet runs through FCS exactly like a real source file, so it can reference any project type — but it cannot reference symbols defined later in the project's compile order."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.ValidateSnippet args)))
+                    |> unwrapResult
+                )
+
+                tool (
                     TypedTool.define<FcsFileSymbolsArgs>
                         "fcs_file_symbols"
                         "[FCS in-process] Raw FCS symbol extraction for one file. Can be noisy on large files; default returns definitions, includeAllUses returns locals/parameters/usages too. Prefer fcs_file_outline for normal agent navigation. Pass projectPath when possible and 'text' for unsaved content."
@@ -431,7 +467,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsTypeAtPositionArgs>
                         "fcs_type_at_position"
-                        "[FCS in-process] Low-level exact-position FCS type/symbol query. Requires accurate line/character AND project context — without a prior set_project (or an explicit projectPath/projectOptions) types are often unresolved. The file at 'path' must exist on disk (not yet-to-be-created). Prefer fcs_symbol_at_word for normal agent workflows."
+                        "[FCS in-process] Low-level exact-position FCS type/symbol query. Requires project context — without a prior set_project (or an explicit projectPath/projectOptions) types are often unresolved. The file at 'path' must exist on disk. line/character are 0-based (LSP convention). Pass fuzzy=true to snap to the nearest symbol within ±2 lines / ±5 cols when coords are approximate; the response then includes resolvedLine/resolvedCharacter and fuzzySnap=true. On a no_symbol miss the response includes lineText + surroundingLines so 1-based-vs-0-based mistakes are visible. Prefer fcs_symbol_at_word for normal agent workflows."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.TypeAtPosition args)))
                     |> unwrapResult
                 )
