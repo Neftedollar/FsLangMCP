@@ -122,6 +122,9 @@ module private FieldFormClassifier =
         | ParsedInput.ImplFile(ParsedImplFileInput(contents = modules)) ->
             for SynModuleOrNamespace(decls = decls) in modules do
                 for decl in decls do walkDecl decl d
+        // SigFile (.fsi): signature files declare types but contain no expression
+        // use-sites — there are no record literals/updates here to classify. Empty
+        // dictionary is the correct return; do not "complete" this arm.
         | ParsedInput.SigFile _ -> ()
 
         d
@@ -1503,6 +1506,12 @@ type internal FcsBridge() =
             let fieldFormCache =
                 System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<FieldFormKey, bool> option>()
 
+            // PERF: this parses each file serially via Async.RunSynchronously. Warm FCS
+            // cache makes this ~microseconds per file, but a cold-cache audit over many
+            // distinct files is O(file count × parse-time). If this surfaces as a
+            // bottleneck, parallelise via Async.Parallel or batch through the project's
+            // checker. See #124 for the parse-tree walker follow-up where this could be
+            // rolled in.
             // Parse one file and return its field-form dictionary, or None on failure.
             let parseFileForForms (filePath: string) =
                 match fieldFormCache.TryGetValue(filePath) with
