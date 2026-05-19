@@ -20,45 +20,72 @@ All tools return a consistent JSON envelope:
 
 - **Success**: `{"status": "ok", "result": <payload>}` (LSP tools) or `{"status": "ok", ...fields}` (FCS tools)
 - **Not ready**: `{"status": "not_ready", "message": "..."}` — LSP workspace still loading
+- **Invalid args**: `{"status": "invalid_args", "message": "..."}` — required string arg blank/missing on `fcs_record_field_audit` / `fcs_project_symbol_uses` / `fcs_find_member_usages` / `fcs_find_symbol` / `fcs_referenced_symbols` / `fcs_nuget_types`. Standardized in 0.8.2 (#120).
 - **Error**: MCP protocol error with `{"errorKind": "...", "message": "..."}` payload
 
-## What You Get
+### Notable response fields
 
-### LSP-proxy tools (via `fsautocomplete`)
-
-- `textDocument_completion`
-- `textDocument_definition`
-- `textDocument_references`
-- `textDocument_formatting` — format F# file via Fantomas (via fsautocomplete)
-- `textDocument_codeAction` — available code actions / quick fixes at cursor
-- `textDocument_rename` — rename a symbol across the project
-- `workspace_symbol`
-- `workspace_diagnostics` (cache of latest `publishDiagnostics`)
-- `fsharp_signature_data` — structured FSAC signature help at an exact position
-- `set_project` (switch active project/workspace for LSP context)
+- **`set_project`** — response includes `fslangmcpVersion` (since 0.8.0, #115), `loadedProjects: string[]` (`.fsproj` paths discovered), and `readiness: { lsp, projectOptions, symbolIndex }` flags (since 0.5.6, #106).
+- **`workspace_diagnostics`** — single-file responses include `analyzedAt`; workspace-wide responses include `mostRecentAnalyzedAt` and `analyzedAtByUri` (per-URI `DateTimeOffset` map). Since 0.8.0 (#116). When `fileGlob` is supplied, `mostRecentAnalyzedAt` is scoped to the glob-filtered subset (since 0.8.2, #123).
+- **`fcs_find_symbol`** — `projectDiagnostics` is scoped. `projectDiagnosticsScope="matched-files"` (normal) returns diagnostics only for files containing matches, with Info/Hint filtered out by default (set `includeInfo=true` to include). `projectDiagnosticsScope="errors-only-no-matches"` (zero-match case) surfaces error-severity diagnostics from the whole project so callers can detect broken projects. Since 0.8.0 / 0.8.1 (#114).
+- **`fsharp_runtime_status`** — response includes top-level `fslangmcpVersion`. Since 0.8.0 (#115).
 
 LSP positions (`line`, `character`) are **0-based**.
 
-The `textDocument_*` and `workspace_*` tools are raw LSP/IDE-shaped proxies. They are useful for exact-position editor operations and FSAC debugging. Prefer the FCS tools and `project_health` for agent-friendly project understanding.
+## What You Get
 
-### FCS tools (compiler semantics)
+The `textDocument_*` and `workspace_*` tools are raw LSP/IDE-shaped proxies — useful for exact-position editor operations and FSAC debugging. Prefer the FCS tools and `project_health` for agent-friendly project understanding.
 
-- `fcs_parse_and_check_file`
-- `fcs_file_outline` — compact per-file API/navigation outline for agents
-- `fcs_project_outline` — compact project-wide outline over filtered compile files
-- `fcs_find_symbol` — grouped definitions/references with source context
-- `fcs_symbol_at_word` — tolerant symbol lookup by line + word/occurrence
-- `fcs_file_symbols`
-- `fcs_project_symbol_uses`
-- `fcs_type_at_position` — inferred F# type and symbol info at cursor (works without LSP workspace)
-- `fcs_signature_help` — method overloads and parameter info at cursor
-- `fcs_get_project_options` — get `OtherOptions` for a `.fsproj` via `proj-info`; use the result as `projectOptions` in other FCS tools
+### LSP-proxy tools (FSAC-backed)
 
-### Project preflight
+All require a prior `set_project`. Tagged `[FSAC]` in tool descriptions.
 
-- `fsharp_project_inspect` — read-only `.fsproj` inspection: compile order, references, source summary, and signature/implementation pairing.
-- `project_health` — fast read-only project preflight. Reports project options availability, source file readability, analyzer setup, test project discovery, and current LSP readiness. It does not start/switch FSAC, run compile, or run tests.
-- `fsharp_compile` — FCS project validation. Loads `.fsproj` options through `Ionide.ProjInfo`, then runs `FSharpChecker.ParseAndCheckProject`. It does not require `set_project`, run `dotnet build`, emit assemblies, or run tests.
+| Tool | What it does |
+|------|--------------|
+| `textDocument_completion` | Raw LSP proxy for completion at an exact position. |
+| `textDocument_definition` | Raw LSP proxy for go-to-definition at an exact position. |
+| `textDocument_references` | Raw LSP proxy for find-references at an exact position. For query-based agent workflows prefer `fcs_project_symbol_uses` / `fcs_find_symbol`. |
+| `textDocument_formatting` | Raw LSP formatting proxy via Fantomas. Returns formatted text and edits; does not write to disk. |
+| `textDocument_codeAction` | Raw LSP codeAction proxy at an exact position with empty diagnostic context. Useful for debugging FSAC. |
+| `textDocument_rename` | Raw LSP semantic rename at an exact position. Returns raw `WorkspaceEdit`. |
+| `workspace_symbol` | Quick lookup after `set_project`. IDE-shaped results without source context. |
+| `workspace_diagnostics` | Cached LSP `publishDiagnostics` payload, scoped to one file or to the whole workspace. Optional `path`, `fileGlob`, `severity` filters. |
+| `fsharp_signature_data` | Structured FSAC signature help via `fsharp/signatureData` at an exact call-site position. |
+
+### FCS in-process tools (compiler semantics)
+
+Tagged `[FCS in-process]` in tool descriptions. Most accept an optional `projectPath` that falls back to the active `set_project`.
+
+| Tool | What it does |
+|------|--------------|
+| `fcs_parse_and_check_file` | Parse + typecheck one file. Pass `text` for unsaved content. |
+| `fcs_check_file` | Cache-invalidating parse + typecheck for one file. Surgically drops cached project-options + project-results entries for THIS project and calls `InvalidateConfiguration` before re-running. Use when `workspace_diagnostics` looks stale right after an `Edit` / `Write`. |
+| `fcs_file_symbols` | Raw FCS symbol extraction for one file. `includeAllUses` adds locals / parameters / usages. Prefer `fcs_file_outline` for normal navigation. |
+| `fcs_file_outline` | Compact per-file outline filtered to definitions: name, kind, range, signature/type, accessibility, declaration range. |
+| `fcs_project_outline` | Compact project-wide outline over filtered compile files. Use `maxFiles` / `maxResultsPerFile` on large projects. |
+| `fcs_project_symbol_uses` | Project-wide symbol-use search by symbol name / full name. Cached by resolved project options. |
+| `fcs_find_symbol` | Project-wide search with grouped definitions / references and source line context. Better than chaining `workspace_symbol` + `fcs_project_symbol_uses` + shell line reads. Misses record-field-set construction sites — for those, use `fcs_record_field_audit`. |
+| `fcs_find_member_usages` | Find all usage sites of a specific `(typeName, memberName)`. FCS-resolved so dotted access, pipeline application, and overload resolution are handled correctly (unlike a textual `rg`). |
+| `fcs_record_field_audit` | Find every construction site for a `(typeName, fieldName)` pair — both `{ Field = expr; ... }` literal form and `{ x with Field = expr }` update form. Closes the gap where `fcs_find_symbol` / `textDocument_references` look up the type name and miss field-set uses. |
+| `fcs_symbol_at_word` | Tolerant FCS symbol lookup by line + word + occurrence. Prefer over exact-position hover/type queries. |
+| `fcs_type_at_position` | Low-level exact-position FCS type/symbol query. Requires `set_project` (or explicit `projectPath` / `projectOptions`). Pass `fuzzy=true` to snap to nearest symbol within ±2 lines / ±5 cols. |
+| `fcs_signature_help` | Exact-position FCS signature help around a call site. |
+| `fcs_make_internal_visible` | Drops the `private` keyword from a `let` / `module` / `type` / `member` / `val` / `new` / `static` / `abstract` / `override` declaration at a given position. Returns a workspace edit; does NOT write the file. |
+| `fcs_validate_snippet` | Compile an arbitrary F# snippet (`.fs` or `.fsi` mode) against the loaded project's references without modifying the project on disk. |
+| `fcs_referenced_symbols` | Search across the project's *referenced* assemblies (NuGet + framework) for types whose `DisplayName` / `FullName` contains the query (case-insensitive). Reports assembly, kind, accessibility, `isObsolete`. |
+| `fcs_nuget_types` | Enumerate types exported by one referenced assembly, matched by **exact** `SimpleName` (case-insensitive). Does NOT silently fall back to a less-specific assembly. To discover assembly names, use `fcs_referenced_symbols` first. |
+| `fcs_get_project_options` | Get `OtherOptions` for a `.fsproj` via `proj-info`; use the result as `projectOptions` in other FCS tools. |
+| `fsharp_compile` | FCS project validation. Loads `.fsproj` options through `Ionide.ProjInfo`, then runs `FSharpChecker.ParseAndCheckProject`. Does not run `dotnet build`, emit assemblies, or run tests. |
+| `fsharp_project_inspect` | Read-only `.fsproj` inspection: compile order, references, source summary, and signature/implementation pairing. |
+
+### Meta / workflow tools
+
+| Tool | What it does |
+|------|--------------|
+| `set_project` | `[FSAC]` Initialize or switch the FSAC/LSP project context. Must be called before `textDocument_*` and `workspace_*` tools. Accepts `.fsproj`, `.sln`, `.slnx`, or directory. Waits up to 30s for workspace load and clears FCS caches. |
+| `project_health` | `[FCS in-process]` Fast read-only preflight: project options availability, source file readability, analyzer setup, test project discovery (`isTestProject`, `testFrameworks`, `testCount`, `lastBuildSucceeded`, `lastBuildAt`, `binaryOutputPath`), and current LSP readiness. Does not start FSAC, build, or test. |
+| `fsharp_runtime_status` | `[FCS in-process]` Read-only observational snapshot: managed-heap sizes by generation/LOH/POH, GC counts, `isServerGC`, assembly load count, FCS checker config + project-results cache size, FSAC child-process working set. Numbers only — no interpretation. |
+| `fslangmcp_version` | `[meta]` Zero-arg. Returns the installed FsLangMCP product version and name. Same value is surfaced in `set_project.result.fslangmcpVersion` and `fsharp_runtime_status.fslangmcpVersion`. Use when filing UX feedback. |
 
 ## Prerequisites
 
