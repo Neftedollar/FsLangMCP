@@ -2488,3 +2488,377 @@ let ``RecordFieldAudit returns invalid_args for empty fieldName`` () : Task =
         Assert.Equal("invalid_args", result["status"].GetValue<string>())
         Assert.Contains("fieldname", (result["message"].GetValue<string>()).ToLowerInvariant())
     }
+
+// ─── #122 — parse-tree-based formOf regression tests ─────────────────────────
+// These tests cover the failure mode of the old textual heuristic: fields that
+// appear 3+ lines below the `with` keyword in a multi-line record-update
+// expression were previously misclassified as "literal".
+
+[<Fact>]
+let ``RecordFieldAudit 5-field with-update — all fields tagged with-update including deep ones`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_rfa_5wu_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // F4 is 3 lines below `with`, F5 is 4 lines below — both would have
+            // been misclassified as "literal" by the old 2-line lookback heuristic.
+            let src =
+                String.concat
+                    "\n"
+                    [ "module Rfa5Wu.Library"
+                      ""
+                      "type R = { F1: int; F2: int; F3: int; F4: int; F5: int }"
+                      ""
+                      "let base1: R = { F1=1; F2=2; F3=3; F4=4; F5=5 }"
+                      "let updated ="
+                      "    { base1 with"
+                      "        F1 = 10"
+                      "        F2 = 20"
+                      "        F3 = 30"
+                      "        F4 = 40"
+                      "        F5 = 50 }"
+                      "" ]
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "Rfa5Wu" src
+
+            // Test each deep field individually (F4 and F5 are the ones that failed
+            // under the old heuristic — they are the primary acceptance criterion).
+            for fieldName in [ "F1"; "F2"; "F3"; "F4"; "F5" ] do
+                let! result =
+                    bridge.RecordFieldAudit(
+                        { typeName = "R"
+                          fieldName = fieldName
+                          path = Some sourcePath
+                          text = None
+                          projectPath = Some projectPath
+                          projectOptions = None
+                          maxResults = Some 20
+                          cursor = None }
+                    )
+
+                Assert.Equal("succeeded", result["status"].GetValue<string>())
+                let sites = result["sites"] :?> JsonArray
+                Assert.True(sites.Count >= 1, $"Expected at least 1 site for {fieldName}")
+
+                let forms =
+                    [ for i in 0 .. sites.Count - 1 do
+                          let s = sites[i]
+                          yield s["form"].GetValue<string>() ]
+
+                // Schema: allowed values are exactly "literal", "with-update", "unknown"
+                for form in forms do
+                    Assert.True(List.contains form [ "literal"; "with-update"; "unknown" ], $"Unexpected form value: {form}")
+
+                // The update site (in `updated`) must be tagged "with-update".
+                Assert.True(
+                    forms |> List.contains "with-update",
+                    $"Field {fieldName} update site must be tagged with-update; got: {forms}"
+                )
+
+                // No update site must be wrongly tagged "literal".
+                // There may be a literal site (from `base1` construction) — that is correct.
+                // We verify that the forms list is NOT all-literal (meaning the with-update
+                // site is present and correctly classified).
+                Assert.True(
+                    not (forms |> List.forall (fun f -> f = "literal")),
+                    $"At least one {fieldName} site should be with-update, not all literal; got: {forms}"
+                )
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``RecordFieldAudit pure literal — all fields tagged literal`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_rfa_lit2_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let src =
+                String.concat
+                    "\n"
+                    [ "module RfaLit2.Library"
+                      ""
+                      "type S = { X: int; Y: string }"
+                      ""
+                      "let s1: S = { X = 1; Y = \"hello\" }"
+                      "let s2: S = { X = 2; Y = \"world\" }"
+                      "" ]
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "RfaLit2" src
+
+            for fieldName in [ "X"; "Y" ] do
+                let! result =
+                    bridge.RecordFieldAudit(
+                        { typeName = "S"
+                          fieldName = fieldName
+                          path = Some sourcePath
+                          text = None
+                          projectPath = Some projectPath
+                          projectOptions = None
+                          maxResults = Some 10
+                          cursor = None }
+                    )
+
+                Assert.Equal("succeeded", result["status"].GetValue<string>())
+                let sites = result["sites"] :?> JsonArray
+                Assert.True(sites.Count >= 2, $"Expected at least 2 literal sites for {fieldName}")
+
+                let forms =
+                    [ for i in 0 .. sites.Count - 1 do
+                          let s = sites[i]
+                          yield s["form"].GetValue<string>() ]
+
+                // Schema check
+                for form in forms do
+                    Assert.True(List.contains form [ "literal"; "with-update"; "unknown" ], $"Unexpected form value: {form}")
+
+                // All construction sites must be literal; no with-update expected.
+                Assert.DoesNotContain("with-update", forms)
+                Assert.Contains("literal", forms)
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``RecordFieldAudit mixed literal and with-update — each site classified independently`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_rfa_mixed_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // The same field `Val` appears in both a literal construction and a
+            // multi-line with-update expression.  The classifier must tag each site
+            // independently — proving it is per-occurrence, not per-file.
+            let src =
+                String.concat
+                    "\n"
+                    [ "module RfaMixed.Library"
+                      ""
+                      "type T = { Val: int; Other: int }"
+                      ""
+                      "let t1: T = { Val = 1; Other = 0 }"  // literal
+                      "let t2: T ="
+                      "    { t1 with"
+                      "        Other = 99"
+                      "        Val = 42 }"  // with-update, 2 lines below `with`
+                      "" ]
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "RfaMixed" src
+
+            let! result =
+                bridge.RecordFieldAudit(
+                    { typeName = "T"
+                      fieldName = "Val"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      maxResults = Some 10
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            let sites = result["sites"] :?> JsonArray
+            Assert.True(sites.Count >= 2, $"Expected >=2 Val sites, got %d{sites.Count}")
+
+            let forms =
+                [ for i in 0 .. sites.Count - 1 do
+                      let s = sites[i]
+                      yield s["form"].GetValue<string>() ]
+
+            // Schema: every form value must be in the allowed set
+            for form in forms do
+                Assert.True(List.contains form [ "literal"; "with-update"; "unknown" ], $"Unexpected form value: {form}")
+
+            // The file has both forms — both must appear in the results.
+            Assert.Contains("literal", forms)
+            Assert.Contains("with-update", forms)
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+// ─── #122 — parse-tree walker miss: member-body regression ───────────────────
+
+[<Fact>]
+let ``RecordFieldAudit classifies record literal inside a type member body (not 'unknown')`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_rfa_member_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // Record literal inside a class member body — historically a position the
+            // parse-tree walker did not descend into (SynModuleDecl.Types is unhandled).
+            // The textual fallback must rescue it so the form is never "unknown".
+            let src =
+                String.concat
+                    "\n"
+                    [ "module RfaMember.Library"
+                      ""
+                      "type Role = { Propose: int -> int }"
+                      ""
+                      "type Builder() ="
+                      "    member _.Make () : Role = { Propose = fun x -> x + 1 }"
+                      "" ]
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "RfaMember" src
+
+            let! result =
+                bridge.RecordFieldAudit(
+                    { typeName = "Role"
+                      fieldName = "Propose"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      maxResults = Some 10
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.True(result["matchedCount"].GetValue<int>() >= 1, "Expected at least one matched site")
+
+            let sites = result["sites"] :?> JsonArray
+            Assert.True(sites.Count >= 1, "Expected at least one site in the result")
+
+            // The critical assertion: the member-body site must not silently degrade to
+            // "unknown" when the parse-tree walker misses it — the textual fallback must
+            // rescue it so we never regress below v0.8.1 behaviour for these site classes.
+            let firstSite = sites[0]
+            let firstForm = firstSite["form"].GetValue<string>()
+            Assert.NotEqual<string>("unknown", firstForm)
+            Assert.True(
+                List.contains firstForm [ "literal"; "with-update" ],
+                $"Expected 'literal' or 'with-update', got '%s{firstForm}'"
+            )
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+// ─── #120 — ArgsValidation.requireNonBlank regression tests ───────────────────
+
+[<Fact>]
+let ``ProjectSymbolUses returns invalid_args envelope for blank symbolQuery`` () : Task =
+    task {
+        let path = writeTempFs "module Blank\n"
+
+        try
+            let bridge = FcsBridge()
+
+            let! result =
+                bridge.ProjectSymbolUses(
+                    { path = path
+                      text = None
+                      projectPath = None
+                      projectOptions = None
+                      symbolQuery = "   "
+                      exact = None
+                      maxResults = None
+                      cursor = None }
+                )
+
+            Assert.Equal("invalid_args", result["status"].GetValue<string>())
+            Assert.Contains("symbolquery", (result["message"].GetValue<string>()).ToLowerInvariant())
+        finally
+            if File.Exists(path) then File.Delete(path)
+    }
+
+[<Fact>]
+let ``FindMemberUsages returns invalid_args envelope for blank typeName`` () : Task =
+    task {
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.FindMemberUsages(
+                { typeName = "   "
+                  memberName = "Foreground"
+                  path = None
+                  text = None
+                  projectPath = None
+                  projectOptions = None
+                  exact = None
+                  maxResults = None
+                  cursor = None }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("typename", (result["message"].GetValue<string>()).ToLowerInvariant())
+    }
+
+[<Fact>]
+let ``FindMemberUsages returns invalid_args envelope for blank memberName`` () : Task =
+    task {
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.FindMemberUsages(
+                { typeName = "Style"
+                  memberName = ""
+                  path = None
+                  text = None
+                  projectPath = None
+                  projectOptions = None
+                  exact = None
+                  maxResults = None
+                  cursor = None }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("membername", (result["message"].GetValue<string>()).ToLowerInvariant())
+    }
+
+[<Fact>]
+let ``FindSymbol returns invalid_args envelope for blank symbolQuery`` () : Task =
+    task {
+        let path = writeTempFs "module Blank\n"
+
+        try
+            let bridge = FcsBridge()
+
+            let! result =
+                bridge.FindSymbol(
+                    { path = path
+                      text = None
+                      projectPath = None
+                      projectOptions = None
+                      symbolQuery = ""
+                      exact = None
+                      maxResults = None
+                      contextLines = None
+                      includeDeclaration = None
+                      includeInfo = None
+                      cursor = None }
+                )
+
+            Assert.Equal("invalid_args", result["status"].GetValue<string>())
+            Assert.Contains("symbolquery", (result["message"].GetValue<string>()).ToLowerInvariant())
+        finally
+            if File.Exists(path) then File.Delete(path)
+    }
+
+[<Fact>]
+let ``MakeInternalVisible returns invalid_args envelope for blank path`` () : Task =
+    task {
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.MakeInternalVisible(
+                { path = "   "
+                  line = 0
+                  character = 0
+                  text = None
+                  projectPath = None }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("path", (result["message"].GetValue<string>()).ToLowerInvariant())
+    }

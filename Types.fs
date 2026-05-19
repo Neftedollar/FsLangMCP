@@ -317,4 +317,25 @@ let toFileUri (path: string) =
     let fullPath = Path.GetFullPath(path)
     Uri(fullPath).AbsoluteUri
 
+// ─── Argument validation helpers ──────────────────────────────────────────────
+
+module ArgsValidation =
+    /// Returns the trimmed value if non-blank, otherwise a JSON <c>invalid_args</c>
+    /// envelope matching the existing wire shape
+    /// <c>{ status: "invalid_args"; message: "..." }</c>.
+    /// Use at the top of MCP handlers to standardise required-string validation.
+    let requireNonBlank (fieldName: string) (value: string) : Result<string, JsonNode> =
+        let trimmed = if isNull value then "" else value.Trim()
+
+        if String.IsNullOrWhiteSpace trimmed then
+            let payload =
+                jobj
+                    [ "status", jstr "invalid_args"
+                      "message", jstr $"{fieldName} must be non-empty" ]
+                :> JsonNode
+
+            Error payload
+        else
+            Ok trimmed
+
 let normalizePath (path: string) = Path.GetFullPath(path)

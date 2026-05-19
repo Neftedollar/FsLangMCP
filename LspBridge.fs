@@ -999,10 +999,14 @@ type internal FsAutoCompleteBridge() =
                             | None -> analyzedAtByUri[uri] <- null
 
                 let mostRecent =
-                    if diagnosticsAnalyzedAt.IsEmpty then
-                        None
-                    else
-                        diagnosticsAnalyzedAt.Values |> Seq.max |> Some
+                    let filtered =
+                        diagnosticsAnalyzedAt
+                        |> Seq.filter (fun kv -> globMatches kv.Key)
+                        |> Seq.map (fun kv -> kv.Value)
+                        |> Seq.toArray
+
+                    if filtered.Length = 0 then None
+                    else filtered |> Array.max |> Some
 
                 return
                     LspResponseShape.diagnosticsResponseForWorkspace

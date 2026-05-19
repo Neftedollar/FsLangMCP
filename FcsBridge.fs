@@ -39,6 +39,93 @@ let private explicitFsproj (projectPath: string option) : string option =
     |> Option.map normalizePath
     |> Option.filter (fun path -> String.Equals(Path.GetExtension(path), ".fsproj", StringComparison.OrdinalIgnoreCase))
 
+// ─── FieldFormClassifier ────────────────────────────────────────────────────────
+// Parse-tree-based classification of record field use sites as either a record
+// literal (`{ Field = expr }`) or a record-update expression (`{ x with Field = expr }`).
+// Replaces the old textual lookback heuristic that mis-classified fields more than
+// 2 lines below the `with` keyword. See issue #122.
+
+open FSharp.Compiler.Syntax
+
+/// A (startLine, startColumn) pair used as a dictionary key for field-name ranges.
+/// FCS range has [<NoComparison>], so it cannot be used directly as a map key.
+type private FieldFormKey = int * int
+
+/// Module that walks a FCS ParsedInput and tags every record-field expression
+/// site as `true` (with-update form) or `false` (literal form).
+module private FieldFormClassifier =
+
+    let private tagFields (isUpdate: bool) (fields: SynExprRecordField list) (d: System.Collections.Generic.Dictionary<FieldFormKey, bool>) =
+        for field in fields do
+            match field with
+            | SynExprRecordField((lid, _), _, _, _, _) ->
+                let r = lid.Range
+                d[(r.StartLine, r.StartColumn)] <- isUpdate
+
+    let rec private walkExpr (e: SynExpr) (d: System.Collections.Generic.Dictionary<FieldFormKey, bool>) =
+        match e with
+        | SynExpr.Record(_, copyInfo, fields, _) ->
+            tagFields copyInfo.IsSome fields d
+            // Recurse into the value expressions so nested records are also classified.
+            for field in fields do
+                match field with
+                | SynExprRecordField(_, _, Some ve, _, _) -> walkExpr ve d
+                | _ -> ()
+        | SynExpr.Paren(inner, _, _, _) -> walkExpr inner d
+        | SynExpr.App(_, _, f, x, _) -> walkExpr f d; walkExpr x d
+        | SynExpr.TypeApp(e2, _, _, _, _, _, _) -> walkExpr e2 d
+        | SynExpr.Lambda(body = body) -> walkExpr body d
+        | SynExpr.LetOrUse lu ->
+            for b in lu.Bindings do
+                let (SynBinding(expr = be)) = b
+                walkExpr be d
+            walkExpr lu.Body d
+        | SynExpr.Sequential(_, _, e1, e2, _, _) -> walkExpr e1 d; walkExpr e2 d
+        | SynExpr.IfThenElse(ifExpr = ie; thenExpr = te; elseExpr = ee) ->
+            walkExpr ie d; walkExpr te d; ee |> Option.iter (fun x -> walkExpr x d)
+        | SynExpr.Match(expr = me; clauses = cs) ->
+            walkExpr me d
+            for SynMatchClause(resultExpr = re) in cs do walkExpr re d
+        | SynExpr.Tuple(exprs = es) -> for x in es do walkExpr x d
+        | SynExpr.ArrayOrList(exprs = es) -> for x in es do walkExpr x d
+        | SynExpr.ComputationExpr(expr = ce) -> walkExpr ce d
+        | SynExpr.Typed(e2, _, _) -> walkExpr e2 d
+        | SynExpr.Do(e2, _) -> walkExpr e2 d
+        | SynExpr.Assert(e2, _) -> walkExpr e2 d
+        | SynExpr.TryFinally(tryExpr = te; finallyExpr = fe) -> walkExpr te d; walkExpr fe d
+        | SynExpr.TryWith(tryExpr = te; withCases = cs) ->
+            walkExpr te d
+            for SynMatchClause(resultExpr = re) in cs do walkExpr re d
+        | SynExpr.YieldOrReturn(_, e2, _, _) -> walkExpr e2 d
+        | SynExpr.YieldOrReturnFrom(_, e2, _, _) -> walkExpr e2 d
+        | _ -> ()
+
+    and private walkDecl (decl: SynModuleDecl) (d: System.Collections.Generic.Dictionary<FieldFormKey, bool>) =
+        match decl with
+        | SynModuleDecl.Let(_, bindings, _, _) ->
+            for b in bindings do
+                let (SynBinding(expr = e)) = b
+                walkExpr e d
+        | SynModuleDecl.Expr(e, _) -> walkExpr e d
+        | SynModuleDecl.NestedModule(_, _, decls, _, _, _) ->
+            for decl2 in decls do walkDecl decl2 d
+        | _ -> ()
+
+    /// Walk the full parse tree and return a dictionary mapping
+    /// field-name range keys to their classification:
+    ///   true  = with-update form  ({ x with Field = ... })
+    ///   false = literal form      ({ Field = ... })
+    let classify (input: ParsedInput) : System.Collections.Generic.Dictionary<FieldFormKey, bool> =
+        let d = System.Collections.Generic.Dictionary<FieldFormKey, bool>()
+
+        match input with
+        | ParsedInput.ImplFile(ParsedImplFileInput(contents = modules)) ->
+            for SynModuleOrNamespace(decls = decls) in modules do
+                for decl in decls do walkDecl decl d
+        | ParsedInput.SigFile _ -> ()
+
+        d
+
 // ─── FcsBridge ─────────────────────────────────────────────────────────────────
 
 type internal FcsBridge() =
@@ -1016,10 +1103,9 @@ type internal FcsBridge() =
 
     member this.ProjectSymbolUses(args: FcsProjectSymbolUsesArgs) : Task<JsonNode> =
         task {
-            let query = args.symbolQuery.Trim()
-
-            if String.IsNullOrWhiteSpace(query) then
-                invalidArg (nameof args.symbolQuery) "symbolQuery must be non-empty."
+            match ArgsValidation.requireNonBlank "symbolQuery" args.symbolQuery with
+            | Error envelope -> return envelope
+            | Ok query ->
 
             match validateSourcePath "fcs_project_symbol_uses" args.text args.path with
             | Some err -> return err
@@ -1109,14 +1195,12 @@ type internal FcsBridge() =
 
     member this.FindMemberUsages(args: FcsFindMemberUsagesArgs) : Task<JsonNode> =
         task {
-            let typeName = args.typeName.Trim()
-            let memberName = args.memberName.Trim()
-
-            if String.IsNullOrWhiteSpace typeName then
-                invalidArg (nameof args.typeName) "typeName must be non-empty."
-
-            if String.IsNullOrWhiteSpace memberName then
-                invalidArg (nameof args.memberName) "memberName must be non-empty."
+            match ArgsValidation.requireNonBlank "typeName" args.typeName with
+            | Error envelope -> return envelope
+            | Ok typeName ->
+            match ArgsValidation.requireNonBlank "memberName" args.memberName with
+            | Error envelope -> return envelope
+            | Ok memberName ->
 
             // Resolve project options either via a file context (PrepareCheckContext)
             // or directly from projectPath (.fsproj). The former gives accurate
@@ -1272,22 +1356,12 @@ type internal FcsBridge() =
     /// See #114.
     member this.RecordFieldAudit(args: FcsRecordFieldAuditArgs) : Task<JsonNode> =
         task {
-            let typeName = (args.typeName |> Option.ofObj |> Option.defaultValue "").Trim()
-            let fieldName = (args.fieldName |> Option.ofObj |> Option.defaultValue "").Trim()
-
-            if String.IsNullOrWhiteSpace typeName then
-                return
-                    jobj
-                        [ "status", jstr "invalid_args"
-                          "message", jstr "typeName must be non-empty" ]
-                    :> JsonNode
-            else if String.IsNullOrWhiteSpace fieldName then
-                return
-                    jobj
-                        [ "status", jstr "invalid_args"
-                          "message", jstr "fieldName must be non-empty" ]
-                    :> JsonNode
-            else
+            match ArgsValidation.requireNonBlank "typeName" args.typeName with
+            | Error envelope -> return envelope
+            | Ok typeName ->
+            match ArgsValidation.requireNonBlank "fieldName" args.fieldName with
+            | Error envelope -> return envelope
+            | Ok fieldName ->
 
             // Resolve project options either via path or projectPath, matching
             // FindMemberUsages's resolution path so callers see the same fallback
@@ -1412,36 +1486,81 @@ type internal FcsBridge() =
                 |> Array.skip (min pageOffset totalMatched)
                 |> Array.truncate pageSize
 
-            // Pre-compute lines from args.text when it matches an audit site's
-            // file — so an unsaved-buffer caller gets form classification from
-            // their edited content, not from the stale on-disk version.
-            let unsavedLinesByPath =
+            // When the caller provides unsaved text for a specific path, use that
+            // content for parsing that file; all other files use their on-disk content.
+            let unsavedText =
                 match args.path, args.text with
                 | Some p, Some t when not (String.IsNullOrWhiteSpace t) ->
-                    Some(normalizePath p, t.Split('\n'))
+                    Some(normalizePath p, t)
                 | _ -> None
 
-            // Determine literal vs with-update form by inspecting the source line
-            // around the field-name use. Heuristic: look for ` with ` in the line
-            // itself or up to 2 preceding lines (record-update expressions often
-            // span lines, with the ` with ` keyword on a different line than the
-            // field name). False positives possible if the comment text contains
-            // " with " — accept the false-positive rate for v0.8.0 simplicity.
-            //
-            // Reads from args.text when the use's file path matches; otherwise
-            // falls back to on-disk read. Honest about staleness for unsaved buffers.
-            let formOf (symbolUse: FSharpSymbolUse) =
+            // Derive parsing options from the already-resolved project options.
+            let parsingOptions, _ = checker.GetParsingOptionsFromProjectOptions(projectOptions)
+
+            // Build a per-file parse-tree classifier cache.
+            // Each file is parsed at most once; results are stored here and reused
+            // for every symbolUse in that file.
+            let fieldFormCache =
+                System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<FieldFormKey, bool> option>()
+
+            // Parse one file and return its field-form dictionary, or None on failure.
+            let parseFileForForms (filePath: string) =
+                match fieldFormCache.TryGetValue(filePath) with
+                | true, cached -> cached
+                | _ ->
+                    let result =
+                        try
+                            let source =
+                                match unsavedText with
+                                | Some(textPath, text) when
+                                    String.Equals(filePath, textPath, StringComparison.Ordinal)
+                                    ->
+                                    text
+                                | _ ->
+                                    if File.Exists filePath then
+                                        File.ReadAllText filePath
+                                    else
+                                        ""
+
+                            if String.IsNullOrEmpty source then
+                                None
+                            else
+                                let sourceText = SourceText.ofString source
+                                // checker.ParseFile is cached by FCS internally on warm cache;
+                                // the Async is started synchronously here since we are already
+                                // inside a task{} and this is a fast in-process parse.
+                                let parseResults =
+                                    checker.ParseFile(filePath, sourceText, parsingOptions)
+                                    |> Async.RunSynchronously
+
+                                Some(FieldFormClassifier.classify parseResults.ParseTree)
+                        with _ ->
+                            // Fall back gracefully: classification will return "unknown"
+                            // for all uses in this file. Likely causes: file deleted
+                            // between project check and audit, or parse exception.
+                            None
+
+                    fieldFormCache[filePath] <- result
+                    result
+
+            // Classify a single symbolUse's form using the parse-tree classifier.
+            // Falls back to the old textual heuristic if the parse tree is unavailable
+            // OR if the walker did not visit the site, so callers never regress to worse
+            // output than the previous version.
+
+            // Named local so it can be called from BOTH miss paths (parse failure and
+            // parse-tree walker miss — e.g. record inside a type member body or for-loop).
+            let fallbackHeuristic (symbolUse: FSharpSymbolUse) : string =
+                let filePath = normalizePath symbolUse.FileName
+                let r = symbolUse.Range
+
                 try
                     let lines =
-                        match unsavedLinesByPath with
-                        | Some(textPath, textLines) when
-                            String.Equals(
-                                normalizePath symbolUse.FileName,
-                                textPath,
-                                StringComparison.Ordinal
-                            )
+                        match unsavedText with
+                        | Some(textPath, text) when
+                            String.Equals(filePath, textPath, StringComparison.Ordinal)
                             ->
-                            Some textLines
+                            Some(text.Split('\n'))
                         | _ ->
                             if File.Exists symbolUse.FileName then
                                 Some(File.ReadAllLines(symbolUse.FileName))
@@ -1451,10 +1570,8 @@ type internal FcsBridge() =
                     match lines with
                     | None -> "unknown"
                     | Some lines ->
-                        let r = symbolUse.Range
                         let startIdx = max 0 (r.StartLine - 3)
                         let endIdx = min (lines.Length - 1) (r.StartLine - 1)
-
                         let mutable foundWith = false
 
                         for i in startIdx..endIdx do
@@ -1464,6 +1581,28 @@ type internal FcsBridge() =
                         if foundWith then "with-update" else "literal"
                 with _ ->
                     "unknown"
+
+            let formOf (symbolUse: FSharpSymbolUse) =
+                let filePath = normalizePath symbolUse.FileName
+                let r = symbolUse.Range
+
+                match parseFileForForms filePath with
+                | Some d ->
+                    let key = (r.StartLine, r.StartColumn)
+
+                    match d.TryGetValue(key) with
+                    | true, isUpdate -> if isUpdate then "with-update" else "literal"
+                    | false, _ ->
+                        // Parse tree was available but the walker did not visit this site
+                        // (e.g., inside a type member body, for-loop, or computation
+                        // expression bind). Fall back to the textual heuristic so we never
+                        // regress below v0.8.1 behaviour for these site classes.
+                        fallbackHeuristic symbolUse
+                | None ->
+                    // Parse failed — fall back to textual heuristic.
+                    // This preserves behaviour for callers that rely on formOf during
+                    // parse failures (e.g. files in error, or temp-file projects).
+                    fallbackHeuristic symbolUse
 
             let siteToJson (symbolUse: FSharpSymbolUse) =
                 let r = symbolUse.Range
@@ -1498,10 +1637,9 @@ type internal FcsBridge() =
 
     member this.FindSymbol(args: FcsFindSymbolArgs) : Task<JsonNode> =
         task {
-            let query = args.symbolQuery.Trim()
-
-            if String.IsNullOrWhiteSpace(query) then
-                invalidArg (nameof args.symbolQuery) "symbolQuery must be non-empty."
+            match ArgsValidation.requireNonBlank "symbolQuery" args.symbolQuery with
+            | Error envelope -> return envelope
+            | Ok query ->
 
             match validateSourcePath "fcs_find_symbol" args.text args.path with
             | Some err -> return err
@@ -2062,6 +2200,10 @@ type internal FcsBridge() =
     /// keyword and returns the edit range. Variant A of #118.
     member this.MakeInternalVisible(args: FcsMakeInternalVisibleArgs) : Task<JsonNode> =
         task {
+            match ArgsValidation.requireNonBlank "path" args.path with
+            | Error envelope -> return envelope
+            | Ok _ ->
+
             match validateSourcePath "fcs_make_internal_visible" args.text args.path with
             | Some err -> return err
             | None ->
@@ -2523,15 +2665,11 @@ type internal FcsBridge() =
     /// Powers the "find the Spectre.Console.Cell internal type" use case (F-3).
     member this.ReferencedSymbols(args: FcsReferencedSymbolsArgs) : Task<JsonNode> =
         task {
-            let query = (args.query |> Option.ofObj |> Option.defaultValue "").Trim()
+            match ArgsValidation.requireNonBlank "query" args.query with
+            | Error envelope -> return envelope
+            | Ok query ->
 
-            if String.IsNullOrWhiteSpace(query) then
-                return
-                    jobj
-                        [ "status", jstr "invalid_args"
-                          "message", jstr "query must be non-empty" ]
-                    :> JsonNode
-            else if args.projectPath.IsNone then
+            if args.projectPath.IsNone then
                 return
                     jobj
                         [ "status", jstr "invalid_args"
@@ -2624,15 +2762,11 @@ type internal FcsBridge() =
     /// Powers the "what types does this NuGet package expose" use case (F-3).
     member this.NugetTypes(args: FcsNugetTypesArgs) : Task<JsonNode> =
         task {
-            let packageId = (args.packageId |> Option.ofObj |> Option.defaultValue "").Trim()
+            match ArgsValidation.requireNonBlank "packageId" args.packageId with
+            | Error envelope -> return envelope
+            | Ok packageId ->
 
-            if String.IsNullOrWhiteSpace(packageId) then
-                return
-                    jobj
-                        [ "status", jstr "invalid_args"
-                          "message", jstr "packageId must be non-empty" ]
-                    :> JsonNode
-            else if args.projectPath.IsNone then
+            if args.projectPath.IsNone then
                 return
                     jobj
                         [ "status", jstr "invalid_args"

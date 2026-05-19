@@ -4,7 +4,7 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <PackageId>FsLangMcp</PackageId>
-    <Version>0.8.1</Version>
+    <Version>0.8.2</Version>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>fslangmcp</ToolCommandName>
     <PackageOutputPath>./nupkg</PackageOutputPath>
@@ -56,6 +56,13 @@
     <PackageReference Include="StreamJsonRpc" Version="2.24.*" />
     <!-- override transitive 1.0.2 from StreamJsonRpc (GHSA-2cwq-pwfr-wcw3) -->
     <PackageReference Include="Nerdbank.MessagePack" Version="1.1.62" />
+    <!-- Pin the transitive load so the bind is satisfied at startup probing
+         rather than first-use of StreamJsonRpc internals. Without this pin,
+         fresh fslangmcp host processes (e.g. those spawned by Claude Code
+         subagent sessions) intermittently fail set_project with a
+         FileNotFoundException for Microsoft.VisualStudio.Threading 17.14.0.0.
+         See issue #121. -->
+    <PackageReference Include="Microsoft.VisualStudio.Threading.Only" Version="17.14.15" />
   </ItemGroup>
 
 </Project>

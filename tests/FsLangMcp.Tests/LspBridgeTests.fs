@@ -482,3 +482,83 @@ let ``diagnosticsResponseForWorkspace with empty filtered files yields empty res
     Assert.Equal(0, result["diagnosticsFileCount"].GetValue<int>())
     let resultObj = (result["result"]) :?> JsonObject
     Assert.Equal(0, resultObj.Count)
+
+// ─── workspace_diagnostics mostRecentAnalyzedAt scoping (#123) ───────────────
+
+/// Simulates the mostRecent computation that LspBridge.Diagnostics performs:
+/// filters the analyzedAt dictionary by globMatches, then takes the max.
+/// Tests are at this level (rather than through the stateful Diagnostics member)
+/// because the LspBridge class requires a live LSP process. The pure filtering
+/// logic is what changed in the fix and is fully exercised here.
+let private computeMostRecent (fileGlob: string option) (store: (string * DateTimeOffset) list) =
+    let globMatches (uri: string) =
+        match fileGlob with
+        | Some pattern -> fileMatchesGlob pattern uri
+        | None -> true
+
+    let filtered =
+        store
+        |> List.filter (fun (uri, _) -> globMatches uri)
+        |> List.map snd
+
+    match filtered with
+    | [] -> None
+    | vs -> vs |> List.max |> Some
+
+[<Fact>]
+let ``mostRecentAnalyzedAt without fileGlob equals workspace-wide max`` () =
+    let earlier = DateTimeOffset.Parse("2026-05-19T08:00:00Z")
+    let later   = DateTimeOffset.Parse("2026-05-19T10:00:00Z")
+
+    let store =
+        [ "file:///src/Foo.fs",   earlier
+          "file:///tests/Bar.fs", later ]
+
+    let mostRecent = computeMostRecent None store
+
+    // No glob → workspace-wide max → the later timestamp wins.
+    Assert.Equal(Some later, mostRecent)
+
+    // Verify it surfaces correctly through the response builder.
+    let root = JsonObject()
+    let analyzedAtByUri = JsonObject()
+    let result = diagnosticsResponseForWorkspace true 2 root mostRecent analyzedAtByUri
+    Assert.Contains("2026-05-19T10:00:00", result["mostRecentAnalyzedAt"].GetValue<string>())
+
+[<Fact>]
+let ``mostRecentAnalyzedAt with fileGlob restricts to matched subset`` () =
+    let srcTs   = DateTimeOffset.Parse("2026-05-19T08:00:00Z")
+    let testsTs = DateTimeOffset.Parse("2026-05-19T10:00:00Z")  // fresher, but outside glob
+
+    let store =
+        [ "file:///src/Foo.fs",   srcTs
+          "file:///tests/Bar.fs", testsTs ]
+
+    // Glob matches only the src file; tests/ is excluded.
+    let mostRecent = computeMostRecent (Some "file:///src/**") store
+
+    // The fresher tests/Bar.fs must NOT influence the result.
+    Assert.Equal(Some srcTs, mostRecent)
+    Assert.NotEqual(Some testsTs, mostRecent)
+
+    // Sanity-check through the response builder.
+    let root = JsonObject()
+    let analyzedAtByUri = JsonObject()
+    let result = diagnosticsResponseForWorkspace true 1 root mostRecent analyzedAtByUri
+    Assert.Contains("2026-05-19T08:00:00", result["mostRecentAnalyzedAt"].GetValue<string>())
+
+[<Fact>]
+let ``mostRecentAnalyzedAt with fileGlob matching zero files is null`` () =
+    let store =
+        [ "file:///tests/Bar.fs", DateTimeOffset.Parse("2026-05-19T10:00:00Z") ]
+
+    // Glob matches nothing in the store.
+    let mostRecent = computeMostRecent (Some "file:///src/**") store
+
+    Assert.Equal(None, mostRecent)
+
+    // The response builder must still produce a well-formed object with null mostRecentAnalyzedAt.
+    let root = JsonObject()
+    let analyzedAtByUri = JsonObject()
+    let result = diagnosticsResponseForWorkspace true 0 root mostRecent analyzedAtByUri
+    Assert.Null(result["mostRecentAnalyzedAt"])
