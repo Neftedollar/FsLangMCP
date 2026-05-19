@@ -1044,3 +1044,111 @@ let ``FindMemberUsages substring typeName does not false-match siblings sharing 
             if Directory.Exists tempRoot then
                 Directory.Delete(tempRoot, true)
     }
+
+// ─── Accessibility surface in symbol JSON (#110) ──────────────────────────────
+
+[<Fact>]
+let ``symbol JSON exposes accessibility for private/internal/public members`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_acc_%s{runId}")
+        let bridge = FcsBridge()
+
+        let source =
+            String.concat
+                "\n"
+                [ "module Theme.Access"
+                  ""
+                  "let publicValue = 1"
+                  "let internal internalValue = 2"
+                  "let private privateValue = 3" ]
+
+        try
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "ThemeAcc" source
+
+            let! result =
+                bridge.FileSymbols(
+                    { path = sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      includeAllUses = None
+                      maxResults = Some 100 }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+
+            let symbols = (result["symbols"]) :?> JsonArray
+
+            let findAcc name =
+                symbols
+                |> Seq.tryPick (fun s ->
+                    if (s["symbol"]["displayName"]).GetValue<string>() = name then
+                        Some((s["symbol"]["accessibility"]).GetValue<string>())
+                    else
+                        None)
+
+            Assert.Equal(Some "public", findAcc "publicValue")
+            Assert.Equal(Some "internal", findAcc "internalValue")
+            Assert.Equal(Some "private", findAcc "privateValue")
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+// ─── fcs_check_file (#109) ───────────────────────────────────────────────────
+
+[<Fact>]
+let ``CheckFile returns succeeded with errorCount=0 for a clean project`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_checkfile_ok_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let sourcePath, projectPath = writeSimpleProject tempRoot "CheckOk" "value"
+
+            let! result =
+                bridge.CheckFile(
+                    { path = sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.Equal(0, result["errorCount"].GetValue<int>())
+            Assert.True(result["hasFullTypeCheckInfo"].GetValue<bool>())
+            Assert.False(result["parseHadErrors"].GetValue<bool>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``CheckFile totalDiagnostics matches parseDiagnostics + checkDiagnostics`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_checkfile_shape_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let sourcePath, projectPath = writeSimpleProject tempRoot "CheckShape" "value"
+
+            let! result =
+                bridge.CheckFile(
+                    { path = sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None }
+                )
+
+            Assert.Equal(
+                result["totalDiagnostics"].GetValue<int>(),
+                ((result["parseDiagnostics"]) :?> JsonArray).Count
+                + ((result["checkDiagnostics"]) :?> JsonArray).Count
+            )
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }

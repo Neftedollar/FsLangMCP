@@ -316,3 +316,146 @@ let ``listProjects skips fsproj entries that don't exist on disk`` () =
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
+
+// ─── workspace_diagnostics filters (#108) ────────────────────────────────────
+
+open FsLangMcp.Types
+
+[<Fact>]
+let ``severityCodeOf maps known names case-insensitively`` () =
+    Assert.Equal(Some 1, severityCodeOf "error")
+    Assert.Equal(Some 1, severityCodeOf "ERROR")
+    Assert.Equal(Some 1, severityCodeOf "errors")
+    Assert.Equal(Some 2, severityCodeOf "warning")
+    Assert.Equal(Some 2, severityCodeOf "Warnings")
+    Assert.Equal(Some 3, severityCodeOf "information")
+    Assert.Equal(Some 3, severityCodeOf "info")
+    Assert.Equal(Some 4, severityCodeOf "hint")
+    Assert.Equal(Some 4, severityCodeOf "hints")
+
+[<Fact>]
+let ``severityCodeOf returns None for unknown names`` () =
+    Assert.Equal(None, severityCodeOf "fatal")
+    Assert.Equal(None, severityCodeOf "")
+    Assert.Equal(None, severityCodeOf "  ")
+
+[<Fact>]
+let ``fileMatchesGlob single-segment star does not span slash`` () =
+    Assert.True(fileMatchesGlob "*.fs" "Foo.fs")
+    Assert.True(fileMatchesGlob "src/*.fs" "src/Foo.fs")
+    Assert.False(fileMatchesGlob "src/*.fs" "src/Sub/Foo.fs") // * is single-segment
+    Assert.True(fileMatchesGlob "file:///*/Foo.fs" "file:///src/Foo.fs")
+    Assert.False(fileMatchesGlob "*.fs" "Foo.fsx")
+    Assert.False(fileMatchesGlob "src/*.fs" "other/Foo.fs")
+    Assert.True(fileMatchesGlob "F?o.fs" "Foo.fs")
+    Assert.False(fileMatchesGlob "F?o.fs" "Fooo.fs")
+    Assert.False(fileMatchesGlob "?.fs" "a/b.fs") // ? doesn't match /
+
+[<Fact>]
+let ``fileMatchesGlob double-star spans across slashes`` () =
+    Assert.True(fileMatchesGlob "src/**/*.fs" "src/Foo.fs")
+    Assert.True(fileMatchesGlob "src/**/*.fs" "src/Sub/Foo.fs")
+    Assert.True(fileMatchesGlob "src/**/*.fs" "src/A/B/C/Foo.fs")
+    Assert.True(fileMatchesGlob "**/*.fs" "Foo.fs")
+    Assert.True(fileMatchesGlob "**/*.fs" "deeply/nested/Foo.fs")
+    Assert.False(fileMatchesGlob "src/**/*.fs" "other/Foo.fs")
+
+[<Fact>]
+let ``fileMatchesGlob is case-insensitive`` () =
+    Assert.True(fileMatchesGlob "*.FS" "Foo.fs")
+    Assert.True(fileMatchesGlob "src/*.fs" "SRC/Foo.fs")
+
+[<Fact>]
+let ``filterDiagnosticsBySeverity keeps only matching codes`` () =
+    let diagnostics =
+        JsonArray(
+            jobj [ "message", jstr "err1"; "severity", jint 1 ] :> JsonNode,
+            jobj [ "message", jstr "warn1"; "severity", jint 2 ] :> JsonNode,
+            jobj [ "message", jstr "err2"; "severity", jint 1 ] :> JsonNode,
+            jobj [ "message", jstr "info1"; "severity", jint 3 ] :> JsonNode
+        )
+        :> JsonNode
+
+    let errorsOnly = filterDiagnosticsBySeverity 1 diagnostics :?> JsonArray
+
+    Assert.Equal(2, errorsOnly.Count)
+    Assert.Equal("err1", (errorsOnly[0]["message"]).GetValue<string>())
+    Assert.Equal("err2", (errorsOnly[1]["message"]).GetValue<string>())
+
+[<Fact>]
+let ``filterDiagnosticsBySeverity drops entries missing severity field`` () =
+    let diagnostics =
+        JsonArray(
+            jobj [ "message", jstr "no-severity" ] :> JsonNode,
+            jobj [ "message", jstr "err"; "severity", jint 1 ] :> JsonNode
+        )
+        :> JsonNode
+
+    let filtered = filterDiagnosticsBySeverity 1 diagnostics :?> JsonArray
+
+    Assert.Equal(1, filtered.Count)
+    Assert.Equal("err", (filtered[0]["message"]).GetValue<string>())
+
+[<Fact>]
+let ``filterDiagnosticsBySeverity returns empty array when nothing matches`` () =
+    let diagnostics =
+        JsonArray(jobj [ "message", jstr "info"; "severity", jint 3 ] :> JsonNode)
+        :> JsonNode
+
+    let filtered = filterDiagnosticsBySeverity 1 diagnostics :?> JsonArray
+
+    Assert.Equal(0, filtered.Count)
+
+[<Fact>]
+let ``fileMatchesGlob trailing double-star matches everything inside`` () =
+    Assert.True(fileMatchesGlob "src/**" "src/Foo.fs")
+    Assert.True(fileMatchesGlob "src/**" "src/A/B/Foo.fs")
+    Assert.False(fileMatchesGlob "src/**" "other/Foo.fs")
+
+[<Fact>]
+let ``diagnosticsResponseForFile preserves payload when no severity filter`` () =
+    // path + severity combo verified at the pure helper layer: severity filter
+    // applies before this builder is called.
+    let payload =
+        JsonArray(
+            jobj [ "message", jstr "err"; "severity", jint 1 ] :> JsonNode,
+            jobj [ "message", jstr "warn"; "severity", jint 2 ] :> JsonNode
+        )
+        :> JsonNode
+
+    let result = diagnosticsResponseForFile true 1 payload
+    let resultArr = (result["result"]) :?> JsonArray
+
+    Assert.Equal(2, resultArr.Count)
+    Assert.Equal("ready", result["lspState"].GetValue<string>())
+
+[<Fact>]
+let ``diagnosticsResponseForFile with pre-filtered severity payload reflects filter`` () =
+    // Simulates the bridge's pipeline: severity filter runs on the payload before
+    // it reaches the response builder. We verify the builder doesn't add/remove.
+    let raw =
+        JsonArray(
+            jobj [ "message", jstr "err"; "severity", jint 1 ] :> JsonNode,
+            jobj [ "message", jstr "warn"; "severity", jint 2 ] :> JsonNode
+        )
+        :> JsonNode
+
+    let filtered = filterDiagnosticsBySeverity 1 raw
+    let result = diagnosticsResponseForFile true 1 filtered
+    let resultArr = (result["result"]) :?> JsonArray
+
+    Assert.Equal(1, resultArr.Count)
+    Assert.Equal("err", (resultArr[0]["message"]).GetValue<string>())
+
+[<Fact>]
+let ``diagnosticsResponseForWorkspace with empty filtered files yields empty result`` () =
+    // Bridge logic drops URIs whose diagnostic list becomes empty after severity
+    // filtering. We exercise the builder with an already-empty root to verify the
+    // outer shape is still well-formed.
+    let root = JsonObject()
+    let result = diagnosticsResponseForWorkspace true 0 root
+
+    Assert.Equal("ready", result["lspState"].GetValue<string>())
+    Assert.Equal(0, result["diagnosticsFileCount"].GetValue<int>())
+    let resultObj = (result["result"]) :?> JsonObject
+    Assert.Equal(0, resultObj.Count)

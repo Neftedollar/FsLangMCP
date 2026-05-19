@@ -38,7 +38,16 @@ type ReferencesArgs =
       text: string option }
 
 type WorkspaceSymbolArgs = { query: string }
-type DiagnosticsArgs = { path: string option }
+type DiagnosticsArgs =
+    { /// Single-file diagnostics. When set, fileGlob is ignored.
+      path: string option
+      /// Glob over file URIs (e.g. "src/Foo/*.fs"). When path is None, only files
+      /// whose URI matches the glob are returned. Use "**" to span directories.
+      fileGlob: string option
+      /// Filter the diagnostic list inside each file payload by LSP severity:
+      /// "error" → 1, "warning" → 2, "information" → 3, "hint" → 4.
+      /// When None, all severities pass through.
+      severity: string option }
 
 type SetProjectArgs =
     { projectPath: string

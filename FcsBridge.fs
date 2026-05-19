@@ -101,6 +101,18 @@ type internal FcsBridge() =
               "end", positionToJson d.End ]
         :> JsonNode
 
+    let accessibilityString (symbol: FSharpSymbol) : string =
+        try
+            let acc = symbol.Accessibility
+
+            if acc.IsPrivate then "private"
+            elif acc.IsInternal then "internal"
+            elif acc.IsPublic then "public"
+            else "unknown"
+        with _ ->
+            // FCS can throw on synthetic symbols; treat as unknown rather than crash.
+            "unknown"
+
     let symbolToJson (symbol: FSharpSymbol) : JsonNode =
         let declarationLocation =
             match symbol.DeclarationLocation with
@@ -112,6 +124,7 @@ type internal FcsBridge() =
               "fullName", jstrOrNull symbol.FullName
               "assembly", jstr symbol.Assembly.SimpleName
               "declarationLocation", declarationLocation
+              "accessibility", jstr (accessibilityString symbol)
               "isExplicitlySuppressed", jbool symbol.IsExplicitlySuppressed ]
         :> JsonNode
 
@@ -478,6 +491,81 @@ type internal FcsBridge() =
                 | FSharpCheckFileAnswer.Aborted -> None
 
             return fullPath, source, optionsSource, options, parseResults, checkedResults
+        }
+
+    /// Invalidates FCS caches for this file's project and runs a fresh parse+check.
+    /// Bypasses the cached projectResults that ProjectSymbolUses/FindSymbol may have
+    /// populated, so changes made since the last cache write are visible.
+    /// Returns a focused diagnostics view (parse + check), without the project-options
+    /// metadata included in fcs_parse_and_check_file.
+    member this.CheckFile(args: FcsParseAndCheckArgs) : Task<JsonNode> =
+        task {
+            match validateSourcePath "fcs_check_file" args.text args.path with
+            | Some err -> return err
+            | None ->
+
+            // Resolve options FIRST so we can do surgical (per-project) cache
+            // invalidation instead of nuking caches for every loaded project.
+            let! path, _, optionsSource, projectOptions, parseResults, checkedResults =
+                this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
+
+            // Drop the cached project-options + project-results entries for THIS
+            // project only — leaves other projects' warm caches alone.
+            let fsprojKey = projectOptions.ProjectFileName
+            let projectResultsKey = makeResolvedProjectCacheKey projectOptions
+            optionsCache.TryRemove(fsprojKey) |> ignore
+            projectResultsCache.TryRemove(projectResultsKey) |> ignore
+
+            // Ask FCS to drop its incremental-build cache for this project so
+            // transitively-checked files are re-read from disk. Per-project, not
+            // global — keeps other projects' caches warm.
+            checker.InvalidateConfiguration(projectOptions)
+
+            // Re-run parse+check now that caches are invalidated. The PrepareCheckContext
+            // call above gave us a baseline; if the user just invalidated mid-edit, we
+            // want the post-invalidation result for diagnostics.
+            let! _, _, _, _, parseResults, checkedResults =
+                this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
+
+            let parseDiagnostics = parseResults.Diagnostics |> Array.map diagnosticToJson
+
+            let checkDiagnostics =
+                checkedResults
+                |> Option.map (fun r -> r.Diagnostics |> Array.map diagnosticToJson)
+                |> Option.defaultValue [||]
+
+            let hasTypeCheckInfo =
+                checkedResults |> Option.map _.HasFullTypeCheckInfo |> Option.defaultValue false
+
+            let status =
+                if checkedResults.IsSome then "succeeded" else "aborted"
+
+            let errorCount =
+                Array.append parseDiagnostics checkDiagnostics
+                |> Array.filter (fun d ->
+                    match d with
+                    | :? JsonObject as obj ->
+                        match obj["severity"] with
+                        | :? JsonValue as sev ->
+                            let mutable code = 0
+                            sev.TryGetValue(&code) && code = 1
+                        | _ -> false
+                    | _ -> false)
+                |> Array.length
+
+            return
+                jobj
+                    [ "status", jstr status
+                      "file", jstr path
+                      "optionsSource", jstr optionsSource
+                      "projectFileName", jstr projectOptions.ProjectFileName
+                      "parseHadErrors", jbool parseResults.ParseHadErrors
+                      "hasFullTypeCheckInfo", jbool hasTypeCheckInfo
+                      "errorCount", jint errorCount
+                      "totalDiagnostics", jint (parseDiagnostics.Length + checkDiagnostics.Length)
+                      "parseDiagnostics", JsonArray(parseDiagnostics) :> JsonNode
+                      "checkDiagnostics", JsonArray(checkDiagnostics) :> JsonNode ]
+                :> JsonNode
         }
 
     member this.ParseAndCheckFile(args: FcsParseAndCheckArgs) : Task<JsonNode> =

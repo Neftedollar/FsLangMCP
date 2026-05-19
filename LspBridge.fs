@@ -186,6 +186,113 @@ type private WorkspaceLoadTarget(setReady: unit -> unit) =
 // ─── LspResponseShape (pure response builders, testable) ──────────────────────
 
 module internal LspResponseShape =
+    /// Maps a severity name (case-insensitive) to the LSP numeric code:
+    /// 1=error, 2=warning, 3=information, 4=hint. Returns None for unrecognised names.
+    let severityCodeOf (raw: string) : int option =
+        if isNull raw then
+            None
+        else
+            match raw.Trim().ToLowerInvariant() with
+            | "error"
+            | "errors" -> Some 1
+            | "warning"
+            | "warnings" -> Some 2
+            | "information"
+            | "info" -> Some 3
+            | "hint"
+            | "hints" -> Some 4
+            | _ -> None
+
+    /// Translates a glob pattern to a regex body (no anchors). POSIX/gitignore
+    /// segment semantics — see fileMatchesGlob for the user-facing spec.
+    let internal globToRegex (pattern: string) : string =
+        let sb = System.Text.StringBuilder()
+        let mutable i = 0
+        let len = pattern.Length
+
+        while i < len do
+            let c = pattern[i]
+
+            if c = '*' then
+                if i + 1 < len && pattern[i + 1] = '*' then
+                    // `**` — cross-segment.
+                    let hasLeftSlash = i > 0 && pattern[i - 1] = '/'
+                    let hasRightSlash = i + 2 < len && pattern[i + 2] = '/'
+
+                    if hasLeftSlash && hasRightSlash then
+                        // `/**/`: drop preceding `/`, emit `(?:/|/.*/)`,
+                        // skip `**/`. Allows zero or more directories.
+                        sb.Length <- sb.Length - 1
+                        sb.Append("(?:/|/.*/)") |> ignore
+                        i <- i + 3
+                    elif hasRightSlash then
+                        // Leading `**/`: emit `(?:.*/)?`, skip `**/`.
+                        sb.Append("(?:.*/)?") |> ignore
+                        i <- i + 3
+                    else
+                        // Trailing `**` or bare `**` — match anything.
+                        sb.Append(".*") |> ignore
+                        i <- i + 2
+                else
+                    sb.Append("[^/]*") |> ignore
+                    i <- i + 1
+            elif c = '?' then
+                sb.Append("[^/]") |> ignore
+                i <- i + 1
+            else
+                // Escape regex metachars individually; everything else is literal.
+                if "\\.+()|^$[]{}".IndexOf(c) >= 0 then
+                    sb.Append('\\') |> ignore
+
+                sb.Append(c) |> ignore
+                i <- i + 1
+
+        sb.ToString()
+
+    /// Glob match against a string. POSIX-style segment semantics:
+    /// - `*`  matches any chars EXCEPT `/` (single segment, like gitignore / VS Code)
+    /// - `**` matches any chars INCLUDING `/` (cross-segment, like gitignore);
+    ///        `/**/` between segments matches zero or more directories
+    /// - `?`  matches a single non-`/` char
+    /// Case-insensitive — file URIs are normalised platform-dependent.
+    let fileMatchesGlob (pattern: string) (candidate: string) : bool =
+        if isNull pattern || isNull candidate then
+            false
+        else
+            let rx =
+                System.Text.RegularExpressions.Regex(
+                    "^" + globToRegex pattern + "$",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase
+                )
+
+            rx.IsMatch(candidate)
+
+    /// Filters a JSON diagnostics array (LSP shape) by severity code.
+    /// Returns a fresh array containing only diagnostics with matching severity.
+    /// Diagnostics missing a severity field are dropped when a filter is active.
+    /// (LSP 3.17 says missing-severity is "server-determined"; FSAC always emits
+    /// severity, so dropping is safe in this project — re-evaluate if another
+    /// LSP backend is wired in.)
+    let filterDiagnosticsBySeverity (severityCode: int) (diagnostics: JsonNode) : JsonNode =
+        match diagnostics with
+        | :? JsonArray as arr ->
+            let kept = JsonArray()
+
+            for node in arr do
+                match node with
+                | :? JsonObject as obj ->
+                    match obj["severity"] with
+                    | :? JsonValue as sev ->
+                        let mutable code = 0
+
+                        if sev.TryGetValue(&code) && code = severityCode then
+                            kept.Add(node.DeepClone())
+                    | _ -> ()
+                | _ -> ()
+
+            kept :> JsonNode
+        | other -> other.DeepClone()
+
     /// Maps the workspace-ready flag to the public lspState string.
     let lspStateString (workspaceReady: bool) : string =
         if workspaceReady then "ready" else "warming"
@@ -801,6 +908,13 @@ type internal FsAutoCompleteBridge() =
 
     member _.Diagnostics(args: DiagnosticsArgs) : Task<JsonNode> =
         task {
+            let severityFilter = args.severity |> Option.bind LspResponseShape.severityCodeOf
+
+            let applySeverity (payload: JsonNode) =
+                match severityFilter with
+                | Some code -> LspResponseShape.filterDiagnosticsBySeverity code payload
+                | None -> payload
+
             let resolveByUri (uri: string) =
                 match diagnostics.TryGetValue(uri) with
                 | true, payload -> payload.DeepClone()
@@ -809,14 +923,27 @@ type internal FsAutoCompleteBridge() =
             match args.path with
             | Some path ->
                 let uri = toFileUri path
+                let payload = resolveByUri uri |> applySeverity
 
                 return
-                    LspResponseShape.diagnosticsResponseForFile workspaceReady diagnostics.Count (resolveByUri uri)
+                    LspResponseShape.diagnosticsResponseForFile workspaceReady diagnostics.Count payload
             | None ->
                 let root = JsonObject()
 
+                let globMatches (uri: string) =
+                    match args.fileGlob with
+                    | Some pattern -> LspResponseShape.fileMatchesGlob pattern uri
+                    | None -> true
+
                 for KeyValue(uri, payload) in diagnostics do
-                    root[uri] <- payload.DeepClone()
+                    if globMatches uri then
+                        let filtered = payload.DeepClone() |> applySeverity
+
+                        // Skip empty-after-filter entries — keeps the response tight when
+                        // the user asked for errors-only and a file only has warnings.
+                        match severityFilter, filtered with
+                        | Some _, (:? JsonArray as arr) when arr.Count = 0 -> ()
+                        | _ -> root[uri] <- filtered
 
                 return LspResponseShape.diagnosticsResponseForWorkspace workspaceReady diagnostics.Count root
         }

@@ -29,4 +29,10 @@ type internal BoundedCache<'K, 'V when 'K: equality>(maxSize: int) =
             dict.Clear()
             order.Clear())
 
+    /// Remove a single key. Returns true if the key existed; false otherwise.
+    /// The eviction queue keeps a stale reference until that key would have been
+    /// dequeued; that's fine — TryGet always consults the dict.
+    member _.TryRemove(key: 'K) : bool =
+        lock lockObj (fun () -> dict.Remove(key))
+
     member _.Count = lock lockObj (fun () -> dict.Count)

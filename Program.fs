@@ -249,7 +249,7 @@ let main argv =
                 tool (
                     TypedTool.define<DiagnosticsArgs>
                         "workspace_diagnostics"
-                        "[FSAC] Raw cached LSP publishDiagnostics payload, either for one file or all files. Requires set_project first. Use for current FSAC/compiler/analyzer diagnostics; it does not run build/tests."
+                        "[FSAC] Cached LSP publishDiagnostics payload, scoped to one file or to the whole workspace. Requires set_project first. Optional fields: path (single file), fileGlob (e.g. \"src/Adapters/*.fs\" — narrows the workspace dict; ignored when path is set), severity (\"error\" | \"warning\" | \"information\" | \"hint\" — filters diagnostics inside each file; entries that empty out after filtering are dropped). Does not run build/tests."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Diagnostics args)))
                     |> unwrapResult
                 )
@@ -353,6 +353,14 @@ let main argv =
                         "fcs_parse_and_check_file"
                         "[FCS in-process] Agent-friendly FCS parse+typecheck for one file. Prefer passing projectPath (.fsproj) for accurate project context; projectOptions can override. Falls back to script inference only when no project can be resolved. Pass 'text' for unsaved content."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.ParseAndCheckFile args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsParseAndCheckArgs>
+                        "fcs_check_file"
+                        "[FCS in-process] Cache-invalidating parse+typecheck for one file. Surgically drops cached project-options + project-results entries for THIS project (other loaded projects keep their warm caches) and calls checker.InvalidateConfiguration on the same project before re-running parse+check. Returns a diagnostics-focused payload with errorCount + totalDiagnostics. Use this when workspace_diagnostics looks stale right after an Edit/Write. Note: FCS may still serve from its own internal AST cache for transitively-referenced files; for absolute ground truth across project boundaries, fall back to dotnet build."
+                        (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.CheckFile args)))
                     |> unwrapResult
                 )
 
