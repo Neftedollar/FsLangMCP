@@ -4,11 +4,19 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <PackageId>FsLangMcp</PackageId>
-    <Version>0.8.4</Version>
+    <Version>0.8.5</Version>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>fslangmcp</ToolCommandName>
     <PackageOutputPath>./nupkg</PackageOutputPath>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Description>An F#-native MCP server for AI coding agents. Combines fsautocomplete and FSharp.Compiler.Service into one stdio process exposing 32+ agent-shaped tools — paginated responses, structured error envelopes, snippet validation, and record-field audits that catch construction sites missed by textual search.</Description>
+    <Authors>Roman Melnikov</Authors>
+    <PackageTags>fsharp;mcp;lsp;fsautocomplete;fcs;ai;agent;ionide;compiler-service;claude-code</PackageTags>
+    <RepositoryUrl>https://github.com/Neftedollar/FsLangMCP</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/Neftedollar/FsLangMCP</PackageProjectUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReleaseNotes>See CHANGELOG.md at https://github.com/Neftedollar/FsLangMCP/blob/main/CHANGELOG.md for full release history.</PackageReleaseNotes>
   </PropertyGroup>
 
   <ItemGroup>
@@ -28,6 +36,7 @@
 
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="LICENSE" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>

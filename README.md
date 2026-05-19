@@ -3,12 +3,49 @@
 [![CI](https://github.com/Neftedollar/FsLangMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/Neftedollar/FsLangMCP/actions/workflows/ci.yml)
 [![NuGet](https://img.shields.io/nuget/v/FsLangMcp.svg)](https://www.nuget.org/packages/FsLangMcp/)
 
-An MCP server written in F# that combines:
+FsLangMcp is an MCP server for AI coding agents working on F# projects. It combines `fsautocomplete` (LSP-shaped editor semantics) and `FSharp.Compiler.Service` (in-process compiler semantics) into a single stdio process with 32 tools designed for agent workflows. Responses are paginated, errors are returned as structured `invalid_args` envelopes, `fcs_check_file` invalidates stale caches after edits, `fcs_validate_snippet` compiles arbitrary F# against your project's references, and `fcs_record_field_audit` catches the record-construction sites that textual search misses.
+
+See the [Quickstart](#quickstart) for the 60-second on-ramp.
+
+### Components
 
 - `fsautocomplete` (LSP bridge for editor-like features)
 - `FSharp.Compiler.Service` (compiler-semantic features for AI workflows)
 
 > Work in progress: APIs and tool shapes may still change.
+
+## Quickstart
+
+1. **Install** (.NET 10 required):
+
+   ```bash
+   dotnet tool install -g FsLangMcp
+   fslangmcp --bootstrap-tools   # one-time: fetches fsautocomplete + ionide.projinfo.tool
+   ```
+
+2. **Add to your MCP client config** (Claude Code example — adjust for your client):
+
+   ```json
+   { "mcpServers": { "fslangmcp": { "command": "fslangmcp" } } }
+   ```
+
+3. **Your first call**: from the MCP client, call `set_project` with your `.fsproj` path:
+
+   ```json
+   { "projectPath": "/absolute/path/to/YourApp.fsproj" }
+   ```
+
+   You'll get back a response with `fslangmcpVersion`, `loadedProjects`, and `readiness` flags. When `readiness.lsp` is `true`, you can call any other tool.
+
+4. **Try a real tool**: call `project_health` for a fast preflight on the project:
+
+   ```json
+   { }
+   ```
+
+   (No args needed — `set_project` set the default.) The response tells you which compile files exist, which test projects were detected, and whether the LSP and FCS layers are ready.
+
+That's it. From here you can browse the [tool catalog](#what-you-get) for the right tool for your task, or skim [troubleshooting](docs/troubleshooting.md) when something looks off.
 
 ## Changelog
 
@@ -22,13 +59,6 @@ All tools return a consistent JSON envelope:
 - **Not ready**: `{"status": "not_ready", "message": "..."}` — LSP workspace still loading
 - **Invalid args**: `{"status": "invalid_args", "message": "..."}` — required string arg blank/missing on `fcs_record_field_audit` / `fcs_project_symbol_uses` / `fcs_find_member_usages` / `fcs_find_symbol` / `fcs_referenced_symbols` / `fcs_nuget_types`. Standardized in 0.8.2 (#120).
 - **Error**: MCP protocol error with `{"errorKind": "...", "message": "..."}` payload
-
-### Notable response fields
-
-- **`set_project`** — response includes `fslangmcpVersion` (since 0.8.0, #115), `loadedProjects: string[]` (`.fsproj` paths discovered), and `readiness: { lsp, projectOptions, symbolIndex }` flags (since 0.5.6, #106).
-- **`workspace_diagnostics`** — single-file responses include `analyzedAt`; workspace-wide responses include `mostRecentAnalyzedAt` and `analyzedAtByUri` (per-URI `DateTimeOffset` map). Since 0.8.0 (#116). When `fileGlob` is supplied, `mostRecentAnalyzedAt` is scoped to the glob-filtered subset (since 0.8.2, #123).
-- **`fcs_find_symbol`** — `projectDiagnostics` is scoped. `projectDiagnosticsScope="matched-files"` (normal) returns diagnostics only for files containing matches, with Info/Hint filtered out by default (set `includeInfo=true` to include). `projectDiagnosticsScope="errors-only-no-matches"` (zero-match case) surfaces error-severity diagnostics from the whole project so callers can detect broken projects. Since 0.8.0 / 0.8.1 (#114).
-- **`fsharp_runtime_status`** — response includes top-level `fslangmcpVersion`. Since 0.8.0 (#115).
 
 LSP positions (`line`, `character`) are **0-based**.
 
@@ -87,37 +117,23 @@ Tagged `[FCS in-process]` in tool descriptions. Most accept an optional `project
 | `fsharp_runtime_status` | `[FCS in-process]` Read-only observational snapshot: managed-heap sizes by generation/LOH/POH, GC counts, `isServerGC`, assembly load count, FCS checker config + project-results cache size, FSAC child-process working set. Numbers only — no interpretation. |
 | `fslangmcp_version` | `[meta]` Zero-arg. Returns the installed FsLangMCP product version and name. Same value is surfaced in `set_project.result.fslangmcpVersion` and `fsharp_runtime_status.fslangmcpVersion`. Use when filing UX feedback. |
 
-## Prerequisites
+### Notable response fields
 
-- .NET SDK 10+
-- `fsautocomplete` installed
-- `ionide.projinfo.tool` (required for `fcs_get_project_options`)
-
-Install `fsautocomplete`:
-
-```bash
-dotnet tool install -g fsautocomplete
-```
-
-Install `ionide.projinfo.tool`:
-
-```bash
-dotnet tool install -g ionide.projinfo.tool
-```
-
-For local development of this repository, restore the local analyzer tool:
-
-```bash
-dotnet tool restore
-```
+- **`set_project`** — response includes `fslangmcpVersion` (since 0.8.0, #115), `loadedProjects: string[]` (`.fsproj` paths discovered), and `readiness: { lsp, projectOptions, symbolIndex }` flags (since 0.5.6, #106).
+- **`workspace_diagnostics`** — single-file responses include `analyzedAt`; workspace-wide responses include `mostRecentAnalyzedAt` and `analyzedAtByUri` (per-URI `DateTimeOffset` map). Since 0.8.0 (#116). When `fileGlob` is supplied, `mostRecentAnalyzedAt` is scoped to the glob-filtered subset (since 0.8.2, #123).
+- **`fcs_find_symbol`** — `projectDiagnostics` is scoped. `projectDiagnosticsScope="matched-files"` (normal) returns diagnostics only for files containing matches, with Info/Hint filtered out by default (set `includeInfo=true` to include). `projectDiagnosticsScope="errors-only-no-matches"` (zero-match case) surfaces error-severity diagnostics from the whole project so callers can detect broken projects. Since 0.8.0 / 0.8.1 (#114).
+- **`fsharp_runtime_status`** — response includes top-level `fslangmcpVersion`. Since 0.8.0 (#115).
 
 ## Install As Dotnet Tool
+
+**Prerequisites**: .NET SDK 10+ on PATH. `fsautocomplete` and `ionide.projinfo.tool`
+are fetched automatically by `--bootstrap-tools` below.
 
 ### From NuGet (recommended)
 
 ```bash
 dotnet tool install -g FsLangMcp
-fslangmcp --bootstrap-tools
+fslangmcp --bootstrap-tools   # one-time: fetches transitive F# tooling (fsautocomplete + ionide.projinfo.tool)
 ```
 
 Update later with `dotnet tool update -g FsLangMcp`.
@@ -127,13 +143,27 @@ Update later with `dotnet tool update -g FsLangMcp`.
 ```bash
 dotnet pack -c Release
 dotnet tool install -g --add-source ./nupkg FsLangMcp
-fslangmcp --bootstrap-tools
+fslangmcp --bootstrap-tools   # one-time: fetches transitive F# tooling
+```
+
+For local development of this repository, restore the local analyzer tool:
+
+```bash
+dotnet tool restore
 ```
 
 After install, command is:
 
 ```bash
 fslangmcp
+```
+
+If you'd rather install the transitive tools yourself instead of using
+`--bootstrap-tools`:
+
+```bash
+dotnet tool install -g fsautocomplete
+dotnet tool install -g ionide.projinfo.tool
 ```
 
 ## Runtime Options

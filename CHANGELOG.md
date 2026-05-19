@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-05-20
+
+### Documentation
+
+- **NuGet listing populated.** The package previously shipped with `description: "Package Description"` (the literal SDK default), no tags, no project URL, no license. v0.8.5 adds `<Description>`, `<Authors>` (Roman Melnikov), `<PackageTags>` (`fsharp;mcp;lsp;fsautocomplete;fcs;ai;agent;ionide;compiler-service;claude-code`), `<RepositoryUrl>` / `<RepositoryType>` / `<PackageProjectUrl>` pointing at the GitHub repo, `<PackageLicenseExpression>MIT</PackageLicenseExpression>`, and `<PackageReleaseNotes>` pointing at CHANGELOG. **A `LICENSE` file (MIT, copyright 2026 Roman Melnikov) was added at the repo root** and packed into the nupkg so the tool ships with explicit licensing — required for corporate-procurement compliance pipelines.
+- **README first-screen rewritten as a pitch.** The first 16 lines now answer "who is this for" (AI coding agents on F# projects) and "what makes it different" (agent-shaped tool surface with paginated responses, structured `invalid_args` envelopes, cache-invalidating reanalysis, snippet validation against the loaded project's references, and record-field audits catching construction sites textual search misses). The pre-existing 2-line component list is demoted to a `### Components` subsection.
+- **New `## Quickstart` section** — 60-second on-ramp from `dotnet tool install -g FsLangMcp` through `--bootstrap-tools`, MCP client config, the first `set_project` call, and a `project_health` preflight. Each step has a copy-pasteable code block.
+- **New `docs/troubleshooting.md`** keyed by user-visible symptoms: `status: "not_ready"` after `set_project`, `FileNotFoundException: Microsoft.VisualStudio.Threading 17.14.0.0` (affects ≤ 0.8.1), stale `workspace_diagnostics` after edit, and `fcs_find_symbol` zero-match-but-symbol-exists (covers both record-field-set sites and broken-project diagnostics-fallback). Linked from the README Quickstart close-out.
+- **Customer-name leak in `fcs_record_field_audit` tool description removed.** The string previously referenced "LlmTrader's port-record widening refactors" — a customer-specific anecdote that meant nothing to anyone outside that customer. Rewritten as the generic "port-record widening refactors (adding a field to a domain record type)" use case. Schema and behaviour unchanged.
+
+(No code or behaviour changes. v0.8.5 ships purely to fix NuGet discoverability and onboarding friction surfaced in the developer-advocate audit after v0.8.4.)
+
 ## [0.8.4] - 2026-05-20
 
 ### Documentation
@@ -258,7 +270,8 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
   Earlier releases (0.2.0, 0.3.0, 0.3.1, 0.4.0) shipped without tags;
   backfilling them would point at synthetic refs.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.8.4...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.8.5...HEAD
+[0.8.5]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.8.5
 [0.8.4]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.8.4
 [0.8.3]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.8.3
 [0.8.2]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.8.2
