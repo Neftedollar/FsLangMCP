@@ -666,3 +666,29 @@ let ``project_health new fields present on success path for any project`` () =
         Assert.True(proj.ContainsKey("binaryOutputPath"))
     finally
         if Directory.Exists root then Directory.Delete(root, true)
+
+// ─── should-2: test-attribute regex word-boundary bug ────────────────────────
+
+[<Fact>]
+let ``countTestAttributesInFile does not count NUnit TestFixture as a test method`` () =
+    // Regression for word-boundary bug: [<TestFixture>] used to match 'Test'
+    // and the trailing 'ixture' was swallowed by [^\]]*, inflating testCount.
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_testfixture_%s{runId}")
+    let source =
+        String.concat "\n"
+            [ "module Tests"
+              "open Xunit"
+              "[<TestFixture>]"   // NUnit class attribute — must NOT be counted
+              "type MyTests () ="
+              "    [<Fact>]"      // one real test method
+              "    member _.testA () = ()" ]
+    try
+        let projectPath = writeXunitTestProject root source
+        let result = report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
+        let proj = result["project"]
+
+        // Only the [<Fact>] should count; [<TestFixture>] must be ignored.
+        Assert.Equal(1, proj["testCount"].GetValue<int>())
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)

@@ -195,7 +195,7 @@ let private countTestAttributesInFile (filePath: string) =
         // `(?:[\w.]+\.)?` allows an optional qualifier (e.g. `Xunit.`)
         // `Attribute` suffix is optional. `[^\]]*` swallows any constructor args.
         let pattern =
-            """\[<(?:[\w.]+\.)?(?:Fact|Theory|Test|TestCase|TestMethod)(?:Attribute)?(?:[^\]]*)?>\]"""
+            """\[<(?:[\w.]+\.)?(?:Fact|Theory|Test|TestCase|TestMethod)(?:Attribute)?\b(?:[^\]]*)?>\]"""
 
         System.Text.RegularExpressions.Regex.Matches(source, pattern).Count
     with _ ->
@@ -203,23 +203,24 @@ let private countTestAttributesInFile (filePath: string) =
 
 /// Find the most-recently-written .dll under bin/ whose basename matches the
 /// project name (case-insensitive). Returns absolute path or None.
-/// Best-effort glob — projects with custom OutputPath may not be found; acceptable for v0.8.0.
+/// Searches only inside projectDir/bin/ to avoid OOM walks on monorepos.
 let private findLatestBuildArtifact (projectDir: string) (projectName: string) =
-    let separator: string = string Path.DirectorySeparatorChar
-    let binSegment = $"%s{separator}bin%s{separator}"
+    let binDir = Path.Combine(projectDir, "bin")
 
-    try
-        Directory.EnumerateFiles(projectDir, "*.dll", SearchOption.AllDirectories)
-        |> Seq.filter (fun p ->
-            p.Contains(binSegment, StringComparison.OrdinalIgnoreCase)
-            && String.Equals(
-                Path.GetFileNameWithoutExtension(p),
-                projectName,
-                StringComparison.OrdinalIgnoreCase))
-        |> Seq.sortByDescending (fun p -> File.GetLastWriteTimeUtc(p))
-        |> Seq.tryHead
-    with _ ->
+    if not (Directory.Exists binDir) then
         None
+    else
+        try
+            Directory.EnumerateFiles(binDir, "*.dll", SearchOption.AllDirectories)
+            |> Seq.filter (fun p ->
+                String.Equals(
+                    Path.GetFileNameWithoutExtension(p),
+                    projectName,
+                    StringComparison.OrdinalIgnoreCase))
+            |> Seq.sortByDescending File.GetLastWriteTimeUtc
+            |> Seq.tryHead
+        with _ ->
+            None
 
 /// Build the test-discovery + last-build JSON sub-object for one project.
 let private testProjectInfo

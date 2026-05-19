@@ -25,9 +25,14 @@ let current: string =
         // (e.g. "0.7.0+abc1234") — strip it for clean SemVer surfacing.
         let raw = attr.InformationalVersion
 
-        match raw.IndexOf('+') with
-        | -1 -> raw
-        | idx -> raw.Substring(0, idx)
+        if System.String.IsNullOrWhiteSpace raw then
+            match asm.GetName().Version with
+            | null -> "0.0.0"
+            | v -> v.ToString()
+        else
+            match raw.IndexOf('+') with
+            | -1 -> raw
+            | idx -> raw.Substring(0, idx)
 
 /// Product name surfaced alongside the version. Pulled from AssemblyProduct
 /// when present, otherwise falls back to a static "FsLangMCP".

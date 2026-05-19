@@ -1621,20 +1621,30 @@ type internal FcsBridge() =
                 |> Array.map (fun u -> normalizePath u.FileName)
                 |> Set.ofArray
 
+            // When no matches were found, fall back to Error-severity diagnostics only
+            // so callers can still detect broken projects. The scope field distinguishes
+            // the two regimes: "matched-files" (normal) vs "errors-only-no-matches"
+            // (zero hits — full project errors surfaced so callers don't lose signal).
             let scopedDiagnostics =
                 projectResults.Diagnostics
                 |> Array.filter (fun d ->
                     let fileOk =
-                        // Empty matchedFileSet → no scope, no relevant diagnostics.
-                        not matchedFileSet.IsEmpty
-                        && matchedFileSet.Contains(normalizePath d.FileName)
+                        if matchedFileSet.IsEmpty then
+                            // No matches → surface errors only, regardless of file.
+                            d.Severity = FSharpDiagnosticSeverity.Error
+                        else
+                            matchedFileSet.Contains(normalizePath d.FileName)
 
                     let severityOk =
-                        includeInfo
+                        matchedFileSet.IsEmpty
+                        || includeInfo
                         || d.Severity = FSharpDiagnosticSeverity.Error
                         || d.Severity = FSharpDiagnosticSeverity.Warning
 
                     fileOk && severityOk)
+
+            let diagnosticsScope =
+                if matchedFileSet.IsEmpty then "errors-only-no-matches" else "matched-files"
 
             let baseFields =
                 [ "status", jstr "succeeded"
@@ -1648,7 +1658,7 @@ type internal FcsBridge() =
                   "symbolCount", jint pageGroups.Length
                   "includeInfo", jbool includeInfo
                   "symbols", JsonArray(groupNodes) :> JsonNode
-                  "projectDiagnosticsScope", jstr "matched-files"
+                  "projectDiagnosticsScope", jstr diagnosticsScope
                   "projectDiagnostics",
                   JsonArray(scopedDiagnostics |> Array.map diagnosticToJson) :> JsonNode ]
 
@@ -1809,21 +1819,105 @@ type internal FcsBridge() =
                         :> JsonNode
         }
 
-    // ── Locate the " private" keyword span on a line, only when it follows a
-    // recognized declaration keyword (let / let rec / module / module rec /
-    // type / member / val / new / static / abstract / override) AND is NOT
-    // inside a line comment. Returns the (startColumn, endColumn) range to
-    // delete. The leading space before "private" is included in the range; the
-    // trailing space before the identifier is preserved. Returns None when no
-    // matching " private" token is found on the line.
-    member private _.FindPrivateSpan(rawLine: string) : (int * int) option =
-        let privateKw = " private"
+    // Returns true if the character at `pos` in `line` is inside a string literal
+    // (regular, verbatim @"...", or triple-quoted """...""") OR past a real //
+    // line comment. Conservative: if the line is too tricky to parse, returns
+    // true so we refuse to edit rather than risk corruption.
+    // Handles:
+    //   Regular  "..."  — \" escapes a quote, \\ escapes a backslash.
+    //   Verbatim @"..." — \ is literal; "" is the escaped-quote sequence.
+    //   Triple   """...""" — no escaping; only """ ends the literal.
+    member private _.PositionIsUnsafe(line: string, pos: int) : bool =
+        let mutable i = 0
+        let mutable state = 0 // 0=code, 1=regular string, 2=verbatim, 3=triple
+        let mutable past = false // set when a real // comment is seen before pos
 
-        // Comment boundary: if "//" appears before the candidate position, this
-        // " private" is inside a comment — refuse to edit.
-        let commentStart =
-            let idx = rawLine.IndexOf("//", StringComparison.Ordinal)
-            if idx < 0 then rawLine.Length else idx
+        while i < pos && not past do
+            match state with
+            | 0 ->
+                if i + 2 < line.Length && line[i] = '"' && line[i + 1] = '"' && line[i + 2] = '"' then
+                    state <- 3
+                    i <- i + 3
+                elif i + 1 < line.Length && line[i] = '@' && line[i + 1] = '"' then
+                    state <- 2
+                    i <- i + 2
+                elif line[i] = '"' then
+                    state <- 1
+                    i <- i + 1
+                elif i + 1 < line.Length && line[i] = '(' && line[i + 1] = '*' then
+                    // F# block comment — advance through nested (* *) pairs.
+                    // We record the start so we can tell if pos fell inside the comment.
+                    let commentStart = i
+                    let mutable depth = 1
+                    i <- i + 2
+
+                    while depth > 0 && i + 1 < line.Length do
+                        if line[i] = '(' && line[i + 1] = '*' then
+                            depth <- depth + 1
+                            i <- i + 2
+                        elif line[i] = '*' && line[i + 1] = ')' then
+                            depth <- depth - 1
+                            i <- i + 2
+                        else
+                            i <- i + 1
+
+                    if depth > 0 then
+                        // Unclosed block comment on this line — too complex to parse safely.
+                        // If pos was anywhere at or after the opener, refuse.
+                        past <- true
+                        i <- line.Length
+                    elif pos < i then
+                        // pos is INSIDE the closed comment span [commentStart, i) — refuse.
+                        // (pos > commentStart is already implied by entering this branch,
+                        // so the discriminator is pos < i, i.e. the comment end.)
+                        past <- true
+                        i <- line.Length
+                    // else: comment fully closed at i ≤ pos, so pos is in real code
+                    // after the closed comment. Fall through: state is back to 0 and
+                    // the outer while loop continues scanning from i.
+                elif i + 1 < line.Length && line[i] = '/' && line[i + 1] = '/' then
+                    // Line comment starts here; pos is inside it if pos > i.
+                    past <- true
+                    i <- line.Length
+                else
+                    i <- i + 1
+            | 1 -> // regular string — \" escapes a quote, \\ escapes a backslash
+                if i + 1 < line.Length && line[i] = '\\' then
+                    i <- i + 2
+                elif line[i] = '"' then
+                    state <- 0
+                    i <- i + 1
+                else
+                    i <- i + 1
+            | 2 -> // verbatim — "" is the escape sequence, \ is literal
+                if i + 1 < line.Length && line[i] = '"' && line[i + 1] = '"' then
+                    i <- i + 2
+                elif line[i] = '"' then
+                    state <- 0
+                    i <- i + 1
+                else
+                    i <- i + 1
+            | 3 -> // triple-quoted — only """ ends the literal
+                if i + 2 < line.Length && line[i] = '"' && line[i + 1] = '"' && line[i + 2] = '"' then
+                    state <- 0
+                    i <- i + 3
+                else
+                    i <- i + 1
+            | _ -> i <- i + 1
+
+        // Unsafe if still inside a string state OR a // comment started before pos.
+        state <> 0 || past
+
+    // ── Locate the " private" keyword span on a line, only when it follows a
+    // recognized declaration keyword (let / let rec / and / module / module rec /
+    // type / member / val / new / static / abstract / override) AND is NOT
+    // inside a line comment or a string literal (regular, verbatim, or triple).
+    // Returns the (startColumn, endColumn) range to delete. The leading space
+    // before "private" is included in the range; the trailing space before the
+    // identifier is preserved. Returns None when no matching " private" token
+    // is found on the line.
+    member private this.FindPrivateSpan(rawLine: string) : (int * int) option =
+        let privateKw = " private"
 
         let mutable idx = 0
         let mutable found = None
@@ -1831,7 +1925,7 @@ type internal FcsBridge() =
         while idx <= rawLine.Length - privateKw.Length && found.IsNone do
             let pos = rawLine.IndexOf(privateKw, idx, StringComparison.Ordinal)
 
-            if pos < 0 || pos >= commentStart then
+            if pos < 0 then
                 idx <- rawLine.Length
             else
                 let afterPos = pos + privateKw.Length
@@ -1843,23 +1937,46 @@ type internal FcsBridge() =
                     || rawLine[afterPos] = ' '
                     || rawLine[afterPos] = '\t'
 
-                if isWordBoundary then
+                if isWordBoundary && not (this.PositionIsUnsafe(rawLine, pos)) then
                     // Strip leading whitespace, then peel off any number of
-                    // `[<...>]` attribute blocks (each optionally followed by
-                    // whitespace). `[<Fact>] let private foo = 1` must match
-                    // `let` after the attribute is removed.
+                    // `[<...>]` attribute blocks and `(* ... *)` block comments
+                    // (each optionally followed by whitespace).
+                    // `[<Fact>] let private foo = 1` must match `let` after the attribute.
+                    // `(* doc *) let private foo = 1` must match `let` after the comment.
                     let mutable before = rawLine.Substring(0, pos).TrimStart()
 
                     let mutable keepStripping = true
 
-                    while keepStripping
-                          && before.StartsWith("[<", StringComparison.Ordinal) do
-                        match before.IndexOf(">]", StringComparison.Ordinal) with
-                        | -1 -> keepStripping <- false
-                        | endIdx -> before <- before.Substring(endIdx + 2).TrimStart()
+                    while keepStripping do
+                        if before.StartsWith("[<", StringComparison.Ordinal) then
+                            match before.IndexOf(">]", StringComparison.Ordinal) with
+                            | -1 -> keepStripping <- false
+                            | endIdx -> before <- before.Substring(endIdx + 2).TrimStart()
+                        elif before.StartsWith("(*", StringComparison.Ordinal) then
+                            // Skip the closed block comment. Use a simple depth-tracking
+                            // scan to handle nested (* *) pairs.
+                            let mutable j = 2
+                            let mutable depth = 1
+                            while depth > 0 && j + 1 < before.Length do
+                                if before[j] = '(' && before[j + 1] = '*' then
+                                    depth <- depth + 1
+                                    j <- j + 2
+                                elif before[j] = '*' && before[j + 1] = ')' then
+                                    depth <- depth - 1
+                                    j <- j + 2
+                                else
+                                    j <- j + 1
+                            if depth = 0 then
+                                // Comment was fully closed; strip it and continue.
+                                before <- before.Substring(j).TrimStart()
+                            else
+                                // Unclosed comment — give up; `recognised` will be false.
+                                keepStripping <- false
+                        else
+                            keepStripping <- false
 
                     let recognised =
-                        [ "let rec"; "let"; "module rec"; "module"; "type"; "member"; "val"; "new"
+                        [ "let rec"; "let"; "and"; "module rec"; "module"; "type"; "member"; "val"; "new"
                           "static member"; "static"; "abstract member"; "abstract"; "override" ]
                         |> List.exists (fun kw ->
                             before = kw

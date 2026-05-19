@@ -473,7 +473,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsFindSymbolArgs>
                         "fcs_find_symbol"
-                        "[FCS in-process] Agent-friendly project-wide symbol search with grouped definitions/references and source line context. Better than chaining workspace_symbol, fcs_project_symbol_uses, and shell line reads. Pass projectPath when possible. Caveat: misses record-field-set construction sites — for those, use fcs_record_field_audit. The projectDiagnostics field is SCOPED: only diagnostics for files that contain a match for `symbolQuery` are returned, and Info/Hint severity is filtered out by default. Set includeInfo=true to see Info/Hint chatter (e.g. FS3520 XML-comment notes)."
+                        "[FCS in-process] Agent-friendly project-wide symbol search with grouped definitions/references and source line context. Better than chaining workspace_symbol, fcs_project_symbol_uses, and shell line reads. Pass projectPath when possible. Caveat: misses record-field-set construction sites — for those, use fcs_record_field_audit. The projectDiagnostics field is SCOPED: projectDiagnosticsScope='matched-files' (normal) returns diagnostics only for files containing matches, with Info/Hint filtered out by default (set includeInfo=true to include them); projectDiagnosticsScope='errors-only-no-matches' means the query returned zero hits and only Error-severity diagnostics from the whole project are surfaced so callers can detect broken projects — an empty projectDiagnostics in that regime means the project is clean."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.FindSymbol args)))
                     |> unwrapResult
                 )

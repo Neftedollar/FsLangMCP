@@ -1782,6 +1782,296 @@ let ``MakeInternalVisible does not match the 'privately' identifier`` () : Task 
                 Directory.Delete(tempRoot, true)
     }
 
+// ─── should-1: FindPrivateSpan must not strip 'private' from string literals ──
+
+[<Fact>]
+let ``MakeInternalVisible does not strip 'private' from inside a string literal`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_miv_strlit_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // The word " private" appears inside a string literal on the let binding
+            // line. FindPrivateSpan must reject this match and return no_action.
+            let src = "module MivStrLit.Library\n\nlet msg = \"before private after\"\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "MivStrLit" src
+
+            // Position cursor on the `let` keyword (column 0).
+            let! result =
+                bridge.MakeInternalVisible(
+                    { path = sourcePath
+                      line = 2
+                      character = 0
+                      text = None
+                      projectPath = Some projectPath }
+                )
+
+            Assert.Equal("no_action", result["status"].GetValue<string>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+// ─── should-1 (verbatim string): FindPrivateSpan must not corrupt verbatim literals ──
+
+[<Fact>]
+let ``MakeInternalVisible does not strip private from inside a verbatim string`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_miv_verbatim_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // The fixture uses a literal " private" (space-then-private) inside the
+            // verbatim string so that IndexOf(" private") returns a non-(-1) position,
+            // forcing PositionIsUnsafe to traverse state-2 and confirm the position is
+            // inside the verbatim literal. The previous @"C:\private\path" fixture had
+            // no space before "private", so IndexOf returned -1 and the test passed for
+            // the wrong reason (short-circuit before state-2 was ever reached).
+            let src = "module M\n\nlet x = @\"hello private world\"\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "MivVerbatim" src
+
+            let! result =
+                bridge.MakeInternalVisible(
+                    { path = sourcePath
+                      line = 2
+                      character = 0
+                      text = None
+                      projectPath = Some projectPath }
+                )
+
+            Assert.Equal("no_action", result["status"].GetValue<string>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+// ─── should-1 (triple-quoted string): FindPrivateSpan must not corrupt triple literals ──
+
+[<Fact>]
+let ``MakeInternalVisible does not strip private from inside a triple-quoted string`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_miv_triple_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // Triple-quoted string contains the word "private" — must not be stripped.
+            let src = "module M\n\nlet s = \"\"\"contains private\"\"\"\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "MivTriple" src
+
+            let! result =
+                bridge.MakeInternalVisible(
+                    { path = sourcePath
+                      line = 2
+                      character = 0
+                      text = None
+                      projectPath = Some projectPath }
+                )
+
+            Assert.Equal("no_action", result["status"].GetValue<string>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+// ─── should-1 (verbatim doubled-quote escape): "" inside @"..." must not end the literal ──
+
+[<Fact>]
+let ``MakeInternalVisible handles doubled-quote escape inside verbatim string`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_miv_vbat2_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // Verbatim literal that contains a doubled quote (the F# way to embed " in @"...")
+            // followed by " private " — the inner " private " is INSIDE the same verbatim string
+            // because "" is the verbatim escape, not a close+reopen.
+            let src = "module M\n\nlet s = @\"prefix\"\" private inner\"\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "MivVbat2" src
+
+            let! result =
+                bridge.MakeInternalVisible(
+                    { path = sourcePath
+                      line = 2
+                      character = 8
+                      text = None
+                      projectPath = Some projectPath }
+                )
+
+            Assert.Equal("no_action", result["status"].GetValue<string>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+// ─── should-2 (block comment): PositionIsUnsafe must skip (* ... *) regions ────
+
+[<Fact>]
+let ``MakeInternalVisible does not strip private from inside a block comment`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_miv_blk_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // The " private" inside the block comment must not be stripped.
+            let src = "module M\n\n(* let private commented = 1 *) let other = 1\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "MivBlk" src
+
+            let! result =
+                bridge.MakeInternalVisible(
+                    { path = sourcePath
+                      line = 2
+                      character = 0
+                      text = None
+                      projectPath = Some projectPath }
+                )
+
+            Assert.Equal("no_action", result["status"].GetValue<string>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``MakeInternalVisible refuses to edit when unclosed block-comment opener precedes private`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_miv_blkopen_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // The (* opener appears BEFORE " private" with no closing *) on the same
+            // line — PositionIsUnsafe sets past=true (conservative refusal) because
+            // depth > 0 when the scan window ends.
+            let src = "module M\n\nlet x = 1 (* let private foo = 1\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "MivBlkOpen" src
+
+            // Cursor at line=2, character=0
+            let! result =
+                bridge.MakeInternalVisible(
+                    { path = sourcePath
+                      line = 2
+                      character = 0
+                      text = None
+                      projectPath = Some projectPath }
+                )
+
+            Assert.Equal("no_action", result["status"].GetValue<string>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+// ─── should-2 (block comment, post-comment binding): pos AFTER closed block comment must be editable ──
+
+[<Fact>]
+let ``MakeInternalVisible strips private from a binding that follows a closed block comment on the same line`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_miv_postblock_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // Closed block comment BEFORE a real `let private foo` on the same line.
+            // The tool MUST strip private from the real declaration, not refuse.
+            let src = "module MivPostBlock.Library\n\n(* doc *) let private foo = 1\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "MivPostBlock" src
+
+            // Cursor on `foo` — after the block comment + "let private ".
+            // Pos: 0..8 "(* doc *)", 9 " ", 10..12 "let", 13 " ", 14..20 "private", 21 " ", 22 "f"
+            let! result =
+                bridge.MakeInternalVisible(
+                    { path = sourcePath
+                      line = 2
+                      character = 22
+                      text = None
+                      projectPath = Some projectPath }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+            let preview = result["appliedPreview"].GetValue<string>()
+            Assert.Contains("(* doc *)", preview)
+            Assert.DoesNotContain("private", preview)
+            Assert.Contains("let foo = 1", preview)
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+// ─── should-2: PositionIsUnsafe must not treat // inside a string as a line comment ──
+
+[<Fact>]
+let ``MakeInternalVisible ignores // inside a string literal and strips private after the URL`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_miv_url_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // The old commentStart = IndexOf("//") would have cut off at the "http://",
+            // making the whole "let private bar" line unreachable.
+            let src = "module M\n\nlet url = \"http://x.com\"\nlet private bar = 1\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "MivUrl" src
+
+            // Cursor on line 3 (0-based), character 12 = 'b' in "let private bar"
+            // 0..2 "let", 3 " ", 4..10 "private", 11 " ", 12 "b"
+            let! result =
+                bridge.MakeInternalVisible(
+                    { path = sourcePath
+                      line = 3
+                      character = 12
+                      text = None
+                      projectPath = Some projectPath }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+            let preview = result["appliedPreview"].GetValue<string>()
+            Assert.Contains("let bar = 1", preview)
+            Assert.DoesNotContain("private", preview)
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+// ─── should-4: FindPrivateSpan must recognise the 'and' keyword ──────────────
+
+[<Fact>]
+let ``MakeInternalVisible strips 'private' from an 'and' binding in a mutual recursion`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_miv_and_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // Two mutually recursive bindings; the second uses `and private bar`.
+            // Cursor is placed on line 1 (the `and private bar` line).
+            let src = "module MivAnd.Library\n\nlet rec foo = 1\nand private bar = 2\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "MivAnd" src
+
+            // Line 3 (0-based), column 12 = 'b' in "and private bar"
+            // 0..2 "and", 3 " ", 4..10 "private", 11 " ", 12 "b"
+            let! result =
+                bridge.MakeInternalVisible(
+                    { path = sourcePath
+                      line = 3
+                      character = 12
+                      text = None
+                      projectPath = Some projectPath }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+            let preview = result["appliedPreview"].GetValue<string>()
+            Assert.Contains("and bar", preview)
+            Assert.DoesNotContain("private", preview)
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
 // ─── fcs_find_symbol projectDiagnostics scoping (#116) ───────────────────────
 
 [<Fact>]
@@ -1882,6 +2172,100 @@ let ``FindSymbol includeInfo=true echoes flag and preserves scoping`` () : Task 
             Assert.Equal("succeeded", result["status"].GetValue<string>())
             Assert.True(result["includeInfo"].GetValue<bool>())
             Assert.Equal("matched-files", result["projectDiagnosticsScope"].GetValue<string>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+// ─── should-3: FindSymbol zero-match scoping black-hole ──────────────────────
+
+[<Fact>]
+let ``FindSymbol returns errors-only-no-matches scope and empty diagnostics for clean project with no hits`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_fs_nomatch_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // Clean project — no errors, just a simple binding.
+            let sourcePath, projectPath =
+                writeProjectWithSource
+                    tempRoot
+                    "FsNoMatch"
+                    "module FsNoMatch.Library\n\nlet value = 1\n"
+
+            // Query a symbol that does not exist in the project.
+            let! result =
+                bridge.FindSymbol(
+                    { path = sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      symbolQuery = "Nonexistent"
+                      exact = Some true
+                      maxResults = Some 10
+                      contextLines = Some 0
+                      includeDeclaration = Some true
+                      includeInfo = None
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            // Zero matches → scope must flip to the fallback regime.
+            Assert.Equal("errors-only-no-matches", result["projectDiagnosticsScope"].GetValue<string>())
+            // Clean project has no errors → diagnostics array is empty.
+            let diags = result["projectDiagnostics"] :?> JsonArray
+            Assert.Equal(0, diags.Count)
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+// ─── should-3: FindSymbol must surface Error diagnostics on broken projects ───
+
+[<Fact>]
+let ``FindSymbol surfaces error-severity diagnostics under errors-only-no-matches scope`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_fs_brokenproj_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // Deliberate compile error: int field assigned a string literal.
+            let src = "module BrokenProj.Library\n\nlet x : int = \"not_an_int\"\n"
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "BrokenProj" src
+
+            let! result =
+                bridge.FindSymbol(
+                    { path = sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      symbolQuery = "Nonexistent"
+                      exact = Some true
+                      maxResults = Some 10
+                      contextLines = Some 0
+                      includeDeclaration = Some true
+                      includeInfo = None
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.Equal("errors-only-no-matches", result["projectDiagnosticsScope"].GetValue<string>())
+            Assert.Equal(0, result["matchedFileCount"].GetValue<int>())
+
+            // At least one Error-severity diagnostic must surface.
+            let diags = result["projectDiagnostics"] :?> JsonArray
+            Assert.True(diags.Count > 0, "Expected at least one error diagnostic from broken project")
+
+            let mutable hasError = false
+
+            for i in 0 .. diags.Count - 1 do
+                let d = diags[i]
+                let sev = d["severity"].GetValue<string>()
+                if sev = "Error" then hasError <- true
+
+            Assert.True(hasError, "Expected at least one Error-severity diagnostic")
         finally
             if Directory.Exists tempRoot then
                 Directory.Delete(tempRoot, true)
