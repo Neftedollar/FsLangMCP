@@ -23,6 +23,7 @@
     <Compile Include="CursorPropertyTests.fs" />
     <Compile Include="OutlineE2ETests.fs" />
     <Compile Include="SymbolPaginationTests.fs" />
+    <Compile Include="ToolDescriptionSchemaTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

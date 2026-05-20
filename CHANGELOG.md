@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-05-21
+
+### Changed
+
+- **Tool description sweep against `docs/tool-description-schema.md` (5-slot schema, 500-char ceiling).** All 33 registered tool descriptions in `Program.fs` re-audited. Four routing-blockers fixed (descriptions that exceeded the 500-char ceiling and pushed implementation detail into the agent-routing prompt budget): `fcs_check_file` 610 → 452, `fcs_find_member_usages` 581 → 448, `fcs_make_internal_visible` 699 → 419, `fcs_type_at_position` 622 → 451. Mechanics moved to dedicated H2 sections in `docs/tools-detailed.md` (now covers 9 tools, up from 5). Eight additional descriptions gained explicit `prefer X` / `avoid Y` callouts to close overlap-pair ambiguity (`workspace_diagnostics`→`fcs_check_file` stale-cache hint, `fcs_referenced_symbols`↔`fcs_nuget_types` substring-vs-exact routing, `fcs_validate_snippet`→`fcs_parse_and_check_file` when-file-exists hint, `fsharp_compile`→`dotnet build` for IL emission, `fsharp_project_inspect` over textual `.fsproj` reads, `fcs_project_outline` over `workspace_symbol` for whole-project overview, `textDocument_rename` over textual rename).
+
+### Added
+
+- **`scripts/audit-tool-descriptions.py` + `just audit-descriptions`.** Python analyzer enforcing the schema: parses `TypedTool.define` entries from `Program.fs`, applies 500-char ceiling + tag-prefix rule as hard failures (non-zero exit), reports under-budget descriptions and missing overlap-pair callouts as soft warnings. Closes the long-standing reference in `docs/tool-description-schema.md` §"Adding a new tool" → step 4 ("Run the length analyzer") to a previously non-existent tool.
+- **`ToolDescriptionSchemaTests.fs` in the xunit suite (+4 tests, 289 → 293 passing).** F#-side enforcement so `dotnet test` is the canonical gate (CI already runs it; the Python script is the local dev convenience). Three rules enforced: every description starts with a recognized tag prefix (`[FSAC]` / `[FCS in-process]` / `[meta]`), no description exceeds 500 chars, every overlap pair has at least one `prefer X` / `avoid Y` callout. Violations are aggregated per rule so the failure message lists all offenders at once (not just the first).
+- **4 new H2 sections in `docs/tools-detailed.md`:** `fcs_check_file`, `fcs_find_member_usages`, `fcs_make_internal_visible`, `fcs_type_at_position`. Each follows the established template (`How it works internally`, `Caveats`, `Related tools`). Routing descriptions in `Program.fs` cross-reference these via `Mechanics: docs/tools-detailed.md#<anchor>` footers.
+
+### Notes
+
+- No behaviour changes. Descriptions are routing-time metadata only; agent prompt-budget pressure shrank by ~750 chars / ~190 tokens across the four over-budget tools combined.
+
 ## [0.9.1] - 2026-05-21
 
 ### Documentation

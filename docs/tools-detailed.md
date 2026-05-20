@@ -197,3 +197,185 @@ accessibility, and `isObsolete`. Set `includeNonPublic=true` for internals. Pagi
 - `fcs_nuget_types` — enumerate all types in a specific assembly by exact SimpleName.
 - `fcs_find_symbol` — search project-local symbols with source context.
 - `workspace_symbol` — FSAC-backed project-local symbol lookup.
+
+---
+
+## fcs_check_file
+
+**Routing description:** `[FCS in-process]` Cache-invalidating parse+typecheck for one file. Use
+when `workspace_diagnostics` looks stale right after Edit/Write. Surgically drops project-options +
+project-results entries for THIS project and calls `InvalidateConfiguration` before re-running.
+Caveat: FCS may still serve from its internal AST cache for transitively-referenced files; fall
+back to `dotnet build` for ground truth.
+
+### How it works internally
+
+1. Resolves the project options for the file (via `set_project`'s active project or explicit
+   `projectPath`).
+2. Removes the cached `FSharpProjectOptions` and `ParseAndCheckProject` results for THIS project
+   from the FCS bridge's in-process caches. Other loaded projects keep their warm caches.
+3. Calls `checker.InvalidateConfiguration(options)` so FCS itself drops its internal options state
+   for the project.
+4. Reloads options and runs `ParseAndCheckFileInProject` from a cold start.
+5. Returns a diagnostics-focused payload: `errorCount`, `warningCount`, `totalDiagnostics`, and
+   the per-diagnostic list.
+
+### Caveats
+
+1. **Transitively-referenced files still cached** — FCS keeps an internal AST cache keyed by
+   file timestamp + content. A stale ancestor file in another project can leak into the check
+   if its modification time hasn't changed. For absolute ground truth, run `dotnet build`.
+2. **Slower than `fcs_parse_and_check_file`** — that tool reuses warm caches and is the right
+   default. Reach for `fcs_check_file` only when `workspace_diagnostics` clearly disagrees with
+   what you just wrote to disk.
+3. **Project-scoped invalidation, not workspace-wide** — sibling projects in the same .sln
+   keep their caches. If you suspect cross-project staleness, prefer `dotnet build` over
+   chaining multiple `fcs_check_file` calls.
+
+### Related tools
+
+- `fcs_parse_and_check_file` — non-invalidating typecheck; use first.
+- `workspace_diagnostics` — cached LSP payload; fast but can lag behind Edit/Write.
+
+---
+
+## fcs_find_member_usages
+
+**Routing description:** `[FCS in-process]` Find every usage site of a member on a specific type
+— resolves via FCS so dotted access (`x.Foo`), pipeline application, and overload resolution are
+handled correctly (unlike a textual `rg`). Pass `typeName` (DisplayName e.g. `Style` or FullName
+e.g. `MyApp.Theme.Style`) and `memberName`. `projectPath` is optional after `set_project`; pass
+`path`/`text` for unsaved buffers.
+
+### How it works internally
+
+1. Resolves the containing type via FCS: by exact `FSharpEntity.DisplayName` equality or, with
+   `exact=false`, by a segment-boundary suffix match of `FSharpEntity.FullName`.
+2. Locates the member on the resolved entity by exact `FSharpMemberOrFunctionOrValue.DisplayName`
+   match against `memberName`.
+3. Calls `FSharpChecker.ParseAndCheckProject` and walks `GetAllUsesOfAllSymbols` to collect every
+   usage site of the resolved member.
+4. Returns per-site `file`, `range` (1-based LSP), and 2 lines of source context.
+
+### typeName matching rules
+
+| Setting | Matches |
+|---------|---------|
+| `exact=true` (default) | `FSharpEntity.DisplayName` must equal `typeName`. `Style` matches type `Style` but NOT `StyleSheet`. |
+| `exact=false` | `FSharpEntity.FullName` may match `typeName` at segment boundaries. `Theme.Style` matches `MyApp.Theme.Style` but NOT `MyApp.Theme.StyleSheet`. |
+
+### Caveats
+
+1. **Member name is exact, case-sensitive** — `OnClick` != `onclick`. Use `fcs_find_symbol`
+   for fuzzy substring search instead.
+2. **Overloaded members** — all overloads sharing the same `DisplayName` are returned together.
+   To narrow to one overload, post-filter the results by the surrounding `lineText`.
+3. **Type extension members** — extensions defined in another module are resolved correctly,
+   but their `DisplayPath` may differ from the type's own path.
+
+### Related tools
+
+- `fcs_find_symbol` — fuzzy substring search across the project, grouped by symbol identity.
+- `fcs_project_symbol_uses` — raw symbol-use list without member-on-type scoping.
+
+---
+
+## fcs_make_internal_visible
+
+**Routing description:** `[FCS in-process]` Drop the `private` keyword from a declaration at
+`(line, character)` — a non-destructive workspace edit that returns
+`{ status, edits, appliedPreview, originalLineText }` and does NOT write the file. Use before
+tests need to call internals. Returns `{ status: "no_action", reason }` when the position has no
+symbol or the line has no recognized `private` modifier. Variant B (auto-add `InternalsVisibleTo`
+on the test project) is a planned follow-up.
+
+### Supported declaration forms
+
+The text scan recognizes `private` immediately following any of:
+
+- `let` / `let rec`
+- `module` / `module rec`
+- `type`
+- `member`
+- `val`
+- `new`
+- `static`
+- `abstract`
+- `override`
+
+### How it works internally
+
+1. Uses FCS to confirm the position at `(line, character)` resolves to a real symbol. This avoids
+   editing inside comments or strings that happen to look like declarations.
+2. Scans the raw source line via `FindPrivateSpan` for one of the recognized declaration keywords
+   followed by ` private`. The state-machine `PositionIsUnsafe` skips:
+   - regular string literals (`"..."`)
+   - verbatim strings (`@"..."`)
+   - triple-quoted strings (`"""..."""`)
+   - block comments (`(* ... *)`)
+   - line comments (`// ...`)
+3. Returns the `private`-token span as a workspace edit with `newText = ""`. The host (Claude
+   Code, Cursor, etc.) applies the edit; this tool never writes to disk.
+
+### Caveats
+
+1. **Heuristic-locating, FCS-validating** — the position-to-symbol check is the safety net.
+   Without a resolved symbol at the cursor, the tool returns `no_action` rather than guessing.
+2. **One declaration per call** — multi-cursor / batch use is not supported. Call the tool once
+   per site.
+3. **Does not touch `InternalsVisibleTo`** — exposing internals to a test project still requires
+   editing the `.fsproj`. That's Variant B (planned).
+
+### Related tools
+
+- `textDocument_rename` — for renames; this tool is access-modifier-only.
+- `textDocument_codeAction` — FSAC's general code-action endpoint; less targeted.
+
+---
+
+## fcs_type_at_position
+
+**Routing description:** `[FCS in-process]` Low-level exact-position FCS type/symbol query.
+Requires project context (a prior `set_project` or explicit `projectPath`/`projectOptions`); the
+file at `path` must exist on disk. `line`/`character` are 0-based (LSP). Prefer `fcs_symbol_at_word`
+for normal agent workflows — that tool accepts a line plus word/occurrence instead of exact coords.
+
+### How it works internally
+
+1. Reads project options (cached after `set_project`).
+2. Calls `FSharpChecker.ParseAndCheckFileInProject` on the file.
+3. Asks FCS for the symbol use at `(line, character)`. Returns symbol identity, kind, type
+   string, and definition range.
+
+### Fuzzy snapping
+
+When `fuzzy=true`, if exact `(line, character)` produces no symbol the tool snaps to the nearest
+symbol within ±2 lines and ±5 columns. The response then includes:
+
+- `resolvedLine` / `resolvedCharacter` — the snapped position actually used
+- `fuzzySnap = true` — flag indicating snapping occurred
+
+### no_symbol recovery hints
+
+When the position has no symbol AND `fuzzy=false` (or fuzzy snapping also missed), the response
+includes:
+
+- `lineText` — the full source line at `line`
+- `surroundingLines` — context above and below
+
+This makes 1-based-vs-0-based coordinate mistakes immediately visible. If `lineText` shows the
+right code but at a different column, the agent's `character` arithmetic is off.
+
+### Caveats
+
+1. **Project context required** — without `set_project` (or explicit options), types are often
+   reported as unresolved or `obj`. Always set the project first.
+2. **File must exist on disk** — this tool reads the file by path. For unsaved buffers, use
+   `fcs_parse_and_check_file` with `text` instead.
+3. **0-based coordinates** — LSP convention. A common bug is passing 1-based line numbers from
+   editor UI; the recovery hints exist specifically to surface this.
+
+### Related tools
+
+- `fcs_symbol_at_word` — tolerant lookup by word; preferred for agent workflows.
+- `fcs_signature_help` — overload/parameter info at a call site.

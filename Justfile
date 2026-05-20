@@ -21,6 +21,9 @@ test:
 
 check: build test
 
+audit-descriptions:
+    python3 scripts/audit-tool-descriptions.py
+
 analyze: tool-restore
     dotnet msbuild FsLangMcp.fsproj /t:AnalyzeFSharpProject
     dotnet msbuild {{test_project}} /t:AnalyzeFSharpProject
