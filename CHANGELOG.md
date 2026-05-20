@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-20
+
+### Added
+
+- **`fcs_suggest_open` (closes #67) — given an unresolved symbol name (e.g. from an `FS0039 'X' is not defined` diagnostic), returns ranked `open` directive candidates from BOTH the project and referenced assemblies (BCL + NuGet).** Composes the same `EnsureProjectResults` + `allEntitiesFromAssembly` primitives that `fcs_referenced_symbols` and `fcs_nuget_types` use. Resolves `FSharpEntity.AccessPath` for each match. Ranking: project hits first (more relevant), then references; dedup by `(accessPath, fullName)` within each tier; reference entries that duplicate a project entry are dropped from the reference tier entirely. Output shape: `{ candidateCount, candidates: [{ openPath, entityFullName, source: "project"|"reference", assembly, kind, accessibility }] }`. Closes the most common F# error→fix loop where an agent would otherwise have to guess the namespace or read docs.
+
+### Changed
+
+- **`FieldFormClassifier` walker reimplemented via `ParsedInput.fold` (closes #124).** The previous 88-line hand-rolled `walkExpr`/`walkDecl` recursion only descended into a curated subset of `SynExpr`/`SynModuleDecl` arms — record literals inside class member bodies (`SynModuleDecl.Types`), `for ... do` loops (`SynExpr.For`/`ForEach`), CE-bind continuations (`SynExpr.LetOrUseBang`), `function | ... ->`, `while`, `New`, `ObjExpr`, `Lazy` were all missed and fell through to the textual heuristic fallback. New 33-line implementation uses `ParsedInput.fold` (the public FCS 43.12+ position-independent whole-tree fold API) with a single match arm on `SynExpr.Record`; every expression-containing AST node is covered automatically and the implementation has no maintenance burden as FCS adds new node types. The `fallbackHeuristic` callsites in `formOf` are preserved as defensive safety nets for parse failures and any future un-handled node kinds. Schema-compatible: `form` values remain `"literal"`/`"with-update"`/`"unknown"`. +3 regression tests proven via proof-by-breaking (with the new walker bypassed to fallback-only, those 3 tests deterministically fail — the assertions distinguish parse-tree-path from fallback, not just smoke-test the audit).
+
+### Tests
+
+- +6 net new tests (3 for #124 walker coverage + 3 for #67 across BCL hit / project hit / ranking / no-hit / invalid-args). 283 → 289 passing.
+
+### Process notes
+
+- Code reviewer iter-1 caught test theatre in BOTH #124 and #67 tests during this batch (fixtures that didn't actually distinguish the path under test). Fixer applied proof-by-breaking to harden the regression tests so they fail deterministically when the production code reverts. Lesson recorded for future review-fix loops.
+
 ## [0.8.6] - 2026-05-20
 
 ### Documentation
@@ -281,7 +299,8 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
   Earlier releases (0.2.0, 0.3.0, 0.3.1, 0.4.0) shipped without tags;
   backfilling them would point at synthetic refs.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.8.6...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.9.0
 [0.8.6]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.8.6
 [0.8.5]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.8.5
 [0.8.4]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.8.4

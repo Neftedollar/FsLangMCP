@@ -387,6 +387,18 @@ let main argv =
                 )
 
                 tool (
+                    TypedTool.define<FcsSuggestOpenArgs>
+                        "fcs_suggest_open"
+                        "[FCS in-process] Given an unresolved symbol name (FS0039), returns ranked `open` directive candidates — project-local first, then referenced assemblies. Use when an agent sees 'X is not defined' to get the right namespace instantly. Set includeReferences=false for project-only. Caveat: openPath is empty for global-namespace symbols; doesn't deduplicate the same name across multiple assemblies."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.SuggestOpen args)))
+                    |> unwrapResult
+                )
+
+                tool (
                     TypedTool.define<FcsNugetTypesArgs>
                         "fcs_nuget_types"
                         "[FCS in-process] Enumerate all types in one referenced assembly matched by EXACT SimpleName (case-insensitive). 'Spectre.Console' resolves only to that assembly — not Spectre.Console.Cli. When a package ships multiple assemblies, call once per name. Each entry reports displayName, fullName, kind, accessibility, isObsolete. Paginated; default 500, max 2000. Returns matchedAssemblies=[] on no match. Mechanics and edge cases: see docs/tools-detailed.md#fcs_nuget_types."

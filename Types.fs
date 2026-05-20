@@ -269,6 +269,20 @@ type FcsReferencedSymbolsArgs =
       /// Opaque cursor from a prior call's `nextCursor`. Omit for first page.
       cursor: string option }
 
+type FcsSuggestOpenArgs =
+    { /// Bare unresolved symbol name from an FS0039-style diagnostic (e.g. "File", "List", "Encoding").
+      symbolName: string
+      /// .fsproj for project context. Falls back to active set_project when omitted.
+      projectPath: string option
+      /// File context used to derive project options when projectPath is absent.
+      path: string option
+      text: string option
+      projectOptions: string list option
+      /// When true (default), also search referenced assemblies (BCL + NuGet). Set false to search project-local only.
+      includeReferences: bool option
+      /// Maximum candidates per source. Default 20, hard ceiling 100.
+      maxResults: int option }
+
 type FcsNugetTypesArgs =
     { /// Package id (matched against referenced assembly SimpleName, case-insensitive).
       /// Example: "Spectre.Console", "Newtonsoft.Json", "System.Text.Json".

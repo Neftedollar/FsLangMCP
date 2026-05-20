@@ -44,6 +44,13 @@ let private explicitFsproj (projectPath: string option) : string option =
 // literal (`{ Field = expr }`) or a record-update expression (`{ x with Field = expr }`).
 // Replaces the old textual lookback heuristic that mis-classified fields more than
 // 2 lines below the `with` keyword. See issue #122.
+//
+// v2 (issue #124): replaced the hand-rolled walkExpr/walkDecl with ParsedInput.fold,
+// a full-tree fold provided by FCS 43.12+ that visits every expression-containing
+// AST node without a position filter. This covers all previously missing arms:
+// SynModuleDecl.Types, SynExpr.ForEach/For/While, SynExpr.LetOrUseBang,
+// SynExpr.MatchLambda, SynExpr.ObjExpr, SynExpr.Lazy, and any future FCS additions.
+// fallbackHeuristic call-sites in formOf are retained as a defensive safety net.
 
 open FSharp.Compiler.Syntax
 
@@ -55,79 +62,38 @@ type private FieldFormKey = int * int
 /// site as `true` (with-update form) or `false` (literal form).
 module private FieldFormClassifier =
 
-    let private tagFields (isUpdate: bool) (fields: SynExprRecordField list) (d: System.Collections.Generic.Dictionary<FieldFormKey, bool>) =
+    let private tagFields
+        (isUpdate: bool)
+        (fields: SynExprRecordField list)
+        (d: System.Collections.Generic.Dictionary<FieldFormKey, bool>)
+        =
         for field in fields do
             match field with
             | SynExprRecordField((lid, _), _, _, _, _) ->
                 let r = lid.Range
                 d[(r.StartLine, r.StartColumn)] <- isUpdate
 
-    let rec private walkExpr (e: SynExpr) (d: System.Collections.Generic.Dictionary<FieldFormKey, bool>) =
-        match e with
-        | SynExpr.Record(_, copyInfo, fields, _) ->
-            tagFields copyInfo.IsSome fields d
-            // Recurse into the value expressions so nested records are also classified.
-            for field in fields do
-                match field with
-                | SynExprRecordField(_, _, Some ve, _, _) -> walkExpr ve d
-                | _ -> ()
-        | SynExpr.Paren(inner, _, _, _) -> walkExpr inner d
-        | SynExpr.App(_, _, f, x, _) -> walkExpr f d; walkExpr x d
-        | SynExpr.TypeApp(e2, _, _, _, _, _, _) -> walkExpr e2 d
-        | SynExpr.Lambda(body = body) -> walkExpr body d
-        | SynExpr.LetOrUse lu ->
-            for b in lu.Bindings do
-                let (SynBinding(expr = be)) = b
-                walkExpr be d
-            walkExpr lu.Body d
-        | SynExpr.Sequential(_, _, e1, e2, _, _) -> walkExpr e1 d; walkExpr e2 d
-        | SynExpr.IfThenElse(ifExpr = ie; thenExpr = te; elseExpr = ee) ->
-            walkExpr ie d; walkExpr te d; ee |> Option.iter (fun x -> walkExpr x d)
-        | SynExpr.Match(expr = me; clauses = cs) ->
-            walkExpr me d
-            for SynMatchClause(resultExpr = re) in cs do walkExpr re d
-        | SynExpr.Tuple(exprs = es) -> for x in es do walkExpr x d
-        | SynExpr.ArrayOrList(exprs = es) -> for x in es do walkExpr x d
-        | SynExpr.ComputationExpr(expr = ce) -> walkExpr ce d
-        | SynExpr.Typed(e2, _, _) -> walkExpr e2 d
-        | SynExpr.Do(e2, _) -> walkExpr e2 d
-        | SynExpr.Assert(e2, _) -> walkExpr e2 d
-        | SynExpr.TryFinally(tryExpr = te; finallyExpr = fe) -> walkExpr te d; walkExpr fe d
-        | SynExpr.TryWith(tryExpr = te; withCases = cs) ->
-            walkExpr te d
-            for SynMatchClause(resultExpr = re) in cs do walkExpr re d
-        | SynExpr.YieldOrReturn(_, e2, _, _) -> walkExpr e2 d
-        | SynExpr.YieldOrReturnFrom(_, e2, _, _) -> walkExpr e2 d
-        | _ -> ()
-
-    and private walkDecl (decl: SynModuleDecl) (d: System.Collections.Generic.Dictionary<FieldFormKey, bool>) =
-        match decl with
-        | SynModuleDecl.Let(_, bindings, _, _) ->
-            for b in bindings do
-                let (SynBinding(expr = e)) = b
-                walkExpr e d
-        | SynModuleDecl.Expr(e, _) -> walkExpr e d
-        | SynModuleDecl.NestedModule(_, _, decls, _, _, _) ->
-            for decl2 in decls do walkDecl decl2 d
-        | _ -> ()
-
-    /// Walk the full parse tree and return a dictionary mapping
-    /// field-name range keys to their classification:
-    ///   true  = with-update form  ({ x with Field = ... })
-    ///   false = literal form      ({ Field = ... })
+    /// Walk the full parse tree using ParsedInput.fold (FCS 43.12+).
+    /// ParsedInput.fold is a position-independent full-tree accumulator that visits
+    /// every SyntaxNode in the tree, including those inside type member bodies,
+    /// for-loops, CE binds, object expressions, and all other expression-containing arms.
     let classify (input: ParsedInput) : System.Collections.Generic.Dictionary<FieldFormKey, bool> =
-        let d = System.Collections.Generic.Dictionary<FieldFormKey, bool>()
-
-        match input with
-        | ParsedInput.ImplFile(ParsedImplFileInput(contents = modules)) ->
-            for SynModuleOrNamespace(decls = decls) in modules do
-                for decl in decls do walkDecl decl d
         // SigFile (.fsi): signature files declare types but contain no expression
         // use-sites — there are no record literals/updates here to classify. Empty
         // dictionary is the correct return; do not "complete" this arm.
-        | ParsedInput.SigFile _ -> ()
+        match input with
+        | ParsedInput.SigFile _ -> System.Collections.Generic.Dictionary<FieldFormKey, bool>()
+        | ParsedInput.ImplFile _ ->
+            let d = System.Collections.Generic.Dictionary<FieldFormKey, bool>()
 
-        d
+            (d, input)
+            ||> ParsedInput.fold (fun acc _path node ->
+                match node with
+                | SyntaxNode.SynExpr(SynExpr.Record(_, copyInfo, fields, _)) ->
+                    tagFields copyInfo.IsSome fields acc
+                    acc
+                | _ -> acc)
+
 
 // ─── FcsBridge ─────────────────────────────────────────────────────────────────
 
@@ -2993,4 +2959,184 @@ type internal FcsBridge() =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
 
             return this.BuildSignatureHelpResult(path, source, optionsSource, args, checkedResults)
+        }
+
+    // ─── fcs_suggest_open (#67) ──────────────────────────────────────────────────
+
+    /// Given an unresolved symbol name (e.g. from FS0039), returns ranked `open`
+    /// directive candidates: project-local symbols first, referenced assemblies second.
+    member this.SuggestOpen(args: FcsSuggestOpenArgs) : Task<JsonNode> =
+        task {
+            match ArgsValidation.requireNonBlank "symbolName" args.symbolName with
+            | Error envelope -> return envelope
+            | Ok symbolName ->
+
+            if args.projectPath.IsNone then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr
+                              "projectPath is required (or call set_project first to set the active project)" ]
+                    :> JsonNode
+            else
+
+            let includeReferences = defaultArg args.includeReferences true
+            let requested         = defaultArg args.maxResults 20
+            let pageSize          = min (max 1 requested) 100
+
+            let! projectResults, options, _optionsSource = this.EnsureProjectResults args.projectPath
+
+            // ── A. Project-local candidates ─────────────────────────────────────
+            // Walk every symbol use recorded during ParseAndCheckProject.
+            // Filter for FSharpEntity whose DisplayName exactly equals symbolName.
+            let projectCandidates =
+                try
+                    projectResults.GetAllUsesOfAllSymbols()
+                    |> Array.choose (fun symbolUse ->
+                        match symbolUse.Symbol with
+                        | :? FSharpEntity as entity when entity.DisplayName = symbolName ->
+                            let accessPath =
+                                try entity.AccessPath |> Option.ofObj |> Option.defaultValue "" with _ -> ""
+                            let fullName =
+                                try entity.FullName   |> Option.ofObj |> Option.defaultValue "" with _ -> ""
+                            let asmName =
+                                try entity.Assembly.SimpleName |> Option.ofObj |> Option.defaultValue "" with _ -> ""
+                            Some (accessPath, fullName, asmName)
+                        | _ -> None)
+                    |> Array.distinctBy (fun (ap, fn, _) -> (ap, fn))
+                with _ ->
+                    [||]
+
+            // ── B. Referenced-assembly candidates ────────────────────────────────
+            let referenceCandidates =
+                if not includeReferences then
+                    [||]
+                else
+                    try
+                        let assemblies = projectResults.ProjectContext.GetReferencedAssemblies()
+                        seq {
+                            for asm in assemblies do
+                                let asmName =
+                                    try asm.SimpleName |> Option.ofObj |> Option.defaultValue "" with _ -> ""
+                                for entity in allEntitiesFromAssembly asm do
+                                    let dn = try entity.DisplayName with _ -> ""
+                                    if dn = symbolName then
+                                        let accessPath =
+                                            try entity.AccessPath |> Option.ofObj |> Option.defaultValue ""
+                                            with _ -> ""
+                                        let fullName =
+                                            try entity.FullName |> Option.ofObj |> Option.defaultValue ""
+                                            with _ -> ""
+                                        yield (accessPath, fullName, asmName)
+                        }
+                        |> Seq.distinctBy (fun (ap, fn, _) -> (ap, fn))
+                        |> Seq.toArray
+                    with _ ->
+                        [||]
+
+            // ── C. Build deduplicated ranked list ────────────────────────────────
+            // Project hits first (more relevant — same codebase), then references.
+            // Within each tier deduplicate by (openPath, entityFullName).
+
+            let toCandidate source (accessPath: string, fullName: string, asmName: string) =
+                // Determine kind + accessibility from the entity (best effort via FullName lookup).
+                // We re-use data already in the tuple; expensive entity re-lookup is avoided.
+                jobj
+                    [ "openPath",       jstr accessPath
+                      "entityFullName", jstr fullName
+                      "source",         jstr source
+                      "assembly",       jstr asmName
+                      "kind",           jstr "unknown"      // enriched below when entity is available
+                      "accessibility",  jstr "unknown" ]
+                :> JsonNode
+
+            // Produce candidate JsonNodes from both tiers.
+            // We need kind + accessibility, so we re-walk — but only for project and only
+            // for the entries that survive deduplication.
+            let projectSet  = projectCandidates  |> Set.ofArray
+            let referenceSet = referenceCandidates |> Set.ofArray
+
+            // Remove reference entries that are already covered by a project entry
+            // (same openPath + fullName).
+            let referenceUnique =
+                referenceCandidates
+                |> Array.filter (fun (ap, fn, _) -> not (projectSet |> Set.exists (fun (ap2, fn2, _) -> ap = ap2 && fn = fn2)))
+
+            let allCandidates =
+                [| yield! projectCandidates  |> Array.truncate pageSize |> Array.map (toCandidate "project")
+                   yield! referenceUnique |> Array.truncate pageSize |> Array.map (toCandidate "reference") |]
+
+            // ── D. Enrich kind + accessibility for project-tier via symbol walk ──
+            // Build a lookup: (accessPath, fullName) → (kind, accessibility)
+            // This re-uses the existing symbolKind helper on FSharpEntity.
+            let projectEnrichment =
+                try
+                    projectResults.GetAllUsesOfAllSymbols()
+                    |> Array.choose (fun symbolUse ->
+                        match symbolUse.Symbol with
+                        | :? FSharpEntity as entity when entity.DisplayName = symbolName ->
+                            let accessPath =
+                                try entity.AccessPath |> Option.ofObj |> Option.defaultValue "" with _ -> ""
+                            let fullName =
+                                try entity.FullName   |> Option.ofObj |> Option.defaultValue "" with _ -> ""
+                            let kind = entityKindString entity
+                            let acc  = entityAccessibilityString entity
+                            Some ((accessPath, fullName), (kind, acc))
+                        | _ -> None)
+                    |> Array.distinctBy fst
+                    |> Map.ofArray
+                with _ ->
+                    Map.empty
+
+            // Enrich reference-tier via walking assemblies again for the surviving entries.
+            let referenceEnrichment =
+                if not includeReferences then
+                    Map.empty
+                else
+                    try
+                        let assemblies = projectResults.ProjectContext.GetReferencedAssemblies()
+                        seq {
+                            for asm in assemblies do
+                                for entity in allEntitiesFromAssembly asm do
+                                    let dn = try entity.DisplayName with _ -> ""
+                                    if dn = symbolName then
+                                        let accessPath =
+                                            try entity.AccessPath |> Option.ofObj |> Option.defaultValue "" with _ -> ""
+                                        let fullName =
+                                            try entity.FullName |> Option.ofObj |> Option.defaultValue "" with _ -> ""
+                                        let key = (accessPath, fullName)
+                                        let kind = entityKindString entity
+                                        let acc  = entityAccessibilityString entity
+                                        yield key, (kind, acc)
+                        }
+                        |> Seq.distinctBy fst
+                        |> Map.ofSeq
+                    with _ ->
+                        Map.empty
+
+            // Patch kind + accessibility in each candidate node.
+            let enriched =
+                allCandidates
+                |> Array.map (fun node ->
+                    let ap  = node["openPath"].GetValue<string>()
+                    let fn  = node["entityFullName"].GetValue<string>()
+                    let src = node["source"].GetValue<string>()
+                    let lookup = if src = "project" then projectEnrichment else referenceEnrichment
+                    match Map.tryFind (ap, fn) lookup with
+                    | Some (kind, acc) ->
+                        let obj = node :?> JsonObject
+                        obj["kind"]          <- jstr kind
+                        obj["accessibility"] <- jstr acc
+                        node
+                    | None -> node)
+
+            return
+                jobj
+                    [ "status",           jstr "ok"
+                      "symbolName",       jstr symbolName
+                      "projectFileName",  jstr options.ProjectFileName
+                      "candidateCount",   jint enriched.Length
+                      "candidates",       JsonArray(enriched) :> JsonNode ]
+                :> JsonNode
         }

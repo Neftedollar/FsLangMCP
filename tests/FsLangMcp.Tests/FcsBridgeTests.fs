@@ -2744,6 +2744,269 @@ let ``RecordFieldAudit classifies record literal inside a type member body (not 
                 Directory.Delete(tempRoot, true)
     }
 
+// ─── #124 — FieldFormClassifier walker expansion ──────────────────────────────
+// Three regression tests proving ParsedInput.fold covers AST arms the old hand-rolled
+// walker missed: SynModuleDecl.Types (member bodies), SynExpr.ForEach (for-loops),
+// and SynExpr.LetOrUseBang (CE bind continuations).
+//
+// Each fixture includes a `{ x with Field = ... }` expression within the 3-line
+// fallback lookback window of the target literal.  Under the OLD walker (dict-miss
+// → fallback heuristic), the fallback sees ` with ` in that window and mis-classifies
+// the target as "with-update".  Under the NEW walker (ParsedInput.fold dict-hit),
+// the target is correctly tagged "literal" by parse-tree descent, bypassing the
+// fallback entirely.  The assertion `Assert.Equal("literal", ...)` therefore
+// distinguishes the two paths and will FAIL on a regression to the old walker.
+
+[<Fact>]
+let ``RecordFieldAudit classifies record literal inside type member body via parse-tree (not textual fallback)`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_rfa_124a_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // Fixture layout (1-based FCS line numbers):
+            //   line 5: { Propose = id }               ← literal (base1)
+            //   line 7: { base1 with Propose = ... }   ← with-update (upd); contains " with "
+            //   line 8: type Builder() =
+            //   line 9: member _.Make () : R = { Propose = fun x -> x + 1 }  ← TARGET literal
+            //
+            // The fallback's 3-line lookback for the line-9 site scans source lines 7–9
+            // (0-indexed 6–8).  Line 7 contains " with ", so the fallback returns
+            // "with-update" for the member-body literal — misclassifying it.
+            //
+            // The new ParsedInput.fold walker descends into SynModuleDecl.Types and records
+            // the dict entry for the member-body field directly from the parse tree, so
+            // formOf hits the dict and returns "literal" without consulting the fallback.
+            //
+            // Fixture has a `with`-update line 2 lines above the target literal.
+            // Under the OLD walker (dict-miss → fallback heuristic), the target would be
+            // misclassified as "with-update" because the fallback's 3-line lookback would
+            // see the ` with ` keyword.  Under the NEW walker (ParsedInput.fold dict-hit),
+            // the target is correctly tagged "literal" by the parse tree, bypassing the
+            // fallback entirely.  The assertion below distinguishes these two paths.
+            let src =
+                String.concat
+                    "\n"
+                    [ "module RfaMemBody.Library"
+                      ""
+                      "type R = { Propose: int -> int }"
+                      ""
+                      "let base1 : R = { Propose = id }"
+                      ""
+                      "let upd = { base1 with Propose = fun y -> y + 1 }"
+                      "type Builder() ="
+                      "    member _.Make () : R = { Propose = fun x -> x + 1 }"
+                      "" ]
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "RfaMemBody" src
+
+            let! result =
+                bridge.RecordFieldAudit(
+                    { typeName = "R"
+                      fieldName = "Propose"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      maxResults = Some 10
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.True(result["matchedCount"].GetValue<int>() >= 3, "Expected >= 3 matched sites (base1 literal, upd with-update, member body literal)")
+
+            let sites = result["sites"] :?> JsonArray
+            Assert.True(sites.Count >= 3, "Expected >= 3 sites in result")
+
+            // Find the member-body site: it is on line 9 (1-based FCS).
+            // Lines 7 and 8 are the with-update expression and the type header —
+            // the fallback's lookback sees " with " on line 7 and would return
+            // "with-update" if the dict miss path were taken.
+            let siteStartLine (node: JsonNode) =
+                let range = node["range"]
+                range["startLine"].GetValue<int>()
+
+            let memberBodySite =
+                sites
+                |> Seq.cast<JsonNode>
+                |> Seq.find (fun s -> siteStartLine s = 9)
+
+            Assert.Equal("literal", memberBodySite["form"].GetValue<string>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``RecordFieldAudit classifies record literal inside for-loop body via parse-tree`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_rfa_124b_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // Fixture layout (1-based FCS line numbers):
+            //   line 5: { F = 0 }                      ← literal (base2)
+            //   line 6: let go () =
+            //   line 7:     let upd = { base2 with F = 99 }  ← with-update; contains " with "
+            //   line 8:     for i in [ 1; 2; 3 ] do
+            //   line 9:         let acc = { F = i }    ← TARGET literal (inside ForEach body)
+            //
+            // The fallback's 3-line lookback for the line-9 site scans source lines 7–9
+            // (0-indexed 6–8).  Line 7 contains " with ", so the fallback returns
+            // "with-update" for the for-loop literal — misclassifying it.
+            //
+            // The old hand-rolled walker's `_ -> ()` arm silently dropped SynExpr.ForEach;
+            // ParsedInput.fold visits ForEach bodies automatically and records the dict entry
+            // for the for-loop literal, so formOf hits the dict and returns "literal".
+            //
+            // Fixture has a `with`-update line 2 lines above the target literal.
+            // Under the OLD walker (dict-miss → fallback heuristic), the target would be
+            // misclassified as "with-update" because the fallback's 3-line lookback would
+            // see the ` with ` keyword.  Under the NEW walker (ParsedInput.fold dict-hit),
+            // the target is correctly tagged "literal" by the parse tree, bypassing the
+            // fallback entirely.  The assertion below distinguishes these two paths.
+            let src =
+                String.concat
+                    "\n"
+                    [ "module RfaForLoop.Library"
+                      ""
+                      "type R = { F: int }"
+                      ""
+                      "let base2 : R = { F = 0 }"
+                      "let go () ="
+                      "    let upd = { base2 with F = 99 }"
+                      "    for i in [ 1; 2; 3 ] do"
+                      "        let acc = { F = i }"
+                      "        ignore acc"
+                      "" ]
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "RfaForLoop" src
+
+            let! result =
+                bridge.RecordFieldAudit(
+                    { typeName = "R"
+                      fieldName = "F"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      maxResults = Some 10
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.True(result["matchedCount"].GetValue<int>() >= 3, "Expected >= 3 matched sites (base2 literal, upd with-update, for-loop body literal)")
+
+            let sites = result["sites"] :?> JsonArray
+            Assert.True(sites.Count >= 3, "Expected >= 3 sites in result")
+
+            // Find the for-loop body site: it is on line 9 (1-based FCS).
+            // Lines 7 and 8 are the with-update expression and the for-loop header —
+            // the fallback's lookback sees " with " on line 7 and would return
+            // "with-update" if the dict miss path were taken.
+            let siteStartLine (node: JsonNode) =
+                let range = node["range"]
+                range["startLine"].GetValue<int>()
+
+            let forLoopSite =
+                sites
+                |> Seq.cast<JsonNode>
+                |> Seq.find (fun s -> siteStartLine s = 9)
+
+            Assert.Equal("literal", forLoopSite["form"].GetValue<string>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``RecordFieldAudit classifies record literal in CE bind continuation via parse-tree`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_rfa_124c_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // Fixture layout (1-based FCS line numbers):
+            //   line 5:  { F = 0 }                      ← literal (base3)
+            //   line 6:  let go () =
+            //   line 7:      async {
+            //   line 8:          let base4 = { base3 with F = 1 }  ← with-update; contains " with "
+            //   line 9:          let! r = async.Return base4.F
+            //   line 10:         return { F = r }        ← TARGET literal (in CE bind continuation)
+            //
+            // The fallback's 3-line lookback for the line-10 site scans source lines 8–10
+            // (0-indexed 7–9).  Line 8 contains " with ", so the fallback returns
+            // "with-update" for the CE-bind literal — misclassifying it.
+            //
+            // The old walker handled SynExpr.LetOrUse but NOT SynExpr.LetOrUseBang;
+            // ParsedInput.fold visits both automatically since it descends into every node.
+            // The dict entry for the CE-bind literal is recorded from the parse tree, so
+            // formOf hits the dict and returns "literal" without consulting the fallback.
+            //
+            // Fixture has a `with`-update line 2 lines above the target literal.
+            // Under the OLD walker (dict-miss → fallback heuristic), the target would be
+            // misclassified as "with-update" because the fallback's 3-line lookback would
+            // see the ` with ` keyword.  Under the NEW walker (ParsedInput.fold dict-hit),
+            // the target is correctly tagged "literal" by the parse tree, bypassing the
+            // fallback entirely.  The assertion below distinguishes these two paths.
+            let src =
+                String.concat
+                    "\n"
+                    [ "module RfaCeBang.Library"
+                      ""
+                      "type R = { F: int }"
+                      ""
+                      "let base3 : R = { F = 0 }"
+                      "let go () ="
+                      "    async {"
+                      "        let base4 = { base3 with F = 1 }"
+                      "        let! r = async.Return base4.F"
+                      "        return { F = r }"
+                      "    }"
+                      "" ]
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "RfaCeBang" src
+
+            let! result =
+                bridge.RecordFieldAudit(
+                    { typeName = "R"
+                      fieldName = "F"
+                      path = Some sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      maxResults = Some 10
+                      cursor = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.True(result["matchedCount"].GetValue<int>() >= 3, "Expected >= 3 matched sites (base3 literal, base4 with-update, CE-bind literal)")
+
+            let sites = result["sites"] :?> JsonArray
+            Assert.True(sites.Count >= 3, "Expected >= 3 sites in result")
+
+            // Find the CE-bind continuation site: it is on line 10 (1-based FCS).
+            // Lines 8 and 9 are the with-update expression and the let! bind —
+            // the fallback's lookback sees " with " on line 8 and would return
+            // "with-update" if the dict miss path were taken.
+            let siteStartLine (node: JsonNode) =
+                let range = node["range"]
+                range["startLine"].GetValue<int>()
+
+            let ceBangSite =
+                sites
+                |> Seq.cast<JsonNode>
+                |> Seq.find (fun s -> siteStartLine s = 10)
+
+            Assert.Equal("literal", ceBangSite["form"].GetValue<string>())
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
 // ─── #120 — ArgsValidation.requireNonBlank regression tests ───────────────────
 
 [<Fact>]
@@ -2862,3 +3125,224 @@ let ``MakeInternalVisible returns invalid_args envelope for blank path`` () : Ta
         Assert.Equal("invalid_args", result["status"].GetValue<string>())
         Assert.Contains("path", (result["message"].GetValue<string>()).ToLowerInvariant())
     }
+
+// ─── fcs_suggest_open (#67) ───────────────────────────────────────────────────
+
+[<Fact>]
+let ``SuggestOpen returns invalid_args envelope for blank symbolName`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.SuggestOpen(
+                { symbolName = ""
+                  projectPath = Some projectPath
+                  path = None
+                  text = None
+                  projectOptions = None
+                  includeReferences = None
+                  maxResults = None }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("symbolname", (result["message"].GetValue<string>()).ToLowerInvariant())
+    }
+
+[<Fact>]
+let ``SuggestOpen returns invalid_args envelope when projectPath is None`` () : Task =
+    task {
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.SuggestOpen(
+                { symbolName = "File"
+                  projectPath = None
+                  path = None
+                  text = None
+                  projectOptions = None
+                  includeReferences = None
+                  maxResults = None }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("projectpath", (result["message"].GetValue<string>()).ToLowerInvariant())
+    }
+
+[<Fact>]
+let ``SuggestOpen finds System.IO.File in BCL references`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.SuggestOpen(
+                { symbolName = "File"
+                  projectPath = Some projectPath
+                  path = None
+                  text = None
+                  projectOptions = None
+                  includeReferences = Some true
+                  maxResults = Some 50 }
+            )
+
+        Assert.Equal("ok", result["status"].GetValue<string>())
+        let candidates = result["candidates"] :?> JsonArray
+        Assert.True(candidates.Count > 0, "Expected at least one candidate for 'File'")
+
+        // There must be at least one candidate with openPath="System.IO"
+        // and entityFullName containing "System.IO.File".
+        // Note: when FsLangMcp.fsproj itself uses System.IO.File, FCS may surface it
+        // as a "project" tier hit (symbol use in project files) even though it is a BCL type.
+        // We assert the path and full-name shape but not the source tier.
+        let ioFileCandidate =
+            candidates
+            |> Seq.cast<JsonNode>
+            |> Seq.tryFind (fun c ->
+                c["openPath"].GetValue<string>() = "System.IO"
+                && c["entityFullName"].GetValue<string>().Contains("System.IO.File"))
+
+        Assert.True(ioFileCandidate.IsSome, "Expected a candidate with openPath='System.IO' and entityFullName containing 'System.IO.File'")
+    }
+
+[<Fact>]
+let ``SuggestOpen finds project-local module`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_sopen_67a_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let src =
+                String.concat
+                    "\n"
+                    [ "namespace MyApp.Tools"
+                      ""
+                      "module StringHelpers ="
+                      "    let greet name = $\"Hello, {name}!\""
+                      "" ]
+
+            let _sourcePath, projectPath = writeProjectWithSource tempRoot "MyApp_Tools" src
+
+            let! result =
+                bridge.SuggestOpen(
+                    { symbolName = "StringHelpers"
+                      projectPath = Some projectPath
+                      path = None
+                      text = None
+                      projectOptions = None
+                      includeReferences = Some false
+                      maxResults = Some 10 }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+            let candidates = result["candidates"] :?> JsonArray
+            Assert.True(candidates.Count > 0, "Expected at least one project-local candidate for 'StringHelpers'")
+
+            let localCandidate =
+                candidates
+                |> Seq.cast<JsonNode>
+                |> Seq.tryFind (fun c ->
+                    c["source"].GetValue<string>() = "project"
+                    && c["openPath"].GetValue<string>().Contains("MyApp"))
+
+            Assert.True(localCandidate.IsSome, "Expected a project-local candidate with openPath containing 'MyApp'")
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``SuggestOpen returns empty candidates for nonexistent symbol`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.SuggestOpen(
+                { symbolName = "DefinitelyNonexistentSymbolName9999"
+                  projectPath = Some projectPath
+                  path = None
+                  text = None
+                  projectOptions = None
+                  includeReferences = Some true
+                  maxResults = Some 20 }
+            )
+
+        Assert.Equal("ok", result["status"].GetValue<string>())
+        Assert.Equal(0, result["candidateCount"].GetValue<int>())
+        let candidates = result["candidates"] :?> JsonArray
+        Assert.Equal(0, candidates.Count)
+    }
+
+[<Fact>]
+let ``SuggestOpen project-local candidates appear before reference candidates`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_sopen_67b_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            // Define a local module named "Path" — same name as System.IO.Path in BCL.
+            // The fixture also USES System.IO.Path directly so FCS surfaces the BCL type as
+            // a project symbol-use even on FCS versions where reference symbols are not
+            // included in GetAllUsesOfAllSymbols by default. Without the usage line, FCS may
+            // return only 1 candidate (the project-local module), making the ranking test vacuous.
+            let src =
+                String.concat
+                    "\n"
+                    [ "namespace MyApp.Util"
+                      ""
+                      "module Path ="
+                      "    let combine a b = sprintf \"%s/%s\" a b"
+                      ""
+                      "let demo () = System.IO.Path.GetFileName \"/tmp/foo\"  // forces BCL Path into symbol uses"
+                      "" ]
+
+            let _sourcePath, projectPath = writeProjectWithSource tempRoot "MyApp_Util" src
+
+            let! result =
+                bridge.SuggestOpen(
+                    { symbolName = "Path"
+                      projectPath = Some projectPath
+                      path = None
+                      text = None
+                      projectOptions = None
+                      includeReferences = Some true
+                      maxResults = Some 50 }
+                )
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+            let candidates = result["candidates"] :?> JsonArray
+
+            // Fixture has BOTH a local `MyApp.Util.Path` module AND uses `System.IO.Path` (so FCS
+            // surfaces the BCL `Path` class as a project symbol-use). The audit returns at least
+            // 2 candidates; assertion verifies (a) both tiers populated, (b) project tier ranked
+            // first, (c) reference tier wasn't fully deduped away. All three properties together
+            // prove the ranking concat ordering at FcsBridge.fs:3066-3068 is correct AND that
+            // the test isn't vacuous on FCS versions where BCL symbols don't appear in
+            // GetAllUsesOfAllSymbols by default.
+            Assert.True(
+                candidates.Count >= 2,
+                $"Expected both project + reference candidates for 'Path', got {candidates.Count}. " +
+                "If FCS truly cannot find a project tier hit, the fixture needs to use the type more visibly.")
+
+            // Assert ranking: first candidate must be the project entry
+            let firstCandidate = candidates.Item(0)
+            Assert.Equal("project", firstCandidate["source"].GetValue<string>())
+
+            // Assert at least one reference candidate survives dedup (proves reference tier isn't completely eaten)
+            let hasReference =
+                candidates
+                |> Seq.cast<System.Text.Json.Nodes.JsonNode>
+                |> Seq.exists (fun c -> c["source"].GetValue<string>() = "reference")
+
+            Assert.True(hasReference, "Expected at least one reference candidate to prove ranking matters when both tiers exist.")
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
