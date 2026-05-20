@@ -227,7 +227,7 @@ let main argv =
                 tool (
                     TypedTool.define<CompletionArgs>
                         "textDocument_completion"
-                        "[FSAC] Raw LSP proxy to fsautocomplete textDocument/completion. Exact-position IDE primitive; requires set_project first. Prefer agent-friendly FCS/navigation tools for codebase understanding. line/character are 0-based. Pass 'text' for unsaved content."
+                        "[FSAC] Raw LSP proxy to fsautocomplete textDocument/completion. Exact-position IDE primitive; requires set_project first. line/character are 0-based. Pass 'text' for unsaved content. Avoid for free-form agent flows — completion is exact-position editor IO; for symbol semantics use fcs_symbol_at_word or fcs_type_at_position instead."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Completion args)))
                     |> unwrapResult
                 )
@@ -235,7 +235,7 @@ let main argv =
                 tool (
                     TypedTool.define<PositionArgs>
                         "textDocument_definition"
-                        "[FSAC] Raw LSP proxy to fsautocomplete textDocument/definition. Exact-position IDE primitive; requires set_project first. line/character are 0-based. Pass 'text' for unsaved content."
+                        "[FSAC] Raw LSP proxy to fsautocomplete textDocument/definition. Exact-position IDE primitive; requires set_project first. line/character are 0-based. Pass 'text' for unsaved content. Prefer fcs_find_symbol for agent flows — it returns grouped definitions+references and works without exact cursor position."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Definition args)))
                     |> unwrapResult
                 )
@@ -251,7 +251,7 @@ let main argv =
                 tool (
                     TypedTool.define<WorkspaceSymbolArgs>
                         "workspace_symbol"
-                        "[FSAC] Raw LSP proxy to fsautocomplete workspace/symbol. Useful for quick lookup after set_project, but returns IDE-shaped results without source context."
+                        "[FSAC] Raw LSP proxy to fsautocomplete workspace/symbol. Useful for quick lookup after set_project, but returns IDE-shaped results without source context. Prefer fcs_find_symbol for agent workflows — it returns grouped definitions+references with source-line context in one call."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.WorkspaceSymbol args)))
                     |> unwrapResult
                 )
@@ -377,7 +377,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsReferencedSymbolsArgs>
                         "fcs_referenced_symbols"
-                        "[FCS in-process] Search across the project's *referenced* assemblies (NuGet + framework) for types whose DisplayName or FullName contains the query (case-insensitive). Complements workspace_symbol (project-local) — use this when you need 'is there a public/internal Cell type in Spectre.Console?' or 'what IBuilder interfaces are reachable from this project?'. Each result reports assembly, kind (class/interface/struct/enum/record/union/module/...), accessibility (public/internal/private/unknown), and isObsolete. Set includeNonPublic=true to see internals. Lazy: first call triggers ParseAndCheckProject if not warm. Paginated; default 200, max 1000. Cursor stability: best-effort — if the project's references change between calls, the offset may shift; treat the cursor as ephemeral."
+                        "[FCS in-process] Search the project's referenced assemblies (NuGet + framework) for types by DisplayName or FullName substring (case-insensitive). Complements workspace_symbol (project-local). Reports assembly, kind, accessibility, isObsolete. Set includeNonPublic=true for internals. Paginated; default 200, max 1000. First call triggers ParseAndCheckProject if cold. Cursor is best-effort — ephemeral if references change. Details: see docs/tools-detailed.md#fcs_referenced_symbols."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -389,7 +389,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsNugetTypesArgs>
                         "fcs_nuget_types"
-                        "[FCS in-process] Enumerate all types exported by one referenced assembly, matched by EXACT SimpleName (case-insensitive). Examples: packageId='Spectre.Console' resolves to assembly Spectre.Console only — NOT Spectre.Console.Cli. packageId='System' resolves to the literal 'System' assembly only — NOT every System.* assembly. When a NuGet package ships multiple assemblies, call this tool once per assembly name. Each entry reports displayName, fullName, kind, accessibility, isObsolete. Use this to survey a NuGet package's surface before writing wrapper code, or to confirm whether a third-party type is internal. Set includeNonPublic=true to surface internals. Paginated; default 500, max 2000. Falls back to active set_project when projectPath is omitted. Returns matchedAssemblies=[] when no assembly matches — does NOT silently fall back to a less-specific assembly. To discover assembly names, use fcs_referenced_symbols with a partial query first."
+                        "[FCS in-process] Enumerate all types in one referenced assembly matched by EXACT SimpleName (case-insensitive). 'Spectre.Console' resolves only to that assembly — not Spectre.Console.Cli. When a package ships multiple assemblies, call once per name. Each entry reports displayName, fullName, kind, accessibility, isObsolete. Paginated; default 500, max 2000. Returns matchedAssemblies=[] on no match. Mechanics and edge cases: see docs/tools-detailed.md#fcs_nuget_types."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -401,7 +401,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsValidateSnippetArgs>
                         "fcs_validate_snippet"
-                        "[FCS in-process] Compile an arbitrary F# snippet (.fs or .fsi mode) against the loaded project's references without modifying the project on disk. Writes the snippet to a uniquely-named file under the OS temp dir, splices it into a fresh copy of project options (cached options not mutated), runs ParseAndCheckFileInProject, and deletes the temp file before returning. Returns FCS diagnostics + errorCount/warningCount. Use this to validate a signature shape (e.g. 'does F# accept exception internal X of T in a .fsi?') or check that a draft type uses only existing project/NuGet types — much faster than scaffolding a scratch .fsproj. projectPath falls back to the active set_project. Caveats: (1) an .fsi snippet without a paired .fs implementation will likely produce 'signature has no implementation' errors — to validate just signature syntax, prefer mode='fs' with the signature wrapped in 'module M = ...'. (2) the snippet runs through FCS exactly like a real source file, so it can reference any project type — but it cannot reference symbols defined later in the project's compile order."
+                        "[FCS in-process] Compile arbitrary F# (mode=\"fs\"|\"fsi\") against the active project's references without writing to the source tree. Useful for 'does this signature type-check?' probes before scaffolding. Returns FCS diagnostics + errorCount/warningCount. projectPath falls back to active set_project. Caveats and mechanics: see docs/tools-detailed.md#fcs_validate_snippet."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -461,7 +461,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsRecordFieldAuditArgs>
                         "fcs_record_field_audit"
-                        "[FCS in-process] Find every construction site for a record field, covering both `{ Field = expr; ... }` literal form AND `{ existing with Field = expr }` update form. Complements `fcs_find_symbol`/`textDocument_references`, which look up the *type name* and miss field-set uses — the gap that port-record widening refactors (adding a field to a domain record type) keep tripping over. Pass typeName (DisplayName e.g. 'TraderRole' OR segment-boundary FullName e.g. 'MyApp.Domain.Ports.TraderRole') and fieldName (exact, case-sensitive). Each site reports file, range, form ('literal' | 'with-update' | 'unknown' via a line-text heuristic — false positives possible if a comment contains ' with '), and 2 lines of source context. Paginated; default 200, max 1000. projectPath is optional after set_project. `path` is optional when `projectPath` is set; provide `path`+`text` together to audit against an unsaved buffer."
+                        "[FCS in-process] Find every construction site for a record field — literal `{ Field = expr }` AND update `{ x with Field = expr }`. Fills the gap left by fcs_find_symbol, which misses field-set uses during widening refactors. Pass typeName (DisplayName e.g. 'TraderRole' or segment-boundary FullName) and fieldName (exact, case-sensitive). Each site reports file, range, form, and 2 context lines. Paginated; default 200, max 1000. Caveats: see docs/tools-detailed.md#fcs_record_field_audit."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -473,7 +473,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsFindSymbolArgs>
                         "fcs_find_symbol"
-                        "[FCS in-process] Agent-friendly project-wide symbol search with grouped definitions/references and source line context. Better than chaining workspace_symbol, fcs_project_symbol_uses, and shell line reads. Pass projectPath when possible. Caveat: misses record-field-set construction sites — for those, use fcs_record_field_audit. The projectDiagnostics field is SCOPED: projectDiagnosticsScope='matched-files' (normal) returns diagnostics only for files containing matches, with Info/Hint filtered out by default (set includeInfo=true to include them); projectDiagnosticsScope='errors-only-no-matches' means the query returned zero hits and only Error-severity diagnostics from the whole project are surfaced so callers can detect broken projects — an empty projectDiagnostics in that regime means the project is clean."
+                        "[FCS in-process] Project-wide symbol search with grouped definitions/references and source-line context in one call. Better than chaining workspace_symbol + fcs_project_symbol_uses + shell reads. Caveat: misses record-field-set sites — use fcs_record_field_audit for those. projectDiagnostics scoped to matched files; errors-only on zero hits. Info/Hint filtered by default (set includeInfo=true). Mechanics: see docs/tools-detailed.md#fcs_find_symbol."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.FindSymbol args)))
                     |> unwrapResult
                 )

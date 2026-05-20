@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-05-20
+
+### Documentation
+
+- **Tool description schema documented + 5 over-long descriptions compressed.** An AI-engineer audit of all 32 tool registrations found 7× length variance (154-1096 chars). The longest five — `fcs_validate_snippet`, `fcs_nuget_types`, `fcs_record_field_audit`, `fcs_find_symbol`, `fcs_referenced_symbols` — were over-explaining implementation detail (temp-file splicing, walker internals, exact escape semantics) which belongs in deep docs, not the routing-prompt that LLMs read on every agent call. Compressed each to ≤500 chars following the new 5-slot schema (`[Tag] What + Prefer-X-over-Y + Key-params + Caveat + Cross-ref`); moved the implementation depth to a new `docs/tools-detailed.md` with one H2 section per compressed tool. Total system-prompt overhead dropped from 13,241 → 10,937 chars (-2,304 chars / ~575 tokens saved per agent call).
+- **3 FSAC tools gained "prefer FCS alternative" anti-recommendations.** `workspace_symbol`, `textDocument_completion`, `textDocument_definition` were positive-only ("useful for...") and didn't tell agents when to route to the agent-shaped FCS-side equivalents. Each now explicitly points to `fcs_find_symbol` / `fcs_symbol_at_word` / `fcs_type_at_position` for non-IDE workflows.
+- **15 Args records documented with `///` field doc-comments** (~74 fields across `CompletionArgs`, `PositionArgs`, `ReferencesArgs`, `SetProjectArgs`, `FSharpCompileArgs`, `ProjectHealthArgs`, `FcsParseAndCheckArgs`, `FcsFileSymbolsArgs`, `FcsFileOutlineArgs`, `FcsSymbolAtWordArgs`, `FSharpProjectInspectArgs`, `FcsSignatureHelpArgs`, `CodeActionArgs`, `RenameArgs`, `RuntimeStatusArgs`). Defaults are stated explicitly (verified against `defaultArg` sites in the handlers — no hallucinations). **Caveat for agent integrators**: confirmed that `///` doc-comments on F# record fields do NOT currently surface in the MCP JSON schema's `properties[x].description`. The value of this change is for IDE tooltips, source-readers, and future schema-gen work that may pick up XML docs — not (yet) for runtime agent arg-construction.
+- **New `docs/tool-description-schema.md`** documents the 5-slot schema for future tool authors with good-example + anti-pattern sections, so the next added tool stays within ~250-400 chars and includes a "prefer X over Y" callout when overlap exists.
+
+(No code or behaviour changes. v0.8.6 ships discoverability and documentation polish.)
+
 ## [0.8.5] - 2026-05-20
 
 ### Documentation
@@ -270,7 +281,8 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
   Earlier releases (0.2.0, 0.3.0, 0.3.1, 0.4.0) shipped without tags;
   backfilling them would point at synthetic refs.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.8.5...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.8.6...HEAD
+[0.8.6]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.8.6
 [0.8.5]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.8.5
 [0.8.4]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.8.4
 [0.8.3]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.8.3

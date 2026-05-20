@@ -18,23 +18,37 @@ type ToolError =
 // ─── Shared arg types ──────────────────────────────────────────────────────────
 
 type CompletionArgs =
-    { path: string
+    { /// Absolute path to an existing F# source file (.fs or .fsi).
+      path: string
+      /// 0-based line number (LSP convention).
       line: int
+      /// 0-based column number (LSP convention).
       character: int
+      /// Unsaved buffer content; when omitted, file is read from disk.
       text: string option
+      /// Single-character trigger that opened the completion list (e.g. "."). Omit for manual invocation.
       triggerCharacter: string option }
 
 type PositionArgs =
-    { path: string
+    { /// Absolute path to an existing F# source file (.fs or .fsi).
+      path: string
+      /// 0-based line number (LSP convention).
       line: int
+      /// 0-based column number (LSP convention).
       character: int
+      /// Unsaved buffer content; when omitted, file is read from disk.
       text: string option }
 
 type ReferencesArgs =
-    { path: string
+    { /// Absolute path to an existing F# source file (.fs or .fsi).
+      path: string
+      /// 0-based line number (LSP convention).
       line: int
+      /// 0-based column number (LSP convention).
       character: int
+      /// When true, include the declaration site in the results. Default false.
       includeDeclaration: bool option
+      /// Unsaved buffer content; when omitted, file is read from disk.
       text: string option }
 
 type WorkspaceSymbolArgs = { query: string }
@@ -50,33 +64,53 @@ type DiagnosticsArgs =
       severity: string option }
 
 type SetProjectArgs =
-    { projectPath: string
+    { /// Path to the .fsproj, .sln, .slnx, or directory to load. Required.
+      projectPath: string
+      /// Override the workspace root; when omitted, inferred from projectPath.
       workspacePath: string option
+      /// When true, restarts the FSAC process before loading. Default true.
       restartLsp: bool option }
 
 type FSharpCompileArgs =
-    { projectPath: string option
+    { /// .fsproj to compile. Falls back to active set_project when omitted.
+      projectPath: string option
+      /// Override workspace root for project resolution; rarely needed.
       workspacePath: string option
+      /// Timeout in milliseconds for ParseAndCheckProject. Default 60000 (60 s).
       timeoutMs: int option }
 
 type ProjectHealthArgs =
-    { projectPath: string option
+    { /// .fsproj, .sln, .slnx, or directory to inspect. Falls back to active set_project when omitted.
+      projectPath: string option
+      /// Override workspace root for resolution; rarely needed.
       workspacePath: string option
+      /// Reserved for future sub-report scoping; currently unused.
       scope: string option
+      /// Controls compile validation: "Skip" (default) | "UseCached". "UseCached" reports the last FCS parse result without re-running.
       compileCheck: string option }
 
 type FcsParseAndCheckArgs =
-    { path: string
+    { /// Absolute path to the F# source file to parse and typecheck.
+      path: string
+      /// Unsaved buffer content; when omitted, file is read from disk.
       text: string option
+      /// .fsproj for project context. Falls back to active set_project when omitted.
       projectPath: string option
+      /// Raw FCS OtherOptions list; overrides projectPath-derived options when provided.
       projectOptions: string list option }
 
 type FcsFileSymbolsArgs =
-    { path: string
+    { /// Absolute path to the F# source file to extract symbols from.
+      path: string
+      /// Unsaved buffer content; when omitted, file is read from disk.
       text: string option
+      /// .fsproj for project context. Falls back to active set_project when omitted.
       projectPath: string option
+      /// Raw FCS OtherOptions list; overrides projectPath-derived options when provided.
       projectOptions: string list option
+      /// When true, return all uses (locals, parameters, usages) in addition to definitions. Default false.
       includeAllUses: bool option
+      /// Maximum symbols returned. Default 200.
       maxResults: int option }
 
 type FcsProjectSymbolUsesArgs =
@@ -126,12 +160,19 @@ type FcsFindMemberUsagesArgs =
       cursor: string option }
 
 type FcsFileOutlineArgs =
-    { path: string
+    { /// Absolute path to the F# source file to outline.
+      path: string
+      /// Unsaved buffer content; when omitted, file is read from disk.
       text: string option
+      /// .fsproj for project context. Falls back to active set_project when omitted.
       projectPath: string option
+      /// Raw FCS OtherOptions list; overrides projectPath-derived options when provided.
       projectOptions: string list option
+      /// When true, include private members. Default true.
       includePrivate: bool option
+      /// When true, include local bindings and parameters (noisy). Default false.
       includeLocal: bool option
+      /// Maximum symbols returned. Default 200.
       maxResults: int option }
 
 type FcsFindSymbolArgs =
@@ -153,13 +194,21 @@ type FcsFindSymbolArgs =
       cursor: string option }
 
 type FcsSymbolAtWordArgs =
-    { path: string
+    { /// Absolute path to the F# source file containing the word.
+      path: string
+      /// 0-based line number where the word appears (LSP convention).
       line: int
+      /// Identifier to locate on the line; when omitted, falls back to column-based scan.
       word: string option
+      /// 0-based index among multiple occurrences of `word` on the line. Default -1 (first match).
       occurrence: int option
+      /// Unsaved buffer content; when omitted, file is read from disk.
       text: string option
+      /// .fsproj for project context. Falls back to active set_project when omitted.
       projectPath: string option
+      /// Raw FCS OtherOptions list; overrides projectPath-derived options when provided.
       projectOptions: string list option
+      /// When true, include XML-doc text in the response. Default false.
       includeDocumentation: bool option }
 
 type FcsProjectOutlineArgs =
@@ -183,11 +232,17 @@ type FcsProjectOutlineArgs =
       nameContains: string list option }
 
 type FSharpProjectInspectArgs =
-    { projectPath: string option
+    { /// .fsproj to inspect. Falls back to active set_project when omitted.
+      projectPath: string option
+      /// Override workspace root for resolution; rarely needed.
       workspacePath: string option
+      /// Reserved for future sub-report scoping; currently unused.
       scope: string option
+      /// When true, include generated/build-artifact source files in the compile order. Default false.
       includeGeneratedFiles: bool option
+      /// When true, include version, includeAssets, and privateAssets per package reference. Default true.
       includePackageDetails: bool option
+      /// When true, include the raw FCS OtherOptions array in the response. Default false.
       includeResolvedOptions: bool option }
 
 type FcsTypeAtPositionArgs =
@@ -236,26 +291,41 @@ type FcsValidateSnippetArgs =
       projectPath: string option }
 
 type FcsSignatureHelpArgs =
-    { path: string
+    { /// Absolute path to the F# source file containing the call site.
+      path: string
+      /// 0-based line number of the call site (LSP convention).
       line: int
+      /// 0-based column number inside or just after the opening parenthesis (LSP convention).
       character: int
+      /// Unsaved buffer content; when omitted, file is read from disk.
       text: string option
+      /// .fsproj for project context. Falls back to active set_project when omitted.
       projectPath: string option
+      /// Raw FCS OtherOptions list; overrides projectPath-derived options when provided.
       projectOptions: string list option }
 
 type FormattingArgs = { path: string; text: string option }
 
 type CodeActionArgs =
-    { path: string
+    { /// Absolute path to the F# source file at which to request code actions.
+      path: string
+      /// 0-based line number of the target position (LSP convention).
       line: int
+      /// 0-based column number of the target position (LSP convention).
       character: int
+      /// Unsaved buffer content; when omitted, file is read from disk.
       text: string option }
 
 type RenameArgs =
-    { path: string
+    { /// Absolute path to the F# source file containing the symbol to rename.
+      path: string
+      /// 0-based line number of the symbol (LSP convention).
       line: int
+      /// 0-based column number of the symbol (LSP convention).
       character: int
+      /// New identifier to assign across the workspace. Required.
       newName: string
+      /// Unsaved buffer content; when omitted, file is read from disk.
       text: string option }
 
 [<CLIMutable>]
@@ -284,9 +354,13 @@ type FslangmcpVersionArgs =
       _placeholder: bool option }
 
 type RuntimeStatusArgs =
-    { includeFcsCacheStats: bool option
+    { /// When true, include FCS checker configuration flags and project-results cache size. Default true.
+      includeFcsCacheStats: bool option
+      /// When true, include the count of loaded assemblies in the process. Default true.
       includeAssemblyCounts: bool option
+      /// When true, include the FSAC child-process working set stats. Default true.
       includeChildProcesses: bool option
+      /// When true, include the MCP server and FSAC process IDs. Default true.
       includeProcessIds: bool option }
 
 // ─── CLI parse result ──────────────────────────────────────────────────────────
