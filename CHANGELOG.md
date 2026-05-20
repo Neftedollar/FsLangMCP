@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-05-21
+
+### Documentation
+
+- **`AGENT_INTEGRATION.md` added at repo root** (158 + 16-line refresh = 174 lines). Salvaged from a prior orphan branch (`docs/agent-integration-guide`, authored 2026-05-17), then surgically refreshed for tools shipped since: boundary heuristic table now points to `fcs_nuget_types` / `fcs_referenced_symbols` (v0.7.0, #113) for NuGet type enumeration instead of `dotnet fsi + reflection`; points to `fcs_validate_snippet` with `mode="fsi"` (v0.7.0, #112) for `.fsi` sketch validation instead of "until `parse_fsi_sketch` lands". Subagent-brief template lists newer tools (`fcs_suggest_open` from v0.9.0 #67, `fcs_record_field_audit` from v0.8.0 #117). "See also" footer links `docs/troubleshooting.md` and `docs/tool-description-schema.md`. CLAUDE.md referenced this file as the canonical multi-agent integration guide for distribution to other contributors — now the file actually exists.
+- **`CONTRIBUTING.md` added at repo root** (86 lines). Build + test commands with current 289-test baseline. Step-by-step walkthrough for "Adding a new MCP tool" referencing real files (Types.fs args records with `///` docs, FcsBridge member implementation, Program.fs `TypedTool.define` registration, description per `docs/tool-description-schema.md`, regression tests). Repo conventions (no `Co-Authored-By`, F# style, warnings-as-errors via `Directory.Build.props`, `ArgsValidation.requireNonBlank` at Types.fs:415, proof-by-breaking for regression tests). PR process. Bug/feature reporting routes (issue #100 catch-all for usage feedback, dedicated issues for concrete bugs).
+- **`docs/architecture.md` added** (102 lines). High-level diagram showing the two-bridge architecture (stdio MCP transport → `FsAutoCompleteBridge` for fsautocomplete child process + `FcsBridge` for in-process FCS). File-by-file tour in compile order matching `FsLangMcp.fsproj`. Design-choice paragraphs covering: two-bridge rationale, Workstation+Concurrent GC defaults (v0.5.1 fix for stdio MCP bursty workload), tool-description schema enforcement (~2700-token system-prompt budget), structured error envelope (v0.8.2 #120). "Where to add things" pointers cross-link to CONTRIBUTING.md and the schema doc.
+- **`docs/roadmap.md` added** (51 lines). Pre-1.0 status. **1.0 exit criteria** (concrete, testable): all #100-class blockers closed, surface stable across 3 consecutive minor releases, `///` field docs surface in MCP JSON schema (currently they don't — see v0.8.6 CHANGELOG), VS.Threading bind race fully closed (v0.8.2 #121 partial), performance baselines (warm `set_project` ≤2s on 10-project solution; cold `fcs_record_field_audit` ≤5s on 50k-LOC project), documentation reflects current surface, ≥1 third-party adoption report. **Deferred items** with issue links. **"Will NOT do"** section: not competing with Ionide for editor use, not replacing `dotnet build` for ground-truth project validation, not adding Paket support.
+- **README polish**:
+  - Two new shields.io badges: `nuget/dt/FsLangMcp` (downloads total) and `badge/target-net10.0`.
+  - New `### When to use FsLangMcp (vs alternatives)` subsection between Components and Quickstart — three concrete "if your agent needs X, use Y" bullets covering raw FSAC, FsLangMcp itself, and raw FCS.
+  - New "Which 'check this code' tool" callout inside the FCS in-process section before the tool table — explicit decision tree for `fcs_parse_and_check_file` / `fcs_check_file` / `fsharp_compile`.
+
+(No code or behaviour changes. Closes the remaining developer-advocate audit findings; 1.0 readiness is now a documented track, not a vibe.)
+
 ## [0.9.0] - 2026-05-20
 
 ### Added
@@ -299,7 +314,8 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
   Earlier releases (0.2.0, 0.3.0, 0.3.1, 0.4.0) shipped without tags;
   backfilling them would point at synthetic refs.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.9.1
 [0.9.0]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.9.0
 [0.8.6]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.8.6
 [0.8.5]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.8.5

@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/Neftedollar/FsLangMCP/actions/workflows/ci.yml/badge.svg)](https://github.com/Neftedollar/FsLangMCP/actions/workflows/ci.yml)
 [![NuGet](https://img.shields.io/nuget/v/FsLangMcp.svg)](https://www.nuget.org/packages/FsLangMcp/)
+[![Downloads](https://img.shields.io/nuget/dt/FsLangMcp.svg)](https://www.nuget.org/packages/FsLangMcp/)
+[![Target](https://img.shields.io/badge/target-net10.0-blue.svg)](https://dotnet.microsoft.com/)
 
 FsLangMcp is an MCP server for AI coding agents working on F# projects. It combines `fsautocomplete` (LSP-shaped editor semantics) and `FSharp.Compiler.Service` (in-process compiler semantics) into a single stdio process with 32 tools designed for agent workflows. Responses are paginated, errors are returned as structured `invalid_args` envelopes, `fcs_check_file` invalidates stale caches after edits, `fcs_validate_snippet` compiles arbitrary F# against your project's references, and `fcs_record_field_audit` catches the record-construction sites that textual search misses.
 
@@ -13,6 +15,20 @@ See the [Quickstart](#quickstart) for the 60-second on-ramp.
 - `FSharp.Compiler.Service` (compiler-semantic features for AI workflows)
 
 > Work in progress: APIs and tool shapes may still change.
+
+### When to use FsLangMcp (vs alternatives)
+
+- **If your agent only needs editor-position queries** (completion at cursor,
+  go-to-definition at cursor, hover-type at cursor), `fsautocomplete` alone
+  via a thin MCP wrapper is sufficient.
+- **If you need project-wide search**, cache-aware reanalysis after edits,
+  snippet validation against the loaded project's NuGet references, or
+  paginated outlines that fit a 200k-token context — FsLangMcp adds the
+  agent-shaped surface that raw FSAC + raw FCS don't expose.
+- **If you need raw FCS access** (custom analyzer development, language-
+  server-side IDE integration), use FCS directly in your own process —
+  FsLangMcp is opinionated about response shapes for agents and doesn't
+  expose every FCS knob.
 
 ## Quickstart
 
@@ -85,6 +101,11 @@ All require a prior `set_project`. Tagged `[FSAC]` in tool descriptions.
 ### FCS in-process tools (compiler semantics)
 
 Tagged `[FCS in-process]` in tool descriptions. Most accept an optional `projectPath` that falls back to the active `set_project`.
+
+**Which "check this code" tool should I use?**
+- `fcs_parse_and_check_file` — default. Parse + typecheck one file, returns diagnostics. Cached.
+- `fcs_check_file` — same as above, but invalidates the project's cached options + results first. Use when `workspace_diagnostics` looks stale right after an Edit/Write.
+- `fsharp_compile` — full project `ParseAndCheckProject`. Slowest but most thorough for project-wide validation. For absolute ground-truth across project boundaries, `dotnet build` is still authoritative.
 
 | Tool | What it does |
 |------|--------------|
