@@ -408,6 +408,29 @@ type FcsCheckCompileOrderArgs =
       /// leftmost identifier in an FS0039 "X is not defined" error). Omit to check all.
       symbol: string option }
 
+/// Arguments for fcs_refactor_impact — a read-only "what will this change affect, and
+/// what should I verify?" planning preview. Orchestrates the existing find sweep,
+/// tests-for-symbol, compile-order, public-api, and (optionally) rename-preview backends
+/// into one blast-radius + verification-checklist synthesis. Writes nothing.
+type FcsRefactorImpactArgs =
+    { /// The symbol about to change (by name). Use this OR a position (path + line + character).
+      symbol: string option
+      /// File context for a position-anchored target (e.g. the symbol under the cursor for a
+      /// rename). Pairs with line/character; the symbol name is resolved at that position.
+      path: string option
+      /// 0-based line (LSP convention) of the position-anchored target. Pairs with path.
+      line: int option
+      /// 0-based column (LSP convention) of the position-anchored target. Pairs with path.
+      character: int option
+      /// New identifier, when a rename is contemplated. Enables the best-effort rename-preview
+      /// edit set (requires a position) and selects kind=rename under kind="auto".
+      newName: string option
+      /// Intended change: "rename" | "signature" | "move" | "delete" | "auto" (default).
+      /// auto infers from inputs (newName ⇒ rename, else a generic blast-radius sweep).
+      kind: string option
+      /// .fsproj / .sln / .slnx to sweep. Falls back to the active set_project.
+      projectPath: string option }
+
 type FcsNugetTypesArgs =
     { /// Package id (matched against referenced assembly SimpleName, case-insensitive).
       /// Example: "Spectre.Console", "Newtonsoft.Json", "System.Text.Json".

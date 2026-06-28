@@ -33,6 +33,7 @@
     <Compile Include="ExplainDiagnosticTests.fs" />
     <Compile Include="DiagnosticFixesTests.fs" />
     <Compile Include="PublicApiTests.fs" />
+    <Compile Include="RefactorImpactTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

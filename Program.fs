@@ -616,6 +616,20 @@ let main argv =
                     |> unwrapResult
                 )
 
+                tool (
+                    TypedTool.define<FcsRefactorImpactArgs>
+                        "fcs_refactor_impact"
+                        "Preview a change's blast radius + a verify checklist WITHOUT editing. Orchestrates find (cross-project use sites), fcs_tests_for_symbol, fcs_check_compile_order (kind=move) and fcs_public_api (kind=signature|delete, when public) into { target, impact, tests, compileOrder?, apiSurface?, verify[] }. Pass `symbol` or path+line+character; kind=rename|signature|move|delete|auto. Use before a rename/move/delete; prefer `fcs_rename_preview` for the exact edits, this for project-wide impact."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (
+                                runLimited fcsGate (fun () ->
+                                    fcsBridge.RefactorImpact(args, (fun rp -> bridge.RenamePreview rp)))))
+                    |> unwrapResult
+                )
+
                 useStdio
             }
 

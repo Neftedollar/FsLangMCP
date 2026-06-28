@@ -6463,3 +6463,483 @@ type internal FcsBridge() =
                       "problemCount", jint problems.Count ]
                 :> JsonNode
         }
+
+    // ── fcs_refactor_impact (#71): read-only blast-radius + verification preview ──────
+    // ORCHESTRATES the existing backends — it adds no new analysis, only synthesis:
+    //   • Find          → all cross-project use sites, the projects + files they touch;
+    //   • TestsForSymbol → the tests that cover the symbol (run-these list);
+    //   • CheckCompileOrder (kind=move) → forward-reference / <Compile>-order risk;
+    //   • PublicApi (kind=signature|delete, target public) → breaking-surface flag;
+    //   • RenamePreview (kind=rename, injected FSAC probe) → exact edit count, best-effort.
+    // The `verify` array is a human-readable checklist distilled from the above. The
+    // RenamePreview probe is injected (mirrors Find's fsacProbe) so this FCS member stays
+    // LSP-agnostic and degrades cleanly when FSAC is unavailable. Writes nothing.
+    member this.RefactorImpact
+        (args: FcsRefactorImpactArgs, ?renamePreview: RenamePreviewArgs -> Task<JsonNode>)
+        : Task<JsonNode> =
+        task {
+            // ── Defensive JsonNode readers (orchestrated payloads are always objects) ──
+            let readStr (node: JsonNode) (key: string) : string option =
+                try
+                    match node[key] with
+                    | null -> None
+                    | v -> Some(v.GetValue<string>())
+                with _ ->
+                    None
+
+            let readInt (node: JsonNode) (key: string) : int option =
+                try
+                    match node[key] with
+                    | null -> None
+                    | v -> Some(v.GetValue<int>())
+                with _ ->
+                    None
+
+            let readBool (node: JsonNode) (key: string) : bool option =
+                try
+                    match node[key] with
+                    | null -> None
+                    | v -> Some(v.GetValue<bool>())
+                with _ ->
+                    None
+
+            let arrayOf (node: JsonNode) (key: string) : JsonNode array =
+                try
+                    match node[key] with
+                    | :? JsonArray as a -> a |> Seq.toArray
+                    | _ -> [||]
+                with _ ->
+                    [||]
+
+            // ── Resolve the target: a symbol name, or a position to resolve it from ──
+            let symbolValue = args.symbol |> Option.map (fun s -> s.Trim())
+            let hasSymbol = symbolValue |> Option.exists (String.IsNullOrWhiteSpace >> not)
+
+            let hasPosition =
+                (args.path |> Option.exists (String.IsNullOrWhiteSpace >> not)) && args.line.IsSome
+
+            if not hasSymbol && not hasPosition then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr "fcs_refactor_impact needs a target: pass `symbol`, or `path` + `line` (+ `character`)." ]
+                    :> JsonNode
+            else
+
+            let kindRaw = (args.kind |> Option.defaultValue "auto").Trim().ToLowerInvariant()
+
+            let kindKnown = set [ "rename"; "signature"; "move"; "delete"; "auto" ]
+
+            let kindResolved =
+                let k = if kindKnown.Contains kindRaw then kindRaw else "auto"
+
+                if k = "auto" then
+                    if args.newName |> Option.exists (String.IsNullOrWhiteSpace >> not) then
+                        "rename"
+                    else
+                        "auto"
+                else
+                    k
+
+            let resolvedVia = if hasSymbol then "symbol" else "position"
+
+            // One Find call gives BOTH the cross-project blast radius AND (for a position
+            // target) the resolved symbol name — Find echoes it back in `query`.
+            let baseFind: FindArgs =
+                { query = "_"
+                  kind = None
+                  scope = Some "workspace"
+                  exact = Some true
+                  ``member`` = None
+                  field = None
+                  path = args.path
+                  line = args.line
+                  word = None
+                  occurrence = None
+                  character = args.character
+                  contextLines = Some 0
+                  includeDeclaration = Some true
+                  includeInfo = Some false
+                  projectPath = args.projectPath
+                  maxResults = Some 1000
+                  cursor = None }
+
+            let findArgs =
+                if hasSymbol then
+                    { baseFind with
+                        query = symbolValue |> Option.defaultValue "_"
+                        kind = Some "auto" }
+                else
+                    { baseFind with kind = Some "position" }
+
+            let! findResult = this.Find(findArgs)
+            let findStatus = readStr findResult "status" |> Option.defaultValue "unknown"
+
+            if findStatus <> "succeeded" then
+                return
+                    jobj
+                        [ "status", jstr findStatus
+                          "stage", jstr "find-sweep"
+                          "message",
+                          (readStr findResult "message"
+                           |> Option.map jstr
+                           |> Option.defaultValue (jstr "could not resolve the target symbol from the given inputs")) ]
+                    :> JsonNode
+            else
+
+            let resolvedName =
+                readStr findResult "query"
+                |> Option.orElse symbolValue
+                |> Option.defaultValue ""
+
+            let totalSites = readInt findResult "totalSites" |> Option.defaultValue 0
+
+            let matched =
+                match findResult["resolution"] with
+                | null -> totalSites > 0
+                | res -> readBool res "matched" |> Option.defaultValue (totalSites > 0)
+
+            // ── Impact: files + projects the sites touch ─────────────────────────────
+            let sites = arrayOf findResult "sites"
+            let perProject = arrayOf findResult "perProject"
+
+            let fileOf (s: JsonNode) = readStr s "file" |> Option.defaultValue ""
+            let projOf (s: JsonNode) = readStr s "project" |> Option.defaultValue ""
+            let kindOf (s: JsonNode) = readStr s "kind" |> Option.defaultValue ""
+
+            let affectedFiles =
+                sites
+                |> Array.map fileOf
+                |> Array.filter (String.IsNullOrWhiteSpace >> not)
+                |> Array.distinct
+                |> Array.sort
+
+            let fileCount = affectedFiles.Length
+
+            let byProject =
+                sites
+                |> Array.map projOf
+                |> Array.filter (String.IsNullOrWhiteSpace >> not)
+                |> Array.countBy id
+                |> Array.sortByDescending snd
+
+            let projectCount = byProject.Length
+            let crossProject = projectCount > 1
+
+            let fsprojForProject (proj: string) =
+                perProject
+                |> Array.tryPick (fun p ->
+                    match readStr p "project" with
+                    | Some pn when String.Equals(pn, proj, StringComparison.Ordinal) -> readStr p "fsproj"
+                    | _ -> None)
+
+            let sitesByProjectNodes =
+                byProject
+                |> Array.map (fun (proj, n) ->
+                    let baseProps = [ "project", jstr proj; "sites", jint n ]
+
+                    let props =
+                        match fsprojForProject proj with
+                        | Some f -> baseProps @ [ "fsproj", jstr f ]
+                        | None -> baseProps
+
+                    jobj props :> JsonNode)
+
+            // The project that DEFINES the target — used to scope the public-API check.
+            let definingFsproj =
+                sites
+                |> Array.tryFind (fun s -> kindOf s = "definition")
+                |> Option.map fileOf
+                |> Option.bind (fun f -> if String.IsNullOrWhiteSpace f then None else findNearestFsproj f)
+                |> Option.map normalizePath
+                |> Option.orElseWith (fun () ->
+                    match args.projectPath with
+                    | Some p when p.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) -> Some(normalizePath p)
+                    | _ -> byProject |> Array.tryHead |> Option.bind (fst >> fsprojForProject))
+
+            // ── Tests that cover the symbol (always) ─────────────────────────────────
+            let! testsResult =
+                this.TestsForSymbol
+                    { symbolQuery = resolvedName
+                      exact = Some true
+                      path = None
+                      text = None
+                      projectPath = args.projectPath
+                      maxResults = Some 100 }
+
+            let testSites = arrayOf testsResult "tests"
+            let testCount = readInt testsResult "testCount" |> Option.defaultValue testSites.Length
+
+            let testNodes =
+                testSites
+                |> Array.map (fun t ->
+                    jobj
+                        [ "file", jstrOrNull (readStr t "file" |> Option.defaultValue "")
+                          "enclosingTest", jstrOrNull (readStr t "enclosingTest" |> Option.defaultValue "")
+                          "project", jstrOrNull (readStr t "project" |> Option.defaultValue "") ]
+                    :> JsonNode)
+
+            let enclosingTestNames =
+                testSites
+                |> Array.choose (fun t -> readStr t "enclosingTest")
+                |> Array.distinct
+                |> Array.sort
+
+            // ── Compile-order risk (kind=move) ───────────────────────────────────────
+            let mutable compileOrderNode: JsonNode option = None
+            let mutable compileProblemCount = 0
+            let mutable compileFirstFix = ""
+
+            if kindResolved = "move" then
+                let! co = this.CheckCompileOrder { projectPath = args.projectPath; symbol = Some resolvedName }
+                let probs = arrayOf co "compileOrderProblems"
+                compileProblemCount <- readInt co "problemCount" |> Option.defaultValue probs.Length
+
+                compileFirstFix <-
+                    if probs.Length > 0 then
+                        readStr probs[0] "fix" |> Option.defaultValue ""
+                    else
+                        ""
+
+                let problemsClone =
+                    match co["compileOrderProblems"] with
+                    | null -> JsonArray() :> JsonNode
+                    | n -> n.DeepClone()
+
+                compileOrderNode <-
+                    Some(jobj [ "problemCount", jint compileProblemCount; "problems", problemsClone ] :> JsonNode)
+
+            // ── Public-API breaking surface (kind=signature|delete) ──────────────────
+            let wantApi = kindResolved = "signature" || kindResolved = "delete"
+            let mutable apiSurfaceNode: JsonNode option = None
+            let mutable apiIsPublic = false
+
+            if wantApi then
+                match definingFsproj with
+                | None ->
+                    apiSurfaceNode <-
+                        Some(
+                            jobj
+                                [ "isPublic", jbool false
+                                  "affectedPublicMembers", JsonArray() :> JsonNode
+                                  "note", jstr "could not resolve the defining project for the target" ]
+                            :> JsonNode
+                        )
+                | Some fsproj ->
+                    let! api =
+                        this.PublicApi
+                            { projectPath = Some fsproj
+                              includeInternal = Some false
+                              namespaceFilter = None
+                              maxResults = Some 1000
+                              cursor = None }
+
+                    let entities = arrayOf api "entities"
+                    let affected = ResizeArray<JsonNode>()
+
+                    for e in entities do
+                        let efull = readStr e "fullName" |> Option.defaultValue ""
+
+                        let lastSeg =
+                            let idx = efull.LastIndexOf '.'
+
+                            if idx >= 0 && idx < efull.Length - 1 then
+                                efull.Substring(idx + 1)
+                            else
+                                efull
+
+                        if String.Equals(lastSeg, resolvedName, StringComparison.Ordinal) then
+                            affected.Add(
+                                jobj
+                                    [ "entity", jstr efull
+                                      "member", jstrOrNull ""
+                                      "kind", jstr (readStr e "kind" |> Option.defaultValue "")
+                                      "signature", jstr efull ]
+                                :> JsonNode
+                            )
+
+                        for m in arrayOf e "members" do
+                            match readStr m "name" with
+                            | Some mn when String.Equals(mn, resolvedName, StringComparison.Ordinal) ->
+                                affected.Add(
+                                    jobj
+                                        [ "entity", jstr efull
+                                          "member", jstr mn
+                                          "kind", jstr (readStr m "kind" |> Option.defaultValue "")
+                                          "signature", jstr (readStr m "signature" |> Option.defaultValue "") ]
+                                    :> JsonNode
+                                )
+                            | _ -> ()
+
+                    apiIsPublic <- affected.Count > 0
+
+                    apiSurfaceNode <-
+                        Some(
+                            jobj
+                                [ "isPublic", jbool apiIsPublic
+                                  "project", jstr fsproj
+                                  "affectedPublicMembers", JsonArray(affected.ToArray()) :> JsonNode ]
+                            :> JsonNode
+                        )
+
+            // ── Rename preview (kind=rename) — best-effort, injected FSAC probe ───────
+            let mutable renamePreviewNode: JsonNode option = None
+            let mutable renameAvailable = false
+            let mutable renameEdits = 0
+            let mutable renameFiles = 0
+
+            match renamePreview with
+            | Some probe when kindResolved = "rename" ->
+                match args.newName, args.path, args.line, args.character with
+                | Some nn, Some p, Some ln, Some ch when
+                    (not (String.IsNullOrWhiteSpace nn)) && (not (String.IsNullOrWhiteSpace p))
+                    ->
+                    try
+                        let! rp =
+                            probe
+                                { path = p
+                                  line = ln
+                                  character = ch
+                                  newName = nn
+                                  text = None }
+
+                        let st = readStr rp "status" |> Option.defaultValue "unknown"
+
+                        if st = "ok" then
+                            renameAvailable <- true
+                            renameEdits <- readInt rp "totalEdits" |> Option.defaultValue 0
+                            renameFiles <- readInt rp "fileCount" |> Option.defaultValue 0
+
+                            renamePreviewNode <-
+                                Some(
+                                    jobj
+                                        [ "status", jstr "ok"
+                                          "totalEdits", jint renameEdits
+                                          "fileCount", jint renameFiles
+                                          "crossProject", jbool (readBool rp "crossProject" |> Option.defaultValue false) ]
+                                    :> JsonNode
+                                )
+                        else
+                            renamePreviewNode <-
+                                Some(
+                                    jobj
+                                        [ "status", jstr st
+                                          "note", jstr "rename preview returned no edits — relying on find sites" ]
+                                    :> JsonNode
+                                )
+                    with ex ->
+                        renamePreviewNode <-
+                            Some(jobj [ "status", jstr "unavailable"; "note", jstr ex.Message ] :> JsonNode)
+                | _ ->
+                    renamePreviewNode <-
+                        Some(
+                            jobj
+                                [ "status", jstr "skipped"
+                                  "note", jstr "rename preview needs newName + path + line + character" ]
+                            :> JsonNode
+                        )
+            | _ -> ()
+
+            // ── verify: human-readable checklist distilled from the sections above ───
+            let verify = ResizeArray<string>()
+
+            if (not matched) || totalSites = 0 then
+                verify.Add(
+                    $"no use sites found for '{resolvedName}' — it may be unused, dynamically referenced, or the name is wrong; double-check before changing it"
+                )
+            elif crossProject then
+                let projectNamesStr = byProject |> Array.map fst |> String.concat ", "
+
+                verify.Add(
+                    $"{totalSites} cross-project site(s) across {projectCount} projects ({projectNamesStr}) — rebuild all affected projects"
+                )
+            else
+                verify.Add($"{totalSites} site(s) in {fileCount} file(s) within one project — re-check the project after the change")
+
+            if testCount > 0 then
+                let namesStr =
+                    if enclosingTestNames.Length > 0 then
+                        enclosingTestNames |> Array.truncate 10 |> String.concat ", "
+                    else
+                        "(see tests list)"
+
+                verify.Add($"{testCount} test reference(s) cover '{resolvedName}' — run: {namesStr}")
+
+            if wantApi then
+                if apiIsPublic then
+                    verify.Add(
+                        $"'{resolvedName}' is part of the public API surface — this is a BREAKING change; bump the minor version and update consumers"
+                    )
+                else
+                    verify.Add($"'{resolvedName}' is not on the public API surface — the change stays internal")
+
+            if kindResolved = "move" then
+                if compileProblemCount > 0 then
+                    let fixHint =
+                        if String.IsNullOrWhiteSpace compileFirstFix then
+                            "reorder the <Compile> entries"
+                        else
+                            compileFirstFix
+
+                    verify.Add($"compile-order risk: {compileProblemCount} forward-reference problem(s) — {fixHint}")
+                else
+                    verify.Add(
+                        "no compile-order problems at the current file positions; re-run `check` after moving the file or definition"
+                    )
+
+            if kindResolved = "rename" then
+                if renameAvailable then
+                    let renameTo = args.newName |> Option.defaultValue "?"
+
+                    verify.Add(
+                        $"rename '{resolvedName}' -> '{renameTo}' touches {renameEdits} edit(s) in {renameFiles} file(s); `fcs_rename_preview` has the exact edit set"
+                    )
+                else
+                    verify.Add("rename preview unavailable (FSAC) — use the find sites as the edit set")
+
+            // ── Assemble ─────────────────────────────────────────────────────────────
+            let targetNode =
+                jobj
+                    ([ "symbol", jstr resolvedName ]
+                     @ (match args.path with
+                        | Some p when not (String.IsNullOrWhiteSpace p) -> [ "path", jstr (normalizePath p) ]
+                        | _ -> [])
+                     @ (match args.line with
+                        | Some l -> [ "line", jint l ]
+                        | None -> [])
+                     @ (match args.character with
+                        | Some c -> [ "character", jint c ]
+                        | None -> [])
+                     @ [ "resolvedVia", jstr resolvedVia ])
+                :> JsonNode
+
+            let impactNode =
+                jobj
+                    [ "totalSites", jint totalSites
+                      "fileCount", jint fileCount
+                      "projectCount", jint projectCount
+                      "crossProject", jbool crossProject
+                      "sitesByProject", JsonArray(sitesByProjectNodes) :> JsonNode
+                      "affectedFiles", JsonArray(affectedFiles |> Array.map jstr) :> JsonNode ]
+                :> JsonNode
+
+            let testsNode =
+                jobj [ "count", jint testCount; "tests", JsonArray(testNodes) :> JsonNode ] :> JsonNode
+
+            let baseProps =
+                [ "status", jstr "succeeded"
+                  "target", targetNode
+                  "kind", jstr kindResolved
+                  "impact", impactNode
+                  "tests", testsNode ]
+
+            let optionalProps =
+                (compileOrderNode |> Option.map (fun n -> [ "compileOrder", n ]) |> Option.defaultValue [])
+                @ (apiSurfaceNode |> Option.map (fun n -> [ "apiSurface", n ]) |> Option.defaultValue [])
+                @ (renamePreviewNode |> Option.map (fun n -> [ "renamePreview", n ]) |> Option.defaultValue [])
+
+            let verifyProp = [ "verify", JsonArray(verify.ToArray() |> Array.map jstr) :> JsonNode ]
+
+            return jobj (baseProps @ optionalProps @ verifyProp) :> JsonNode
+        }
