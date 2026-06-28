@@ -227,73 +227,15 @@ let main argv =
                 tool (
                     TypedTool.define<CompletionArgs>
                         "textDocument_completion"
-                        "[FSAC] Raw LSP proxy to fsautocomplete textDocument/completion. Exact-position IDE primitive; requires set_project first. line/character are 0-based. Pass 'text' for unsaved content. Avoid for free-form agent flows — completion is exact-position editor IO; for symbol semantics use fcs_symbol_at_word or fcs_type_at_position instead."
+                        "Raw LSP proxy to fsautocomplete textDocument/completion. Exact-position IDE primitive; requires set_project first. line/character are 0-based. Pass 'text' for unsaved content. Avoid for free-form agent flows — completion is exact-position editor IO; for symbol semantics use fcs_symbol_at_word or fcs_type_at_position instead."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Completion args)))
-                    |> unwrapResult
-                )
-
-                tool (
-                    TypedTool.define<PositionArgs>
-                        "textDocument_definition"
-                        "[FSAC] Raw LSP proxy to fsautocomplete textDocument/definition. Exact-position IDE primitive; requires set_project first. line/character are 0-based. Pass 'text' for unsaved content. Prefer fcs_find_symbol for agent flows — it returns grouped definitions+references and works without exact cursor position. Prefer find for cross-project work."
-                        (fun args ->
-                            toolResult (
-                                runLimited lspGate (fun () ->
-                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.Definition args))))
-                    |> unwrapResult
-                )
-
-                tool (
-                    TypedTool.define<ReferencesArgs>
-                        "textDocument_references"
-                        "[FSAC] Raw LSP proxy to fsautocomplete textDocument/references. Exact-position IDE primitive; requires set_project first. For query-based agent workflows prefer project symbol-use tools. line/character are 0-based. Pass 'text' for unsaved content. Prefer find for cross-project work."
-                        (fun args ->
-                            toolResult (
-                                runLimited lspGate (fun () ->
-                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.References args))))
-                    |> unwrapResult
-                )
-
-                tool (
-                    TypedTool.define<WorkspaceSymbolArgs>
-                        "workspace_symbol"
-                        "[FSAC] Raw LSP proxy to fsautocomplete workspace/symbol. Useful for quick lookup after set_project, but returns IDE-shaped results without source context. Prefer fcs_find_symbol for agent workflows — it returns grouped definitions+references with source-line context in one call. Prefer find for cross-project work."
-                        (fun args ->
-                            toolResult (
-                                runLimited lspGate (fun () ->
-                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.WorkspaceSymbol args))))
-                    |> unwrapResult
-                )
-
-                tool (
-                    TypedTool.define<DiagnosticsArgs>
-                        "workspace_diagnostics"
-                        "[FSAC] Cached LSP publishDiagnostics payload, scoped to one file or the whole workspace. Requires `set_project` first. If diagnostics look stale right after Edit/Write, fall back to `fcs_check_file`. Optional: `path` (single file), `fileGlob` (e.g. `\"src/Adapters/*.fs\"` — narrows the workspace dict; ignored when `path` is set), `severity` (`error`|`warning`|`information`|`hint` — filters per file; empty entries dropped). Does not run build/tests. Prefer check for a yes/no verdict."
-                        (fun args ->
-                            toolResult (
-                                runLimited lspGate (fun () ->
-                                    Dispatcher.CheckDispatch.run fcsBridge bridge (Dispatcher.Diagnostics args))))
-                    |> unwrapResult
-                )
-
-                tool (
-                    TypedTool.define<FSharpCompileArgs>
-                        "fsharp_compile"
-                        "[FCS in-process] Agent-friendly FCS project validation — loads project options via Ionide.ProjInfo, then runs `FSharpChecker.ParseAndCheckProject`. Prefer `dotnet build` for IL emission and cross-project ground truth; use this for cheap type-check-only validation. `projectPath` is optional after `set_project`. Does not run tests, does not emit assemblies. Prefer check for a yes/no verdict."
-                        (fun args ->
-                            let args =
-                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
-
-                            toolResult (
-                                runLimited fcsGate (fun () ->
-                                    Dispatcher.CheckDispatch.run fcsBridge bridge (Dispatcher.Compile args))))
                     |> unwrapResult
                 )
 
                 tool (
                     TypedTool.define<CheckArgs>
                         "check"
-                        "[FSAC] One trustworthy verdict for the active F# context. Bare check() suffices: returns `verdict` (clean|errors|unknown) after a FRESH in-process type-check, so it never reports a stale-`{}` false-clean and you don't fall back to dotnet build. Optional: scope (auto|file|project|workspace|snippet), path, snippet (inline source), speed (trusted default | fast = cached FSAC snapshot), severity. Prefer over workspace_diagnostics / fcs_check_file when you just need a yes/no answer."
+                        "One trustworthy verdict for the active F# context. Bare check() suffices: returns `verdict` (clean|errors|unknown) after a FRESH in-process type-check, so it never reports a stale-`{}` false-clean and you don't fall back to dotnet build. Optional: scope (auto|file|project|workspace|snippet), path, snippet (inline source), speed (trusted default | fast = cached FSAC snapshot), severity. Prefer over workspace_diagnostics / fcs_check_file when you just need a yes/no answer."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -307,7 +249,7 @@ let main argv =
                 tool (
                     TypedTool.define<SetProjectArgs>
                         "set_project"
-                        "[FSAC] Initialize or switch the FSAC/LSP project context. Must be called before textDocument_* and workspace_* tools. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load and clears FCS caches. Response includes loadedProjects (.fsproj paths discovered) and readiness (lsp / projectOptions / symbolIndex flags)."
+                        "Initialize or switch the FSAC/LSP project context. Must be called before textDocument_* and workspace_* tools. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load and clears FCS caches. Response includes loadedProjects (.fsproj paths discovered) and readiness (lsp / projectOptions / symbolIndex flags)."
                         (fun args ->
                             toolResult (
                                 runLimited lspGate (fun () ->
@@ -378,7 +320,7 @@ let main argv =
                 tool (
                     TypedTool.define<ProjectHealthArgs>
                         "project_health"
-                        "[FCS in-process] Fast read-only preflight for one F# project. Reports whether FsLangMCP can trust semantic tooling, project options availability, source file readability, analyzer setup, test project discovery, and current LSP readiness. projectPath is optional after set_project (falls back to the active project); pass it explicitly to inspect a different .fsproj/.sln/.slnx. Does not start/switch FSAC, run compile, or run tests."
+                        "Fast read-only preflight for one F# project. Reports whether FsLangMCP can trust semantic tooling, project options availability, source file readability, analyzer setup, test project discovery, and current LSP readiness. projectPath is optional after set_project (falls back to the active project); pass it explicitly to inspect a different .fsproj/.sln/.slnx. Does not start/switch FSAC, run compile, or run tests."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -401,7 +343,7 @@ let main argv =
                 tool (
                     TypedTool.define<FSharpProjectInspectArgs>
                         "fsharp_project_inspect"
-                        "[FCS in-process] Read-only .fsproj inspection for agents. Prefer over textual reads of `.fsproj` — handles MSBuild evaluation correctly. Returns project identity, compile order, package/project references, signature/implementation pairing, and shared scan filtering summary. `projectPath` is optional after `set_project`. Does not build, restore, test, or edit files."
+                        "Read-only .fsproj inspection for agents. Prefer over textual reads of `.fsproj` — handles MSBuild evaluation correctly. Returns project identity, compile order, package/project references, signature/implementation pairing, and shared scan filtering summary. `projectPath` is optional after `set_project`. Does not build, restore, test, or edit files."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -411,31 +353,9 @@ let main argv =
                 )
 
                 tool (
-                    TypedTool.define<FcsParseAndCheckArgs>
-                        "fcs_parse_and_check_file"
-                        "[FCS in-process] Agent-friendly FCS parse+typecheck for one file. Prefer passing projectPath (.fsproj) for accurate project context; projectOptions can override. Falls back to script inference only when no project can be resolved. Pass 'text' for unsaved content. Prefer check for a yes/no verdict."
-                        (fun args ->
-                            toolResult (
-                                runLimited fcsGate (fun () ->
-                                    Dispatcher.CheckDispatch.run fcsBridge bridge (Dispatcher.ParseAndCheckFile args))))
-                    |> unwrapResult
-                )
-
-                tool (
-                    TypedTool.define<FcsParseAndCheckArgs>
-                        "fcs_check_file"
-                        "[FCS in-process] Cache-invalidating parse+typecheck for one file. Use when `workspace_diagnostics` looks stale right after Edit/Write. Surgically drops project-options + project-results entries for THIS project and calls `InvalidateConfiguration` before re-running. Caveat: FCS may still serve from its internal AST cache for transitively-referenced files; fall back to `dotnet build` for ground truth. Mechanics: docs/tools-detailed.md#fcs_check_file. Prefer check for a yes/no verdict."
-                        (fun args ->
-                            toolResult (
-                                runLimited fcsGate (fun () ->
-                                    Dispatcher.CheckDispatch.run fcsBridge bridge (Dispatcher.CheckFile args))))
-                    |> unwrapResult
-                )
-
-                tool (
                     TypedTool.define<FcsReferencedSymbolsArgs>
                         "fcs_referenced_symbols"
-                        "[FCS in-process] Substring search across the project's referenced assemblies (NuGet + framework) by DisplayName or FullName (case-insensitive). Prefer `fcs_nuget_types` when you already know the exact assembly name. Complements `workspace_symbol` (project-local). Reports assembly, kind, accessibility, isObsolete. `includeNonPublic=true` for internals. Paginated; default 200, max 1000. First call triggers ParseAndCheckProject. Details: docs/tools-detailed.md#fcs_referenced_symbols."
+                        "Substring search across the project's referenced assemblies (NuGet + framework) by DisplayName or FullName (case-insensitive). Prefer `fcs_nuget_types` when you already know the exact assembly name. Complements `workspace_symbol` (project-local). Reports assembly, kind, accessibility, isObsolete. `includeNonPublic=true` for internals. Paginated; default 200, max 1000. First call triggers ParseAndCheckProject. Details: docs/tools-detailed.md#fcs_referenced_symbols."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -447,7 +367,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsSuggestOpenArgs>
                         "fcs_suggest_open"
-                        "[FCS in-process] Given an unresolved symbol name (FS0039), returns ranked `open` directive candidates — project-local first, then referenced assemblies. Use when an agent sees 'X is not defined' to get the right namespace instantly. Set includeReferences=false for project-only. Caveat: openPath is empty for global-namespace symbols; doesn't deduplicate the same name across multiple assemblies."
+                        "Given an unresolved symbol name (FS0039), returns ranked `open` directive candidates — project-local first, then referenced assemblies. Use when an agent sees 'X is not defined' to get the right namespace instantly. Set includeReferences=false for project-only. Caveat: openPath is empty for global-namespace symbols; doesn't deduplicate the same name across multiple assemblies."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -459,7 +379,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsNugetTypesArgs>
                         "fcs_nuget_types"
-                        "[FCS in-process] Enumerate all types in one referenced assembly matched by EXACT SimpleName (case-insensitive). Prefer `fcs_referenced_symbols` when you need substring search across assemblies. `Spectre.Console` resolves only to that assembly — not `Spectre.Console.Cli`; call once per assembly. Each entry: displayName, fullName, kind, accessibility, isObsolete. Paginated; default 500, max 2000. Returns `matchedAssemblies=[]` on no match. Mechanics: docs/tools-detailed.md#fcs_nuget_types."
+                        "Enumerate all types in one referenced assembly matched by EXACT SimpleName (case-insensitive). Prefer `fcs_referenced_symbols` when you need substring search across assemblies. `Spectre.Console` resolves only to that assembly — not `Spectre.Console.Cli`; call once per assembly. Each entry: displayName, fullName, kind, accessibility, isObsolete. Paginated; default 500, max 2000. Returns `matchedAssemblies=[]` on no match. Mechanics: docs/tools-detailed.md#fcs_nuget_types."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -471,7 +391,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsNugetMembersArgs>
                         "fcs_nuget_members"
-                        "[FCS in-process] Enumerate members of one type from a referenced assembly (matched by packageId + typeName). Prefer `fcs_nuget_types` to discover available type names first. Each entry: name, kind, signature, accessibility, isObsolete, xmlDocSummary. Paginated; default 500, max 2000. Returns `matchedTypes=[]` on no type match. Mechanics: docs/tools-detailed.md#fcs_nuget_members."
+                        "Enumerate members of one type from a referenced assembly (matched by packageId + typeName). Prefer `fcs_nuget_types` to discover available type names first. Each entry: name, kind, signature, accessibility, isObsolete, xmlDocSummary. Paginated; default 500, max 2000. Returns `matchedTypes=[]` on no type match. Mechanics: docs/tools-detailed.md#fcs_nuget_members."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -481,64 +401,17 @@ let main argv =
                 )
 
                 tool (
-                    TypedTool.define<FcsValidateSnippetArgs>
-                        "fcs_validate_snippet"
-                        "[FCS in-process] Compile arbitrary F# (`mode=\"fs\"|\"fsi\"`) against the active project's references without writing to the source tree. Use for 'does this signature type-check?' probes before scaffolding. Prefer `fcs_parse_and_check_file` when the file already exists on disk. Returns FCS diagnostics + errorCount/warningCount. `projectPath` falls back to active `set_project`. Caveats: docs/tools-detailed.md#fcs_validate_snippet. Prefer check for a yes/no verdict."
-                        (fun args ->
-                            let args =
-                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
-
-                            toolResult (
-                                runLimited fcsGate (fun () ->
-                                    Dispatcher.CheckDispatch.run fcsBridge bridge (Dispatcher.ValidateSnippet args))))
-                    |> unwrapResult
-                )
-
-                tool (
-                    TypedTool.define<FcsFileSymbolsArgs>
-                        "fcs_file_symbols"
-                        "[FCS in-process] Raw FCS symbol extraction for one file. Can be noisy on large files; default returns definitions, includeAllUses returns locals/parameters/usages too. Prefer fcs_file_outline for normal agent navigation. Pass projectPath when possible and 'text' for unsaved content."
-                        (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.FileSymbols args)))
-                    |> unwrapResult
-                )
-
-                tool (
                     TypedTool.define<FcsFileOutlineArgs>
                         "fcs_file_outline"
-                        "[FCS in-process] Agent-friendly compact F# outline for one file. Filters local/noisy symbols by default and returns name, kind, range, signature/type, accessibility, and declaration range. Prefer this over fcs_file_symbols for navigation."
+                        "Agent-friendly compact F# outline for one file. Filters local/noisy symbols by default and returns name, kind, range, signature/type, accessibility, and declaration range. Prefer this over fcs_file_symbols for navigation."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.FileOutline args)))
-                    |> unwrapResult
-                )
-
-                tool (
-                    TypedTool.define<FcsProjectSymbolUsesArgs>
-                        "fcs_project_symbol_uses"
-                        "[FCS in-process] Agent-friendly FCS project-wide symbol-use search by symbol name/full name. Results are cached by resolved project options. Prefer exact=true for narrow queries. Pass projectPath when possible and 'text' for unsaved content. Prefer find for cross-project work."
-                        (fun args ->
-                            toolResult (
-                                runLimited fcsGate (fun () ->
-                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.ProjectSymbolUses args))))
-                    |> unwrapResult
-                )
-
-                tool (
-                    TypedTool.define<FcsFindMemberUsagesArgs>
-                        "fcs_find_member_usages"
-                        "[FCS in-process] Find every usage of a member on a specific type — resolves via FCS so dotted access (`x.Foo`), pipelines, and overload resolution are handled correctly (unlike a textual `rg`). Pass `typeName` (DisplayName or FullName) and `memberName` (exact, case-sensitive). `projectPath` is optional after `set_project`; pass `path`/`text` for unsaved buffers. typeName matching rules and caveats: docs/tools-detailed.md#fcs_find_member_usages. Prefer find for cross-project work."
-                        (fun args ->
-                            let args =
-                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
-
-                            toolResult (
-                                runLimited fcsGate (fun () ->
-                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.FindMemberUsages args))))
                     |> unwrapResult
                 )
 
                 tool (
                     TypedTool.define<FcsMakeInternalVisibleArgs>
                         "fcs_make_internal_visible"
-                        "[FCS in-process] Drop the `private` keyword from a declaration at `(line, character)`. Returns a non-destructive workspace edit `{ status, edits, appliedPreview, originalLineText }` — does NOT write the file. Use before tests need to call internals. Returns `{ status: 'no_action', reason }` on no symbol or no recognized modifier. Supported forms and Variant B status: docs/tools-detailed.md#fcs_make_internal_visible."
+                        "Drop the `private` keyword from a declaration at `(line, character)`. Returns a non-destructive workspace edit `{ status, edits, appliedPreview, originalLineText }` — does NOT write the file. Use before tests need to call internals. Returns `{ status: 'no_action', reason }` on no symbol or no recognized modifier. Supported forms and Variant B status: docs/tools-detailed.md#fcs_make_internal_visible."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -548,34 +421,9 @@ let main argv =
                 )
 
                 tool (
-                    TypedTool.define<FcsRecordFieldAuditArgs>
-                        "fcs_record_field_audit"
-                        "[FCS in-process] Find every construction site for a record field — literal `{ Field = expr }` AND update `{ x with Field = expr }`. Fills the gap left by fcs_find_symbol, which misses field-set uses. Pass typeName (DisplayName e.g. 'TraderRole' or segment-boundary FullName) and fieldName (exact, case-sensitive). Each site reports file, range, form, and 2 context lines. Paginated; default 200, max 1000. Caveats: docs/tools-detailed.md#fcs_record_field_audit. Prefer find for cross-project work."
-                        (fun args ->
-                            let args =
-                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
-
-                            toolResult (
-                                runLimited fcsGate (fun () ->
-                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.RecordFieldAudit args))))
-                    |> unwrapResult
-                )
-
-                tool (
-                    TypedTool.define<FcsFindSymbolArgs>
-                        "fcs_find_symbol"
-                        "[FCS in-process] Project-wide symbol search with grouped definitions/references and source-line context in one call. Better than chaining workspace_symbol + fcs_project_symbol_uses + shell reads. Caveat: misses record-field-set sites — use fcs_record_field_audit for those. projectDiagnostics scoped to matched files; errors-only on zero hits. Info/Hint filtered by default (set includeInfo=true). Mechanics: see docs/tools-detailed.md#fcs_find_symbol. Prefer find for cross-project work."
-                        (fun args ->
-                            toolResult (
-                                runLimited fcsGate (fun () ->
-                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.FindSymbol args))))
-                    |> unwrapResult
-                )
-
-                tool (
                     TypedTool.define<FindArgs>
                         "find"
-        "[FCS in-process] Multi-project symbol search. Sweeps every member .fsproj of the solution and unions definitions, references, record-field set sites, and member-usage sites — recovering cross-project sites single-project fcs_find_symbol / fcs_record_field_audit miss. Bare find(query) returns a compact one-line-per-site list (file/line/kind/lineText); pass contextLines for surrounding code. Optional kind + scope narrow it. Prefer over fcs_find_symbol for cross-project refactors."
+        "Multi-project F# semantic search: definitions, references, record-field set sites, and member call-sites on a type (`x.Foo`), unioned across every solution .fsproj. FCS-resolved — beats a textual rg that over-matches `.Member()` on unrelated types or can't cross projects. Bare find(query) gives a compact one-line-per-site list (file/line/kind/lineText); contextLines adds code. Narrow with kind (symbol|members|field|definition|position)+scope; member call sites = kind=members + member=Name."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -589,7 +437,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsSymbolAtWordArgs>
                         "fcs_symbol_at_word"
-                        "[FCS in-process] Tolerant FCS symbol lookup for agent workflows. Accepts a line plus word/occurrence, finds the candidate span, and returns symbol identity, kind, type string, definition range, and optional documentation. Prefer over exact-position hover/type queries."
+                        "Tolerant FCS symbol lookup for agent workflows. Accepts a line plus word/occurrence, finds the candidate span, and returns symbol identity, kind, type string, definition range, and optional documentation. Prefer over exact-position hover/type queries."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.SymbolAtWord args)))
                     |> unwrapResult
                 )
@@ -597,7 +445,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsProjectOutlineArgs>
                         "fcs_project_outline"
-                        "[FCS in-process] Agent-friendly project outline over filtered compile files. Prefer over `workspace_symbol` for whole-project structural overview — skips generated/build artifacts and returns compact per-file outlines. `projectPath` is optional after `set_project` (falls back to the active project); pass it explicitly for a different .fsproj. Use `maxFiles`/`maxResultsPerFile` on large projects."
+                        "Agent-friendly project outline over filtered compile files. Prefer over `workspace_symbol` for whole-project structural overview — skips generated/build artifacts and returns compact per-file outlines. `projectPath` is optional after `set_project` (falls back to the active project); pass it explicitly for a different .fsproj. Use `maxFiles`/`maxResultsPerFile` on large projects."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -607,17 +455,9 @@ let main argv =
                 )
 
                 tool (
-                    TypedTool.define<FcsTypeAtPositionArgs>
-                        "fcs_type_at_position"
-                        "[FCS in-process] Low-level exact-position FCS type/symbol query. Requires project context (`set_project` or explicit `projectPath`/`projectOptions`); the file at `path` must exist on disk. `line`/`character` are 0-based (LSP). Prefer `fcs_symbol_at_word` for agent workflows — it accepts a line plus word/occurrence instead of exact coords. Fuzzy snapping (±2 lines / ±5 cols) and no_symbol recovery hints: docs/tools-detailed.md#fcs_type_at_position."
-                        (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.TypeAtPosition args)))
-                    |> unwrapResult
-                )
-
-                tool (
                     TypedTool.define<FcsSignatureHelpArgs>
                         "fcs_signature_help"
-                        "[FCS in-process] Low-level exact-position FCS signature help. Returns overloads/parameters around a call site. line/character are 0-based. Pass projectPath/projectOptions and 'text' when available."
+                        "Low-level exact-position FCS signature help. Returns overloads/parameters around a call site. line/character are 0-based. Pass projectPath/projectOptions and 'text' when available."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.SignatureHelp args)))
                     |> unwrapResult
                 )
@@ -625,7 +465,7 @@ let main argv =
                 tool (
                     TypedTool.define<PositionArgs>
                         "fsharp_signature_data"
-                        "[FSAC] Structured FSAC signature help via fsharp/signatureData. Requires set_project and an exact call-site position. Use this when FCS fallback is insufficient or when validating FSAC's current workspace view."
+                        "Structured FSAC signature help via fsharp/signatureData. Requires set_project and an exact call-site position. Use this when FCS fallback is insufficient or when validating FSAC's current workspace view."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.SignatureData args)))
                     |> unwrapResult
                 )
@@ -633,7 +473,7 @@ let main argv =
                 tool (
                     TypedTool.define<FormattingArgs>
                         "textDocument_formatting"
-                        "[FSAC] Raw LSP formatting proxy via fsautocomplete/Fantomas. Requires set_project first. Returns formatted text and edits; it does not write to disk. Pass 'text' for unsaved content."
+                        "Raw LSP formatting proxy via fsautocomplete/Fantomas. Requires set_project first. Returns formatted text and edits; it does not write to disk. Pass 'text' for unsaved content."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Formatting args)))
                     |> unwrapResult
                 )
@@ -641,7 +481,7 @@ let main argv =
                 tool (
                     TypedTool.define<CodeActionArgs>
                         "textDocument_codeAction"
-                        "[FSAC] Raw LSP codeAction proxy at an exact position with empty diagnostic context. Requires set_project first. Useful for debugging FSAC; prefer future diagnostics-to-fix workflows for agent repairs. Pass 'text' for unsaved content."
+                        "Raw LSP codeAction proxy at an exact position with empty diagnostic context. Requires set_project first. Useful for debugging FSAC; prefer future diagnostics-to-fix workflows for agent repairs. Pass 'text' for unsaved content."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.CodeAction args)))
                     |> unwrapResult
                 )
@@ -649,7 +489,7 @@ let main argv =
                 tool (
                     TypedTool.define<RenameArgs>
                         "textDocument_rename"
-                        "[FSAC] Raw LSP semantic rename at an exact position. Requires `set_project` first. Prefer over textual rename — handles shadowing and aliased opens safely. Returns raw WorkspaceEdit; needs a precise target. Pass `text` for unsaved content."
+                        "Raw LSP semantic rename at an exact position. Requires `set_project` first. Prefer over textual rename — handles shadowing and aliased opens safely. Returns raw WorkspaceEdit; needs a precise target. Pass `text` for unsaved content."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Rename args)))
                     |> unwrapResult
                 )
@@ -657,7 +497,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsGetProjectOptionsArgs>
                         "fcs_get_project_options"
-                        "[FCS in-process] Diagnostic helper: get FSharp compiler OtherOptions for a .fsproj via proj-info. projectPath is optional after set_project (falls back to the active project); pass it explicitly to inspect a different one."
+                        "Diagnostic helper: get FSharp compiler OtherOptions for a .fsproj via proj-info. projectPath is optional after set_project (falls back to the active project); pass it explicitly to inspect a different one."
                         (fun args ->
                             let resolved =
                                 args.projectPath
@@ -679,7 +519,7 @@ let main argv =
                 tool (
                     TypedTool.define<FslangmcpVersionArgs>
                         "fslangmcp_version"
-                        "[meta] Returns the installed FsLangMCP product version and name. Zero-arg (pass {}). Same value is also surfaced in the set_project response (fslangmcpVersion field) and the fsharp_runtime_status response. Use this tool when filing UX feedback so reports can be matched to a specific release of the MCP server. Pure: no project context required, no side effects, no caches read."
+                        "Returns the installed FsLangMCP product version and name. Zero-arg (pass {}). Same value is also surfaced in the set_project response (fslangmcpVersion field) and the fsharp_runtime_status response. Use this tool when filing UX feedback so reports can be matched to a specific release of the MCP server. Pure: no project context required, no side effects, no caches read."
                         (fun _ -> toolResult versionResponse)
                     |> unwrapResult
                 )
@@ -687,7 +527,7 @@ let main argv =
                 tool (
                     TypedTool.define<RuntimeStatusArgs>
                         "fsharp_runtime_status"
-                        "[FCS in-process] Read-only observational snapshot of the FsLangMCP process runtime state: managed-heap sizes by generation/LOH/POH, GC collection counts, isServerGC flag, assembly load count, FCS checker configuration flags and project-results cache size, and the FSAC child-process working set. Returns numbers only — no interpretation. Never triggers a GC collection, never walks the heap, never attaches diagnostic listeners."
+                        "Read-only observational snapshot of the FsLangMCP process runtime state: managed-heap sizes by generation/LOH/POH, GC collection counts, isServerGC flag, assembly load count, FCS checker configuration flags and project-results cache size, and the FSAC child-process working set. Returns numbers only — no interpretation. Never triggers a GC collection, never walks the heap, never attaches diagnostic listeners."
                         (fun args ->
                             toolResult (
                                 Task.FromResult(
