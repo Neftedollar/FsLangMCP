@@ -455,6 +455,18 @@ type RenameArgs =
       /// Unsaved buffer content; when omitted, file is read from disk.
       text: string option }
 
+type RenamePreviewArgs =
+    { /// Absolute path to the F# source file containing the symbol to preview a rename for.
+      path: string
+      /// 0-based line number of the symbol (LSP convention).
+      line: int
+      /// 0-based column number of the symbol (LSP convention).
+      character: int
+      /// New identifier the preview pretends to assign across the workspace. Required.
+      newName: string
+      /// Unsaved buffer content; when omitted, file is read from disk.
+      text: string option }
+
 [<CLIMutable>]
 type FcsGetProjectOptionsArgs = { projectPath: string option }
 

@@ -15,6 +15,7 @@
     <Compile Include="RuntimeStatusTests.fs" />
     <Compile Include="TypesToolsTests.fs" />
     <Compile Include="LspBridgeTests.fs" />
+    <Compile Include="RenamePreviewTests.fs" />
     <Compile Include="ProjectFilesTests.fs" />
     <Compile Include="ProjectHealthTests.fs" />
     <Compile Include="BoundedCacheTests.fs" />

@@ -383,6 +383,212 @@ module internal LspResponseShape =
               "result", response ]
         :> JsonNode
 
+// ─── RenamePreviewShape (pure rename-preview transform, testable) ──────────────
+
+/// Transforms a raw LSP WorkspaceEdit (as produced by FSAC's textDocument/rename)
+/// into an agent-friendly grouped preview: edits bucketed by file, counted, and
+/// each paired with the original line and a synthesized post-rename line. Pure —
+/// it only reads file content through the injected lookups, so it can never write.
+module internal RenamePreviewShape =
+
+    /// Carries everything the transform needs that is not in the WorkspaceEdit:
+    /// the new name, the originating position (to identify the renamed symbol),
+    /// and three injected readers so the core stays pure and unit-testable.
+    [<NoComparison; NoEquality>]
+    type Context =
+        { NewName: string
+          /// File URI of the originating request — used to locate the renamed symbol.
+          OriginatingUri: string
+          /// 0-based line of the originating position.
+          Line: int
+          /// 0-based character of the originating position.
+          Character: int
+          /// uri -> the file's lines (LF-split, CR-trimmed); None when unreadable.
+          LookupLines: string -> string[] option
+          /// uri -> owning project identity; used to flag cross-project renames.
+          ResolveProject: string -> string option
+          /// uri -> human-readable file path for the response.
+          UriToDisplay: string -> string }
+
+    /// Splits text into lines on '\n', trimming a trailing '\r' so CRLF and LF
+    /// inputs both yield clean line content (mirrors Formatting's line handling).
+    let splitLines (text: string) : string[] =
+        text.Split('\n') |> Array.map (fun l -> l.TrimEnd('\r'))
+
+    /// Reads (startLine, startChar, endLine, endChar) from a TextEdit's `range`.
+    /// Returns None when the shape is missing or malformed.
+    let internal tryRange (edit: JsonNode) : (int * int * int * int) option =
+        match edit with
+        | :? JsonObject as o ->
+            match o["range"] with
+            | :? JsonObject as r ->
+                match r["start"], r["end"] with
+                | (:? JsonObject as s), (:? JsonObject as e) ->
+                    try
+                        Some(
+                            s["line"].GetValue<int>(),
+                            s["character"].GetValue<int>(),
+                            e["line"].GetValue<int>(),
+                            e["character"].GetValue<int>()
+                        )
+                    with _ ->
+                        None
+                | _ -> None
+            | _ -> None
+        | _ -> None
+
+    let private editNewText (edit: JsonNode) : string =
+        match edit with
+        | :? JsonObject as o ->
+            match o["newText"] with
+            | null -> ""
+            | n ->
+                try
+                    n.GetValue<string>()
+                with _ ->
+                    ""
+        | _ -> ""
+
+    /// Applies a single-line TextEdit to one line, producing the preview line:
+    /// keep the prefix before `startChar`, splice in `newText`, keep the suffix
+    /// from `endChar`. Char offsets are clamped to the line so malformed ranges
+    /// never throw.
+    let applyEditToLine (line: string) (startChar: int) (endChar: int) (newText: string) : string =
+        let safeStart = max 0 (min startChar line.Length)
+        let safeEnd = max safeStart (min endChar line.Length)
+        line[.. safeStart - 1] + newText + line[safeEnd..]
+
+    /// Extracts (uri, edits) pairs from a raw WorkspaceEdit. Handles both the
+    /// `documentChanges` array (FSAC's shape, possibly carrying resource ops that
+    /// lack an `edits` array — those are skipped) and the legacy `changes` map.
+    let extractFileEdits (workspaceEdit: JsonNode) : (string * JsonNode list) list =
+        match workspaceEdit with
+        | :? JsonObject as we ->
+            match we["documentChanges"] with
+            | :? JsonArray as docChanges ->
+                [ for dc in docChanges do
+                      match dc with
+                      | :? JsonObject as o ->
+                          match o["textDocument"], o["edits"] with
+                          | (:? JsonObject as td), (:? JsonArray as edits) ->
+                              match td["uri"] with
+                              | null -> ()
+                              | uriNode -> yield uriNode.GetValue<string>(), (edits |> Seq.cast<JsonNode> |> Seq.toList)
+                          | _ -> ()
+                      | _ -> () ]
+            | _ ->
+                match we["changes"] with
+                | :? JsonObject as changes ->
+                    [ for kv in changes do
+                          match kv.Value with
+                          | :? JsonArray as edits -> yield kv.Key, (edits |> Seq.cast<JsonNode> |> Seq.toList)
+                          | _ -> () ]
+                | _ -> []
+        | _ -> []
+
+    /// Identifies the symbol being renamed by reading the original text under the
+    /// edit at the originating position. None when no covering edit is found.
+    let private detectSymbol (ctx: Context) (grouped: (string * JsonNode list) list) : string option =
+        grouped
+        |> List.tryFind (fun (uri, _) -> String.Equals(uri, ctx.OriginatingUri, StringComparison.OrdinalIgnoreCase))
+        |> Option.bind (fun (uri, edits) ->
+            match ctx.LookupLines uri with
+            | None -> None
+            | Some lines ->
+                edits
+                |> List.tryPick (fun edit ->
+                    match tryRange edit with
+                    | Some(sl, sc, el, ec) when
+                        sl = ctx.Line
+                        && el = ctx.Line
+                        && sc <= ctx.Character
+                        && ctx.Character <= ec
+                        && sl < lines.Length
+                        ->
+                        let line = lines[sl]
+                        let safeStart = max 0 (min sc line.Length)
+                        let safeEnd = max safeStart (min ec line.Length)
+                        Some(line.Substring(safeStart, safeEnd - safeStart))
+                    | _ -> None))
+
+    let private rangeNodeOf (edit: JsonNode) : JsonNode =
+        match edit with
+        | :? JsonObject as o when not (isNull o["range"]) -> o["range"].DeepClone()
+        | _ -> JsonObject() :> JsonNode
+
+    let private editPreviewNode (linesOpt: string[] option) (edit: JsonNode) : JsonNode =
+        let originalLine, previewLine =
+            match tryRange edit, linesOpt with
+            | Some(sl, _, el, _), Some lines when sl < lines.Length ->
+                let orig = lines[sl]
+
+                match tryRange edit with
+                | Some(_, sc, _, ec) when el = sl -> orig, applyEditToLine orig sc ec (editNewText edit)
+                | Some(_, sc, _, _) ->
+                    // Multi-line range (rare for rename): splice newText after the
+                    // start-line prefix as a best-effort single-line preview.
+                    let safeStart = max 0 (min sc orig.Length)
+                    orig, orig[.. safeStart - 1] + editNewText edit
+                | None -> orig, orig
+            | _ -> "", ""
+
+        jobj
+            [ "range", rangeNodeOf edit
+              "originalLineText", jstr originalLine
+              "previewLineText", jstr previewLine ]
+        :> JsonNode
+
+    /// Builds the grouped preview response from a raw WorkspaceEdit. Returns a
+    /// `{ status: "no_symbol"; reason }` envelope when the edit is null/empty —
+    /// i.e. FSAC could not resolve a renamable symbol at the position.
+    let build (ctx: Context) (workspaceEdit: JsonNode) : JsonNode =
+        let grouped =
+            extractFileEdits workspaceEdit
+            |> List.groupBy fst
+            |> List.map (fun (uri, items) -> uri, (items |> List.collect snd))
+
+        let totalEdits = grouped |> List.sumBy (fun (_, edits) -> edits.Length)
+
+        if List.isEmpty grouped || totalEdits = 0 then
+            let display = ctx.UriToDisplay ctx.OriginatingUri
+
+            jobj
+                [ "status", jstr "no_symbol"
+                  "reason",
+                  jstr
+                      $"No renamable symbol at {Path.GetFileName display}:{ctx.Line}:{ctx.Character}. The position may fall on a keyword, literal, operator, whitespace, or a symbol the compiler cannot resolve." ]
+            :> JsonNode
+        else
+            let symbol = detectSymbol ctx grouped
+
+            let fileNodes =
+                grouped
+                |> List.map (fun (uri, edits) ->
+                    let linesOpt = ctx.LookupLines uri
+                    let editNodes = edits |> List.map (editPreviewNode linesOpt)
+
+                    jobj
+                        [ "file", jstr (ctx.UriToDisplay uri)
+                          "editCount", jint edits.Length
+                          "edits", JsonArray(editNodes |> List.toArray) :> JsonNode ]
+                    :> JsonNode)
+
+            let crossProject =
+                grouped
+                |> List.choose (fun (uri, _) -> ctx.ResolveProject uri)
+                |> List.distinct
+                |> List.length > 1
+
+            jobj
+                [ "status", jstr "ok"
+                  "symbol", (symbol |> Option.map jstr |> Option.defaultValue null)
+                  "newName", jstr ctx.NewName
+                  "totalEdits", jint totalEdits
+                  "fileCount", jint grouped.Length
+                  "files", JsonArray(fileNodes |> List.toArray) :> JsonNode
+                  "crossProject", jbool crossProject ]
+            :> JsonNode
+
 // ─── FsAutoCompleteBridge ──────────────────────────────────────────────────────
 
 type internal FsAutoCompleteBridge() =
@@ -1172,6 +1378,114 @@ type internal FsAutoCompleteBridge() =
                       "position", jobj [ "line", jint args.line; "character", jint args.character ]
                       "newName", jstr args.newName ]
         )
+
+    /// Non-destructive preview of a rename. Runs the same FSAC rename machinery as
+    /// `Rename` (which only computes the WorkspaceEdit — it never writes), then
+    /// transforms the raw WorkspaceEdit into a grouped, line-annotated preview.
+    member this.RenamePreview(args: RenamePreviewArgs) : Task<JsonNode> =
+        task {
+            let originatingUri = toFileUri args.path
+
+            let uriToPath (uri: string) =
+                try
+                    Uri(uri).LocalPath
+                with _ ->
+                    uri
+
+            let tryReadLines (uri: string) =
+                try
+                    let path = uriToPath uri
+
+                    if File.Exists path then
+                        Some(RenamePreviewShape.splitLines (File.ReadAllText path))
+                    else
+                        None
+                with _ ->
+                    None
+
+            // Originating file: honour the unsaved buffer when provided so the
+            // preview reflects what FSAC actually saw. Other files: read from disk.
+            let lookupLines (uri: string) =
+                if String.Equals(uri, originatingUri, StringComparison.OrdinalIgnoreCase) then
+                    match args.text with
+                    | Some t -> Some(RenamePreviewShape.splitLines t)
+                    | None -> tryReadLines uri
+                else
+                    tryReadLines uri
+
+            // Nearest ancestor directory containing a .fsproj owns the file.
+            let owningProjectFile (filePath: string) : string option =
+                let rec walk (dir: string) =
+                    if String.IsNullOrEmpty dir then
+                        None
+                    else
+                        let fsprojs =
+                            try
+                                Directory.GetFiles(dir, "*.fsproj", SearchOption.TopDirectoryOnly)
+                            with _ ->
+                                [||]
+
+                        if fsprojs.Length > 0 then
+                            Some(Array.min fsprojs)
+                        else
+                            let parent = Path.GetDirectoryName dir
+
+                            if String.IsNullOrEmpty parent || parent = dir then
+                                None
+                            else
+                                walk parent
+
+                try
+                    walk (Path.GetDirectoryName(Path.GetFullPath filePath))
+                with _ ->
+                    None
+
+            let context: RenamePreviewShape.Context =
+                { NewName = args.newName
+                  OriginatingUri = originatingUri
+                  Line = args.line
+                  Character = args.character
+                  LookupLines = lookupLines
+                  ResolveProject = uriToPath >> owningProjectFile
+                  UriToDisplay = uriToPath }
+
+            try
+                let! raw =
+                    this.WithDocument(
+                        args.path,
+                        args.text,
+                        "textDocument/rename",
+                        fun uri ->
+                            jobj
+                                [ "textDocument", jobj [ "uri", jstr uri ]
+                                  "position", jobj [ "line", jint args.line; "character", jint args.character ]
+                                  "newName", jstr args.newName ]
+                    )
+
+                // WithDocument wraps the WorkspaceEdit as { status: "ok"; result }, or
+                // returns a not-ready envelope. Only transform the success case; pass
+                // everything else (e.g. not_ready) straight through.
+                match raw with
+                | :? JsonObject as obj when
+                    (match obj["status"] with
+                     | null -> false
+                     | s ->
+                         try
+                             s.GetValue<string>() = "ok"
+                         with _ ->
+                             false)
+                    ->
+                    return RenamePreviewShape.build context obj["result"]
+                | _ -> return raw
+            with ex ->
+                // FSAC raises an LSP error for some unrenamable positions instead of
+                // returning a null edit. Surface that as a clean no_symbol for agents.
+                return
+                    jobj
+                        [ "status", jstr "no_symbol"
+                          "reason", jstr ex.Message ]
+                    :> JsonNode
+        }
 
     interface IDisposable with
         member this.Dispose() =
