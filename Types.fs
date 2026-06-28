@@ -233,6 +233,20 @@ type FindArgs =
       /// Opaque cursor from a prior call's nextCursor. Omit for the first page.
       cursor: string option }
 
+type FcsTestsForSymbolArgs =
+    { /// Symbol, type, or member name whose covering tests to find. Required.
+      symbolQuery: string
+      /// When true (default), match symbolQuery exactly; false = case-insensitive substring.
+      exact: bool option
+      /// File context: derives the sweep target (nearest .fsproj) when projectPath is absent.
+      path: string option
+      /// Unsaved buffer content for `path`; when omitted, the file is read from disk.
+      text: string option
+      /// .fsproj / .sln / .slnx / directory to sweep. Falls back to active set_project.
+      projectPath: string option
+      /// Maximum test sites returned. Default 100.
+      maxResults: int option }
+
 type CheckArgs =
     { /// What to check: "auto" (default) | "file" | "project" | "workspace" | "snippet".
       /// auto picks snippet when `snippet` is set, file when `path` is set, else the
