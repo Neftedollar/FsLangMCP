@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`fcs_nuget_members <packageId> <typeName>` — member-level companion to `fcs_nuget_types` (#125).** Enumerates the members of one type from a referenced NuGet assembly (methods, properties, fields, constructors, events, union cases) with formatted FCS signatures, accessibility, `[Obsolete]` flag, and XML-doc summary. Resolves the assembly through the same `GetReferencedAssemblies()` path as `fcs_nuget_types`; paginated (default 500, max 2000), returns an empty `matchedTypes` marker (not an error) on no match. Type matching is generic-arity-aware (a bare `FSharpOption` resolves the arity-suffixed compiled type), compiler-generated property accessors (`get_`/`set_`) are filtered so a property isn't duplicated by its accessor, and identical member rows are de-duplicated. +8 tests; the tool description passes the `docs/tool-description-schema.md` audit.
 
+### Fixed
+
+- **`set_project` now returns a clear `invalid_args` envelope naming `projectPath` when the argument is missing or supplied under the wrong key (#100).** Previously a wrong/missing key let `Path.GetFullPath(null)` throw `ArgumentNullException` whose message named the internal `path` parameter (`Value cannot be null. (Parameter 'path')`), misdirecting callers to the wrong field. The handler now routes through `ArgsValidation.requireNonBlank "projectPath"` before any path operation, matching the other six handlers standardised in #120. +2 tests.
+
 ### Security
 
 - **Patched the MessagePack serialization chain behind the StreamJsonRpc transport (DoS advisories).** `StreamJsonRpc` 2.24.\* → 2.25.\* (pulls patched `MessagePack` 2.5.302) and `Nerdbank.MessagePack` 1.1.62 → 1.2.30 (clears GHSA-92vj-hp7m-gwcj and GHSA-qjvr-435c-5fjh). Pinned `Microsoft.NET.StringTools` to 18.4.0: `Nerdbank.MessagePack` 1.2.30 drops the transitive StringTools 18.4.0 that had been masking MessagePack's stale 17.6.3 — which lacks `SpanBasedStringBuilder.Equals(string, StringComparison)` and silently breaks Ionide.ProjInfo's MSBuild project loading. `dotnet restore` now passes with NuGet audit enabled; 301/301 tests green.
