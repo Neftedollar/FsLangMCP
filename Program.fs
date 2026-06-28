@@ -236,7 +236,10 @@ let main argv =
                     TypedTool.define<PositionArgs>
                         "textDocument_definition"
                         "[FSAC] Raw LSP proxy to fsautocomplete textDocument/definition. Exact-position IDE primitive; requires set_project first. line/character are 0-based. Pass 'text' for unsaved content. Prefer fcs_find_symbol for agent flows — it returns grouped definitions+references and works without exact cursor position."
-                        (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Definition args)))
+                        (fun args ->
+                            toolResult (
+                                runLimited lspGate (fun () ->
+                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.Definition args))))
                     |> unwrapResult
                 )
 
@@ -244,7 +247,10 @@ let main argv =
                     TypedTool.define<ReferencesArgs>
                         "textDocument_references"
                         "[FSAC] Raw LSP proxy to fsautocomplete textDocument/references. Exact-position IDE primitive; requires set_project first. For query-based agent workflows prefer project symbol-use tools. line/character are 0-based. Pass 'text' for unsaved content."
-                        (fun args -> toolResult (runLimited lspGate (fun () -> bridge.References args)))
+                        (fun args ->
+                            toolResult (
+                                runLimited lspGate (fun () ->
+                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.References args))))
                     |> unwrapResult
                 )
 
@@ -252,7 +258,10 @@ let main argv =
                     TypedTool.define<WorkspaceSymbolArgs>
                         "workspace_symbol"
                         "[FSAC] Raw LSP proxy to fsautocomplete workspace/symbol. Useful for quick lookup after set_project, but returns IDE-shaped results without source context. Prefer fcs_find_symbol for agent workflows — it returns grouped definitions+references with source-line context in one call."
-                        (fun args -> toolResult (runLimited lspGate (fun () -> bridge.WorkspaceSymbol args)))
+                        (fun args ->
+                            toolResult (
+                                runLimited lspGate (fun () ->
+                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.WorkspaceSymbol args))))
                     |> unwrapResult
                 )
 
@@ -260,7 +269,10 @@ let main argv =
                     TypedTool.define<DiagnosticsArgs>
                         "workspace_diagnostics"
                         "[FSAC] Cached LSP publishDiagnostics payload, scoped to one file or the whole workspace. Requires `set_project` first. If diagnostics look stale right after Edit/Write, fall back to `fcs_check_file`. Optional: `path` (single file), `fileGlob` (e.g. `\"src/Adapters/*.fs\"` — narrows the workspace dict; ignored when `path` is set), `severity` (`error`|`warning`|`information`|`hint` — filters per file; empty entries dropped). Does not run build/tests."
-                        (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Diagnostics args)))
+                        (fun args ->
+                            toolResult (
+                                runLimited lspGate (fun () ->
+                                    Dispatcher.CheckDispatch.run fcsBridge bridge (Dispatcher.Diagnostics args))))
                     |> unwrapResult
                 )
 
@@ -272,7 +284,9 @@ let main argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.CompileProject args)))
+                            toolResult (
+                                runLimited fcsGate (fun () ->
+                                    Dispatcher.CheckDispatch.run fcsBridge bridge (Dispatcher.Compile args))))
                     |> unwrapResult
                 )
 
@@ -362,7 +376,10 @@ let main argv =
                     TypedTool.define<FcsParseAndCheckArgs>
                         "fcs_parse_and_check_file"
                         "[FCS in-process] Agent-friendly FCS parse+typecheck for one file. Prefer passing projectPath (.fsproj) for accurate project context; projectOptions can override. Falls back to script inference only when no project can be resolved. Pass 'text' for unsaved content."
-                        (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.ParseAndCheckFile args)))
+                        (fun args ->
+                            toolResult (
+                                runLimited fcsGate (fun () ->
+                                    Dispatcher.CheckDispatch.run fcsBridge bridge (Dispatcher.ParseAndCheckFile args))))
                     |> unwrapResult
                 )
 
@@ -370,7 +387,10 @@ let main argv =
                     TypedTool.define<FcsParseAndCheckArgs>
                         "fcs_check_file"
                         "[FCS in-process] Cache-invalidating parse+typecheck for one file. Use when `workspace_diagnostics` looks stale right after Edit/Write. Surgically drops project-options + project-results entries for THIS project and calls `InvalidateConfiguration` before re-running. Caveat: FCS may still serve from its internal AST cache for transitively-referenced files; fall back to `dotnet build` for ground truth. Mechanics: docs/tools-detailed.md#fcs_check_file."
-                        (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.CheckFile args)))
+                        (fun args ->
+                            toolResult (
+                                runLimited fcsGate (fun () ->
+                                    Dispatcher.CheckDispatch.run fcsBridge bridge (Dispatcher.CheckFile args))))
                     |> unwrapResult
                 )
 
@@ -430,7 +450,9 @@ let main argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.ValidateSnippet args)))
+                            toolResult (
+                                runLimited fcsGate (fun () ->
+                                    Dispatcher.CheckDispatch.run fcsBridge bridge (Dispatcher.ValidateSnippet args))))
                     |> unwrapResult
                 )
 
@@ -454,7 +476,10 @@ let main argv =
                     TypedTool.define<FcsProjectSymbolUsesArgs>
                         "fcs_project_symbol_uses"
                         "[FCS in-process] Agent-friendly FCS project-wide symbol-use search by symbol name/full name. Results are cached by resolved project options. Prefer exact=true for narrow queries. Pass projectPath when possible and 'text' for unsaved content."
-                        (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.ProjectSymbolUses args)))
+                        (fun args ->
+                            toolResult (
+                                runLimited fcsGate (fun () ->
+                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.ProjectSymbolUses args))))
                     |> unwrapResult
                 )
 
@@ -466,7 +491,9 @@ let main argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.FindMemberUsages args)))
+                            toolResult (
+                                runLimited fcsGate (fun () ->
+                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.FindMemberUsages args))))
                     |> unwrapResult
                 )
 
@@ -490,7 +517,9 @@ let main argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.RecordFieldAudit args)))
+                            toolResult (
+                                runLimited fcsGate (fun () ->
+                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.RecordFieldAudit args))))
                     |> unwrapResult
                 )
 
@@ -498,7 +527,10 @@ let main argv =
                     TypedTool.define<FcsFindSymbolArgs>
                         "fcs_find_symbol"
                         "[FCS in-process] Project-wide symbol search with grouped definitions/references and source-line context in one call. Better than chaining workspace_symbol + fcs_project_symbol_uses + shell reads. Caveat: misses record-field-set sites — use fcs_record_field_audit for those. projectDiagnostics scoped to matched files; errors-only on zero hits. Info/Hint filtered by default (set includeInfo=true). Mechanics: see docs/tools-detailed.md#fcs_find_symbol."
-                        (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.FindSymbol args)))
+                        (fun args ->
+                            toolResult (
+                                runLimited fcsGate (fun () ->
+                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.FindSymbol args))))
                     |> unwrapResult
                 )
 
