@@ -552,6 +552,18 @@ let main argv =
                     |> unwrapResult
                 )
 
+                tool (
+                    TypedTool.define<FcsTestsForSymbolArgs>
+                        "fcs_tests_for_symbol"
+                        "List the tests that likely cover a symbol. Sweeps the active solution's test projects (detected as project_health does — <IsTestProject> or an xunit/nunit/expecto ref), filters FCS symbol uses to test files, and tags each site with its enclosing test ([<Fact>]/[<Theory>]/[<Test>]/testCase). Complements `find`: the test-coverage slice — find returns every use; this returns only the test-file ones plus the enclosing test name. projectPath falls back to set_project."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.TestsForSymbol args)))
+                    |> unwrapResult
+                )
+
                 useStdio
             }
 

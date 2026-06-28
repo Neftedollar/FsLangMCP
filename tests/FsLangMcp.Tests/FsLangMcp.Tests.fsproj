@@ -25,6 +25,7 @@
     <Compile Include="SymbolPaginationTests.fs" />
     <Compile Include="ToolDescriptionSchemaTests.fs" />
     <Compile Include="FindTests.fs" />
+    <Compile Include="TestsForSymbolTests.fs" />
     <Compile Include="CheckTests.fs" />
     <Compile Include="NugetClassFieldTests.fs" />
     <Compile Include="ExplainDiagnosticTests.fs" />

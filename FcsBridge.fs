@@ -3352,6 +3352,227 @@ type internal FcsBridge() =
             return jobj (baseFields @ paginationFields) :> JsonNode
         }
 
+    // ── fcs_tests_for_symbol (#60): the test-coverage slice of `find` ───────────
+    // Reuses the multi-project sweep machinery, but keeps ONLY the test projects of the
+    // active solution (detected the way project_health does — ProjectHealth.isTestProjectFile,
+    // i.e. <IsTestProject>true> OR an xunit/nunit/expecto package ref). Each test project's
+    // GetAllUsesOfAllSymbols() is filtered to uses of the queried symbol, and every use site
+    // is tagged with its nearest enclosing test ([<Fact>]/[<Theory>]/[<Test>]/testCase),
+    // located by scanning the source lines upward. Shares ProjectSweepUses' (#131) per-project
+    // use cache, so a `find` already run on the solution makes this nearly free.
+    member this.TestsForSymbol(args: FcsTestsForSymbolArgs) : Task<JsonNode> =
+        task {
+            match ArgsValidation.requireNonBlank "symbolQuery" args.symbolQuery with
+            | Error envelope -> return envelope
+            | Ok query ->
+
+            let exact = args.exact |> Option.defaultValue true
+            let maxResults = args.maxResults |> Option.defaultValue 100
+
+            // Resolve the sweep target like Find: explicit projectPath (Program.fs already
+            // falls back to the active set_project), else the nearest .fsproj to args.path.
+            let sweepTargetOpt =
+                args.projectPath
+                |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.map normalizePath
+                |> Option.orElseWith (fun () ->
+                    args.path |> Option.bind findNearestFsproj |> Option.map normalizePath)
+
+            match sweepTargetOpt with
+            | None ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr
+                              "fcs_tests_for_symbol needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first." ]
+                    :> JsonNode
+            | Some sweepTarget ->
+
+            // The test-coverage slice: sweep only the solution's TEST projects.
+            let testProjects =
+                SolutionParsing.listProjects sweepTarget
+                |> Array.filter FsLangMcp.ProjectHealth.isTestProjectFile
+
+            // ── Enclosing-test detection (best-effort, textual) ──────────────────
+            // Scan source lines upward from a use to the nearest test marker:
+            //   • an Expecto label   → the quoted label string is the test name;
+            //   • a test attribute   → the name of the let/member it decorates.
+            let testAttrRegex =
+                System.Text.RegularExpressions.Regex(
+                    """\[<\s*(?:[\w.]+\.)?(?:Fact|Theory|Test|TestCase|TestMethod|Property)(?:Attribute)?\b""",
+                    System.Text.RegularExpressions.RegexOptions.Compiled
+                )
+
+            let expectoLabelRegex =
+                System.Text.RegularExpressions.Regex(
+                    "\\b(?:ftestCaseAsync|ptestCaseAsync|testCaseAsync|ftestCase|ptestCase|testCase|ftestAsync|ptestAsync|testAsync|ftestProperty|ptestProperty|testProperty|test)\\s+\"([^\"]*)\"",
+                    System.Text.RegularExpressions.RegexOptions.Compiled
+                )
+
+            let bindingNameRegex =
+                System.Text.RegularExpressions.Regex(
+                    """\b(?:let|member)\s+(?:rec\s+|inline\s+|mutable\s+|private\s+|internal\s+|this\.|_\.)*(``[^`]+``|[A-Za-z_][\w']*)""",
+                    System.Text.RegularExpressions.RegexOptions.Compiled
+                )
+
+            let findEnclosingTest (lines: string array) (useLine1: int) : string option =
+                if lines.Length = 0 then
+                    None
+                else
+                    let startIdx = min (max 0 (useLine1 - 1)) (lines.Length - 1)
+                    let mutable result = None
+                    let mutable i = startIdx
+
+                    while result.IsNone && i >= 0 do
+                        let labelMatch = expectoLabelRegex.Match lines[i]
+
+                        if labelMatch.Success then
+                            result <- Some labelMatch.Groups[1].Value
+                        elif testAttrRegex.IsMatch lines[i] then
+                            // Scan downward from the attribute to the use for the decorated name.
+                            let mutable j = i
+                            let mutable name = None
+
+                            while name.IsNone && j <= startIdx do
+                                let bm = bindingNameRegex.Match lines[j]
+
+                                if bm.Success then
+                                    name <- Some(bm.Groups[1].Value.Trim('`'))
+                                else
+                                    j <- j + 1
+
+                            result <- Some(name |> Option.defaultValue "<test>")
+                        else
+                            i <- i - 1
+
+                    result
+
+            // Per-file line cache: read each test source once for lineText + enclosing test.
+            let linesCache = System.Collections.Generic.Dictionary<string, string array>()
+
+            let readLines (path: string) =
+                match linesCache.TryGetValue path with
+                | true, cached -> cached
+                | _ ->
+                    let lines =
+                        try
+                            if File.Exists path then File.ReadAllLines path else [||]
+                        with _ ->
+                            [||]
+
+                    linesCache[path] <- lines
+                    lines
+
+            // De-dup accumulator keyed by stable source location (mirrors Find).
+            let siteByKey =
+                System.Collections.Generic.Dictionary<
+                    string,
+                    {| File: string
+                       StartLine: int
+                       StartCol: int
+                       EndLine: int
+                       EndCol: int
+                       Project: string
+                       EnclosingTest: string option
+                       LineText: string |}
+                 >()
+
+            for fsproj in testProjects do
+                try
+                    let projDisplay = Path.GetFileNameWithoutExtension fsproj
+                    let! options, _ = this.ResolveFsprojOptions(fsproj)
+
+                    let usesKey =
+                        $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}|{referencedProjectSourcesStamp options}"
+
+                    let! allUses, _ = this.ProjectSweepUses(usesKey, options)
+
+                    for u in allUses do
+                        if symbolMatches query exact u.Symbol then
+                            // FSharpSymbolUse is a struct: bind Range before reading fields (FS0052).
+                            let r = u.Range
+                            let file = normalizePath r.FileName
+                            let key = $"{file}:{r.StartLine}:{r.StartColumn}:{r.EndLine}:{r.EndColumn}"
+
+                            if not (siteByKey.ContainsKey key) then
+                                let lines = readLines file
+                                let lineIdx = r.StartLine - 1
+
+                                let lineText =
+                                    if lineIdx >= 0 && lineIdx < lines.Length then
+                                        lines[lineIdx]
+                                    else
+                                        ""
+
+                                siteByKey[key] <-
+                                    {| File = file
+                                       StartLine = r.StartLine
+                                       StartCol = r.StartColumn
+                                       EndLine = r.EndLine
+                                       EndCol = r.EndColumn
+                                       Project = projDisplay
+                                       EnclosingTest = findEnclosingTest lines r.StartLine
+                                       LineText = lineText |}
+                with _ ->
+                    // A test project that fails to resolve/check is skipped — the coverage
+                    // slice is best-effort, never a hard failure for one bad project.
+                    ()
+
+            let sortedSites =
+                siteByKey.Values
+                |> Seq.toArray
+                |> Array.sortBy (fun s -> s.File, s.StartLine, s.StartCol, s.EndLine, s.EndCol)
+
+            let totalTests = sortedSites.Length
+            let pageSites = sortedSites |> Array.truncate (max 0 maxResults)
+
+            let testToJson
+                (s:
+                    {| File: string
+                       StartLine: int
+                       StartCol: int
+                       EndLine: int
+                       EndCol: int
+                       Project: string
+                       EnclosingTest: string option
+                       LineText: string |})
+                =
+                // range carries coordinates only — `file` is the sibling field above, so it
+                // is not duplicated inside the range object.
+                let rangeNode =
+                    jobj
+                        [ "startLine", jint s.StartLine
+                          "startColumn", jint s.StartCol
+                          "endLine", jint s.EndLine
+                          "endColumn", jint s.EndCol ]
+                    :> JsonNode
+
+                let enclosing =
+                    match s.EnclosingTest with
+                    | Some t -> jstr t
+                    | None -> null
+
+                jobj
+                    [ "file", jstr s.File
+                      "range", rangeNode
+                      "enclosingTest", enclosing
+                      "project", jstr s.Project
+                      "lineText", jstr s.LineText ]
+                :> JsonNode
+
+            let testNodes = pageSites |> Array.map testToJson
+
+            return
+                jobj
+                    [ "status", jstr "succeeded"
+                      "symbol", jstr query
+                      "tests", JsonArray(testNodes) :> JsonNode
+                      "testCount", jint totalTests
+                      "projectsScanned", jint testProjects.Length ]
+                :> JsonNode
+        }
+
     // ── check: one fresh project type-check (issue #128, Stage 1) ────────────────
     // Drops FCS's incremental builder + cached project results for THIS project so a
     // source edit on disk is re-read — this is what makes the `check` verdict

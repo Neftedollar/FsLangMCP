@@ -182,6 +182,15 @@ let private looksLikeTestProject (doc: XDocument) =
                || id.Contains("nunit", StringComparison.OrdinalIgnoreCase)
                || id.Contains("expecto", StringComparison.OrdinalIgnoreCase)))
 
+/// Public test-project predicate reused by fcs_tests_for_symbol (#60). A project counts
+/// as a test project when <IsTestProject>true</IsTestProject> is set OR it references a
+/// known test framework (xunit / nunit / expecto) — the SAME signal project_health's test
+/// discovery uses (looksLikeTestProject). Missing / unreadable .fsproj → false.
+let isTestProjectFile (fsprojPath: string) : bool =
+    match tryReadProject fsprojPath with
+    | Error _ -> false
+    | Ok doc -> looksLikeTestProject doc
+
 /// Count test-method attribute occurrences in a source file. Best-effort regex
 /// scan — no dotnet test invocation. Matches both bare names and namespace-qualified
 /// variants, plus the trailing "Attribute" suffix (so `[<Xunit.FactAttribute>]`
