@@ -218,7 +218,8 @@ type FindArgs =
       occurrence: int option
       /// 0-based column (LSP convention) for kind=position.
       character: int option
-      /// Source-context lines emitted per site. Default 1.
+      /// Source-context lines emitted per site. Default 0 — compact, one line per
+      /// site (lineText only, no before/after arrays). Pass > 0 for surrounding code.
       contextLines: int option
       /// Include declaration sites among results. Default true.
       includeDeclaration: bool option
@@ -226,7 +227,8 @@ type FindArgs =
       includeInfo: bool option
       /// .fsproj / .sln / .slnx / directory to sweep. Falls back to active set_project.
       projectPath: string option
-      /// Maximum sites returned per page. Default 500.
+      /// Maximum sites returned per page. Default 40 (keeps the compact payload well
+      /// under the MCP token ceiling on a hot symbol); cursor pages the rest.
       maxResults: int option
       /// Opaque cursor from a prior call's nextCursor. Omit for the first page.
       cursor: string option }

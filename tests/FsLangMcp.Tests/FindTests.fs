@@ -333,6 +333,54 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
         }
 
     [<Fact>]
+    member _.``find kind=field honors exact=false on the declaring type — query 'role' reaches TraderRole.Propose``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // The declaring-type predicate for field sites must honor exact=false the same
+            // way the symbol branch does: substring 'role' (lowercase) must reach the
+            // TraderRole.Propose field sites. field='Propose' restricts to that field.
+            let! find =
+                bridge.Find(
+                    { findArgs fx.Slnx "role" with
+                        kind = Some "field"
+                        field = Some "Propose"
+                        exact = Some false }
+                )
+
+            Assert.Equal("succeeded", gs find "status")
+            let breakdown = find["breakdown"]
+
+            let fieldTotal =
+                gi breakdown "fieldSetLiteral" + gi breakdown "fieldSetUpdate" + gi breakdown "fieldRead"
+
+            // All 5 Propose field sites (2 literal + 1 update + 2 read) recovered via the substring match.
+            Assert.Equal(5, fieldTotal)
+
+            // CONTROL: the same substring query with exact=true matches nothing — no type is
+            // literally named 'role' — proving exact=false is what unlocks the sites.
+            let! exactFind =
+                bridge.Find(
+                    { findArgs fx.Slnx "role" with
+                        kind = Some "field"
+                        field = Some "Propose"
+                        exact = Some true }
+                )
+
+            let exactBreakdown = exactFind["breakdown"]
+
+            let exactFieldTotal =
+                gi exactBreakdown "fieldSetLiteral"
+                + gi exactBreakdown "fieldSetUpdate"
+                + gi exactBreakdown "fieldRead"
+
+            Assert.Equal(0, exactFieldTotal)
+        }
+
+    [<Fact>]
     member _.``find with empty query returns invalid_args naming query``() : Task =
         task {
             let bridge = FcsBridge()
@@ -358,4 +406,187 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
             Assert.False(gb resolution "matched", "absent symbol must report matched=false")
             Assert.Equal("none", gs resolution "via")
             Assert.Equal(3, gi resolution "projectsSwept")
+        }
+
+    [<Fact>]
+    member _.``find defaults to compact one-line-per-site output; contextLines>0 restores before/after``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // DEFAULT shape: contextLines unset → compact. Every site keeps lineText but
+            // emits NO before/after arrays (the overflow fix). breakdown + resolution stay.
+            let! compact = bridge.Find({ findArgs fx.Slnx "TraderRole" with contextLines = None })
+
+            Assert.Equal("succeeded", gs compact "status")
+            Assert.NotNull(compact["breakdown"])
+            Assert.NotNull(compact["resolution"])
+
+            let compactSites = compact["sites"] :?> JsonArray
+            Assert.True((compactSites.Count > 0), "fixture must produce sites")
+
+            for site in compactSites do
+                Assert.NotNull(site["lineText"]) // the single matched line is preserved
+                Assert.Null(site["before"]) // no surrounding-context arrays
+                Assert.Null(site["after"])
+
+            // OPT-IN context: contextLines=2 restores before/after on every site, with at
+            // least one non-empty (TraderRole is used mid-file across the fixture).
+            let! withCtx = bridge.Find({ findArgs fx.Slnx "TraderRole" with contextLines = Some 2 })
+            let ctxSites = withCtx["sites"] :?> JsonArray
+            Assert.True((ctxSites.Count > 0), "context run must produce sites")
+
+            for site in ctxSites do
+                Assert.NotNull(site["before"])
+                Assert.NotNull(site["after"])
+
+            let anyContextEmitted =
+                ctxSites
+                |> Seq.exists (fun s -> (s["before"] :?> JsonArray).Count > 0 || (s["after"] :?> JsonArray).Count > 0)
+
+            Assert.True(anyContextEmitted, "contextLines=2 must emit surrounding lines on at least one site")
+        }
+
+// ── kind=position FullName disambiguation (Codex P2 #1) ──────────────────────────
+//
+// Two types both named `Config` in DIFFERENT namespaces. kind=position resolves THE
+// specific symbol under the cursor; the subsequent sweep must key on its FullName, not
+// its DisplayName — otherwise it sweeps BOTH Config types. One project is enough: the
+// bug is about symbol identity, not cross-project recovery.
+
+let private configProbeFs =
+    String.concat
+        "\n"
+        [ "namespace ConfigProbe.Alpha"
+          ""
+          "type Config = { Value: int }"
+          ""
+          "module Use ="
+          "    let mk () : Config = { Value = 1 }"
+          "    let other () : Config = { Value = 2 }"
+          ""
+          "namespace ConfigProbe.Beta"
+          ""
+          "type Config = { Flag: bool }"
+          ""
+          "module Use ="
+          "    let mk () : Config = { Flag = true }"
+          "" ]
+
+type ConfigFixture() =
+    let runId = Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_findpos_{runId}")
+
+    let write (rel: string) (content: string) =
+        let full = Path.Combine(root, rel)
+        Directory.CreateDirectory(Path.GetDirectoryName full) |> ignore
+        File.WriteAllText(full, content)
+        full
+
+    let fsproj = write "ConfigProbe/ConfigProbe.fsproj" (leafProject "ConfigProbe.fs")
+    let source = write "ConfigProbe/ConfigProbe.fs" configProbeFs
+
+    // Build once so Ionide.ProjInfo resolves options. Isolation/retry flags mirror FindFixture.
+    let buildOnce () =
+        let psi =
+            ProcessStartInfo(
+                "dotnet",
+                $"build \"{fsproj}\" -c Debug -m:1 -nologo --disable-build-servers -nodeReuse:false -p:UseSharedCompilation=false"
+            )
+
+        psi.RedirectStandardOutput <- true
+        psi.RedirectStandardError <- true
+        psi.UseShellExecute <- false
+        psi.Environment["MSBUILDDISABLENODEREUSE"] <- "1"
+        psi.Environment["DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER"] <- "1"
+        use p = Process.Start(psi)
+        let stdout = p.StandardOutput.ReadToEnd()
+        let stderr = p.StandardError.ReadToEnd()
+        p.WaitForExit()
+        p.ExitCode, stdout + stderr
+
+    let rec buildWithRetry attempt =
+        let code, log = buildOnce ()
+
+        if code = 0 || attempt >= 3 then
+            code, log
+        else
+            System.Threading.Thread.Sleep(1500)
+            buildWithRetry (attempt + 1)
+
+    let buildExit, buildLog = buildWithRetry 1
+
+    member _.Root = root
+    member _.Fsproj = fsproj
+    member _.Source = source
+    member _.SourceText = configProbeFs
+    member _.BuildExitCode = buildExit
+    member _.BuildLog = buildLog
+
+    interface IDisposable with
+        member _.Dispose() =
+            if Directory.Exists root then
+                try
+                    Directory.Delete(root, true)
+                with _ ->
+                    ()
+
+let private symbolFullNames (result: JsonNode) =
+    match result["sites"] with
+    | :? JsonArray as arr ->
+        arr
+        |> Seq.choose (fun s ->
+            match s["symbolFullName"] with
+            | :? JsonValue as v -> Some(v.GetValue<string>())
+            | _ -> None)
+        |> Seq.toList
+    | _ -> []
+
+type FindPositionTests(fx: ConfigFixture) =
+    interface IClassFixture<ConfigFixture>
+
+    [<Fact>]
+    member _.``find kind=position keys the sweep on FullName, not DisplayName — disambiguates same-named types``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // Cursor lands on `Config` in Alpha.Use.mk (the line carrying `Value = 1`) →
+            // resolves ConfigProbe.Alpha.Config (FullName), NOT the Beta namesake.
+            let lines = fx.SourceText.Split('\n')
+            let posLine = lines |> Array.findIndex (fun l -> l.Contains "Value = 1")
+
+            let! find =
+                bridge.Find(
+                    { findArgs fx.Fsproj "Config" with
+                        kind = Some "position"
+                        path = Some fx.Source
+                        line = Some posLine
+                        word = Some "Config" }
+                )
+
+            Assert.Equal("succeeded", gs find "status")
+            Assert.Equal("symbol", gs find "kindResolved")
+
+            let fullNames = symbolFullNames find
+            Assert.True((fullNames.Length > 1), $"expected multiple Alpha.Config sites, got {fullNames.Length}")
+
+            // EVERY site belongs to the Alpha namesake; the Beta.Config sites must NOT leak in.
+            let joined = String.concat ", " fullNames
+
+            Assert.True(
+                fullNames |> List.forall (fun fn -> fn = "ConfigProbe.Alpha.Config"),
+                $"every position site must be ConfigProbe.Alpha.Config; got: {joined}"
+            )
+
+            Assert.DoesNotContain("ConfigProbe.Beta.Config", fullNames)
+
+            // CONTROL: a plain exact query 'Config' keys on DisplayName and therefore sweeps
+            // BOTH namesakes — the ambiguity that position resolution must avoid.
+            let! plain = bridge.Find({ findArgs fx.Fsproj "Config" with exact = Some true })
+            let plainNames = symbolFullNames plain
+            Assert.Contains("ConfigProbe.Alpha.Config", plainNames)
+            Assert.Contains("ConfigProbe.Beta.Config", plainNames)
         }

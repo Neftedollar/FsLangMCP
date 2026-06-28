@@ -575,7 +575,7 @@ let main argv =
                 tool (
                     TypedTool.define<FindArgs>
                         "find"
-        "[FCS in-process] Multi-project symbol search. Sweeps every member .fsproj of the solution and unions definitions, references, record-field set sites, and member-usage sites — recovering cross-project sites single-project fcs_find_symbol / fcs_record_field_audit miss. Bare find(query) suffices; optional kind (auto|symbol|members|field|definition|position) + scope narrow it. Prefer over fcs_find_symbol for cross-project refactors. matched=false only when the FCS sweep and FSAC index are empty."
+        "[FCS in-process] Multi-project symbol search. Sweeps every member .fsproj of the solution and unions definitions, references, record-field set sites, and member-usage sites — recovering cross-project sites single-project fcs_find_symbol / fcs_record_field_audit miss. Bare find(query) returns a compact one-line-per-site list (file/line/kind/lineText); pass contextLines for surrounding code. Optional kind + scope narrow it. Prefer over fcs_find_symbol for cross-project refactors."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }

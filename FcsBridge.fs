@@ -120,8 +120,11 @@ type internal CheckFsacSnapshot =
       /// Most recent analyzedAt / mostRecentAnalyzedAt timestamp, when present.
       /// None is the un-analyzed (stale-`{}`) case — the fast path cannot confirm clean.
       MostRecentAnalyzedAt: string option
-      /// Error-severity diagnostics, LSP-shaped, deep-cloned for surfacing.
-      ErrorDiagnostics: JsonNode }
+      /// ALL-severity diagnostics, LSP-shaped (each carries its `severity` code),
+      /// deep-cloned for surfacing. The fast path filters these by the requested
+      /// severity floor so check(speed="fast", severity="warning"|"all") surfaces
+      /// the warnings the caller asked for — not just errors.
+      Diagnostics: JsonNode }
 
 [<RequireQualifiedAccess>]
 module internal CheckFsacSnapshot =
@@ -132,7 +135,7 @@ module internal CheckFsacSnapshot =
           ErrorCount = 0
           WarningCount = 0
           MostRecentAnalyzedAt = None
-          ErrorDiagnostics = JsonArray() }
+          Diagnostics = JsonArray() }
 
     /// Projects a workspace_diagnostics response (file or workspace shape) into a
     /// CheckFsacSnapshot. Tolerant of missing fields — anything it cannot read
@@ -168,7 +171,10 @@ module internal CheckFsacSnapshot =
 
             let mutable errorCount = 0
             let mutable warningCount = 0
-            let errorDiags = JsonArray()
+            // ALL severities are retained (each node keeps its LSP `severity` code) so the
+            // fast path can surface by the requested floor. errorCount/warningCount stay
+            // the FULL-set tallies the caller-facing counts are built from.
+            let diags = JsonArray()
 
             let severityOf (obj: JsonObject) =
                 match obj["severity"] with
@@ -182,17 +188,19 @@ module internal CheckFsacSnapshot =
                     match node with
                     | :? JsonObject as obj ->
                         match severityOf obj with
-                        | 1 ->
-                            errorCount <- errorCount + 1
-                            let clone = node.DeepClone()
-
-                            match file, clone with
-                            | Some f, (:? JsonObject as co) -> co["file"] <- jstr f
-                            | _ -> ()
-
-                            errorDiags.Add(clone)
+                        | 1 -> errorCount <- errorCount + 1
                         | 2 -> warningCount <- warningCount + 1
                         | _ -> ()
+
+                        // Retain every diagnostic (all severities), patching `file` for the
+                        // workspace shape where it is the dictionary key, not a node field.
+                        let clone = node.DeepClone()
+
+                        match file, clone with
+                        | Some f, (:? JsonObject as co) -> co["file"] <- jstr f
+                        | _ -> ()
+
+                        diags.Add(clone)
                     | _ -> ()
 
             match resp["result"] with
@@ -209,7 +217,7 @@ module internal CheckFsacSnapshot =
               ErrorCount = errorCount
               WarningCount = warningCount
               MostRecentAnalyzedAt = analyzedAt
-              ErrorDiagnostics = errorDiags }
+              Diagnostics = diags }
         with _ ->
             empty
 
@@ -2212,7 +2220,23 @@ type internal FcsBridge() =
                                             checkResults.GetSymbolUseAtLocation(fcsLine, column, lineText, [ text ]))
 
                                     match symbolUse with
-                                    | Some u -> return Ok u.Symbol.DisplayName
+                                    | Some u ->
+                                        // kind=position resolved THE specific symbol under the cursor.
+                                        // Key the subsequent sweep on its FullName so the match stays
+                                        // precise: DisplayName alone would also sweep an unrelated
+                                        // `Config` in another namespace (or every same-named overload).
+                                        // Locals / synthetic symbols may carry no useful FullName, so
+                                        // fall back to DisplayName there.
+                                        let key =
+                                            try
+                                                match u.Symbol.FullName with
+                                                | null -> u.Symbol.DisplayName
+                                                | fn when String.IsNullOrWhiteSpace fn -> u.Symbol.DisplayName
+                                                | fn -> fn
+                                            with _ ->
+                                                u.Symbol.DisplayName
+
+                                        return Ok key
                                     | None ->
                                         return
                                             Error(
@@ -2252,10 +2276,22 @@ type internal FcsBridge() =
             let kind = (args.kind |> Option.defaultValue "auto").Trim().ToLowerInvariant()
             let scope = (args.scope |> Option.defaultValue "auto").Trim().ToLowerInvariant()
             let exact = args.exact |> Option.defaultValue true
-            let contextLines = args.contextLines |> Option.defaultValue 1
+            // Compact by default: 0 context lines → one line per site (lineText only),
+            // no before/after arrays. A bare find on a hot symbol must never overflow
+            // the MCP token ceiling (issue: 0.10.0 dogfooding — 50 sites × ctx=1 = 73k
+            // chars). Surrounding context is strictly opt-in via contextLines > 0.
+            let contextLines = args.contextLines |> Option.defaultValue 0
             let includeDeclaration = args.includeDeclaration |> Option.defaultValue true
             let includeInfo = args.includeInfo |> Option.defaultValue false
-            let pageSize = args.maxResults |> Option.defaultValue 500
+            // Default page size kept low so even the compact payload stays well under
+            // the MCP token ceiling on a cap-case hit. Each site is serialized twice
+            // (grouped buckets + the flat `sites` superset), so per-site cost is
+            // ~1000 chars even compact — measured: a hot symbol at 40 sites is ~42k
+            // chars (~14k tokens, well under the ~25k-token ceiling ≈ ~72k chars),
+            // whereas 100 sites overflows it. breakdown + totalSites still report the
+            // FULL set, and cursor/nextCursor pages the rest, so a complete refactor
+            // list stays reachable past the default.
+            let pageSize = args.maxResults |> Option.defaultValue 40
 
             let pageOffset =
                 match args.cursor with
@@ -2338,10 +2374,19 @@ type internal FcsBridge() =
                         && fullName.Length > query.Length
                         && fullName[fullName.Length - query.Length - 1] = '.'))
 
+            // Declaring-type predicate for field/member sites. Honors `exact` the same
+            // way symbolMatches does for the name branch: exact=false must do substring
+            // matching so query="role", field="Propose" still reaches TraderRole.Propose.
             let entityMatchesQuery (e: FSharpEntity) =
                 try
-                    String.Equals(e.DisplayName, query, StringComparison.Ordinal)
-                    || fullNameBoundaryMatch e.FullName
+                    if exact then
+                        String.Equals(e.DisplayName, query, StringComparison.Ordinal)
+                        || fullNameBoundaryMatch e.FullName
+                    else
+                        (not (isNull e.DisplayName)
+                         && e.DisplayName.Contains(query, StringComparison.OrdinalIgnoreCase))
+                        || (not (isNull e.FullName)
+                            && e.FullName.Contains(query, StringComparison.OrdinalIgnoreCase))
                 with _ ->
                     false
 
@@ -2617,18 +2662,27 @@ type internal FcsBridge() =
                           "endColumn", jint s.EndCol ]
                     :> JsonNode
 
+                // Compact default (contextLines = 0): emit only the matched line —
+                // omit before/after entirely (not even empty arrays) so a large site
+                // count stays well under the MCP token ceiling. contextLines > 0
+                // restores the richer surrounding-code output.
+                let contextFields =
+                    if contextLines > 0 then
+                        [ "before", ctx["before"].DeepClone(); "after", ctx["after"].DeepClone() ]
+                    else
+                        []
+
                 jobj
-                    [ "file", jstr s.File
-                      "range", rangeNode
-                      "kind", jstr s.Kind
-                      "project", jstr s.Project
-                      "symbolFullName",
-                      (match s.FullName with
-                       | null -> null
-                       | v -> jstr v)
-                      "lineText", ctx["lineText"].DeepClone()
-                      "before", ctx["before"].DeepClone()
-                      "after", ctx["after"].DeepClone() ]
+                    ([ "file", jstr s.File
+                       "range", rangeNode
+                       "kind", jstr s.Kind
+                       "project", jstr s.Project
+                       "symbolFullName",
+                       (match s.FullName with
+                        | null -> null
+                        | v -> jstr v)
+                       "lineText", ctx["lineText"].DeepClone() ]
+                     @ contextFields)
                 :> JsonNode
 
             let pagePairs = pageSites |> Array.map (fun s -> s.Kind, siteToJson s)
@@ -2983,9 +3037,30 @@ type internal FcsBridge() =
                     else
                         "clean", true, None
 
+                // Surface the snapshot's diagnostics by the requested severity floor —
+                // LSP severity codes (1=Error … 4=Hint) line up with floorRank, so a node
+                // is emitted when 1 ≤ code ≤ floorRank. This is what makes
+                // check(speed="fast", severity="warning"|"all") actually return the
+                // warnings the caller asked for. errorCount/warningCount below stay the
+                // FULL-set tallies, matching the trusted path's count/floor split.
+                let severityCode (obj: JsonObject) =
+                    match obj["severity"] with
+                    | :? JsonValue as v ->
+                        let mutable c = 0
+                        if v.TryGetValue(&c) then c else 0
+                    | _ -> 0
+
                 let nodes =
-                    match snap.ErrorDiagnostics with
-                    | :? JsonArray as arr -> arr |> Seq.map (fun n -> n.DeepClone()) |> Seq.toArray
+                    match snap.Diagnostics with
+                    | :? JsonArray as arr ->
+                        arr
+                        |> Seq.choose (fun n ->
+                            match n with
+                            | :? JsonObject as obj ->
+                                let code = severityCode obj
+                                if code >= 1 && code <= floorRank then Some(n.DeepClone()) else None
+                            | _ -> None)
+                        |> Seq.toArray
                     | _ -> [||]
 
                 let files =
@@ -4418,11 +4493,26 @@ type internal FcsBridge() =
                             if passesMemberAccessibility m && not isAccessor then
                                 yield referencedMemberToJson m
 
-                        // Record fields / struct fields
+                        // Record / struct / class fields. Public fields and consts on a
+                        // reference-type CLASS (C# class fields, F# `val`) are exposed ONLY
+                        // via FSharpFields — they are not in MembersFunctionsAndValues — so
+                        // enumerate classes here too, not just records/structs. Drop
+                        // compiler-generated backing fields (`<Prop>k__BackingField`, F#'s
+                        // `Name@`) so an auto-property is not duplicated by its hidden field.
                         try
-                            if entity.IsFSharpRecord || entity.IsValueType then
+                            if entity.IsFSharpRecord || entity.IsValueType || entity.IsClass then
+                                let isBackingField (f: FSharpField) =
+                                    try
+                                        f.IsCompilerGenerated
+                                        || f.IsNameGenerated
+                                        || (let n = f.Name
+                                            not (isNull n)
+                                            && (n.Contains "k__BackingField" || n.Contains "@"))
+                                    with _ ->
+                                        false
+
                                 for f in entity.FSharpFields do
-                                    if passesFieldAccessibility f then
+                                    if passesFieldAccessibility f && not (isBackingField f) then
                                         yield referencedFieldToJson f
                         with _ ->
                             ()
