@@ -2283,15 +2283,18 @@ type internal FcsBridge() =
             let contextLines = args.contextLines |> Option.defaultValue 0
             let includeDeclaration = args.includeDeclaration |> Option.defaultValue true
             let includeInfo = args.includeInfo |> Option.defaultValue false
-            // Default page size kept low so even the compact payload stays well under
-            // the MCP token ceiling on a cap-case hit. Each site is serialized twice
-            // (grouped buckets + the flat `sites` superset), so per-site cost is
-            // ~1000 chars even compact — measured: a hot symbol at 40 sites is ~42k
-            // chars (~14k tokens, well under the ~25k-token ceiling ≈ ~72k chars),
-            // whereas 100 sites overflows it. breakdown + totalSites still report the
-            // FULL set, and cursor/nextCursor pages the rest, so a complete refactor
-            // list stays reachable past the default.
-            let pageSize = args.maxResults |> Option.defaultValue 40
+            // Default page size keeps the compact payload well under the MCP token
+            // ceiling on a cap-case hit. Each site is now serialized ONCE — the flat
+            // `sites` list — after the grouped definitions/references/fieldSites/
+            // memberSites buckets (which duplicated every site) were dropped, so the
+            // per-site cost dropped from ~1030 to ~527 chars (measured on
+            // find("FindArgs")). With one representation the default is raised from 40
+            // to 80: a full 80-site page is ~43k chars (~14k tokens, under the
+            // ~25k-token ceiling ≈ ~72k chars), and a 69-site hot symbol now fits one
+            // page at ~37k chars instead of truncating at 40. breakdown + totalSites
+            // still report the FULL set, and cursor/nextCursor pages the rest, so a
+            // complete refactor list stays reachable past the default.
+            let pageSize = args.maxResults |> Option.defaultValue 80
 
             let pageOffset =
                 match args.cursor with
@@ -2685,19 +2688,13 @@ type internal FcsBridge() =
                      @ contextFields)
                 :> JsonNode
 
-            let pagePairs = pageSites |> Array.map (fun s -> s.Kind, siteToJson s)
-
-            let bucket (kinds: string list) =
-                pagePairs
-                |> Array.choose (fun (k, n) -> if List.contains k kinds then Some n else None)
-
-            let definitions = bucket [ "definition" ]
-            let references = bucket [ "reference" ]
-            let fieldSites = bucket [ "field-set-literal"; "field-set-update"; "field-read" ]
-            let memberSites = bucket [ "member-usage" ]
-            // A JsonNode can have only one parent: the grouped buckets above own the
-            // originals, so the flat legacy-superset `sites` array gets deep clones.
-            let flatSites = pagePairs |> Array.map (fun (_, n) -> n.DeepClone())
+            // One self-describing representation per site: each node carries
+            // file / range / kind / project / symbolFullName / lineText, so an agent
+            // filters the flat list by `kind` and reads `breakdown` for per-kind
+            // counts. The grouped definitions/references/fieldSites/memberSites buckets
+            // were dropped — they re-emitted every site a second time and doubled the
+            // payload (the reason the default page cap had been forced down to 40).
+            let siteNodes = pageSites |> Array.map siteToJson
 
             // Aggregated diagnostics across swept projects: Error always (so callers can
             // detect broken projects even on zero hits), Warning/Info gated by includeInfo.
@@ -2754,11 +2751,7 @@ type internal FcsBridge() =
                   "totalSites", jint totalSites
                   "matchedUseCount", jint totalSites
                   "breakdown", breakdown
-                  "definitions", JsonArray(definitions) :> JsonNode
-                  "references", JsonArray(references) :> JsonNode
-                  "fieldSites", JsonArray(fieldSites) :> JsonNode
-                  "memberSites", JsonArray(memberSites) :> JsonNode
-                  "sites", JsonArray(flatSites) :> JsonNode
+                  "sites", JsonArray(siteNodes) :> JsonNode
                   "perProject", JsonArray(perProject.ToArray()) :> JsonNode
                   "sweepElapsedMs", jint (int sweepSw.ElapsedMilliseconds)
                   "projectDiagnostics", JsonArray(diagNodes) :> JsonNode ]
