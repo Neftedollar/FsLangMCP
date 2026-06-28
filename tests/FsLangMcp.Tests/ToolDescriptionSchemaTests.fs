@@ -15,21 +15,13 @@ let OverBudgetCeiling = 500
 [<Literal>]
 let UnderBudgetFloor = 150
 
-let private recognizedTags = [ "[FSAC]"; "[FCS in-process]"; "[meta]" ]
-
 // Tools known to overlap with each other. At least one side of every pair
 // must contain an explicit "prefer X" / "avoid for" / "instead of" / etc.
 // callout so an agent reading either description can disambiguate.
 let private overlapPairs : (string * string) list =
-    [ "workspace_symbol", "fcs_find_symbol"
-      "fcs_referenced_symbols", "fcs_nuget_types"
+    [ "fcs_referenced_symbols", "fcs_nuget_types"
       "fcs_nuget_types", "fcs_nuget_members"
-      "fcs_validate_snippet", "fcs_parse_and_check_file"
-      "fcs_signature_help", "fsharp_signature_data"
-      "fcs_symbol_at_word", "fcs_type_at_position"
-      "fcs_file_outline", "fcs_file_symbols"
-      "workspace_diagnostics", "fcs_check_file"
-      "textDocument_definition", "fcs_find_symbol" ]
+      "fcs_signature_help", "fsharp_signature_data" ]
 
 let private preferRegex =
     Regex(
@@ -65,9 +57,6 @@ let private parseDescriptions () : (string * string) list =
 
     [ for m in toolPattern.Matches(source) -> m.Groups.[1].Value, decodeFSharpStringLiteral m.Groups.[2].Value ]
 
-let private hasTag (desc: string) =
-    recognizedTags |> List.exists desc.StartsWith
-
 let private hasPreferCallout (desc: string) = preferRegex.IsMatch(desc)
 
 [<Fact>]
@@ -76,13 +65,18 @@ let ``Program.fs contains at least one parseable tool description`` () =
     Assert.NotEmpty(descs)
 
 [<Fact>]
-let ``every tool description starts with a recognized tag prefix`` () =
+let ``no tool description starts with a bracket tag prefix`` () =
+    // Tags ([FSAC] / [FCS in-process] / [meta]) were stripped in #136 — agents see
+    // a clean leading verb, not an implementation-layer marker. Enforce the inverse:
+    // no description may start with a `[`-bracket tag.
+    let startsWithBracket = Regex(@"^\[")
+
     let violations =
         parseDescriptions ()
-        |> List.filter (fun (_, d) -> not (hasTag d))
+        |> List.filter (fun (_, d) -> startsWithBracket.IsMatch d)
         |> List.map (fun (name, d) ->
             let head = if d.Length > 40 then d.Substring(0, 40) + "..." else d
-            sprintf "%s: starts with %A (expected one of %A)" name head recognizedTags)
+            sprintf "%s: starts with bracket tag %A (tags must be stripped)" name head)
 
     Assert.Empty(violations)
 

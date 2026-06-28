@@ -4,7 +4,8 @@
 Schema reference: docs/tool-description-schema.md
 
 Hard rules (enforced — non-zero exit on violation):
-1. Every description must start with a recognized tag: [FSAC], [FCS in-process], or [meta].
+1. No description may start with a `[`-bracket tag. The [FSAC]/[FCS in-process]/[meta]
+   implementation-layer prefixes were stripped in #136 — descriptions lead with a verb.
 2. Length must not exceed the OVER_BUDGET threshold (500 chars).
 
 Soft signals (reported only — exit code unaffected):
@@ -24,20 +25,12 @@ TARGET_MAX = 400
 ACCEPTABLE_MAX = 500
 OVER_BUDGET = 500
 
-TAGS = ("[FSAC]", "[FCS in-process]", "[meta]")
-
 # Pairs of tools known to overlap — at least one description in each pair
 # should contain a "prefer X over Y" callout. Order-independent.
 OVERLAP_PAIRS: list[tuple[str, str]] = [
-    ("workspace_symbol", "fcs_find_symbol"),
     ("fcs_referenced_symbols", "fcs_nuget_types"),
     ("fcs_nuget_types", "fcs_nuget_members"),
-    ("fcs_validate_snippet", "fcs_parse_and_check_file"),
     ("fcs_signature_help", "fsharp_signature_data"),
-    ("fcs_symbol_at_word", "fcs_type_at_position"),
-    ("fcs_file_outline", "fcs_file_symbols"),
-    ("workspace_diagnostics", "fcs_check_file"),
-    ("textDocument_definition", "fcs_find_symbol"),
 ]
 
 PREFER_PATTERNS = re.compile(
@@ -70,8 +63,8 @@ def verdict_label(n: int) -> str:
     return "OVER"
 
 
-def has_tag(desc: str) -> bool:
-    return any(desc.startswith(t) for t in TAGS)
+def starts_with_bracket_tag(desc: str) -> bool:
+    return desc.startswith("[")
 
 
 def has_prefer_callout(desc: str) -> bool:
@@ -96,19 +89,22 @@ def main(argv: list[str]) -> int:
     soft_warnings: list[str] = []
 
     print(f"Audited {len(rows)} tool descriptions in Program.fs\n")
-    print(f"{'Tool':<35} {'len':>4}  {'verdict':<7} tag prefer")
+    print(f"{'Tool':<35} {'len':>4}  {'verdict':<7} notag prefer")
     print("-" * 70)
     for name, desc in rows:
         L = len(desc)
         v = verdict_label(L)
-        tag_ok = has_tag(desc)
+        has_bracket = starts_with_bracket_tag(desc)
         prefer_ok = has_prefer_callout(desc)
         print(
-            f"{name:<35} {L:>4}  {v:<7} {'OK ' if tag_ok else 'MIS'} "
+            f"{name:<35} {L:>4}  {v:<7} {'OK ' if not has_bracket else 'BAD'} "
             f"{'OK ' if prefer_ok else '---'}"
         )
-        if not tag_ok:
-            hard_failures.append(f"{name}: missing tag prefix (expected one of {TAGS})")
+        if has_bracket:
+            hard_failures.append(
+                f"{name}: starts with a `[` bracket tag — implementation-layer prefixes "
+                f"must be stripped (#136)"
+            )
         if L > OVER_BUDGET:
             hard_failures.append(
                 f"{name}: length {L} exceeds {OVER_BUDGET}-char ceiling — split into "
@@ -141,7 +137,7 @@ def main(argv: list[str]) -> int:
             print(f"  - {f}", file=sys.stderr)
         return 1
 
-    print("OK — all descriptions within 500-char ceiling and tagged.")
+    print("OK — all descriptions within 500-char ceiling and free of bracket tags.")
     return 0
 
 

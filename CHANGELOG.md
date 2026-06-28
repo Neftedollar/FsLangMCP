@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-28
+
+### Removed
+
+- **BREAKING — the agent-facing MCP tool surface shrank from 36 → 22 tools: 14 thin single-tool aliases over the consolidated `find` / `check` were removed (#136).** Since 0.10.0 these were already steered toward `find` / `check` via `Prefer …` description hints; #136 completes the consolidation by dropping the registrations. The backend `FcsBridge` / `FsAutoCompleteBridge` methods (`FindSymbol`, `References`, `WorkspaceSymbol`, `CompileProject`, `ParseAndCheckFile`, `ValidateSnippet`, etc.) are unchanged — only the agent-facing tool registrations were removed. Removed tools, grouped:
+  - **find cluster (7):** `textDocument_definition`, `textDocument_references`, `workspace_symbol`, `fcs_find_symbol`, `fcs_project_symbol_uses`, `fcs_find_member_usages`, `fcs_record_field_audit`
+  - **check cluster (5):** `workspace_diagnostics`, `fsharp_compile`, `fcs_parse_and_check_file`, `fcs_check_file`, `fcs_validate_snippet`
+  - **low-level position/symbol (2):** `fcs_file_symbols`, `fcs_type_at_position`
+
+  Every capability remains reachable: cross-project **and** single-project symbol / reference / record-field-set / member-usage search via `find` (with `kind` + `scope` narrowing); type-check verdicts for file / project / workspace / inline snippet via `check`; raw per-file symbol extraction via `fcs_file_outline`; and position- or unsaved-buffer symbol / type lookups via `fcs_symbol_at_word`.
+
+### Changed
+
+- **`[FCS in-process]` / `[FSAC]` / `[meta]` description prefixes were stripped from all 22 remaining tool descriptions — each now leads with its action verb.** The implementation-layer tag leaked an internal backend distinction into the most valuable routing position (the first token the agent reads) without helping the call/skip decision. The `ToolDescriptionSchemaTests` (`dotnet test` gate) and `scripts/audit-tool-descriptions.py` schema rule were inverted accordingly: from "every description must start with a recognized tag" to "no description may start with a `[`-bracket tag", and the overlap-pair set was pruned to the three pairs whose members both still exist (`fcs_referenced_symbols`↔`fcs_nuget_types`, `fcs_nuget_types`↔`fcs_nuget_members`, `fcs_signature_help`↔`fsharp_signature_data`). `docs/tool-description-schema.md` documents the new rule.
+
+### Notes
+
+- **Accepted limitations of the consolidated path (carried over from the 0.10.0 `find` / `check` design):** `find` / `check` do not accept `text` (unsaved buffer content) or raw `projectOptions` / `workspacePath` overrides — Write the file to disk first, then call `find` / `check`. Position-based and unsaved-buffer symbol / type lookups remain available through `fcs_symbol_at_word`.
+
 ## [0.10.1] - 2026-06-28
 
 ### Fixed
