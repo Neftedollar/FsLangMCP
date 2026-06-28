@@ -1,7 +1,164 @@
 # Detailed Tool Mechanics
 
-This file expands on the five tool descriptions that were compressed in `Program.fs`.
 The MCP description tells you *whether* to call a tool; this file tells you *how it works internally*.
+
+**Start here.** `find` and `check` are the primary entry points and lead every category below.
+`find` is the multi-project symbol sweep that supersedes the seven single-project search tools
+(`fcs_find_symbol`, `fcs_record_field_audit`, `fcs_find_member_usages`, `workspace_symbol`,
+`fcs_project_symbol_uses`, `textDocument_references`, `textDocument_definition`). `check` is the
+single yes/no type-check verdict that supersedes the five lower-level check tools
+(`workspace_diagnostics`, `fsharp_compile`, `fcs_check_file`, `fcs_parse_and_check_file`,
+`fcs_validate_snippet`). Those twelve cluster tools remain registered as lower-level primitives —
+reach for them only when you need a specific knob `find` / `check` don't expose.
+
+---
+
+## find
+
+**Routing description:** `[FCS in-process]` Multi-project symbol search. Sweeps every member
+`.fsproj` of the solution and unions definitions, references, record-field set sites, and
+member-usage sites — recovering cross-project sites that the single-project `fcs_find_symbol` /
+`fcs_record_field_audit` miss. Bare `find(query)` suffices; optional `kind`
+(`auto`|`symbol`|`members`|`field`|`definition`|`position`) and `scope` narrow it. Prefer over
+`fcs_find_symbol` for cross-project refactors.
+
+**Signature:** `query` is the only required argument. `kind` (default `auto`) and `scope` (default
+`auto`) shape the sweep. `exact` (default `true`) toggles exact-vs-substring matching. `member` /
+`field` restrict the member-usage / record-field unions. `path` + `line` + `word` + `occurrence` +
+`character` anchor `kind=position`. `contextLines` (default 1), `includeDeclaration` (default true),
+`includeInfo` (default false), `projectPath` (falls back to active `set_project`), `maxResults`
+(default 500), and `cursor` round out the surface.
+
+### Bare-call default
+
+`find(query)` runs `kind=auto` over `scope=auto` — i.e. it sweeps **every** member project of the
+active solution and unions all four site kinds. No position, no project path, no flags needed; the
+common case is a single argument.
+
+### kind and scope
+
+| `kind` | What it resolves |
+|--------|------------------|
+| `auto` (default) | Union of `symbol` + `members` + `field` definitions/references/sites |
+| `symbol` | Grouped definitions + references (like `fcs_find_symbol`) |
+| `members` | Member-usage sites on a type (like `fcs_find_member_usages`); pair with `member` |
+| `field` | Record construction/update sites (like `fcs_record_field_audit`); pair with `field` |
+| `definition` | Definition sites only (like `textDocument_definition`) |
+| `position` | Exact-position resolution; needs `path` + `line` + `word`/`character` |
+
+| `scope` | Breadth |
+|---------|---------|
+| `auto` (default) / `workspace` | Sweep every member `.fsproj` of the active solution |
+| `project` | The active (or `projectPath`) project only |
+| `file` | The single file at `path` only |
+
+### How it works internally
+
+1. Resolves the sweep target list — every member `.fsproj` of the active solution via
+   `SolutionParsing.listProjects` (or the single active project when `scope=project`/`file`).
+2. For each project, runs FCS name resolution and unions four site kinds: definitions, references,
+   record-field set sites (`{ Field = expr }` and `{ x with Field = expr }`), and member-usage
+   sites — so it covers exactly the ground that `fcs_find_symbol` (no field sites) and
+   `fcs_record_field_audit` (no cross-project sweep) each miss alone.
+3. De-duplicates the union by `(file, range)` and groups by symbol identity.
+4. Falls back to the FSAC `workspace/symbol` index when the FCS sweep returns nothing.
+5. Returns grouped entries with `file`, `range`, `lineText`, plus scoped `projectDiagnostics`.
+
+### The cross-project problem it solves
+
+`fcs_find_symbol` and `fcs_record_field_audit` resolve against **one** project's symbol table, so a
+symbol used in a downstream project is invisible to them. On the consolidation validation fixture,
+the single-project path surfaced **1** site where the whole-solution `find` sweep surfaced **11**.
+`find` removes the "did I check every project?" burden — the bare call already swept all of them.
+
+### Caveats
+
+1. **`matched=false` is a real negative** — it is returned only when both the FCS sweep AND the
+   FSAC index come back empty. A populated `definitions`/`references` group means a hit.
+2. **`exact=true` is the default** — set `exact=false` for case-insensitive substring matching;
+   broad substrings on common names ("Id", "Create") can return large pages.
+3. **`kind=position` needs coordinates** — supply `path` + `line` + (`word` or `character`).
+   0-based LSP coordinates apply.
+
+### Related tools
+
+- `fcs_find_symbol` — single-project grouped definitions/references; `find`'s `kind=symbol` on one project.
+- `fcs_record_field_audit` — single-project record field-set sites; `find`'s `kind=field`.
+- `fcs_find_member_usages` — single-project member-usage sites; `find`'s `kind=members`.
+- `workspace_symbol` / `fcs_project_symbol_uses` / `textDocument_references` / `textDocument_definition`
+  — lower-level single-project primitives `find` unions over.
+
+---
+
+## check
+
+**Routing description:** `[FSAC]` One trustworthy verdict for the active F# context. Bare `check()`
+suffices: returns `verdict` (`clean`|`errors`|`unknown`) after a FRESH in-process type-check, so it
+never reports a stale-`{}` false-clean and you don't fall back to `dotnet build`. Optional `scope`
+(`auto`|`file`|`project`|`workspace`|`snippet`), `path`, `snippet` (inline source), `speed` (trusted
+default | `fast` = cached FSAC snapshot), `severity`. Prefer over `workspace_diagnostics` /
+`fcs_check_file` when you just need a yes/no answer.
+
+**Signature:** every argument is optional. `scope` (default `auto`) picks `snippet` when `snippet`
+is set, `file` when `path` is set, else the active project (or the whole solution when it spans
+>1 `.fsproj`). `path` / `snippet` / `fileGlob` / `mode` (`fs`|`fsi`) target the unit to check.
+`speed` (`trusted` default | `fast`), `severity` (`error` default | `warning` | `information` |
+`hint` | `all`), `projectPath` (falls back to active `set_project`), and `timeoutMs` (default 60000)
+round out the surface.
+
+### Bare-call default
+
+`check()` runs `scope=auto` at `speed=trusted` — a FRESH in-process FCS type-check of the active
+project, collapsed to a single `verdict`. No path, no project, no flags needed for the common
+"did my last edit compile?" question.
+
+### verdict and speed
+
+| `verdict` | Meaning |
+|-----------|---------|
+| `clean` | The checked unit type-checked with zero errors |
+| `errors` | At least one error-severity diagnostic |
+| `unknown` | The check could not run (no project context / resolution failed) — **not** clean |
+
+| `speed` | Behaviour |
+|---------|-----------|
+| `trusted` (default) | Runs a FRESH FCS check; the verdict reflects the current source on disk |
+| `fast` | Reads the cheap cached FSAC `publishDiagnostics` snapshot — may lag a recent edit |
+
+### How it works internally
+
+1. Resolves `scope`: `snippet` when `snippet` is set, `file` when `path` is set, else `project`
+   (escalating to `workspace` when the solution spans more than one `.fsproj`).
+2. At `speed=trusted`, runs a fresh in-process FCS pass (`ParseAndCheckFileInProject` for a file,
+   `ParseAndCheckProject` for a project/workspace) so the result reflects the current source — never
+   a stale cached payload. At `speed=fast`, reads the cached FSAC snapshot instead.
+3. Collapses the diagnostics into one `verdict` (`clean` / `errors` / `unknown`).
+4. Returns `verdict` + `errorCount` + `warningCount` + a `diagnostics` array filtered to `severity`.
+
+### The stale-`{}` problem it solves
+
+Right after an `Edit`/`Write`, `workspace_diagnostics` can serve an empty `{}` from the FSAC cache
+and report **clean** while the file actually has errors — the false-clean that historically drove
+agents to fall back to `dotnet build`. At `speed=trusted`, `check` re-checks fresh in-process, so a
+`clean` verdict is trustworthy and `errors` is caught immediately. One tool, one verdict, no
+build-shell fallback.
+
+### Caveats
+
+1. **`unknown` ≠ `clean`** — `unknown` means the check could not run (no `set_project`, unresolved
+   options). Establish project context and retry; do not treat it as a pass.
+2. **`severity` filters the array only** — `errorCount`/`warningCount` always reflect the full
+   result regardless of the `severity` cutoff applied to the returned `diagnostics`.
+3. **`speed=fast` can lag** — it reads the cached FSAC snapshot; use the default `trusted` when you
+   need the verdict to reflect a just-written edit.
+
+### Related tools
+
+- `workspace_diagnostics` — cached FSAC `publishDiagnostics`; fast but can serve the stale `{}` `check` guards against.
+- `fcs_check_file` — cache-invalidating single-file recheck; `check`'s `scope=file` does this for you.
+- `fsharp_compile` — project-wide `ParseAndCheckProject`; `check`'s `scope=project`.
+- `fcs_parse_and_check_file` — non-invalidating single-file typecheck.
+- `fcs_validate_snippet` — compile an inline snippet; `check`'s `scope=snippet` (`snippet` arg).
 
 ---
 

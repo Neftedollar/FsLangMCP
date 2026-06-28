@@ -193,6 +193,69 @@ type FcsFindSymbolArgs =
       /// Opaque cursor from a prior call's `nextCursor`. Omit for the first page.
       cursor: string option }
 
+type FindArgs =
+    { /// Symbol, type, or member name to find. The ONLY required argument.
+      query: string
+      /// Resolution mode: "auto" (default) | "symbol" | "members" | "field" | "definition" | "position".
+      /// auto unions definitions + references + record-field sites + member-usage sites.
+      kind: string option
+      /// Sweep breadth: "auto" (default) | "file" | "project" | "workspace".
+      /// auto/workspace sweep every member project of the active solution.
+      scope: string option
+      /// When true (default), match query exactly; false = case-insensitive substring.
+      exact: bool option
+      /// Restrict the member-usage union to this member name (used with kind=members).
+      ``member``: string option
+      /// Restrict the record-field union to this field name (used with kind=field).
+      field: string option
+      /// File context: derives project options and anchors kind=position / scope=file.
+      path: string option
+      /// 0-based line (LSP convention) for kind=position.
+      line: int option
+      /// Identifier near the position to resolve (kind=position); pairs with line.
+      word: string option
+      /// 0-based occurrence index of `word` on the line. Default -1 (first match).
+      occurrence: int option
+      /// 0-based column (LSP convention) for kind=position.
+      character: int option
+      /// Source-context lines emitted per site. Default 1.
+      contextLines: int option
+      /// Include declaration sites among results. Default true.
+      includeDeclaration: bool option
+      /// Include Info/Hint diagnostics in projectDiagnostics. Default false.
+      includeInfo: bool option
+      /// .fsproj / .sln / .slnx / directory to sweep. Falls back to active set_project.
+      projectPath: string option
+      /// Maximum sites returned per page. Default 500.
+      maxResults: int option
+      /// Opaque cursor from a prior call's nextCursor. Omit for the first page.
+      cursor: string option }
+
+type CheckArgs =
+    { /// What to check: "auto" (default) | "file" | "project" | "workspace" | "snippet".
+      /// auto picks snippet when `snippet` is set, file when `path` is set, else the
+      /// active project (or whole solution when it spans >1 .fsproj).
+      scope: string option
+      /// Single F# file to check. Implies scope=file.
+      path: string option
+      /// Inline F# source to type-check against the project's references. Implies
+      /// scope=snippet. (Consistent rename of fcs_validate_snippet's `content`.)
+      snippet: string option
+      /// scope=workspace fast-mode glob over file URIs (e.g. "src/Adapters/*.fs").
+      fileGlob: string option
+      /// Snippet parse mode: "fs" (default) | "fsi". Pick "fsi" for a signature sketch.
+      mode: string option
+      /// "trusted" (default) runs a FRESH in-process FCS check — the verdict is never
+      /// a stale `{}` false-clean. "fast" reads the cheap cached FSAC snapshot instead.
+      speed: string option
+      /// Minimum severity surfaced in `diagnostics`: "error" (default) | "warning" |
+      /// "information" | "hint" | "all". errorCount/warningCount are unaffected.
+      severity: string option
+      /// .fsproj / .sln / .slnx context. Falls back to active set_project.
+      projectPath: string option
+      /// Timeout in milliseconds for the project/workspace type-check. Default 60000.
+      timeoutMs: int option }
+
 type FcsSymbolAtWordArgs =
     { /// Absolute path to the F# source file containing the word.
       path: string

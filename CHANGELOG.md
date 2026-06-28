@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-28
+
+### Added
+
+- **`find <query>` — one multi-project symbol search that supersedes the seven single-project search tools (#128).** Sweeps every member `.fsproj` of the active solution and unions four site kinds in a single call: definitions, references, record-field set sites (`{ Field = expr }` and `{ x with Field = expr }`), and member-usage sites. This recovers cross-project usage sites that the single-project `fcs_find_symbol` / `fcs_record_field_audit` miss — on the consolidation validation fixture the single-project path surfaced **1** site where the whole-solution `find` sweep surfaced **11**. Bare `find(query)` suffices (`kind=auto`, `scope=auto` over the whole solution); optional `kind` (`auto`|`symbol`|`members`|`field`|`definition`|`position`) and `scope` (`auto`|`file`|`project`|`workspace`) narrow it. Falls back to the FSAC `workspace/symbol` index when the FCS sweep is empty, so `matched=false` is a real negative. Mechanics: `docs/tools-detailed.md#find`.
+- **`check` — one trustworthy type-check verdict that supersedes the five lower-level check tools (#128).** Returns a single `verdict` (`clean` | `errors` | `unknown`) collapsed from a FRESH in-process FCS type-check, so it never reports the stale-`{}` false-clean that `workspace_diagnostics` can serve right after an `Edit`/`Write` — the false-clean that historically drove agents to fall back to `dotnet build`. Bare `check()` covers the active project (`scope=auto`, `speed=trusted`); optional `scope` (`auto`|`file`|`project`|`workspace`|`snippet`), `path`, `snippet` (inline source), `speed` (`trusted` default | `fast` = cached FSAC snapshot), and `severity`. `unknown` means the check could not run (no project context), not a pass. Mechanics: `docs/tools-detailed.md#check`.
+
+### Changed
+
+- **The 12 legacy "cluster" tools are now routing-steered toward `find` / `check`.** The seven find-cluster descriptions (`fcs_find_symbol`, `fcs_record_field_audit`, `fcs_find_member_usages`, `workspace_symbol`, `fcs_project_symbol_uses`, `textDocument_references`, `textDocument_definition`) gained a trailing `Prefer find for cross-project work.` steer; the five check-cluster descriptions (`workspace_diagnostics`, `fsharp_compile`, `fcs_check_file`, `fcs_parse_and_check_file`, `fcs_validate_snippet`) gained `Prefer check for a yes/no verdict.` `fcs_record_field_audit` was trimmed before the steer (491 → 497 after; cut the `during widening refactors` clause and a `see` filler word) to stay within the 500-char `ToolDescriptionSchemaTests` / `audit-tool-descriptions.py` ceiling. README, `AGENT_INTEGRATION.md`, and `docs/tools-detailed.md` now lead with `find` / `check` and mark the twelve cluster tools as lower-level primitives. The cluster tools remain fully registered — actual removal is telemetry-gated and deferred to a future release.
+
 ## [0.9.3] - 2026-06-28
 
 ### Added

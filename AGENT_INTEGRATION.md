@@ -24,10 +24,24 @@ Drop this into your project's `CLAUDE.md` (Claude Code), your `.cursorrules` (Cu
   the `fslangmcp` MCP server. Never use `rg` / `grep` (text search misses
   partial application, shadowing, aliased opens, and produces noise from
   comments / strings).
-- Call `mcp__fslangmcp__set_project` once per session, then use as needed:
-  `project_health`, `fcs_project_outline`, `workspace_symbol`,
-  `fcs_project_symbol_uses`, `textDocument_definition`,
-  `fcs_type_at_position`, `workspace_diagnostics`.
+- Call `mcp__fslangmcp__set_project` once per session. Then for the two most
+  common questions, reach for the consolidated entry points first:
+  - **"Where is X used / defined?"** → `mcp__fslangmcp__find` (one
+    multi-project symbol sweep that unions definitions, references,
+    record-field set sites, and member-usage sites across every member
+    project). It supersedes the lower-level `workspace_symbol`,
+    `fcs_find_symbol`, `fcs_project_symbol_uses`, `fcs_find_member_usages`,
+    `fcs_record_field_audit`, `textDocument_references`, and
+    `textDocument_definition`.
+  - **"Did my edit compile?"** → `mcp__fslangmcp__check` (one
+    `clean` / `errors` / `unknown` verdict from a FRESH in-process
+    type-check — no stale-`{}` false-clean, no `dotnet build` fallback). It
+    supersedes the lower-level `workspace_diagnostics`, `fsharp_compile`,
+    `fcs_check_file`, `fcs_parse_and_check_file`, and `fcs_validate_snippet`.
+  - Those twelve cluster tools stay available as lower-level primitives —
+    use them only when you need a specific knob `find` / `check` don't expose.
+  - Other entry points as needed: `project_health`, `fcs_project_outline`,
+    `fcs_type_at_position`.
 - `rg` remains correct for non-F# files (`.fsproj`, `paket.dependencies`,
   `Directory.Packages.props`, CI YAML) and textual idiom counts.
 
@@ -37,6 +51,8 @@ Apply the tool that matches the data shape, not the calendar:
 
 | Data shape                              | Tool                          |
 |-----------------------------------------|-------------------------------|
+| "Where is X used / defined?" (any symbol) | `find` — one multi-project sweep |
+| "Did my edit compile?" (yes/no verdict)   | `check` — fresh in-process verdict |
 | Semantic question on compiled F# source | fslangmcp                     |
 | Textual scan of .fsproj XML / YAML / md | rg                            |
 | NuGet third-party type enumeration      | `fcs_nuget_types` / `fcs_referenced_symbols` (shipped v0.7.0) |
@@ -54,10 +70,12 @@ Every subagent brief that touches F# code MUST include a "Tool discipline"
 section telling the subagent to:
 
 1. **Use `fslangmcp`** for all semantic F# queries. Spell out canonical
-   entry points: `mcp__fslangmcp__set_project` once, then
-   `workspace_diagnostics` after edits, `fcs_project_outline` for structure,
-   `workspace_symbol` / `textDocument_references` for navigation,
-   `fcs_type_at_position` for types.
+   entry points: `mcp__fslangmcp__set_project` once, then `check` for a
+   compile verdict after edits, `find` for "where is X used / defined?"
+   navigation, `fcs_project_outline` for structure, and `fcs_type_at_position`
+   for types. The single-project `workspace_symbol` / `textDocument_references`
+   / `workspace_diagnostics` primitives are lower-level fallbacks behind
+   `find` / `check`.
 2. **Use `rg` only for non-F# files** (`.fsproj`, `.md`, JSON, YAML, idiom
    counts).
 3. **Deliver a 5–10 bullet end-of-run UX report on `fslangmcp`** — what
@@ -88,10 +106,11 @@ A minimal F# subagent brief skeleton. Embed your task-specific content where ind
 ## Tool discipline — non-negotiable
 
 - For F# semantic queries (`.fs` / `.fsi`): use `fslangmcp` MCP. Call
-  `mcp__fslangmcp__set_project` ONCE with the repo root, then use
-  `workspace_diagnostics`, `fcs_project_outline`, `workspace_symbol`,
-  `textDocument_references`, `fcs_type_at_position`,
-  `textDocument_codeAction` as needed.
+  `mcp__fslangmcp__set_project` ONCE with the repo root, then use `find`
+  for "where is X used / defined?", `check` for "did my edit compile?",
+  and `fcs_project_outline` / `fcs_type_at_position` / `textDocument_codeAction`
+  as needed. The single-project `workspace_diagnostics`, `workspace_symbol`,
+  and `textDocument_references` are lower-level fallbacks behind `find` / `check`.
 - `rg` is OK for non-F# files (.fsproj, .md, .json, .yml).
 - For NuGet third-party type enumeration: `fcs_nuget_types` (exact
   assembly) and `fcs_referenced_symbols` (cross-assembly search), both

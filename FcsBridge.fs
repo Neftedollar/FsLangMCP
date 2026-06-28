@@ -95,11 +95,134 @@ module private FieldFormClassifier =
                 | _ -> acc)
 
 
+// ─── check: cached FSAC diagnostics snapshot (issue #128, Stage 1) ──────────────
+//
+// The `check` tool's speed="fast" path reads the cheap cached FSAC publishDiagnostics
+// snapshot instead of re-type-checking in FCS. The FSAC dictionary lives in
+// FsAutoCompleteBridge, so — exactly like `find` injecting its fsacProbe — the
+// dispatcher projects a workspace_diagnostics response into this struct and hands it
+// to the FCS-only substrate, which therefore stays LSP-agnostic.
+//
+// Honesty contract: `MostRecentAnalyzedAt = None` (or `Ready = false`) is the stale
+// `{}` ambiguity from #100 — FSAC has not pushed analysis yet, so absence of cached
+// errors does NOT mean "clean". The fast path turns that into verdict="unknown"
+// rather than a false-clean.
+[<NoComparison; NoEquality>]
+type internal CheckFsacSnapshot =
+    { /// FSAC workspace reached the "ready" state (lspState = "ready").
+      Ready: bool
+      /// Number of files FSAC currently holds diagnostics for.
+      AnalyzedFileCount: int
+      /// Error-severity (LSP code 1) diagnostics across the snapshot.
+      ErrorCount: int
+      /// Warning-severity (LSP code 2) diagnostics across the snapshot.
+      WarningCount: int
+      /// Most recent analyzedAt / mostRecentAnalyzedAt timestamp, when present.
+      /// None is the un-analyzed (stale-`{}`) case — the fast path cannot confirm clean.
+      MostRecentAnalyzedAt: string option
+      /// Error-severity diagnostics, LSP-shaped, deep-cloned for surfacing.
+      ErrorDiagnostics: JsonNode }
+
+[<RequireQualifiedAccess>]
+module internal CheckFsacSnapshot =
+
+    let empty: CheckFsacSnapshot =
+        { Ready = false
+          AnalyzedFileCount = 0
+          ErrorCount = 0
+          WarningCount = 0
+          MostRecentAnalyzedAt = None
+          ErrorDiagnostics = JsonArray() }
+
+    /// Projects a workspace_diagnostics response (file or workspace shape) into a
+    /// CheckFsacSnapshot. Tolerant of missing fields — anything it cannot read
+    /// degrades toward `empty`, which the fast path reads as "unknown".
+    let ofDiagnosticsResponse (resp: JsonNode) : CheckFsacSnapshot =
+        try
+            let ready =
+                match resp["lspState"] with
+                | :? JsonValue as v ->
+                    match v.GetValue<string>() with
+                    | "ready" -> true
+                    | _ -> false
+                | _ -> false
+
+            let fileCount =
+                match resp["diagnosticsFileCount"] with
+                | :? JsonValue as v ->
+                    let mutable n = 0
+                    if v.TryGetValue(&n) then n else 0
+                | _ -> 0
+
+            let analyzedAt =
+                let read (key: string) =
+                    match resp[key] with
+                    | :? JsonValue as v ->
+                        match v.GetValue<string>() with
+                        | null -> None
+                        | s when String.IsNullOrWhiteSpace s -> None
+                        | s -> Some s
+                    | _ -> None
+
+                read "mostRecentAnalyzedAt" |> Option.orElseWith (fun () -> read "analyzedAt")
+
+            let mutable errorCount = 0
+            let mutable warningCount = 0
+            let errorDiags = JsonArray()
+
+            let severityOf (obj: JsonObject) =
+                match obj["severity"] with
+                | :? JsonValue as s ->
+                    let mutable code = 0
+                    if s.TryGetValue(&code) then code else 0
+                | _ -> 0
+
+            let consume (file: string option) (arr: JsonArray) =
+                for node in arr do
+                    match node with
+                    | :? JsonObject as obj ->
+                        match severityOf obj with
+                        | 1 ->
+                            errorCount <- errorCount + 1
+                            let clone = node.DeepClone()
+
+                            match file, clone with
+                            | Some f, (:? JsonObject as co) -> co["file"] <- jstr f
+                            | _ -> ()
+
+                            errorDiags.Add(clone)
+                        | 2 -> warningCount <- warningCount + 1
+                        | _ -> ()
+                    | _ -> ()
+
+            match resp["result"] with
+            | :? JsonArray as arr -> consume None arr
+            | :? JsonObject as obj ->
+                for kv in obj do
+                    match kv.Value with
+                    | :? JsonArray as arr -> consume (Some kv.Key) arr
+                    | _ -> ()
+            | _ -> ()
+
+            { Ready = ready
+              AnalyzedFileCount = fileCount
+              ErrorCount = errorCount
+              WarningCount = warningCount
+              MostRecentAnalyzedAt = analyzedAt
+              ErrorDiagnostics = errorDiags }
+        with _ ->
+            empty
+
 // ─── FcsBridge ─────────────────────────────────────────────────────────────────
 
 type internal FcsBridge() =
-    // Default FCS projectCacheSize is 3. We capture it so RuntimeStatus can report it.
-    let defaultProjectCacheSize = 3
+    // FCS default projectCacheSize is 3. The `find` multi-project union sweep
+    // (issue #128) re-checks EVERY member project of the active solution on each
+    // call; with a cache of 3 a >3-project solution thrashes FCS's project cache
+    // and re-pays the cold type-check cost every sweep. Raise it to a
+    // solution-scale bound so a whole solution stays warm between sweeps. We
+    // capture the value so RuntimeStatus can report it.
+    let defaultProjectCacheSize = 50
     // Single source of truth for checker flags used in both Create and CheckerConfig.
     let keepAssemblyContents = true
     let keepAllBackgroundResolutions = true
@@ -116,7 +239,10 @@ type internal FcsBridge() =
     // Bounded caches keyed by a string combining projectPath + projectOptions hash.
     // Keep the source label with the options so cache hits report the same
     // resolution path as the original miss.
-    let optionsCache = BoundedCache<string, FSharpProjectOptions * string>(10)
+    // Sized to keep a whole solution's resolved options warm during a `find` sweep
+    // (issue #128) — a 10-entry cache would evict early projects mid-sweep on a
+    // >10-project solution, forcing redundant Ionide.ProjInfo re-resolution.
+    let optionsCache = BoundedCache<string, FSharpProjectOptions * string>(50)
     let projectResultsCache = BoundedCache<string, FSharpCheckProjectResults>(3)
 
     let asTask (workflow: Async<'T>) : Task<'T> =
@@ -1975,6 +2101,1124 @@ type internal FcsBridge() =
                   JsonArray(scopedDiagnostics |> Array.map diagnosticToJson) :> JsonNode ]
 
             return jobj (baseFields @ paginationFields) :> JsonNode
+        }
+
+    // ── find: ParseAndCheckProject warm-up for one project (issue #128) ──────────
+    // Used by the set_project fire-and-forget pre-warm so the FIRST `find` sweep
+    // hits FCS's (now solution-scale) project cache instead of paying cold cost.
+    // Swallows all failures — pre-warming is a latency optimization, never a gate.
+    member this.PrewarmProject(fsproj: string) : Task<unit> =
+        task {
+            try
+                let! options, _ = this.ResolveFsprojOptions(normalizePath fsproj)
+                let! _ = checker.ParseAndCheckProject(options) |> asTask
+                return ()
+            with _ ->
+                return ()
+        }
+
+    // ── find: resolve the symbol name under a cursor (kind=position) ─────────────
+    // Returns Ok displayName (fed to the union sweep as an exact query) or Error
+    // envelope. Mirrors fcs_symbol_at_word's tolerant resolution: line + optional
+    // word/occurrence/character.
+    member private this.ResolveQueryAtPosition(args: FindArgs) : Task<Result<string, JsonNode>> =
+        task {
+            match args.path with
+            | None ->
+                return
+                    Error(
+                        jobj
+                            [ "status", jstr "invalid_args"
+                              "message", jstr "kind='position' requires 'path' (and 'line')." ]
+                        :> JsonNode
+                    )
+            | Some path when String.IsNullOrWhiteSpace path ->
+                return
+                    Error(
+                        jobj
+                            [ "status", jstr "invalid_args"
+                              "message", jstr "kind='position' requires 'path' (and 'line')." ]
+                        :> JsonNode
+                    )
+            | Some path ->
+                match args.line with
+                | None ->
+                    return
+                        Error(
+                            jobj
+                                [ "status", jstr "invalid_args"
+                                  "message", jstr "kind='position' requires 'line' (0-based)." ]
+                            :> JsonNode
+                        )
+                | Some line ->
+                    // FindArgs carries no unsaved-buffer field; resolve position against on-disk content.
+                    match validateSourcePath "find" None path with
+                    | Some err -> return Error err
+                    | None ->
+                        let! _, source, _, _, _, checkedResults =
+                            this.PrepareCheckContext(path, None, args.projectPath, None)
+
+                        match checkedResults with
+                        | None ->
+                            return
+                                Error(
+                                    jobj
+                                        [ "status", jstr "aborted"
+                                          "message", jstr "Type checking was aborted at the requested position." ]
+                                    :> JsonNode
+                                )
+                        | Some checkResults ->
+                            let lines = sourceLines source
+
+                            if line < 0 || line >= lines.Length then
+                                return
+                                    Error(
+                                        jobj
+                                            [ "status", jstr "invalid_args"
+                                              "message",
+                                              jstr $"line {line} is out of range (file has {lines.Length} lines)." ]
+                                        :> JsonNode
+                                    )
+                            else
+                                let lineText = lines[line]
+                                let candidates = wordSpans args.word lineText
+
+                                if candidates.Length = 0 then
+                                    return
+                                        Error(
+                                            jobj
+                                                [ "status", jstr "no_candidate"
+                                                  "message", jstr "No identifier found at the requested position." ]
+                                            :> JsonNode
+                                        )
+                                else
+                                    let occurrence = args.occurrence |> Option.defaultValue -1
+
+                                    let candidateIndex =
+                                        match args.character with
+                                        | Some ch ->
+                                            candidates
+                                            |> Array.tryFindIndex (fun (s, e, _) -> ch >= s && ch <= e)
+                                            |> Option.defaultValue 0
+                                        | None -> if occurrence < 0 then 0 else min occurrence (candidates.Length - 1)
+
+                                    let startColumn, endColumn, text = candidates[candidateIndex]
+                                    let fcsLine = line + 1
+                                    let columnsToTry = [| endColumn; startColumn + 1; startColumn |] |> Array.distinct
+
+                                    let symbolUse =
+                                        columnsToTry
+                                        |> Array.tryPick (fun column ->
+                                            checkResults.GetSymbolUseAtLocation(fcsLine, column, lineText, [ text ]))
+
+                                    match symbolUse with
+                                    | Some u -> return Ok u.Symbol.DisplayName
+                                    | None ->
+                                        return
+                                            Error(
+                                                jobj
+                                                    [ "status", jstr "no_symbol"
+                                                      "message",
+                                                      jstr
+                                                          $"Could not resolve a symbol at {Path.GetFileName path}:{line}." ]
+                                                :> JsonNode
+                                            )
+        }
+
+    // ── find: multi-project union sweep (issue #128, Stage 1) ───────────────────
+    // Productionized from spike/find-multiproject-sweep. Sweeps every member
+    // .fsproj of the active solution, unions each project's GetAllUsesOfAllSymbols()
+    // (de-duped by FULL source range), and auto-unions record-field and member
+    // usage sites the single-project fcs_find_symbol / fcs_record_field_audit miss.
+    //
+    // HEADLINE TRUST PROPERTY: matched=false is reported ONLY when BOTH the FCS
+    // multi-project sweep AND the FSAC workspace/symbol index (via the injected
+    // fsacProbe) are empty — never a confident "absent" from a single project,
+    // which would false-negative cross-project symbols (the RiskDebatorRole /
+    // TraderRole.Propose port-widening cases).
+    //
+    // FCS CROSS-COMPILATION INVARIANT (do NOT "fix" with ==): FSharpSymbol instances
+    // from DIFFERENT ParseAndCheckProject compilations are NOT reference-equal for
+    // the same logical symbol. We match the target by stable strings (DisplayName /
+    // FullName via symbolMatches; DeclaringEntity.DisplayName for fields/members)
+    // and de-dup by source LOCATION, never by symbol identity. FSharpSymbolUse is a
+    // struct, so we bind `let r = u.Range` before reading r.FileName (FS0052).
+    member this.Find(args: FindArgs, ?fsacProbe: string -> Task<int>) : Task<JsonNode> =
+        task {
+            match ArgsValidation.requireNonBlank "query" args.query with
+            | Error envelope -> return envelope
+            | Ok query0 ->
+
+            let kind = (args.kind |> Option.defaultValue "auto").Trim().ToLowerInvariant()
+            let scope = (args.scope |> Option.defaultValue "auto").Trim().ToLowerInvariant()
+            let exact = args.exact |> Option.defaultValue true
+            let contextLines = args.contextLines |> Option.defaultValue 1
+            let includeDeclaration = args.includeDeclaration |> Option.defaultValue true
+            let includeInfo = args.includeInfo |> Option.defaultValue false
+            let pageSize = args.maxResults |> Option.defaultValue 500
+
+            let pageOffset =
+                match args.cursor with
+                | None -> 0
+                | Some cursorStr ->
+                    match Cursor.tryDecode cursorStr with
+                    | Ok payload -> payload.offset
+                    | Error reason -> invalidArg (nameof args.cursor) $"Invalid cursor: %s{reason}"
+
+            // kind=position resolves the symbol under the cursor, then sweeps it as a symbol.
+            let! queryResult =
+                task {
+                    if kind = "position" then
+                        return! this.ResolveQueryAtPosition(args)
+                    else
+                        return Ok query0
+                }
+
+            match queryResult with
+            | Error envelope -> return envelope
+            | Ok query ->
+
+            let kindResolved = if kind = "position" then "symbol" else kind
+
+            // Resolve the sweep target: explicit projectPath (already falls back to the
+            // active set_project in Program.fs), else the nearest .fsproj to args.path.
+            let sweepTargetOpt =
+                args.projectPath
+                |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.map normalizePath
+                |> Option.orElseWith (fun () -> args.path |> Option.bind findNearestFsproj |> Option.map normalizePath)
+
+            match sweepTargetOpt with
+            | None ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr
+                              "find needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first." ]
+                    :> JsonNode
+            | Some sweepTarget ->
+
+            let memberProjects = SolutionParsing.listProjects sweepTarget
+
+            // scope=file/project narrows to the single owning project; workspace/auto
+            // sweeps every member project of the solution.
+            let projectsToSweep =
+                match scope with
+                | "file"
+                | "project" ->
+                    let single =
+                        args.path
+                        |> Option.bind findNearestFsproj
+                        |> Option.orElseWith (fun () ->
+                            if sweepTarget.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
+                                Some sweepTarget
+                            else
+                                None)
+
+                    match single with
+                    | Some p -> [| normalizePath p |]
+                    | None -> memberProjects
+                | _ -> memberProjects
+
+            if projectsToSweep.Length = 0 then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr $"find could not resolve any .fsproj to sweep from: {sweepTarget}" ]
+                    :> JsonNode
+            else
+
+            // ── Matching predicates (stable-string, cross-compilation-safe) ───────
+            let fullNameBoundaryMatch (fullName: string) =
+                not (isNull fullName)
+                && (String.Equals(fullName, query, StringComparison.Ordinal)
+                    || (fullName.EndsWith(query, StringComparison.Ordinal)
+                        && fullName.Length > query.Length
+                        && fullName[fullName.Length - query.Length - 1] = '.'))
+
+            let entityMatchesQuery (e: FSharpEntity) =
+                try
+                    String.Equals(e.DisplayName, query, StringComparison.Ordinal)
+                    || fullNameBoundaryMatch e.FullName
+                with _ ->
+                    false
+
+            let fieldRestrict = args.field
+            let memberRestrict = args.``member``
+
+            let isQueriedField (symbolUse: FSharpSymbolUse) =
+                match symbolUse.Symbol with
+                | :? FSharpField as field ->
+                    try
+                        let nameOk =
+                            match fieldRestrict with
+                            | Some fn -> String.Equals(field.Name, fn, StringComparison.Ordinal)
+                            | None -> true
+
+                        nameOk
+                        && (match field.DeclaringEntity with
+                            | Some e -> entityMatchesQuery e
+                            | None -> false)
+                    with _ ->
+                        false
+                | _ -> false
+
+            let isQueriedMember (symbolUse: FSharpSymbolUse) =
+                match symbolUse.Symbol with
+                | :? FSharpMemberOrFunctionOrValue as m when m.IsMember ->
+                    try
+                        let nameOk =
+                            match memberRestrict with
+                            | Some mn -> String.Equals(m.DisplayName, mn, StringComparison.Ordinal)
+                            | None -> true
+
+                        nameOk
+                        && (match m.DeclaringEntity with
+                            | Some e -> entityMatchesQuery e
+                            | None -> false)
+                    with _ ->
+                        false
+                | _ -> false
+
+            let wantName =
+                kindResolved = "auto" || kindResolved = "symbol" || kindResolved = "definition"
+
+            let wantDefsOnly = kindResolved = "definition"
+            let wantField = kindResolved = "auto" || kindResolved = "field"
+            let wantMember = kindResolved = "auto" || kindResolved = "members"
+
+            // De-dup accumulator keyed by stable source location.
+            // NOTE: we store only primitive coordinates, NOT the FCS `range` struct —
+            // `range` carries [<NoComparison>], and anonymous records auto-derive
+            // comparison, which would fail under warnings-as-errors. The range JSON is
+            // rebuilt from these fields in siteToJson.
+            let siteByKey =
+                System.Collections.Generic.Dictionary<
+                    string,
+                    {| File: string
+                       StartLine: int
+                       StartCol: int
+                       EndLine: int
+                       EndCol: int
+                       Kind: string
+                       Project: string
+                       FullName: string |}
+                 >()
+
+            let perProject = ResizeArray<JsonNode>()
+            let aggregatedDiagnostics = ResizeArray<FSharpDiagnostic>()
+            let sweepSw = System.Diagnostics.Stopwatch.StartNew()
+
+            let locationKey (r: range) =
+                $"{normalizePath r.FileName}:{r.StartLine}:{r.StartColumn}:{r.EndLine}:{r.EndColumn}"
+
+            // Per-project sweep. Sequential by design: parallel Ionide.ProjInfo option
+            // resolution races on MSBuild's *.nuget.g.props for sibling projects that
+            // share a P2P reference; FCS also serializes ParseAndCheckProject internally,
+            // so the set_project pre-warm + solution-scale cache (not intra-call
+            // parallelism) is what removes the cold cost. See the spike's -m:1 finding.
+            for fsproj in projectsToSweep do
+                let projSw = System.Diagnostics.Stopwatch.StartNew()
+                let projDisplay = Path.GetFileNameWithoutExtension fsproj
+
+                try
+                    let! options, _ = this.ResolveFsprojOptions(fsproj)
+                    let! results = checker.ParseAndCheckProject(options) |> asTask
+                    let allUses = results.GetAllUsesOfAllSymbols()
+                    aggregatedDiagnostics.AddRange(results.Diagnostics)
+
+                    // Per-file record-field form classifier (literal vs with-update).
+                    let parsingOptions, _ = checker.GetParsingOptionsFromProjectOptions(options)
+
+                    let formCache =
+                        System.Collections.Generic.Dictionary<
+                            string,
+                            System.Collections.Generic.Dictionary<FieldFormKey, bool> option
+                         >()
+
+                    let classifyForms (filePath: string) =
+                        match formCache.TryGetValue filePath with
+                        | true, cached -> cached
+                        | _ ->
+                            let parsed =
+                                try
+                                    if File.Exists filePath then
+                                        let st = SourceText.ofString (File.ReadAllText filePath)
+                                        let p = checker.ParseFile(filePath, st, parsingOptions) |> Async.RunSynchronously
+                                        Some(FieldFormClassifier.classify p.ParseTree)
+                                    else
+                                        None
+                                with _ ->
+                                    None
+
+                            formCache[filePath] <- parsed
+                            parsed
+
+                    let fieldKind (symbolUse: FSharpSymbolUse) =
+                        let r = symbolUse.Range
+
+                        match classifyForms (normalizePath r.FileName) with
+                        | Some d ->
+                            match d.TryGetValue((r.StartLine, r.StartColumn)) with
+                            | true, true -> "field-set-update"
+                            | true, false -> "field-set-literal"
+                            | _ -> "field-read"
+                        | None -> "field-read"
+
+                    let mutable nameCount = 0
+                    let mutable fieldCount = 0
+                    let mutable memberCount = 0
+
+                    let add (symbolUse: FSharpSymbolUse) (siteKind: string) (overwrite: bool) =
+                        let r = symbolUse.Range
+                        let key = locationKey r
+
+                        if overwrite || not (siteByKey.ContainsKey key) then
+                            siteByKey[key] <-
+                                {| File = normalizePath r.FileName
+                                   StartLine = r.StartLine
+                                   StartCol = r.StartColumn
+                                   EndLine = r.EndLine
+                                   EndCol = r.EndColumn
+                                   Kind = siteKind
+                                   Project = projDisplay
+                                   FullName =
+                                    (match symbolUse.Symbol.FullName with
+                                     | null -> null
+                                     | s -> s) |}
+
+                    // Field/member sites first so their richer kind wins over a generic
+                    // "reference" tag when a non-exact name-match overlaps the same range.
+                    if wantField then
+                        for u in allUses do
+                            if not u.IsFromDefinition && isQueriedField u then
+                                fieldCount <- fieldCount + 1
+                                add u (fieldKind u) true
+
+                    if wantMember then
+                        for u in allUses do
+                            if not u.IsFromDefinition && isQueriedMember u then
+                                memberCount <- memberCount + 1
+                                add u "member-usage" true
+
+                    if wantName then
+                        for u in allUses do
+                            if symbolMatches query exact u.Symbol then
+                                let passDefsOnly = (not wantDefsOnly) || u.IsFromDefinition
+                                let passDecl = wantDefsOnly || includeDeclaration || not u.IsFromDefinition
+
+                                if passDefsOnly && passDecl then
+                                    nameCount <- nameCount + 1
+                                    let k = if u.IsFromDefinition then "definition" else "reference"
+                                    add u k false
+
+                    projSw.Stop()
+
+                    perProject.Add(
+                        jobj
+                            [ "project", jstr projDisplay
+                              "fsproj", jstr (normalizePath fsproj)
+                              "totalProjectSymbolUses", jint allUses.Length
+                              "nameMatchUses", jint nameCount
+                              "fieldMatchUses", jint fieldCount
+                              "memberMatchUses", jint memberCount
+                              "elapsedMs", jint (int projSw.ElapsedMilliseconds) ]
+                        :> JsonNode
+                    )
+                with ex ->
+                    projSw.Stop()
+
+                    perProject.Add(
+                        jobj
+                            [ "project", jstr projDisplay
+                              "fsproj", jstr (normalizePath fsproj)
+                              "error", jstr ex.Message
+                              "elapsedMs", jint (int projSw.ElapsedMilliseconds) ]
+                        :> JsonNode
+                    )
+
+            sweepSw.Stop()
+
+            // scope=file post-filters to args.path's file (still type-checked in-project).
+            let allSites0 = siteByKey.Values |> Seq.toArray
+
+            let allSites =
+                if scope = "file" then
+                    match args.path with
+                    | Some p when not (String.IsNullOrWhiteSpace p) ->
+                        let pf = normalizePath p
+                        allSites0 |> Array.filter (fun s -> String.Equals(s.File, pf, StringComparison.Ordinal))
+                    | _ -> allSites0
+                else
+                    allSites0
+
+            let sortedSites =
+                allSites
+                |> Array.sortBy (fun s -> s.File, s.StartLine, s.StartCol, s.EndLine, s.EndCol, s.Kind)
+
+            let countKind (k: string) =
+                sortedSites |> Array.filter (fun s -> s.Kind = k) |> Array.length
+
+            let defCount = countKind "definition"
+            let refCount = countKind "reference"
+            let fLit = countKind "field-set-literal"
+            let fUpd = countKind "field-set-update"
+            let fRead = countKind "field-read"
+            let memCount = countKind "member-usage"
+            let totalSites = sortedSites.Length
+
+            // HEADLINE: matched is true if the FCS sweep found anything; only when it
+            // is empty do we consult the FSAC symbol index, and only when THAT is also
+            // empty do we report matched=false.
+            let fcsMatched = totalSites > 0
+
+            let! fsacHits =
+                task {
+                    if fcsMatched then
+                        return 0
+                    else
+                        match fsacProbe with
+                        | Some probe ->
+                            try
+                                return! probe query
+                            with _ ->
+                                return 0
+                        | None -> return 0
+                }
+
+            let matched = fcsMatched || fsacHits > 0
+
+            let via =
+                if fcsMatched then "fcs-multiproject-sweep"
+                elif fsacHits > 0 then "fsac-symbol-index"
+                else "none"
+
+            let pageSites =
+                sortedSites |> Array.skip (min pageOffset totalSites) |> Array.truncate pageSize
+
+            let siteToJson (s: {| File: string
+                                  StartLine: int
+                                  StartCol: int
+                                  EndLine: int
+                                  EndCol: int
+                                  Kind: string
+                                  Project: string
+                                  FullName: string |}) =
+                let ctx = lineContextToJson contextLines s.File s.StartLine
+
+                let rangeNode =
+                    jobj
+                        [ "file", jstr s.File
+                          "startLine", jint s.StartLine
+                          "startColumn", jint s.StartCol
+                          "endLine", jint s.EndLine
+                          "endColumn", jint s.EndCol ]
+                    :> JsonNode
+
+                jobj
+                    [ "file", jstr s.File
+                      "range", rangeNode
+                      "kind", jstr s.Kind
+                      "project", jstr s.Project
+                      "symbolFullName",
+                      (match s.FullName with
+                       | null -> null
+                       | v -> jstr v)
+                      "lineText", ctx["lineText"].DeepClone()
+                      "before", ctx["before"].DeepClone()
+                      "after", ctx["after"].DeepClone() ]
+                :> JsonNode
+
+            let pagePairs = pageSites |> Array.map (fun s -> s.Kind, siteToJson s)
+
+            let bucket (kinds: string list) =
+                pagePairs
+                |> Array.choose (fun (k, n) -> if List.contains k kinds then Some n else None)
+
+            let definitions = bucket [ "definition" ]
+            let references = bucket [ "reference" ]
+            let fieldSites = bucket [ "field-set-literal"; "field-set-update"; "field-read" ]
+            let memberSites = bucket [ "member-usage" ]
+            // A JsonNode can have only one parent: the grouped buckets above own the
+            // originals, so the flat legacy-superset `sites` array gets deep clones.
+            let flatSites = pagePairs |> Array.map (fun (_, n) -> n.DeepClone())
+
+            // Aggregated diagnostics across swept projects: Error always (so callers can
+            // detect broken projects even on zero hits), Warning/Info gated by includeInfo.
+            let diagNodes =
+                aggregatedDiagnostics.ToArray()
+                |> Array.filter (fun d ->
+                    d.Severity = FSharpDiagnosticSeverity.Error
+                    || (includeInfo
+                        && (d.Severity = FSharpDiagnosticSeverity.Warning
+                            || d.Severity = FSharpDiagnosticSeverity.Hidden
+                            || d.Severity = FSharpDiagnosticSeverity.Info)))
+                |> Array.truncate 200
+                |> Array.map diagnosticToJson
+
+            let scopeResolved =
+                if projectsToSweep.Length <= 1 then
+                    if scope = "file" then "file" else "project"
+                else
+                    "workspace"
+
+            let resolution =
+                jobj
+                    [ "matched", jbool matched
+                      "kindResolved", jstr kindResolved
+                      "scopeResolved", jstr scopeResolved
+                      "projectsSwept", jint projectsToSweep.Length
+                      "via", jstr via
+                      "fcsSiteCount", jint totalSites
+                      "fsacFallbackHits", jint fsacHits ]
+                :> JsonNode
+
+            let breakdown =
+                jobj
+                    [ "definitions", jint defCount
+                      "references", jint refCount
+                      "fieldSetLiteral", jint fLit
+                      "fieldSetUpdate", jint fUpd
+                      "fieldRead", jint fRead
+                      "memberUsages", jint memCount ]
+                :> JsonNode
+
+            let paginationFields =
+                Cursor.paginationFields "sites" totalSites pageOffset pageSize pageSites.Length
+
+            let baseFields =
+                [ "status", jstr "succeeded"
+                  "query", jstr query
+                  "kind", jstr kind
+                  "kindResolved", jstr kindResolved
+                  "scope", jstr scope
+                  "exact", jbool exact
+                  "resolution", resolution
+                  "projectsSwept", jint projectsToSweep.Length
+                  "totalSites", jint totalSites
+                  "matchedUseCount", jint totalSites
+                  "breakdown", breakdown
+                  "definitions", JsonArray(definitions) :> JsonNode
+                  "references", JsonArray(references) :> JsonNode
+                  "fieldSites", JsonArray(fieldSites) :> JsonNode
+                  "memberSites", JsonArray(memberSites) :> JsonNode
+                  "sites", JsonArray(flatSites) :> JsonNode
+                  "perProject", JsonArray(perProject.ToArray()) :> JsonNode
+                  "sweepElapsedMs", jint (int sweepSw.ElapsedMilliseconds)
+                  "projectDiagnostics", JsonArray(diagNodes) :> JsonNode ]
+
+            return jobj (baseFields @ paginationFields) :> JsonNode
+        }
+
+    // ── check: one fresh project type-check (issue #128, Stage 1) ────────────────
+    // Drops FCS's incremental builder + cached project results for THIS project so a
+    // source edit on disk is re-read — this is what makes the `check` verdict
+    // trustworthy (never a stale-`{}` false-clean). The resolved MSBuild options stay
+    // cached: they only change when the .fsproj itself changes, so re-resolving them
+    // every call would burn cost for no freshness gain. Ok carries the project's
+    // diagnostics; Error is a load failure ("timeout" or the exception message), which
+    // the caller turns into verdict="unknown" rather than a confident clean.
+    member private this.FreshProjectCheck
+        (fsproj: string, timeoutMs: int)
+        : Task<Result<FSharpDiagnostic array * string * string, string>> =
+        task {
+            try
+                let! options, optionsSource = this.ResolveFsprojOptions(normalizePath fsproj)
+                let cacheKey = makeResolvedProjectCacheKey options
+                projectResultsCache.TryRemove(cacheKey) |> ignore
+                checker.InvalidateConfiguration(options)
+                use cts = new CancellationTokenSource(timeoutMs)
+                let! results = Async.StartAsTask(checker.ParseAndCheckProject(options), cancellationToken = cts.Token)
+                return Ok(results.Diagnostics, options.ProjectFileName, optionsSource)
+            with
+            | :? OperationCanceledException
+            | :? TaskCanceledException -> return Error "timeout"
+            | ex -> return Error ex.Message
+        }
+
+    // ── check: one trustworthy verdict for the active context (issue #128) ───────
+    // Consolidates the 5 check-cluster tools (workspace_diagnostics, fsharp_compile,
+    // fcs_check_file, fcs_parse_and_check_file, fcs_validate_snippet) behind ONE field
+    // an agent can act on: `verdict` ∈ { "clean", "errors", "unknown" }.
+    //
+    // HEADLINE TRUST PROPERTY: the default speed="trusted" runs a FRESH in-process FCS
+    // re-check (FreshProjectCheck / cache-invalidated parse+check), so it can NEVER
+    // emit the stale-`{}` false-clean that made agents fall back to `dotnet build`
+    // (#100). "clean"/"errors" are terminal and ground-truth. "unknown" is returned
+    // ONLY when analysis genuinely could not run (aborted / timed out / a swept project
+    // failed to load) — honest, never a silently-escalated `dotnet build`.
+    //
+    // speed="fast" is the explicit opt-in to the cheap cached FSAC snapshot
+    // (old workspace_diagnostics behaviour). Even then, a cold cache (no analysis
+    // pushed yet) reports verdict="unknown" instead of a false-clean.
+    //
+    // RELOCATED-CHOICE GUARD: no output field tells the agent which tool to call next.
+    // The workspace_diagnostics → fresh-FCS-re-check escalation is hidden behind the
+    // verdict (surfaced only as the debug `escalated`/`via` fields).
+    //
+    // fsacSnapshot is injected (like find's fsacProbe) so this FCS substrate stays
+    // LSP-agnostic; it is consulted only on the speed="fast" path.
+    member this.Check(args: CheckArgs, ?fsacSnapshot: unit -> Task<CheckFsacSnapshot>) : Task<JsonNode> =
+        task {
+            let speed = (args.speed |> Option.defaultValue "trusted").Trim().ToLowerInvariant()
+            let mode = (args.mode |> Option.defaultValue "fs").Trim().ToLowerInvariant()
+            let severityFloor = (args.severity |> Option.defaultValue "error").Trim().ToLowerInvariant()
+            let scopeRaw = (args.scope |> Option.defaultValue "auto").Trim().ToLowerInvariant()
+            let timeoutMs = args.timeoutMs |> Option.defaultValue 60000
+
+            let invalid msg =
+                jobj [ "status", jstr "invalid_args"; "message", jstr msg ] :> JsonNode
+
+            let hasText (o: string option) =
+                o |> Option.exists (String.IsNullOrWhiteSpace >> not)
+
+            let severityNames =
+                [ "error"; "errors"; "warning"; "warnings"; "information"; "info"; "hint"; "hints"; "all" ]
+
+            if speed <> "trusted" && speed <> "fast" then
+                return invalid $"speed must be 'trusted' or 'fast' (got '{speed}')"
+            elif mode <> "fs" && mode <> "fsi" then
+                return invalid $"mode must be 'fs' or 'fsi' (got '{mode}')"
+            elif not (List.contains severityFloor severityNames) then
+                return invalid $"severity must be one of error|warning|information|hint|all (got '{severityFloor}')"
+            elif not (List.contains scopeRaw [ "auto"; "file"; "project"; "workspace"; "snippet" ]) then
+                return invalid $"scope must be one of auto|file|project|workspace|snippet (got '{scopeRaw}')"
+            else
+
+            // Severity floor → rank (Error = 1, highest). A diagnostic is surfaced in the
+            // `diagnostics` array when its rank ≤ the floor rank; errorCount/warningCount
+            // are always computed from the FULL set, independent of the floor.
+            let floorRank =
+                match severityFloor with
+                | "error"
+                | "errors" -> 1
+                | "warning"
+                | "warnings" -> 2
+                | "information"
+                | "info" -> 3
+                | "hint"
+                | "hints" -> 4
+                | _ -> 5 // "all"
+
+            let fcsRank (sev: FSharpDiagnosticSeverity) =
+                match sev with
+                | FSharpDiagnosticSeverity.Error -> 1
+                | FSharpDiagnosticSeverity.Warning -> 2
+                | FSharpDiagnosticSeverity.Info -> 3
+                | FSharpDiagnosticSeverity.Hidden -> 4
+
+            let passesFloor (sev: FSharpDiagnosticSeverity) = fcsRank sev <= floorRank
+
+            // Project / solution target for project + workspace scopes. (Program.fs has
+            // already defaulted projectPath to the active set_project.)
+            let sweepTargetOpt =
+                args.projectPath
+                |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.map normalizePath
+                |> Option.orElseWith (fun () -> args.path |> Option.bind findNearestFsproj |> Option.map normalizePath)
+
+            let resolvedScope =
+                match scopeRaw with
+                | "file" -> "file"
+                | "project" -> "project"
+                | "workspace" -> "workspace"
+                | "snippet" -> "snippet"
+                | _ -> // auto
+                    if hasText args.snippet then "snippet"
+                    elif hasText args.path then "file"
+                    else
+                        match sweepTargetOpt with
+                        | Some t -> if (SolutionParsing.listProjects t).Length > 1 then "workspace" else "project"
+                        | None -> "project"
+
+            // Single response builder — keeps the actionable header (verdict/analyzed/
+            // counts) identical across every scope and speed, then folds in the legacy
+            // superset + per-scope extras so migrating callers lose nothing.
+            let build
+                (verdict: string)
+                (analyzed: bool)
+                (via: string)
+                (escalated: string option)
+                (errorCount: int)
+                (warningCount: int)
+                (totalDiagnostics: int)
+                (diagNodes: JsonNode array)
+                (files: string array)
+                (reason: string option)
+                (extra: (string * JsonNode) list)
+                : JsonNode =
+                jobj (
+                    [ "status", jstr "succeeded"
+                      "verdict", jstr verdict
+                      "analyzed", jbool analyzed
+                      "scope", jstr resolvedScope
+                      "speed", jstr speed
+                      "errorCount", jint errorCount
+                      "warningCount", jint warningCount
+                      "diagnosticsFileCount", jint files.Length
+                      "files", JsonArray(files |> Array.map jstr) :> JsonNode
+                      "diagnostics", JsonArray(diagNodes) :> JsonNode
+                      // debug-only
+                      "escalated", (match escalated with Some e -> jstr e | None -> null)
+                      "via", jstr via
+                      // legacy superset
+                      "fresh", jbool (speed = "trusted")
+                      "groundTruth", jbool (analyzed && via = "fcs")
+                      "totalDiagnostics", jint totalDiagnostics
+                      "reason", (match reason with Some r -> jstr r | None -> null) ]
+                    @ extra
+                )
+                :> JsonNode
+
+            // FCS-diagnostics surfacing shared by every trusted (FCS) scope.
+            let surfaceFcs (diags: FSharpDiagnostic array) =
+                let surfaced = diags |> Array.filter (fun d -> passesFloor d.Severity)
+                let nodes = surfaced |> Array.map diagnosticToJson
+                let files = surfaced |> Array.map (fun d -> normalizePath d.FileName) |> Array.distinct
+                nodes, files
+
+            match resolvedScope with
+            // ── snippet: always FRESH (ignores speed); old ValidateSnippet logic ──
+            | "snippet" ->
+                match args.snippet with
+                | Some snippetText when not (String.IsNullOrWhiteSpace snippetText) ->
+                    let snippetProject =
+                        match args.projectPath with
+                        | Some p when not (String.IsNullOrWhiteSpace p) ->
+                            let np = normalizePath p
+
+                            if np.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
+                                Some np
+                            else
+                                SolutionParsing.listProjects np |> Array.tryHead
+                        | _ -> args.path |> Option.bind findNearestFsproj |> Option.map normalizePath
+
+                    match snippetProject with
+                    | None ->
+                        return
+                            invalid
+                                "snippet check needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first."
+                    | Some fsproj ->
+                        let! options, optionsSource = this.ResolveFsprojOptions(fsproj)
+                        let ext = if mode = "fsi" then ".fsi" else ".fs"
+
+                        let snippetFile =
+                            Path.Combine(Path.GetTempPath(), $"fslangmcp_check_{Guid.NewGuid():N}{ext}")
+
+                        try
+                            File.WriteAllText(snippetFile, snippetText)
+
+                            let modifiedOptions =
+                                { options with
+                                    SourceFiles = Array.append options.SourceFiles [| snippetFile |] }
+
+                            let sourceText = SourceText.ofString snippetText
+
+                            let! parseResults, checkAnswer =
+                                checker.ParseAndCheckFileInProject(snippetFile, 0, sourceText, modifiedOptions)
+                                |> asTask
+
+                            let checkDiagnostics, succeeded =
+                                match checkAnswer with
+                                | FSharpCheckFileAnswer.Succeeded r -> r.Diagnostics, true
+                                | FSharpCheckFileAnswer.Aborted -> [||], false
+
+                            let allDiags = Array.append parseResults.Diagnostics checkDiagnostics
+                            let errorCount, warningCount = countDiagnosticsBySeverity allDiags
+
+                            let verdict, analyzed, reason =
+                                if not succeeded then
+                                    "unknown", false, Some "Type checking was aborted; snippet verdict is indeterminate."
+                                elif errorCount > 0 then
+                                    "errors", true, None
+                                else
+                                    "clean", true, None
+
+                            let nodes, _ = surfaceFcs allDiags
+
+                            return
+                                build
+                                    verdict
+                                    analyzed
+                                    "fcs"
+                                    None
+                                    errorCount
+                                    warningCount
+                                    allDiags.Length
+                                    nodes
+                                    [||] // synthetic temp file — no meaningful source path to surface
+                                    reason
+                                    [ "mode", jstr mode
+                                      "projectFileName", jstr options.ProjectFileName
+                                      "optionsSource", jstr optionsSource ]
+                        finally
+                            try
+                                if File.Exists snippetFile then
+                                    File.Delete snippetFile
+                            with _ ->
+                                ()
+                | _ -> return invalid "scope='snippet' requires non-empty 'snippet' text."
+
+            // ── file / project / workspace ───────────────────────────────────────
+            | _ when speed = "fast" ->
+                // Cheap cached FSAC snapshot. A cold cache (no analysis pushed yet) is
+                // the stale-`{}` ambiguity → verdict="unknown", NOT a false-clean.
+                let! snap =
+                    match fsacSnapshot with
+                    | Some thunk -> thunk ()
+                    | None -> Task.FromResult CheckFsacSnapshot.empty
+
+                let hasAnalysis = snap.Ready && snap.MostRecentAnalyzedAt.IsSome
+
+                let verdict, analyzed, reason =
+                    if not hasAnalysis then
+                        "unknown",
+                        false,
+                        Some
+                            "FSAC has not published diagnostics yet (cold cache); the default trusted check returns a ground-truth verdict."
+                    elif snap.ErrorCount > 0 then
+                        "errors", true, None
+                    else
+                        "clean", true, None
+
+                let nodes =
+                    match snap.ErrorDiagnostics with
+                    | :? JsonArray as arr -> arr |> Seq.map (fun n -> n.DeepClone()) |> Seq.toArray
+                    | _ -> [||]
+
+                let files =
+                    nodes
+                    |> Array.choose (fun n ->
+                        match n["file"] with
+                        | :? JsonValue as v -> Some(v.GetValue<string>())
+                        | _ -> None)
+                    |> Array.distinct
+
+                return
+                    build
+                        verdict
+                        analyzed
+                        "fsac"
+                        None
+                        snap.ErrorCount
+                        snap.WarningCount
+                        (snap.ErrorCount + snap.WarningCount)
+                        nodes
+                        files
+                        reason
+                        [ "lspState", jstr (if snap.Ready then "ready" else "warming")
+                          "mostRecentAnalyzedAt", (match snap.MostRecentAnalyzedAt with Some t -> jstr t | None -> null)
+                          "analyzedFileCount", jint snap.AnalyzedFileCount ]
+
+            | "file" ->
+                match args.path with
+                | Some path when not (String.IsNullOrWhiteSpace path) ->
+                    match validateSourcePath "check" None path with
+                    | Some err -> return err
+                    | None ->
+                        // Resolve options, invalidate THIS project, then re-check fresh so
+                        // on-disk edits (incl. cross-file) are reflected — mirrors fcs_check_file.
+                        let! _, _, _, projectOptions, _, _ =
+                            this.PrepareCheckContext(path, None, args.projectPath, None)
+
+                        let projectResultsKey = makeResolvedProjectCacheKey projectOptions
+                        projectResultsCache.TryRemove(projectResultsKey) |> ignore
+                        checker.InvalidateConfiguration(projectOptions)
+
+                        let! _, _, optionsSource, _, parseResults, checkedResults =
+                            this.PrepareCheckContext(path, None, args.projectPath, None)
+
+                        let checkDiagnostics =
+                            checkedResults
+                            |> Option.map (fun r -> r.Diagnostics)
+                            |> Option.defaultValue [||]
+
+                        let allDiags = Array.append parseResults.Diagnostics checkDiagnostics
+                        let succeeded = checkedResults.IsSome
+                        let errorCount, warningCount = countDiagnosticsBySeverity allDiags
+
+                        let verdict, analyzed, reason =
+                            if not succeeded then
+                                "unknown", false, Some "Type checking was aborted; file verdict is indeterminate."
+                            elif errorCount > 0 then
+                                "errors", true, None
+                            else
+                                "clean", true, None
+
+                        let nodes, files = surfaceFcs allDiags
+
+                        return
+                            build
+                                verdict
+                                analyzed
+                                "fcs"
+                                (Some "fcs-reanalyze")
+                                errorCount
+                                warningCount
+                                allDiags.Length
+                                nodes
+                                files
+                                reason
+                                [ "projectFileName", jstr projectOptions.ProjectFileName
+                                  "optionsSource", jstr optionsSource
+                                  "projectsSwept", jint 1 ]
+                | _ -> return invalid "scope='file' requires 'path'."
+
+            | "project" ->
+                match sweepTargetOpt with
+                | None ->
+                    return
+                        invalid
+                            "check needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first."
+                | Some target ->
+                    let fsproj =
+                        if target.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
+                            Some target
+                        else
+                            args.path
+                            |> Option.bind findNearestFsproj
+                            |> Option.map normalizePath
+                            |> Option.orElseWith (fun () -> SolutionParsing.listProjects target |> Array.tryHead)
+
+                    match fsproj with
+                    | None -> return invalid $"check could not resolve a single .fsproj to check from: {target}"
+                    | Some proj ->
+                        let! result = this.FreshProjectCheck(proj, timeoutMs)
+
+                        match result with
+                        | Error "timeout" ->
+                            return
+                                build
+                                    "unknown"
+                                    false
+                                    "fcs"
+                                    (Some "fcs-reanalyze")
+                                    0
+                                    0
+                                    0
+                                    [||]
+                                    [||]
+                                    (Some $"FCS type-check timed out after {timeoutMs}ms.")
+                                    [ "projectsSwept", jint 1 ]
+                        | Error msg ->
+                            return
+                                build
+                                    "unknown"
+                                    false
+                                    "fcs"
+                                    (Some "fcs-reanalyze")
+                                    0
+                                    0
+                                    0
+                                    [||]
+                                    [||]
+                                    (Some $"Project could not be analyzed: {msg}")
+                                    [ "projectsSwept", jint 1 ]
+                        | Ok(diags, projFileName, optionsSource) ->
+                            let errorCount, warningCount = countDiagnosticsBySeverity diags
+                            let verdict = if errorCount > 0 then "errors" else "clean"
+                            let nodes, files = surfaceFcs diags
+
+                            return
+                                build
+                                    verdict
+                                    true
+                                    "fcs"
+                                    (Some "fcs-reanalyze")
+                                    errorCount
+                                    warningCount
+                                    diags.Length
+                                    nodes
+                                    files
+                                    None
+                                    [ "projectFileName", jstr projFileName
+                                      "optionsSource", jstr optionsSource
+                                      "projectsSwept", jint 1 ]
+
+            | "workspace" ->
+                match sweepTargetOpt with
+                | None ->
+                    return
+                        invalid
+                            "check needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first."
+                | Some target ->
+                    let projects0 = SolutionParsing.listProjects target
+
+                    let projects =
+                        if projects0.Length = 0 && target.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
+                            [| target |]
+                        else
+                            projects0
+
+                    if projects.Length = 0 then
+                        return invalid $"check could not resolve any .fsproj to check from: {target}"
+                    else
+                        let allDiags = ResizeArray<FSharpDiagnostic>()
+                        let perProject = ResizeArray<JsonNode>()
+                        let mutable failCount = 0
+
+                        for proj in projects do
+                            let! result = this.FreshProjectCheck(proj, timeoutMs)
+
+                            match result with
+                            | Ok(diags, _, _) ->
+                                allDiags.AddRange diags
+                                let e, w = countDiagnosticsBySeverity diags
+
+                                perProject.Add(
+                                    jobj
+                                        [ "project", jstr (Path.GetFileNameWithoutExtension proj)
+                                          "fsproj", jstr (normalizePath proj)
+                                          "errorCount", jint e
+                                          "warningCount", jint w
+                                          "analyzed", jbool true ]
+                                    :> JsonNode
+                                )
+                            | Error msg ->
+                                failCount <- failCount + 1
+
+                                perProject.Add(
+                                    jobj
+                                        [ "project", jstr (Path.GetFileNameWithoutExtension proj)
+                                          "fsproj", jstr (normalizePath proj)
+                                          "error", jstr msg
+                                          "analyzed", jbool false ]
+                                    :> JsonNode
+                                )
+
+                        let diags = allDiags.ToArray()
+                        let errorCount, warningCount = countDiagnosticsBySeverity diags
+
+                        let verdict, analyzed, reason =
+                            if errorCount > 0 then
+                                "errors", true, None
+                            elif failCount > 0 then
+                                "unknown",
+                                false,
+                                Some $"{failCount} of {projects.Length} project(s) failed to analyze; cannot confirm clean."
+                            else
+                                "clean", true, None
+
+                        let nodes, files = surfaceFcs diags
+
+                        return
+                            build
+                                verdict
+                                analyzed
+                                "fcs"
+                                (Some "fcs-reanalyze")
+                                errorCount
+                                warningCount
+                                diags.Length
+                                nodes
+                                files
+                                reason
+                                [ "projectsSwept", jint projects.Length
+                                  "perProject", JsonArray(perProject.ToArray()) :> JsonNode ]
+
+            | _ -> return invalid $"unsupported scope '{resolvedScope}'"
         }
 
     member this.TypeAtPosition(args: FcsTypeAtPositionArgs) : Task<JsonNode> =

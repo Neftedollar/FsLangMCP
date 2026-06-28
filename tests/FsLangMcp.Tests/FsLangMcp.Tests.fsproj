@@ -24,6 +24,8 @@
     <Compile Include="OutlineE2ETests.fs" />
     <Compile Include="SymbolPaginationTests.fs" />
     <Compile Include="ToolDescriptionSchemaTests.fs" />
+    <Compile Include="FindTests.fs" />
+    <Compile Include="CheckTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
