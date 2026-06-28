@@ -27,6 +27,7 @@
     <Compile Include="FindTests.fs" />
     <Compile Include="CheckTests.fs" />
     <Compile Include="NugetClassFieldTests.fs" />
+    <Compile Include="ExplainDiagnosticTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

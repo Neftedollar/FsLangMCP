@@ -348,6 +348,26 @@ type FcsSuggestOpenArgs =
       /// Maximum candidates per source. Default 20, hard ceiling 100.
       maxResults: int option }
 
+type FcsExplainDiagnosticArgs =
+    { /// Numeric error code WITHOUT the "FS" prefix (e.g. 39 for FS0039). Use this OR `code`.
+      errorNumber: int option
+      /// Full diagnostic code WITH the "FS" prefix (e.g. "FS0039"). Takes precedence over `errorNumber`.
+      code: string option
+      /// The raw FCS diagnostic message. Used to enrich repairHints — e.g. the undefined
+      /// name is extracted from an FS0039 message to suggest `fcs_suggest_open`.
+      message: string option
+      /// File context: when neither `code` nor `errorNumber` is given, the diagnostic at
+      /// (line, character) is auto-fetched by type-checking this file via FCS.
+      path: string option
+      /// 0-based line (LSP convention) for the position-based auto-fetch. Pairs with `path`.
+      line: int option
+      /// 0-based column (LSP convention) for the position-based auto-fetch. Pairs with `path`.
+      character: int option
+      /// Unsaved buffer content for the auto-fetch path; when omitted, the file is read from disk.
+      text: string option
+      /// .fsproj for project context on the auto-fetch path. Falls back to active set_project.
+      projectPath: string option }
+
 type FcsNugetTypesArgs =
     { /// Package id (matched against referenced assembly SimpleName, case-insensitive).
       /// Example: "Spectre.Console", "Newtonsoft.Json", "System.Text.Json".
