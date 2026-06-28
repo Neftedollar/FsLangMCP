@@ -4755,6 +4755,284 @@ type internal FcsBridge() =
             return jobj (baseFields @ paginationFields) :> JsonNode
         }
 
+    /// Emit the project's OWN public API surface — every public (and, when
+    /// includeInternal=true, internal) type plus its public members with signatures —
+    /// sorted stably by fullName then member name so two version snapshots diff cleanly.
+    /// Source is FSharpCheckProjectResults.AssemblySignature (the project's own inferred
+    /// signature), NOT referenced assemblies. `private` declarations are never emitted.
+    member this.PublicApi(args: FcsPublicApiArgs) : Task<JsonNode> =
+        task {
+            if args.projectPath.IsNone then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr "projectPath is required (or call set_project first to set the active project)" ]
+                    :> JsonNode
+            else
+
+            let includeInternal = defaultArg args.includeInternal false
+            let requested = defaultArg args.maxResults 100
+            let pageSize = min (max 1 requested) 1000
+
+            let pageOffsetResult =
+                match args.cursor with
+                | None -> Ok 0
+                | Some cursorStr -> Cursor.tryDecode cursorStr |> Result.map (fun p -> p.offset)
+
+            match pageOffsetResult with
+            | Error reason ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr $"Invalid cursor: %s{reason}" ]
+                    :> JsonNode
+            | Ok pageOffset ->
+
+            let! results, options, optionsSource = this.EnsureProjectResults args.projectPath
+
+            // Public-only by default; includeInternal also admits `internal`. `private`
+            // never passes. "unknown" (synthetic symbols FCS throws on) is treated as
+            // public-visible, matching fcs_referenced_symbols / fcs_nuget_types.
+            let accPasses (acc: string) =
+                if includeInternal then
+                    acc = "public" || acc = "internal" || acc = "unknown"
+                else
+                    acc = "public" || acc = "unknown"
+
+            let nsFilterLower =
+                args.namespaceFilter
+                |> Option.map (fun s -> s.Trim())
+                |> Option.filter (fun s -> s.Length > 0)
+                |> Option.map (fun s -> s.ToLowerInvariant())
+
+            // ── Per-member signature/accessibility helpers (reuse the shared kind/acc
+            //    helpers; only the bare signature strings are built locally) ──────────
+            let fieldSignature (f: FSharpField) =
+                try
+                    $"{f.Name}: {typeName f.FieldType}"
+                with _ ->
+                    try f.Name with _ -> "<unknown>"
+
+            let isBackingField (f: FSharpField) =
+                try
+                    f.IsCompilerGenerated
+                    || f.IsNameGenerated
+                    || (let n = f.Name in
+                        not (isNull n) && (n.Contains "k__BackingField" || n.Contains "@"))
+                with _ ->
+                    false
+
+            let unionCaseSignature (uc: FSharpUnionCase) =
+                try
+                    if uc.Fields.Count = 0 then
+                        uc.Name
+                    else
+                        let fieldTypes =
+                            uc.Fields
+                            |> Seq.map (fun f -> try typeName f.FieldType with _ -> "?")
+                            |> String.concat " * "
+
+                        $"{uc.Name} of {fieldTypes}"
+                with _ ->
+                    try uc.Name with _ -> "<unknown>"
+
+            let unionCaseAccessibility (uc: FSharpUnionCase) =
+                try
+                    let acc = uc.Accessibility
+
+                    if acc.IsPrivate then "private"
+                    elif acc.IsInternal then "internal"
+                    elif acc.IsPublic then "public"
+                    else "unknown"
+                with _ ->
+                    "unknown"
+
+            // Members of one entity: methods/properties/functions/values (skipping
+            // compiler-generated members and property accessors), record/struct/class
+            // fields (skipping backing fields), and union cases — accessibility-filtered,
+            // de-duplicated, and stably sorted by (name, kind, signature).
+            let membersOf (entity: FSharpEntity) =
+                // For records, the field-getter property duplicates the field row; drop
+                // those synthesized properties so a record's surface is its fields.
+                let recordFieldNames =
+                    try
+                        if entity.IsFSharpRecord then
+                            entity.FSharpFields |> Seq.map (fun f -> f.Name) |> Set.ofSeq
+                        else
+                            Set.empty
+                    with _ ->
+                        Set.empty
+
+                let fromMfvs =
+                    try
+                        entity.MembersFunctionsAndValues
+                        |> Seq.choose (fun m ->
+                            let isAccessor =
+                                try m.IsPropertyGetterMethod || m.IsPropertySetterMethod with _ -> false
+
+                            let isCompilerGenerated = try m.IsCompilerGenerated with _ -> false
+
+                            let isRecordFieldProperty =
+                                try entity.IsFSharpRecord && m.IsProperty && recordFieldNames.Contains m.DisplayName with _ -> false
+
+                            let acc = memberAccessibilityString m
+
+                            if not isAccessor && not isCompilerGenerated && not isRecordFieldProperty && accPasses acc then
+                                Some
+                                    {| name = (try m.DisplayName with _ -> "<unknown>")
+                                       kind = memberKindString m
+                                       signature = memberSignature m
+                                       accessibility = acc |}
+                            else
+                                None)
+                        |> Seq.toList
+                    with _ ->
+                        []
+
+                let fromFields =
+                    try
+                        if entity.IsFSharpRecord || entity.IsValueType || entity.IsClass then
+                            entity.FSharpFields
+                            |> Seq.choose (fun f ->
+                                let acc = fieldAccessibilityString f
+
+                                if not (isBackingField f) && accPasses acc then
+                                    Some
+                                        {| name = (try f.Name with _ -> "<unknown>")
+                                           kind = "field"
+                                           signature = fieldSignature f
+                                           accessibility = acc |}
+                                else
+                                    None)
+                            |> Seq.toList
+                        else
+                            []
+                    with _ ->
+                        []
+
+                let fromUnionCases =
+                    try
+                        if entity.IsFSharpUnion then
+                            entity.UnionCases
+                            |> Seq.choose (fun uc ->
+                                let acc = unionCaseAccessibility uc
+
+                                if accPasses acc then
+                                    Some
+                                        {| name = (try uc.Name with _ -> "<unknown>")
+                                           kind = "union-case"
+                                           signature = unionCaseSignature uc
+                                           accessibility = acc |}
+                                else
+                                    None)
+                            |> Seq.toList
+                        else
+                            []
+                    with _ ->
+                        []
+
+                fromMfvs @ fromFields @ fromUnionCases
+                |> List.distinctBy (fun m -> m.name, m.kind, m.signature)
+                |> List.sortBy (fun m -> m.name, m.kind, m.signature)
+
+            let entityFullName (e: FSharpEntity) =
+                try
+                    match e.FullName |> Option.ofObj with
+                    | Some fn when fn.Length > 0 -> fn
+                    | _ -> e.DisplayName
+                with _ ->
+                    try e.DisplayName with _ -> "<unknown>"
+
+            let topEntities =
+                try
+                    results.AssemblySignature.Entities :> seq<FSharpEntity>
+                with _ ->
+                    Seq.empty
+
+            // walkEntities flattens nested entities, so skipping a namespace container
+            // never drops the modules/types declared inside it.
+            let allEntities =
+                topEntities
+                |> Seq.collect walkEntities
+                |> Seq.choose (fun e ->
+                    let isNamespace = try e.IsNamespace with _ -> false
+
+                    if isNamespace then
+                        None
+                    else
+                        let acc = entityAccessibilityString e
+
+                        if not (accPasses acc) then
+                            None
+                        else
+                            let fullName = entityFullName e
+
+                            let nsOk =
+                                match nsFilterLower with
+                                | None -> true
+                                | Some f -> fullName.ToLowerInvariant().Contains(f)
+
+                            if not nsOk then
+                                None
+                            else
+                                Some
+                                    {| fullName = fullName
+                                       kind = entityKindString e
+                                       accessibility = acc
+                                       members = membersOf e |})
+                |> Seq.toList
+                |> List.sortBy (fun e -> e.fullName, e.kind)
+
+            let totalEntityCount = allEntities.Length
+            let totalMemberCount = allEntities |> List.sumBy (fun e -> e.members.Length)
+
+            let pageEntities =
+                allEntities
+                |> List.skip (min pageOffset totalEntityCount)
+                |> List.truncate pageSize
+
+            let entityNodes =
+                pageEntities
+                |> List.map (fun e ->
+                    let memberNodes =
+                        e.members
+                        |> List.map (fun m ->
+                            jobj
+                                [ "name", jstr m.name
+                                  "kind", jstr m.kind
+                                  "signature", jstr m.signature
+                                  "accessibility", jstr m.accessibility ]
+                            :> JsonNode)
+                        |> List.toArray
+
+                    jobj
+                        [ "fullName", jstr e.fullName
+                          "kind", jstr e.kind
+                          "accessibility", jstr e.accessibility
+                          "members", JsonArray(memberNodes) :> JsonNode ]
+                    :> JsonNode)
+                |> List.toArray
+
+            let baseFields =
+                [ "status", jstr "ok"
+                  "project", jstr options.ProjectFileName
+                  "optionsSource", jstr optionsSource
+                  "includeInternal", jbool includeInternal
+                  "namespaceFilter",
+                  (match args.namespaceFilter with
+                   | Some s when not (String.IsNullOrWhiteSpace s) -> jstr s
+                   | _ -> null)
+                  "entityCount", jint totalEntityCount
+                  "memberCount", jint totalMemberCount
+                  "entities", JsonArray(entityNodes) :> JsonNode ]
+
+            let paginationFields =
+                Cursor.paginationFields "entities" totalEntityCount pageOffset pageSize pageEntities.Length
+
+            return jobj (baseFields @ paginationFields) :> JsonNode
+        }
+
     member _.ClearCaches() =
         optionsCache.Clear()
         projectResultsCache.Clear()

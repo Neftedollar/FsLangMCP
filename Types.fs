@@ -334,6 +334,21 @@ type FcsReferencedSymbolsArgs =
       /// Opaque cursor from a prior call's `nextCursor`. Omit for first page.
       cursor: string option }
 
+type FcsPublicApiArgs =
+    { /// .fsproj whose own public API surface to emit. Falls back to active set_project.
+      projectPath: string option
+      /// When true, include `internal` entities and members alongside public ones.
+      /// `private` is never emitted. Default false (public-only surface).
+      includeInternal: bool option
+      /// Case-insensitive substring filter applied to each entity's FullName.
+      /// Omit to emit the whole surface.
+      namespaceFilter: string option
+      /// Maximum entities per page. Default 100, hard ceiling 1000. Members are
+      /// never split across pages — an entity carries its full member list.
+      maxResults: int option
+      /// Opaque cursor from a prior call's `nextCursor`. Omit for the first page.
+      cursor: string option }
+
 type FcsSuggestOpenArgs =
     { /// Bare unresolved symbol name from an FS0039-style diagnostic (e.g. "File", "List", "Encoding").
       symbolName: string
