@@ -304,9 +304,19 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
             Assert.Equal(1, fUpd)
             Assert.Equal(2, fRead)
 
-            // 5. Field sites are surfaced in the grouped `fieldSites` bucket too.
-            let fieldBucket = find["fieldSites"] :?> JsonArray
-            Assert.Equal(5, fieldBucket.Count)
+            // 5. The same 5 cross-project field sites are recoverable from the flat
+            //    `sites` list filtered by `kind` (the grouped `fieldSites` bucket was
+            //    removed; `sites` + `kind` is now the single representation, and its
+            //    field-kind count must agree with the breakdown total above).
+            let fieldKinds = Set.ofList [ "field-set-literal"; "field-set-update"; "field-read" ]
+
+            let fieldSitesInList =
+                (find["sites"] :?> JsonArray)
+                |> Seq.filter (fun s -> fieldKinds.Contains(gs s "kind"))
+                |> Seq.length
+
+            Assert.Equal(5, fieldSitesInList)
+            Assert.Equal(fieldSitesTotal, fieldSitesInList)
 
             // 6. Headline: find finds strictly more than the single-project baseline.
             Assert.True(
