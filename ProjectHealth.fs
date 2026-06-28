@@ -12,7 +12,7 @@ type LspHealthSnapshot =
       WorkspaceReady: bool
       DiagnosticsFileCount: int }
 
-type ProjectOptionsProbe = string -> Async<Result<string, string>>
+type ProjectOptionsProbe = string -> Async<Result<ProjectOptionsInfo, string>>
 
 let private xname localName = XName.Get(localName)
 
@@ -434,18 +434,48 @@ let createReport
                 let hasMissingFiles = fileSummary["missingFiles"].AsArray().Count > 0
                 let hasUnreadableFiles = fileSummary["unreadableFiles"].AsArray().Count > 0
 
-                let! projectOptionsHealth =
+                let! projectOptionsHealth, restoreUnresolved =
                     async {
                         match! projectOptionsProbe projectPath with
-                        | Ok source -> return jobj [ "status", jstr "available"; "source", jstr source ] :> JsonNode
+                        | Ok info ->
+                            let frac =
+                                ReferenceResolution.fraction info.ReferencesExisting info.ReferencesTotal
+
+                            let unrestored =
+                                ReferenceResolution.looksUnrestored info.ReferencesExisting info.ReferencesTotal
+
+                            let fields =
+                                [ "status", jstr "available"
+                                  "source", jstr info.Source
+                                  "restoreStatus", jstr (if unrestored then "unrestored" else "restored")
+                                  "referencesResolved", JsonValue.Create(Math.Round(frac, 3)) :> JsonNode
+                                  "referencesExisting", jint info.ReferencesExisting
+                                  "referencesTotal", jint info.ReferencesTotal ]
+
+                            let fields =
+                                if unrestored then
+                                    fields
+                                    @ [ "warning",
+                                        jstr
+                                            "External references unresolved — run dotnet restore (then build). FCS semantic tools will fail with 'FSharp.Core.dll not found' until restored." ]
+                                else
+                                    fields
+
+                            return jobj fields :> JsonNode, unrestored
                         | Error reason ->
-                            return jobj [ "status", jstr "unavailable"; "reason", jstr reason ] :> JsonNode
+                            return jobj [ "status", jstr "unavailable"; "reason", jstr reason ] :> JsonNode, false
                     }
 
                 let fcsWarnings = ResizeArray<JsonNode>()
 
                 if hasMissingFiles || hasUnreadableFiles then
                     fcsWarnings.Add(jstr "Some project source files are missing or unreadable.")
+
+                if restoreUnresolved then
+                    fcsWarnings.Add(
+                        jstr
+                            "External references unresolved — run dotnet restore (FCS semantic tools fail with 'FSharp.Core.dll not found' until the project is restored/built)."
+                    )
 
                 match projectOptionsHealth["status"].GetValue<string>() with
                 | "available" -> ()

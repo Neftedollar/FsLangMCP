@@ -299,14 +299,26 @@ let main argv =
                                             | Some path ->
                                                 let! probe = fcsBridge.ProbeProjectOptions path
 
-                                                let ok =
-                                                    match probe with
-                                                    | Ok _ -> true
-                                                    | Error _ -> false
-
                                                 match resultObj["readiness"] with
                                                 | :? JsonObject as readinessObj ->
-                                                    readinessObj["projectOptions"] <- jbool ok
+                                                    match probe with
+                                                    | Ok info ->
+                                                        readinessObj["projectOptions"] <- jbool true
+
+                                                        // Restore-awareness (#138): options can load while the
+                                                        // project's external references are absent on disk, which
+                                                        // leaves symbolIndex empty and makes FCS tools fail with
+                                                        // 'FSharp.Core.dll not found'. Surface "restore first"
+                                                        // rather than letting `ready` imply it's usable.
+                                                        if FsLangMcp.Types.ReferenceResolution.looksUnrestored
+                                                               info.ReferencesExisting
+                                                               info.ReferencesTotal then
+                                                            readinessObj["restoreStatus"] <- jstr "unrestored"
+
+                                                            readinessObj["restoreHint"] <-
+                                                                jstr
+                                                                    "external references unresolved — run dotnet restore && dotnet build before using FCS tools"
+                                                    | Error _ -> readinessObj["projectOptions"] <- jbool false
                                                 | _ -> ()
                                             | None -> ()
                                         | _ -> ()
@@ -403,7 +415,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsFileOutlineArgs>
                         "fcs_file_outline"
-                        "Agent-friendly compact F# outline for one file. Filters local/noisy symbols by default and returns name, kind, range, signature/type, accessibility, and declaration range. Prefer this over fcs_file_symbols for navigation."
+                        "Agent-friendly compact F# outline for one file. Defaults to summaryOnly=true: module/type headers + per-kind memberCounts only (no per-member signatures), so large files never overflow the token ceiling. Set summaryOnly=false for full name/kind/range/signature/accessibility entries. Filters local/noisy symbols by default. Prefer fcs_project_outline for a whole-project overview; fcs_file_symbols for raw unfiltered symbols."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.FileOutline args)))
                     |> unwrapResult
                 )

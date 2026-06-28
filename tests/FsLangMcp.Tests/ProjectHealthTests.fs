@@ -50,7 +50,14 @@ let private readySnapshot projectPath root =
       DiagnosticsFileCount = 0 }
 
 let private report args snapshot =
-    let probe _ = async { return Ok "test-probe" }
+    let probe _ =
+        async { return Ok { Source = "test-probe"; ReferencesExisting = 0; ReferencesTotal = 0 } }
+
+    createReport args snapshot probe |> Async.RunSynchronously
+
+/// Like `report` but with an injectable probe so tests can simulate an unrestored
+/// project (references declared but absent on disk).
+let private reportWithProbe (probe: ProjectOptionsProbe) args snapshot =
     createReport args snapshot probe |> Async.RunSynchronously
 
 [<Fact>]
@@ -690,5 +697,61 @@ let ``countTestAttributesInFile does not count NUnit TestFixture as a test metho
 
         // Only the [<Fact>] should count; [<TestFixture>] must be ignored.
         Assert.Equal(1, proj["testCount"].GetValue<int>())
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+// ─── Restore-awareness (#138) ─────────────────────────────────────────────────
+// When the probe reports that the project's external references are unresolved
+// (declared but absent on disk), project_health must surface "unrestored" rather
+// than a bare "available", and degrade the FCS readiness axis with a clear warning
+// so an agent reads "restore first" instead of trusting `ready`.
+
+[<Fact>]
+let ``project_health flags an unrestored project via restoreStatus and a degraded fcs axis`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_unrestored_%s{runId}")
+
+    try
+        let projectPath = writeProject root
+        // 1 of 200 references resolved = 0.5% < 20% → unrestored.
+        let unrestoredProbe _ =
+            async { return Ok { Source = "ionide-proj-info"; ReferencesExisting = 1; ReferencesTotal = 200 } }
+
+        let result =
+            reportWithProbe unrestoredProbe (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
+
+        let projectOptions = result["projectOptions"]
+        Assert.Equal("available", projectOptions["status"].GetValue<string>())
+        Assert.Equal("unrestored", projectOptions["restoreStatus"].GetValue<string>())
+        Assert.Equal(200, projectOptions["referencesTotal"].GetValue<int>())
+        Assert.Equal(1, projectOptions["referencesExisting"].GetValue<int>())
+        Assert.NotNull(projectOptions["warning"])
+
+        // The FCS axis must visibly degrade with a warning — not report a bare "ready".
+        let fcs = result["toolingReadiness"]["fcs"]
+        Assert.Equal("degraded", fcs["status"].GetValue<string>())
+        let warnings = fcs["warnings"] :?> JsonArray
+        Assert.True(warnings.Count > 0, "the unrestored project must surface an FCS warning")
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health reports a restored project as restored with high referencesResolved`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_restored_%s{runId}")
+
+    try
+        let projectPath = writeProject root
+        let restoredProbe _ =
+            async { return Ok { Source = "ionide-proj-info"; ReferencesExisting = 200; ReferencesTotal = 200 } }
+
+        let result =
+            reportWithProbe restoredProbe (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
+
+        let projectOptions = result["projectOptions"]
+        Assert.Equal("restored", projectOptions["restoreStatus"].GetValue<string>())
+        Assert.Equal(1.0, projectOptions["referencesResolved"].GetValue<float>())
+        // No restore warning means the FCS axis stays ready.
+        Assert.Equal("ready", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
     finally
         if Directory.Exists root then Directory.Delete(root, true)

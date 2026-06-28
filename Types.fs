@@ -172,6 +172,10 @@ type FcsFileOutlineArgs =
       includePrivate: bool option
       /// When true, include local bindings and parameters (noisy). Default false.
       includeLocal: bool option
+      /// When true (default), return module/type headers + per-kind member counts
+      /// only (no per-member signatures) — safe on very large files that would
+      /// otherwise overflow the MCP token ceiling. Set false for full signatures.
+      summaryOnly: bool option
       /// Maximum symbols returned. Default 200.
       maxResults: int option }
 
@@ -564,3 +568,47 @@ module ArgsValidation =
             Ok trimmed
 
 let normalizePath (path: string) = Path.GetFullPath(path)
+
+// ─── Reference-resolution probe ────────────────────────────────────────────────
+
+/// Deterministic "is this project restored/built?" probe over an FCS OtherOptions
+/// list. Counts how many `-r:`/`--reference:` target assemblies actually exist on
+/// disk. An unrestored/unbuilt project evaluates its .fsproj (so OtherOptions are
+/// populated) but its external reference assemblies (FSharp.Core.dll, BCL refs,
+/// NuGet packages) are absent — yielding total > 0 with existing far below total.
+/// Shared by check (FcsBridge) and project_health/set_project readiness so both can
+/// tell "not restored" apart from "no symbols".
+module ReferenceResolution =
+
+    /// Returns (existing, total): how many `-r:`/`--reference:` targets resolve on
+    /// disk, out of how many were requested.
+    let probe (otherOptions: string seq) : int * int =
+        let refTargets =
+            otherOptions
+            |> Seq.choose (fun opt ->
+                if isNull opt then None
+                elif opt.StartsWith("-r:", StringComparison.Ordinal) then Some(opt.Substring(3))
+                elif opt.StartsWith("--reference:", StringComparison.Ordinal) then Some(opt.Substring(12))
+                else None)
+            |> Seq.toArray
+
+        let existing = refTargets |> Array.filter File.Exists |> Array.length
+        existing, refTargets.Length
+
+    /// Fraction of references resolved on disk. Returns 1.0 when total = 0 (nothing
+    /// to resolve) so callers can gate the "unrestored" verdict on `total > 0`.
+    let fraction (existing: int) (total: int) : float =
+        if total <= 0 then 1.0 else float existing / float total
+
+    /// True when the project looks effectively unrestored/unbuilt: it declares
+    /// external references but fewer than 20% of them exist on disk.
+    let looksUnrestored (existing: int) (total: int) : bool =
+        total > 0 && fraction existing total < 0.2
+
+/// Resolved project-options summary shared by ProbeProjectOptions (FcsBridge) and
+/// createReport (ProjectHealth). Carries the reference-resolution counts so readiness
+/// reporting can surface "unrestored" instead of a bare "available".
+type ProjectOptionsInfo =
+    { Source: string
+      ReferencesExisting: int
+      ReferencesTotal: int }

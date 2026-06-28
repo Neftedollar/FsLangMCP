@@ -190,3 +190,53 @@ let ``toolResult exception with not ready message returns Error with NotReady er
         | Ok _ -> Assert.Fail("Expected Error but got Ok")
         | Error e -> Assert.Fail($"Expected TransportError but got: {e}")
     }
+
+// ─── Group: ReferenceResolution probe (#138) ──────────────────────────────────
+// The deterministic restore-awareness heuristic shared by check (FcsBridge) and
+// project_health / set_project readiness. Pure over an FCS OtherOptions list.
+
+[<Fact>]
+let ``ReferenceResolution.probe counts only existing -r:/--reference: targets`` () =
+    let existingDll = typeof<System.String>.Assembly.Location // guaranteed on disk
+    let missingDll = Path.Combine(Path.GetTempPath(), $"no_such_{System.Guid.NewGuid():N}.dll")
+
+    let otherOptions =
+        [ "--target:library"
+          $"-r:{existingDll}"
+          $"--reference:{missingDll}"
+          "-r:" + missingDll + ".other"
+          "--nowarn:57" ]
+
+    let existing, total = ReferenceResolution.probe otherOptions
+
+    Assert.Equal(3, total) // two -r: and one --reference:
+    Assert.Equal(1, existing) // only the real BCL dll exists
+
+[<Fact>]
+let ``ReferenceResolution.probe ignores non-reference flags and nulls`` () =
+    let existing, total =
+        ReferenceResolution.probe [ "--debug+"; null; "-o:out.dll"; "--noframework" ]
+
+    Assert.Equal(0, total)
+    Assert.Equal(0, existing)
+
+[<Fact>]
+let ``ReferenceResolution.fraction is 1.0 when there are no references`` () =
+    Assert.Equal(1.0, ReferenceResolution.fraction 0 0)
+
+[<Fact>]
+let ``ReferenceResolution.fraction divides existing by total`` () =
+    Assert.Equal(0.25, ReferenceResolution.fraction 1 4)
+
+[<Fact>]
+let ``ReferenceResolution.looksUnrestored fires only below the 20pct floor with refs present`` () =
+    // total = 0 → nothing to resolve → not unrestored.
+    Assert.False(ReferenceResolution.looksUnrestored 0 0)
+    // 1/100 = 1% < 20% → unrestored.
+    Assert.True(ReferenceResolution.looksUnrestored 1 100)
+    // 19/100 = 19% < 20% → unrestored.
+    Assert.True(ReferenceResolution.looksUnrestored 19 100)
+    // 20/100 = 20% is NOT below the floor → restored.
+    Assert.False(ReferenceResolution.looksUnrestored 20 100)
+    // fully resolved → restored.
+    Assert.False(ReferenceResolution.looksUnrestored 100 100)
