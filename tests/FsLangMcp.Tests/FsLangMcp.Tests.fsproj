@@ -30,6 +30,7 @@
     <Compile Include="CheckTests.fs" />
     <Compile Include="NugetClassFieldTests.fs" />
     <Compile Include="ExplainDiagnosticTests.fs" />
+    <Compile Include="DiagnosticFixesTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

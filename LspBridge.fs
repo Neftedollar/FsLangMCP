@@ -383,6 +383,187 @@ module internal LspResponseShape =
               "result", response ]
         :> JsonNode
 
+    // ─── diagnostic-fixes shaping (fcs_diagnostic_fixes, #53) ──────────────────
+    // Pure builders for the agent-friendly "diagnostics → grouped fixes" payload.
+    // Tested in isolation (the live grouping path needs an FSAC process); the bridge
+    // member feeds these the raw FSAC diagnostics + per-diagnostic codeAction arrays.
+
+    /// Reads an int child from a JSON object by key. None when the node is not an
+    /// object, the key is absent, or the value is not an integer.
+    let private childInt (node: JsonNode) (key: string) : int option =
+        match node with
+        | :? JsonObject as obj ->
+            match obj[key] with
+            | :? JsonValue as v ->
+                let mutable n = 0
+                if v.TryGetValue(&n) then Some n else None
+            | _ -> None
+        | _ -> None
+
+    /// Reads a string child from a JSON object by key. None when absent/not a string.
+    let private childString (node: JsonNode) (key: string) : string option =
+        match node with
+        | :? JsonObject as obj ->
+            match obj[key] with
+            | :? JsonValue as v ->
+                let mutable s = ""
+                if v.TryGetValue(&s) then Some s else None
+            | _ -> None
+        | _ -> None
+
+    /// True when (line, character) falls within the LSP range [start, end] inclusive.
+    /// A missing start/end character is treated as unbounded on that edge.
+    let positionWithinRange (line: int) (character: int) (range: JsonNode) : bool =
+        match range with
+        | :? JsonObject as obj ->
+            match childInt obj["start"] "line", childInt obj["end"] "line" with
+            | Some sl, Some el ->
+                let afterStart =
+                    line > sl
+                    || (line = sl
+                        && (match childInt obj["start"] "character" with
+                            | Some sc -> character >= sc
+                            | None -> true))
+
+                let beforeEnd =
+                    line < el
+                    || (line = el
+                        && (match childInt obj["end"] "character" with
+                            | Some ec -> character <= ec
+                            | None -> true))
+
+                afterStart && beforeEnd
+            | _ -> false
+        | _ -> false
+
+    /// True when `line` is between the range's start and end line (inclusive).
+    let lineWithinRange (line: int) (range: JsonNode) : bool =
+        match range with
+        | :? JsonObject as obj ->
+            match childInt obj["start"] "line", childInt obj["end"] "line" with
+            | Some sl, Some el -> line >= sl && line <= el
+            | _ -> false
+        | _ -> false
+
+    /// Position filter for a diagnostic's range:
+    /// - both line+character → point-in-range
+    /// - line only           → diagnostics intersecting that line
+    /// - neither             → keep everything (whole-file mode)
+    let diagnosticCoversPosition (line: int option) (character: int option) (range: JsonNode) : bool =
+        match line, character with
+        | Some l, Some c -> positionWithinRange l c range
+        | Some l, None -> lineWithinRange l range
+        | None, _ -> true
+
+    /// Collects the individual TextEdits inside an LSP CodeAction's WorkspaceEdit,
+    /// handling both the `documentChanges` and the `changes` representations.
+    let private codeActionEdits (codeAction: JsonNode) : JsonNode list =
+        match codeAction with
+        | :? JsonObject as ca ->
+            match ca["edit"] with
+            | :? JsonObject as edit ->
+                match edit["documentChanges"] with
+                | :? JsonArray as docChanges ->
+                    [ for dc in docChanges do
+                          match dc with
+                          | :? JsonObject as dco ->
+                              match dco["edits"] with
+                              | :? JsonArray as edits -> yield! Seq.cast<JsonNode> edits
+                              | _ -> ()
+                          | _ -> () ]
+                | _ ->
+                    match edit["changes"] with
+                    | :? JsonObject as changes ->
+                        [ for kv in changes do
+                              match kv.Value with
+                              | :? JsonArray as edits -> yield! Seq.cast<JsonNode> edits
+                              | _ -> () ]
+                    | _ -> []
+            | _ -> []
+        | _ -> []
+
+    /// One-line human summary of what a CodeAction's edit does: edit count plus a
+    /// whitespace-collapsed, truncated preview of the first inserted text. Lets an
+    /// agent triage fixes without parsing the raw WorkspaceEdit.
+    let editSummaryOf (codeAction: JsonNode) : string =
+        let edits = codeActionEdits codeAction
+
+        let preview (text: string) =
+            let collapsed =
+                System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ").Trim()
+
+            if collapsed.Length > 60 then
+                collapsed.Substring(0, 57) + "..."
+            else
+                collapsed
+
+        match edits with
+        | [] ->
+            match codeAction with
+            | :? JsonObject as ca when not (isNull ca["command"]) -> "command (no text edit)"
+            | _ -> "no edit"
+        | _ ->
+            let firstNewText =
+                edits
+                |> List.tryPick (fun e -> childString e "newText")
+                |> Option.defaultValue ""
+
+            let label =
+                if List.length edits = 1 then
+                    "1 edit"
+                else
+                    $"{List.length edits} edits"
+
+            if firstNewText = "" then
+                $"{label} (deletion)"
+            else
+                $"{label}: {preview firstNewText}"
+
+    /// Projects a raw LSP CodeAction to the compact agent shape { title, kind, editSummary }.
+    let summarizeCodeAction (codeAction: JsonNode) : JsonNode =
+        jobj
+            [ "title", (childString codeAction "title" |> Option.map jstr |> Option.defaultValue null)
+              "kind", (childString codeAction "kind" |> Option.map jstr |> Option.defaultValue null)
+              "editSummary", jstr (editSummaryOf codeAction) ]
+        :> JsonNode
+
+    /// Deep-clones a field off a diagnostic node, or null when absent. Cloning keeps
+    /// the source node (owned by the FSAC store) attached to its parent.
+    let private cloneField (diag: JsonNode) (key: string) : JsonNode =
+        match diag with
+        | :? JsonObject as obj ->
+            match obj[key] with
+            | null -> null
+            | node -> node.DeepClone()
+        | _ -> null
+
+    /// One grouped entry: the diagnostic's range/severity/code/message plus its fixes.
+    let diagnosticFixEntry (diag: JsonNode) (fixes: JsonNode list) : JsonNode =
+        let fixNodes = fixes |> List.map summarizeCodeAction |> List.toArray
+
+        jobj
+            [ "range", cloneField diag "range"
+              "severity", cloneField diag "severity"
+              "code", cloneField diag "code"
+              "message", cloneField diag "message"
+              "fixes", JsonArray(fixNodes) :> JsonNode ]
+        :> JsonNode
+
+    /// Builds the full fcs_diagnostic_fixes payload from (diagnostic, fixes) pairs.
+    let buildDiagnosticFixesResponse (file: string) (entries: (JsonNode * JsonNode list) list) : JsonNode =
+        let diagNodes =
+            entries |> List.map (fun (d, fixes) -> diagnosticFixEntry d fixes) |> List.toArray
+
+        let fixCount = entries |> List.sumBy (fun (_, fixes) -> List.length fixes)
+
+        jobj
+            [ "status", jstr "ok"
+              "file", jstr file
+              "diagnostics", JsonArray(diagNodes) :> JsonNode
+              "diagnosticCount", jint (List.length entries)
+              "fixCount", jint fixCount ]
+        :> JsonNode
+
 // ─── RenamePreviewShape (pure rename-preview transform, testable) ──────────────
 
 /// Transforms a raw LSP WorkspaceEdit (as produced by FSAC's textDocument/rename)
@@ -972,7 +1153,36 @@ type internal FsAutoCompleteBridge() =
                       jobj
                           [ "workspace", jobj [ "workspaceFolders", jbool true ]
                             "textDocument",
-                            jobj [ "completion", jobj [ "completionItem", jobj [ "snippetSupport", jbool true ] ] ] ] ]
+                            jobj
+                                [ "completion", jobj [ "completionItem", jobj [ "snippetSupport", jbool true ] ]
+                                  // FSAC gates codeAction *kinds* (its quick-fixes) on the client
+                                  // advertising codeActionLiteralSupport; without it codeAction returns
+                                  // null/Commands only. Required for fcs_diagnostic_fixes (#53).
+                                  "codeAction",
+                                  jobj
+                                      [ "codeActionLiteralSupport",
+                                        jobj
+                                            [ "codeActionKind",
+                                              jobj
+                                                  [ "valueSet",
+                                                    JsonArray(
+                                                        [| "quickfix"
+                                                           "refactor"
+                                                           "refactor.extract"
+                                                           "refactor.inline"
+                                                           "refactor.rewrite"
+                                                           "source"
+                                                           "source.organizeImports" |]
+                                                        |> Array.map jstr
+                                                    )
+                                                    :> JsonNode ] ]
+                                        "isPreferredSupport", jbool true
+                                        "dataSupport", jbool true
+                                        "resolveSupport", jobj [ "properties", JsonArray(jstr "edit") :> JsonNode ] ]
+                                  // Advertise push-diagnostics + save sync so FSAC publishes
+                                  // diagnostics for opened/changed documents.
+                                  "publishDiagnostics", jobj [ "relatedInformation", jbool true ]
+                                  "synchronization", jobj [ "didSave", jbool true ] ] ] ]
 
             let! _ = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("initialize", initializeParams)
             do! jsonRpc.NotifyWithParameterObjectAsync("initialized", JsonObject())
@@ -1366,6 +1576,102 @@ type internal FsAutoCompleteBridge() =
                       "range", jobj [ "start", posNode (); "end", posNode () ]
                       "context", jobj [ "diagnostics", JsonArray() :> JsonNode ] ]
         )
+
+    /// Agent-friendly wrapper over the raw codeAction proxy: fetches the file's
+    /// diagnostics (FSAC publishDiagnostics), then for EACH diagnostic re-requests
+    /// codeActions with that diagnostic populated in context.diagnostics — the
+    /// context the raw `CodeAction` proxy leaves empty — and groups the fixes per
+    /// diagnostic. line/character narrow to one position; omit for the whole file.
+    member this.DiagnosticFixes(args: DiagnosticFixesArgs) : Task<JsonNode> =
+        task {
+            let! jsonRpc = this.EnsureStarted()
+
+            if not workspaceReady then
+                return this.NotReadyResponse()
+            else
+                let fullPath = Path.GetFullPath(args.path)
+                let uri = toFileUri fullPath
+
+                // Snapshot the prior publish time so we can detect a FRESH republish
+                // (publishDiagnostics arrives asynchronously after didOpen/didChange).
+                let priorAnalyzedAt =
+                    match diagnosticsAnalyzedAt.TryGetValue(uri) with
+                    | true, ts -> ValueSome ts
+                    | false, _ -> ValueNone
+
+                // Sync the document under the gate so FSAC re-analyzes and republishes.
+                let! _ =
+                    task {
+                        do! gate.WaitAsync()
+
+                        try
+                            return! this.SyncDocument(jsonRpc, args.path, args.text)
+                        finally
+                            gate.Release() |> ignore
+                    }
+
+                // Bounded wait for FSAC to push a fresh diagnostics set for this URI.
+                // On timeout we proceed with whatever the store holds (possibly empty)
+                // rather than blocking the single LSP slot indefinitely.
+                let deadline = DateTimeOffset.UtcNow.AddSeconds(5.0)
+
+                let isFresh () =
+                    match diagnosticsAnalyzedAt.TryGetValue(uri) with
+                    | true, ts ->
+                        match priorAnalyzedAt with
+                        | ValueSome prev -> ts > prev
+                        | ValueNone -> true
+                    | false, _ -> false
+
+                while not (isFresh ()) && DateTimeOffset.UtcNow < deadline do
+                    do! Task.Delay(50)
+
+                let fileDiagnostics =
+                    match diagnostics.TryGetValue(uri) with
+                    | true, (:? JsonArray as arr) -> arr |> Seq.cast<JsonNode> |> Seq.toList
+                    | _ -> []
+
+                let targeted =
+                    fileDiagnostics
+                    |> List.filter (fun d ->
+                        match d with
+                        | :? JsonObject as obj ->
+                            LspResponseShape.diagnosticCoversPosition args.line args.character obj["range"]
+                        | _ -> false)
+
+                let entries = ResizeArray<JsonNode * JsonNode list>()
+
+                for diag in targeted do
+                    // codeAction over the diagnostic's own range, with the diagnostic
+                    // populated in context — this is what unlocks the diagnostic-keyed
+                    // fixes that the empty-context raw proxy never sees.
+                    let range =
+                        match diag with
+                        | :? JsonObject as obj when not (isNull obj["range"]) -> obj["range"].DeepClone()
+                        | _ ->
+                            jobj
+                                [ "start", jobj [ "line", jint 0; "character", jint 0 ]
+                                  "end", jobj [ "line", jint 0; "character", jint 0 ] ]
+                            :> JsonNode
+
+                    let parameters =
+                        jobj
+                            [ "textDocument", jobj [ "uri", jstr uri ]
+                              "range", range
+                              "context", jobj [ "diagnostics", JsonArray(diag.DeepClone()) :> JsonNode ] ]
+
+                    let! response =
+                        jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("textDocument/codeAction", parameters)
+
+                    let fixes =
+                        match response with
+                        | :? JsonArray as arr -> arr |> Seq.cast<JsonNode> |> Seq.toList
+                        | _ -> []
+
+                    entries.Add(diag, fixes)
+
+                return LspResponseShape.buildDiagnosticFixesResponse fullPath (List.ofSeq entries)
+        }
 
     member this.Rename(args: RenameArgs) : Task<JsonNode> =
         this.WithDocument(

@@ -443,6 +443,18 @@ type CodeActionArgs =
       /// Unsaved buffer content; when omitted, file is read from disk.
       text: string option }
 
+type DiagnosticFixesArgs =
+    { /// Absolute path to an existing F# source file (.fs or .fsi).
+      path: string
+      /// Unsaved buffer content; when omitted, file is read from disk.
+      text: string option
+      /// 0-based line (LSP convention). With character, narrows to diagnostics
+      /// covering that exact position; with line alone, to diagnostics on that line.
+      /// Omit both to report every diagnostic in the file.
+      line: int option
+      /// 0-based column (LSP convention). Pairs with line to pin one position.
+      character: int option }
+
 type RenameArgs =
     { /// Absolute path to the F# source file containing the symbol to rename.
       path: string
