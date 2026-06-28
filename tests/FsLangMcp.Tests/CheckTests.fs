@@ -286,6 +286,58 @@ type CheckTests(fx: CheckFixture) =
         }
 
     [<Fact>]
+    member _.``speed=fast honors requested severity — a warning-only snapshot surfaces the warning when the floor allows it``
+        ()
+        : Task =
+        task {
+            let bridge = FcsBridge()
+
+            // A ready, freshly-analyzed FSAC snapshot holding ONE warning and zero errors.
+            // The fast path projects this through CheckFsacSnapshot, which now retains all
+            // severities so the requested floor can surface them.
+            let json =
+                "{ \"lspState\": \"ready\", \"mostRecentAnalyzedAt\": \"2026-01-01T00:00:00Z\","
+                + " \"diagnosticsFileCount\": 1, \"result\": { \"/probe/Warn.fs\": ["
+                + " { \"severity\": 2, \"message\": \"unused value\", \"file\": \"/probe/Warn.fs\","
+                + " \"range\": { \"startLine\": 1, \"startColumn\": 0, \"endLine\": 1, \"endColumn\": 5 } } ] } }"
+
+            let snap = CheckFsacSnapshot.ofDiagnosticsResponse (JsonNode.Parse json)
+
+            let fastCheck (severity: string option) =
+                bridge.Check(
+                    { bareCheck with
+                        projectPath = Some fx.ProbeFsproj
+                        speed = Some "fast"
+                        scope = Some "project"
+                        severity = severity },
+                    fsacSnapshot = (fun () -> Task.FromResult snap)
+                )
+
+            // DEFAULT floor = error: verdict stays clean (a warning is not an error) and the
+            // warning is COUNTED, but it is below the floor so it is not in the list.
+            let! atError = fastCheck None
+            Assert.Equal("fast", gs atError "speed")
+            Assert.Equal("clean", gs atError "verdict")
+            Assert.Equal(0, gi atError "errorCount")
+            Assert.Equal(1, gi atError "warningCount")
+            Assert.Equal(0, (atError["diagnostics"] :?> JsonArray).Count)
+
+            // severity=warning: the warning the caller asked for MUST now appear — this is
+            // the regression the fix closes (the old fast path stored only errors).
+            let! atWarning = fastCheck (Some "warning")
+            Assert.Equal("clean", gs atWarning "verdict")
+            Assert.Equal(1, gi atWarning "warningCount")
+            let warnDiags = atWarning["diagnostics"] :?> JsonArray
+            Assert.Equal(1, warnDiags.Count)
+            let firstWarn = warnDiags[0]
+            Assert.Equal(2, firstWarn["severity"].GetValue<int>())
+
+            // severity=all surfaces it too.
+            let! atAll = fastCheck (Some "all")
+            Assert.Equal(1, (atAll["diagnostics"] :?> JsonArray).Count)
+        }
+
+    [<Fact>]
     member _.``invalid speed is rejected with invalid_args``() : Task =
         task {
             let bridge = FcsBridge()

@@ -255,7 +255,9 @@ Paginated; default 500, max 2000. Returns `matchedTypes=[]` on no type match.
    with `.typeName` at a segment boundary.
 4. For each matched entity, enumerates three member sources:
    - `MembersFunctionsAndValues` — methods, properties, constructors, events
-   - `FSharpFields` — record and struct fields (only for record/value types)
+   - `FSharpFields` — record, struct, AND class fields (e.g. F# `val` fields), with
+     compiler-generated backing fields (`Name@`, `<Prop>k__BackingField`) filtered out so an
+     auto-property is not duplicated by its hidden field
    - `UnionCases` — F# union cases (only for union types)
 5. Overloaded methods appear as separate entries with distinct `signature` strings.
 6. Filters by accessibility (public-only by default; `includeNonPublic=true` for private/internal).
@@ -282,7 +284,12 @@ Paginated; default 500, max 2000. Returns `matchedTypes=[]` on no type match.
    files in the loaded project with `///` comments. For BCL types, use the official documentation.
 4. **Signature formatting** — uses FCS `BasicQualifiedName` for types; generic type parameters may
    appear as `'T` or fully-qualified names depending on the FCS representation.
-5. **Warm-up** — first call after `set_project` triggers `ParseAndCheckProject`.
+5. **Class fields: F# `val` yes, imported C#/IL fields no** — public `val` fields on a reference-type
+   class ARE now enumerated (they live only in `FSharpFields`, not `MembersFunctionsAndValues`), and
+   compiler-generated backing fields are filtered. However, FCS returns an empty `FSharpFields` for
+   classes imported from a **C#/IL** assembly, so public instance/const fields declared in C# are not
+   surfaced through the symbol API — an FCS limitation outside this tool's control.
+6. **Warm-up** — first call after `set_project` triggers `ParseAndCheckProject`.
 
 ### Related tools
 

@@ -26,6 +26,7 @@
     <Compile Include="ToolDescriptionSchemaTests.fs" />
     <Compile Include="FindTests.fs" />
     <Compile Include="CheckTests.fs" />
+    <Compile Include="NugetClassFieldTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
