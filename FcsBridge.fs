@@ -5977,3 +5977,211 @@ type internal FcsBridge() =
             // The rendering is a pure synchronous helper so this continuation reduces.
             return renderExplanation args.message resolved
         }
+
+    // ── fcs_check_compile_order (issue #58) ──────────────────────────────────────
+    // Detects F#'s order-of-compilation gotcha: a symbol used in a file that is
+    // DEFINED in a file appearing LATER in the project's <Compile> order is "not
+    // defined" purely because of file ordering — distinct from a missing `open`.
+    //
+    // MECHANISM (verified against FCS 43.12.x): an out-of-order forward reference does
+    // NOT resolve — FCS drops the use and emits FS0039 "X is not defined". So the use
+    // never appears in GetAllUsesOfAllSymbols(); a naïve "resolved-use index vs def
+    // index" comparison would find nothing. Instead we CORRELATE each FS0039 error with
+    // the project's resolved DEFINITIONS: the offending file's compile index is compared
+    // against the compile index of any same-named definition that lives elsewhere in the
+    // SAME project. If a matching definition compiles LATER (cross-file: higher index;
+    // same-file: a later line), the FS0039 is an ordering problem, not a missing open —
+    // exactly the discrimination fcs_suggest_open can't make. Reuses the #131
+    // ProjectSweepUses memo for the definition index.
+    member this.CheckCompileOrder(args: FcsCheckCompileOrderArgs) : Task<JsonNode> =
+        task {
+            let targetOpt =
+                args.projectPath
+                |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.map normalizePath
+
+            match targetOpt with
+            | None ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr
+                              "fcs_check_compile_order needs a project: pass projectPath (.fsproj/.sln/.slnx) or call set_project first." ]
+                    :> JsonNode
+            | Some target ->
+
+            let symbolFilter = args.symbol |> Option.filter (String.IsNullOrWhiteSpace >> not)
+            let projectsToScan = SolutionParsing.listProjects target
+
+            if projectsToScan.Length = 0 then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr $"fcs_check_compile_order could not resolve any .fsproj from: {target}" ]
+                    :> JsonNode
+            else
+
+            // Read each source file's lines at most once for lineText emission.
+            let lineCache = System.Collections.Generic.Dictionary<string, string array>(StringComparer.Ordinal)
+
+            let lineTextAt (file: string) (oneBasedLine: int) =
+                let lines =
+                    match lineCache.TryGetValue file with
+                    | true, ls -> ls
+                    | _ ->
+                        let ls =
+                            try
+                                if File.Exists file then File.ReadAllLines file else [||]
+                            with _ ->
+                                [||]
+
+                        lineCache[file] <- ls
+                        ls
+
+                let idx = oneBasedLine - 1
+                if idx >= 0 && idx < lines.Length then lines[idx] else ""
+
+            // Pull the first single-quoted identifier out of an FS0039 message. The
+            // compiler emits straight quotes in the invariant culture; tolerate the
+            // typographic pair as well.
+            let extractUnresolvedName (message: string) : string option =
+                if isNull message then
+                    None
+                else
+                    let quotes = [| '\''; '‘'; '’' |]
+                    let startIdx = message.IndexOfAny quotes
+
+                    if startIdx < 0 then
+                        None
+                    else
+                        let endIdx = message.IndexOfAny(quotes, startIdx + 1)
+
+                        if endIdx <= startIdx + 1 then
+                            None
+                        else
+                            Some(message.Substring(startIdx + 1, endIdx - startIdx - 1))
+
+            let problems = ResizeArray<JsonNode>()
+            let mutable projectsScanned = 0
+
+            for fsproj in projectsToScan do
+                try
+                    let! options, _ = this.ResolveFsprojOptions fsproj
+                    projectsScanned <- projectsScanned + 1
+
+                    // <Compile> order: SourceFiles array index = compile index.
+                    let fileIndex =
+                        System.Collections.Generic.Dictionary<string, int>(StringComparer.Ordinal)
+
+                    options.SourceFiles |> Array.iteri (fun i f -> fileIndex[normalizePath f] <- i)
+
+                    let usesKey =
+                        $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}|{referencedProjectSourcesStamp options}"
+
+                    let! allUses, diagnostics = this.ProjectSweepUses(usesKey, options)
+
+                    // Index every IN-PROJECT definition by DisplayName → (file, declStartLine,
+                    // compileIndex). An out-of-order use resolves to its definition by name;
+                    // we match the unresolved FS0039 name against these. Only the declaration's
+                    // line is retained (not the `range` struct) so later filtering/sorting never
+                    // touches a struct field (avoids FS0052 defensive-copy warnings).
+                    let defsByName =
+                        System.Collections.Generic.Dictionary<string, ResizeArray<string * int * int>>(
+                            StringComparer.Ordinal
+                        )
+
+                    for u in allUses do
+                        if u.IsFromDefinition then
+                            match u.Symbol.DeclarationLocation with
+                            | Some r ->
+                                let f = normalizePath r.FileName
+                                let declStartLine = r.StartLine
+
+                                match fileIndex.TryGetValue f with
+                                | true, idx ->
+                                    let name = u.Symbol.DisplayName
+
+                                    if not (String.IsNullOrEmpty name) then
+                                        match defsByName.TryGetValue name with
+                                        | true, lst -> lst.Add(f, declStartLine, idx)
+                                        | _ ->
+                                            let lst = ResizeArray<string * int * int>()
+                                            lst.Add(f, declStartLine, idx)
+                                            defsByName[name] <- lst
+                                | _ -> ()
+                            | None -> ()
+
+                    // Correlate each FS0039 "not defined" error with a later-compiling
+                    // definition of the same name.
+                    let seen = System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
+
+                    for d in diagnostics do
+                        if d.Severity = FSharpDiagnosticSeverity.Error && d.ErrorNumber = 39 then
+                            match extractUnresolvedName d.Message with
+                            | Some name when
+                                symbolFilter
+                                |> Option.forall (fun s -> String.Equals(s, name, StringComparison.Ordinal))
+                                ->
+                                // Bind the diagnostic range once: chained `d.Range.X` access
+                                // would force a defensive struct copy (FS0052) under warnaserror.
+                                let useRange = d.Range
+                                let useStartLine = useRange.StartLine
+                                let useFile = normalizePath useRange.FileName
+
+                                match fileIndex.TryGetValue useFile with
+                                | true, useIdx ->
+                                    match defsByName.TryGetValue name with
+                                    | true, candidates ->
+                                        // Nearest definition that compiles AFTER the use
+                                        // (cross-file: higher index; same-file: later line).
+                                        let later =
+                                            candidates
+                                            |> Seq.filter (fun (_, defLine, didx) ->
+                                                didx > useIdx || (didx = useIdx && defLine > useStartLine))
+                                            |> Seq.sortBy (fun (_, defLine, didx) -> didx, defLine)
+                                            |> Seq.tryHead
+
+                                        match later with
+                                        | Some(defFile, _, defIdx) ->
+                                            let dedupKey =
+                                                $"{useFile}:{useStartLine}:{useRange.StartColumn}:{name}"
+
+                                            if seen.Add dedupKey then
+                                                let defBase = Path.GetFileName defFile
+                                                let useBase = Path.GetFileName useFile
+
+                                                let problem =
+                                                    jobj
+                                                        [ "symbol", jstr name
+                                                          "definedIn",
+                                                          jobj [ "file", jstr defFile; "compileIndex", jint defIdx ]
+                                                          :> JsonNode
+                                                          "usedIn",
+                                                          jobj
+                                                              [ "file", jstr useFile
+                                                                "compileIndex", jint useIdx
+                                                                "range", rangeToJson useRange
+                                                                "lineText", jstr (lineTextAt useFile useStartLine) ]
+                                                          :> JsonNode
+                                                          "fix",
+                                                          jstr
+                                                              $"definition compiles after use — move {defBase} before {useBase} in <Compile> order, or move the definition" ]
+                                                    :> JsonNode
+
+                                                problems.Add problem
+                                        | None -> () // defined earlier/elsewhere → not an order problem
+                                    | _ -> () // name not defined in this project → missing open / genuinely absent
+                                | _ -> ()
+                            | _ -> ()
+                with _ ->
+                    () // a project that fails to resolve is skipped; keep scanning the rest
+
+            return
+                jobj
+                    [ "status", jstr "succeeded"
+                      "projectsScanned", jint projectsScanned
+                      "compileOrderProblems", JsonArray(problems.ToArray()) :> JsonNode
+                      "problemCount", jint problems.Count ]
+                :> JsonNode
+        }

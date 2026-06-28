@@ -386,6 +386,13 @@ type FcsExplainDiagnosticArgs =
       /// .fsproj for project context on the auto-fetch path. Falls back to active set_project.
       projectPath: string option }
 
+type FcsCheckCompileOrderArgs =
+    { /// .fsproj / .sln / .slnx to scan. Falls back to the active set_project when omitted.
+      projectPath: string option
+      /// When set, only report compile-order problems for this unresolved name (the
+      /// leftmost identifier in an FS0039 "X is not defined" error). Omit to check all.
+      symbol: string option }
+
 type FcsNugetTypesArgs =
     { /// Package id (matched against referenced assembly SimpleName, case-insensitive).
       /// Example: "Spectre.Console", "Newtonsoft.Json", "System.Text.Json".
