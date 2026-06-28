@@ -517,6 +517,18 @@ let main argv =
                 )
 
                 tool (
+                    TypedTool.define<FcsCheckCompileOrderArgs>
+                        "fcs_check_compile_order"
+                        "Detect F#'s file-ordering gotcha: a symbol used before the file that DEFINES it in <Compile> order reads as FS0039 'not defined' though it exists. Returns { symbol, definedIn, usedIn{file,compileIndex,range,lineText}, fix } so an agent reorders the .fsproj. Use when `check` reports FS0039 'X is not defined' to tell a compile-ORDER problem from a missing `open` (fcs_suggest_open handles that). projectPath optional after set_project; `symbol` narrows to one name."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.CheckCompileOrder args)))
+                    |> unwrapResult
+                )
+
+                tool (
                     TypedTool.define<FslangmcpVersionArgs>
                         "fslangmcp_version"
                         "Returns the installed FsLangMCP product version and name. Zero-arg (pass {}). Same value is also surfaced in the set_project response (fslangmcpVersion field) and the fsharp_runtime_status response. Use this tool when filing UX feedback so reports can be matched to a specific release of the MCP server. Pure: no project context required, no side effects, no caches read."
