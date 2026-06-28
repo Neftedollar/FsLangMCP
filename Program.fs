@@ -423,7 +423,7 @@ let main argv =
                 tool (
                     TypedTool.define<FindArgs>
                         "find"
-        "Multi-project symbol search. Sweeps every member .fsproj of the solution and unions definitions, references, record-field set sites, and member-usage sites — recovering cross-project sites single-project fcs_find_symbol / fcs_record_field_audit miss. Bare find(query) returns a compact one-line-per-site list (file/line/kind/lineText); pass contextLines for surrounding code. Optional kind + scope narrow it. Prefer over fcs_find_symbol for cross-project refactors."
+        "Multi-project F# semantic search: definitions, references, record-field set sites, and member call-sites on a type (`x.Foo`), unioned across every solution .fsproj. FCS-resolved — beats a textual rg that over-matches `.Member()` on unrelated types or can't cross projects. Bare find(query) gives a compact one-line-per-site list (file/line/kind/lineText); contextLines adds code. Narrow with kind (symbol|members|field|definition|position)+scope; member call sites = kind=members + member=Name."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
