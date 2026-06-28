@@ -221,6 +221,416 @@ module internal CheckFsacSnapshot =
         with _ ->
             empty
 
+// ─── Curated F# diagnostic explanations (issue #61) ─────────────────────────────
+// Plain-language explanation + actionable repair context for the compiler
+// diagnostics agents hit most. Keyed by numeric ErrorNumber (FS0039 -> 39).
+// Titles and explanations are grounded in the real FCS resource messages —
+// the wording for the verified codes was captured from live FCS output.
+
+type internal DiagnosticExplanation =
+    { Title: string
+      Explanation: string
+      LikelyCauses: string list
+      RepairHints: string list
+      RelatedTools: string list }
+
+let internal curatedDiagnostics: Map<int, DiagnosticExplanation> =
+    Map.ofList
+        [ 1,
+          { Title = "Type mismatch"
+            Explanation =
+              "An expression has a different type than the surrounding context requires. F# is statically typed and inserts no implicit conversions, so the inferred type and the expected type must line up exactly."
+            LikelyCauses =
+              [ "A value of the wrong type passed to a function, operator, or binding"
+                "A missing conversion (int vs float, string vs char, list vs array)"
+                "A type annotation that contradicts the inferred type"
+                "A unit-of-measure or generic-parameter mismatch" ]
+            RepairHints =
+              [ "Read the 'Expecting X but given Y' line — it names both the expected and actual type"
+                "Add an explicit conversion (e.g. `float`, `string`, `int`) or correct the annotation"
+                "Inspect the offending sub-expression's inferred type with fcs_symbol_at_word" ]
+            RelatedTools = [ "check"; "fcs_symbol_at_word"; "fcs_signature_help" ] }
+
+          3,
+          { Title = "Value applied as if it were a function"
+            Explanation =
+              "You wrote `f x` where `f` is a value, not a function, so it cannot be applied to an argument. F# reads juxtaposition as function application."
+            LikelyCauses =
+              [ "Too many arguments passed to a function"
+                "A name shadowed by a non-function value"
+                "A missing operator or comma between expressions"
+                "Indexing with `xs i` instead of `xs[i]`" ]
+            RepairHints =
+              [ "Check the arity of the function you meant to call"
+                "Use fcs_signature_help at the call site to see the expected parameters" ]
+            RelatedTools = [ "fcs_signature_help"; "fcs_symbol_at_word"; "check" ] }
+
+          10,
+          { Title = "Syntax error — unexpected token or incomplete construct"
+            Explanation =
+              "The parser hit a token it did not expect, or a structured construct (let/match/type/module) was left incomplete. This is a syntax error, not a type error."
+            LikelyCauses =
+              [ "Incorrect indentation (the offside rule) under let/match/if/module"
+                "A missing keyword such as `then`, `->`, `=`, `in`, or `done`"
+                "Unbalanced parentheses, brackets, or quotation marks"
+                "A `let`/`member` placed at the wrong scope" ]
+            RepairHints =
+              [ "Check the indentation of the line the error points at — F# is whitespace-sensitive"
+                "Run textDocument_formatting to normalize layout and reveal the structural mistake" ]
+            RelatedTools = [ "check"; "textDocument_formatting"; "fcs_file_outline" ] }
+
+          20,
+          { Title = "Expression result is implicitly ignored"
+            Explanation =
+              "A non-unit expression sits in statement position (e.g. its own line in a sequence), so its result is discarded. F# flags this because a silently dropped value is usually a bug."
+            LikelyCauses =
+              [ "Calling a function for a side effect but forgetting it returns a value"
+                "Writing `=` (comparison) where `<-` (assignment) was intended"
+                "A forgotten `let` binding, or a missing `return`/`return!` in a computation expression" ]
+            RepairHints =
+              [ "If the result is genuinely unwanted, discard it explicitly: `expr |> ignore`"
+                "If you meant to keep it, bind it: `let result = expr`"
+                "If you meant assignment, use `<-` not `=`" ]
+            RelatedTools = [ "check"; "fcs_symbol_at_word" ] }
+
+          25,
+          { Title = "Incomplete pattern match"
+            Explanation =
+              "A `match` (or `function`) does not cover every possible case of the value's type. At runtime an uncovered value raises MatchFailureException."
+            LikelyCauses =
+              [ "A missing DU case, None/Some arm, or empty/non-empty list arm"
+                "A `when` guard that makes an arm non-total"
+                "A newly added DU case that left existing matches stale" ]
+            RepairHints =
+              [ "Add the missing case(s) the message names (e.g. 'None may indicate a case not covered')"
+                "Add a catch-all `| _ ->` only if a default is truly intended — otherwise enumerate cases explicitly"
+                "List the type's cases with fcs_file_outline or find" ]
+            RelatedTools = [ "check"; "fcs_file_outline"; "find" ] }
+
+          26,
+          { Title = "Unreachable pattern-match rule"
+            Explanation =
+              "A match arm can never be reached because an earlier arm already matches everything it would. The dead arm is almost always a logic error."
+            LikelyCauses =
+              [ "A catch-all `| _ ->` or variable pattern placed before more specific arms"
+                "Duplicate or subsumed patterns"
+                "An overly broad guard on an earlier arm" ]
+            RepairHints =
+              [ "Reorder arms so specific patterns precede general ones"
+                "Remove the duplicate arm, or tighten the earlier pattern" ]
+            RelatedTools = [ "check" ] }
+
+          30,
+          { Title = "Value restriction"
+            Explanation =
+              "A top-level value was inferred to be generic, but the value restriction forbids generalizing something that is not a syntactic function. F# cannot safely make it polymorphic."
+            LikelyCauses =
+              [ "A partially applied function bound to a value (e.g. `let f = List.map id`)"
+                "An empty collection or `None` bound without enough type information"
+                "A point-free definition the compiler cannot generalize" ]
+            RepairHints =
+              [ "Add a type annotation pinning the generic parameter (e.g. `let f : int list -> int list = ...`)"
+                "Make the argument explicit: `let f x = List.map id x`" ]
+            RelatedTools = [ "check"; "fcs_symbol_at_word" ] }
+
+          35,
+          { Title = "Deprecated construct"
+            Explanation =
+              "The code uses a construct marked deprecated (via an Obsolete attribute or a legacy language form). It still compiles but should be replaced."
+            LikelyCauses =
+              [ "Calling an API annotated [<Obsolete>]"
+                "Using a legacy F# syntax form kept only for compatibility" ]
+            RepairHints =
+              [ "Read the deprecation message — it usually names the replacement"
+                "Find the recommended API with fcs_referenced_symbols or fcs_nuget_members" ]
+            RelatedTools = [ "fcs_referenced_symbols"; "fcs_nuget_members"; "check" ] }
+
+          39,
+          { Title = "Name is not defined"
+            Explanation =
+              "An identifier (value, constructor, namespace, module, type, field, or record label) could not be resolved in the current scope. The name is unknown to the compiler here."
+            LikelyCauses =
+              [ "A missing `open` for the namespace/module that declares the name"
+                "A typo or wrong casing in the identifier"
+                "Using a name before its declaration (F# resolves top-to-bottom)"
+                "A missing project or package reference" ]
+            RepairHints =
+              [ "Run fcs_suggest_open with the unresolved name to get the exact `open` directive"
+                "Check spelling and that the declaration appears earlier in compile order"
+                "Confirm the defining project/package is referenced" ]
+            RelatedTools = [ "fcs_suggest_open"; "find"; "fcs_referenced_symbols"; "check" ] }
+
+          40,
+          { Title = "Recursive object reference checked at runtime"
+            Explanation =
+              "You defined one or more recursive objects (not functions) with `let rec`, so the compiler inserts a runtime initialization check: a recursive value can be observed before it is fully constructed."
+            LikelyCauses =
+              [ "A `let rec` binding a value (recursive record/closure) rather than a function"
+                "Mutually recursive values that reference each other during construction" ]
+            RepairHints =
+              [ "Restructure into recursive functions instead of recursive values where possible"
+                "Defer the self-reference with `lazy`/`Lazy<_>` or a function indirection" ]
+            RelatedTools = [ "check"; "fcs_file_outline" ] }
+
+          41,
+          { Title = "No overload matches the arguments"
+            Explanation =
+              "A method has several overloads but none accepts the argument types (or count) you supplied, so overload resolution failed."
+            LikelyCauses =
+              [ "An argument of the wrong type for every overload"
+                "The wrong number of arguments"
+                "An ambiguous numeric literal that fits no overload without an annotation" ]
+            RepairHints =
+              [ "Read the listed candidate overloads and annotate the offending argument's type"
+                "Use fcs_signature_help at the call site to see all overloads and their parameters" ]
+            RelatedTools = [ "fcs_signature_help"; "fcs_nuget_members"; "check" ] }
+
+          49,
+          { Title = "Uppercase identifier used as a pattern variable"
+            Explanation =
+              "An uppercase identifier in a pattern is being bound as a fresh variable (capturing everything) rather than matched against an existing case or literal. F# warns because this usually means a case name is misspelled or its module is not opened."
+            LikelyCauses =
+              [ "A DU case or literal whose module is not `open`ed, so the name binds as a variable"
+                "A misspelled pattern or case name"
+                "Intending to match a constant but writing it as a bare identifier" ]
+            RepairHints =
+              [ "`open` the module that declares the case, or qualify it (e.g. `MyDu.CaseName`)"
+                "Match a constant via a `[<Literal>]` value or a `when` guard"
+                "Run fcs_suggest_open for the intended case name" ]
+            RelatedTools = [ "fcs_suggest_open"; "find"; "check" ] }
+
+          64,
+          { Title = "Construct is less generic than annotated"
+            Explanation =
+              "A type annotation promises a generic type parameter, but the body forces it to a concrete type, so the value is not as generic as written. The message names the variable and the type it was constrained to."
+            LikelyCauses =
+              [ "Using a type-specific operation (e.g. `+`, `.Length`) on a value annotated as generic `'a`"
+                "An annotation promising more polymorphism than the implementation delivers" ]
+            RepairHints =
+              [ "Either drop the generic annotation and let the type be concrete, or use `inline` + SRTP to genuinely generalize the operation"
+                "Replace `'a` with the concrete type the message reports" ]
+            RelatedTools = [ "check"; "fcs_symbol_at_word" ] }
+
+          66,
+          { Title = "Unnecessary upcast"
+            Explanation =
+              "An upcast (`:>`) converts a value to a type it already has, so the coercion does nothing. F# flags it as redundant."
+            LikelyCauses =
+              [ "An explicit `:> SomeType` where the expression is already that type"
+                "A leftover coercion after a refactor changed the inferred type" ]
+            RepairHints = [ "Remove the `:>` coercion" ]
+            RelatedTools = [ "check" ] }
+
+          67,
+          { Title = "Type test or downcast that always succeeds"
+            Explanation =
+              "A runtime type test (`:?`) or downcast checks for a type the value statically already has, so it is always true and therefore redundant."
+            LikelyCauses =
+              [ "A `:?` test against the value's own static type"
+                "A downcast the type system already guarantees" ]
+            RepairHints =
+              [ "Remove the redundant test/cast, or widen the static type if a real test was intended" ]
+            RelatedTools = [ "check"; "fcs_symbol_at_word" ] }
+
+          72,
+          { Title = "Member lookup on a value of indeterminate type"
+            Explanation =
+              "You accessed a member (`x.Foo`) before the compiler knew the type of `x`. F# infers types top-to-bottom and left-to-right, so at this point the object's type is still unknown and the member cannot be resolved."
+            LikelyCauses =
+              [ "A lambda or function parameter whose type is only inferred from a later use"
+                "Pipelining into a member access before the type is fixed"
+                "A missing type annotation on a parameter" ]
+            RepairHints =
+              [ "Annotate the parameter (e.g. `fun (x: string) -> x.Length`)"
+                "Reorder so the type-determining use comes first" ]
+            RelatedTools = [ "check"; "fcs_symbol_at_word"; "fcs_signature_help" ] }
+
+          193,
+          { Title = "Type constraint mismatch"
+            Explanation =
+              "A type was used where it does not satisfy a required constraint — for example an interface, default-constructor, comparison, or byref constraint demanded by a generic parameter or member. The supplied type is incompatible with the constraint."
+            LikelyCauses =
+              [ "A type argument that does not implement the required interface or constraint"
+                "An SRTP/member constraint not satisfied by the concrete type"
+                "A byref or struct constraint violation" ]
+            RepairHints =
+              [ "Check the constraint the message names and supply a type that satisfies it"
+                "Confirm which interfaces a type implements with fcs_referenced_symbols" ]
+            RelatedTools = [ "fcs_referenced_symbols"; "fcs_signature_help"; "check" ] }
+
+          493,
+          { Title = "Member is static, not an instance method"
+            Explanation =
+              "You called a member through an instance (`obj.Member`), but the member is declared `static`. Static members are invoked on the type, not on a value."
+            LikelyCauses =
+              [ "Calling a static member via an instance variable"
+                "Confusing a static factory/helper with an instance method" ]
+            RepairHints =
+              [ "Call it on the type: `TypeName.Member(...)` instead of `instance.Member(...)`"
+                "Confirm whether the member is static with fcs_nuget_members or fcs_referenced_symbols" ]
+            RelatedTools = [ "fcs_nuget_members"; "fcs_referenced_symbols"; "fcs_signature_help" ] }
+
+          505,
+          { Title = "Wrong number of arguments to a member"
+            Explanation =
+              "A method or constructor was called with an argument count no overload accepts. The message reports the arity you supplied and an arity that exists."
+            LikelyCauses =
+              [ "Passing too many or too few arguments to a .NET method"
+                "Forgetting that a member takes a tuple `(a, b)` vs curried arguments"
+                "Calling a parameterless member with arguments, or vice-versa" ]
+            RepairHints =
+              [ "Match the call to one of the overloads the message reports"
+                "Use fcs_signature_help at the call site to see the exact parameter lists" ]
+            RelatedTools = [ "fcs_signature_help"; "fcs_nuget_members"; "check" ] }
+
+          588,
+          { Title = "Block after 'let' is not indented enough"
+            Explanation =
+              "The expression that should follow a `let` binding is indented at or before the `let`, so the offside rule does not treat it as the binding's body or continuation."
+            LikelyCauses =
+              [ "The line after `let x = ...` is indented less than the `let`"
+                "A dedented continuation in a sequence of bindings"
+                "Mixed tabs and spaces breaking the indentation" ]
+            RepairHints =
+              [ "Indent the following block more than the `let` keyword"
+                "Run textDocument_formatting to normalize indentation" ]
+            RelatedTools = [ "textDocument_formatting"; "check" ] }
+
+          759,
+          { Title = "Cannot create an instance of an abstract type"
+            Explanation =
+              "You tried to construct a type marked abstract (or one with unimplemented abstract members), so no instances can be created directly."
+            LikelyCauses =
+              [ "`new` on an [<AbstractClass>] type"
+                "Instantiating an interface, or a type with unimplemented abstract members" ]
+            RepairHints =
+              [ "Use (or define) a concrete subclass that implements the abstract members"
+                "Supply the members inline with an object expression: `{ new AbstractType with ... }`" ]
+            RelatedTools = [ "fcs_referenced_symbols"; "fcs_file_outline"; "check" ] }
+
+          760,
+          { Title = "Create IDisposable with 'new'"
+            Explanation =
+              "An object whose type implements IDisposable was created without the `new` keyword. F# recommends `new Type(args)` for disposables to make clear the value owns a resource that should be disposed."
+            LikelyCauses = [ "Constructing a disposable as `Type(args)` instead of `new Type(args)`" ]
+            RepairHints =
+              [ "Add the `new` keyword: `use x = new Type(args)`"
+                "Bind it with `use` (not `let`) so it is disposed at scope exit" ]
+            RelatedTools = [ "check" ] }
+
+          1182,
+          { Title = "Unused value"
+            Explanation =
+              "A bound value or function parameter is never used. This warning is off by default (enabled with --warnon:1182) and flags likely dead code or a typo."
+            LikelyCauses =
+              [ "A `let` binding or parameter that is never referenced"
+                "A parameter kept only for signature compatibility"
+                "A typo that references a different name than the one bound" ]
+            RepairHints =
+              [ "Remove the unused binding, or prefix it with `_` (e.g. `_unused`) to signal intent"
+                "If it is a typo, fix the reference to match the bound name" ]
+            RelatedTools = [ "find"; "check" ] }
+
+          3261,
+          { Title = "Nullness warning"
+            Explanation =
+              "With nullable reference types enabled, a possibly-null value is used where a non-null value is expected (or vice-versa). The nullability annotations do not line up."
+            LikelyCauses =
+              [ "Passing a `T | null` value where a non-null `T` is required"
+                "Dereferencing a value that may be null without a check"
+                "Interop with a .NET API whose nullability annotations differ" ]
+            RepairHints =
+              [ "Null-check before use (pattern-match on null, or `Option.ofObj`)"
+                "Adjust the annotation (`T?`) to reflect the true nullability"
+                "Wrap external boundaries that may return null in `Option.ofObj`" ]
+            RelatedTools = [ "check"; "fcs_symbol_at_word" ] } ]
+
+// ── Resolution + enrichment helpers for fcs_explain_diagnostic ───────────────────
+
+/// Parse a diagnostic code such as "FS0039", "fs39", or "39" into its numeric part.
+let internal parseDiagnosticCode (raw: string) : int option =
+    if String.IsNullOrWhiteSpace raw then
+        None
+    else
+        let trimmed = raw.Trim()
+
+        let digits =
+            if trimmed.StartsWith("FS", StringComparison.OrdinalIgnoreCase) then
+                trimmed.Substring(2)
+            else
+                trimmed
+
+        match Int32.TryParse digits with
+        | true, n -> Some n
+        | _ -> None
+
+/// Render a numeric error number back into canonical "FS0039" form.
+let internal formatDiagnosticCode (n: int) : string = $"FS%04d{n}"
+
+/// First single-quoted token in an FCS message, e.g. 'Encoding' from an FS0039 text.
+let internal firstQuotedToken (message: string) : string option =
+    let m = System.Text.RegularExpressions.Regex.Match(message, "'([^']+)'")
+    if m.Success then Some m.Groups[1].Value else None
+
+/// Enrich the base repair hints from the raw message. For name-resolution diagnostics
+/// (FS0039 / FS0049) the offending name is extracted and a fcs_suggest_open hint is
+/// prepended as the most actionable next step.
+let internal enrichRepairHints (errorNumber: int) (message: string option) (baseHints: string list) : string list =
+    match errorNumber, message with
+    | (39 | 49), Some msg ->
+        match firstQuotedToken msg with
+        | Some name ->
+            $"The unresolved name is '{name}' — run fcs_suggest_open with symbolName=\"{name}\" to get the right `open` directive."
+            :: baseHints
+        | None -> baseHints
+    | _ -> baseHints
+
+/// Build a one-line-per-string JSON array.
+let internal jstrArray (xs: string list) : JsonNode =
+    JsonArray(xs |> List.map jstr |> List.toArray) :> JsonNode
+
+/// Render the final explain-diagnostic envelope from a resolved code, or pass an
+/// already-built error envelope straight through. Pure and synchronous so the task
+/// continuation that calls it stays a statically compilable state machine (FS3511).
+let internal renderExplanation
+    (explicitMessage: string option)
+    (resolved: Result<int * string option, JsonNode>)
+    : JsonNode =
+    match resolved with
+    | Error envelope -> envelope
+    | Ok(errorNumber, fetchedMessage) ->
+        let effectiveMessage = explicitMessage |> Option.orElse fetchedMessage
+        let codeText = formatDiagnosticCode errorNumber
+        let messageNode = effectiveMessage |> Option.map jstr |> Option.defaultValue null
+
+        match Map.tryFind errorNumber curatedDiagnostics with
+        | Some entry ->
+            let repairHints = enrichRepairHints errorNumber effectiveMessage entry.RepairHints
+
+            jobj
+                [ "status", jstr "ok"
+                  "code", jstr codeText
+                  "title", jstr entry.Title
+                  "explanation", jstr entry.Explanation
+                  "likelyCauses", jstrArray entry.LikelyCauses
+                  "repairHints", jstrArray repairHints
+                  "relatedTools", jstrArray entry.RelatedTools
+                  "message", messageNode ]
+            :> JsonNode
+        | None ->
+            jobj
+                [ "status", jstr "unknown_code"
+                  "code", jstr codeText
+                  "title", jstr ""
+                  "explanation", jstr "No curated entry for this diagnostic code."
+                  "likelyCauses", jstrArray []
+                  "repairHints",
+                  jstrArray
+                      [ $"Run `check` to see the full diagnostic, then consult the F# error reference for {codeText}." ]
+                  "relatedTools", jstrArray [ "check" ]
+                  "message", messageNode ]
+            :> JsonNode
+
 // ─── FcsBridge ─────────────────────────────────────────────────────────────────
 
 type internal FcsBridge() =
@@ -5074,4 +5484,116 @@ type internal FcsBridge() =
                       "candidateCount",   jint enriched.Length
                       "candidates",       JsonArray(enriched) :> JsonNode ]
                 :> JsonNode
+        }
+
+    /// Auto-fetch the diagnostic at a path+position via a fresh FCS parse+check (issue #61).
+    /// Returns Ok(errorNumber, message) for the diagnostic covering the position, or an
+    /// Error JSON envelope when none is found. Kept in its own member so ExplainDiagnostic's
+    /// resolution `match` binds a plain Task and stays statically compilable (FS3511).
+    member private this.ResolveDiagnosticFromPosition
+        (path: string, line: int option, character: int option, text: string option, projectPath: string option)
+        : Task<Result<int * string option, JsonNode>> =
+        task {
+            let! _, _, _, _, parseResults, checkedResults =
+                this.PrepareCheckContext(path, text, projectPath, None)
+
+            // LSP coordinates are 0-based; FCS diagnostic lines are 1-based.
+            let fcsLine = defaultArg line -1 |> (+) 1
+            let col = defaultArg character -1
+
+            let allDiagnostics =
+                Array.append
+                    parseResults.Diagnostics
+                    (checkedResults |> Option.map (fun r -> r.Diagnostics) |> Option.defaultValue [||])
+
+            let covers (d: FSharpDiagnostic) =
+                let sL, sC, eL, eC = d.StartLine, d.StartColumn, d.EndLine, d.EndColumn
+
+                if fcsLine < sL || fcsLine > eL then false
+                elif col < 0 then true // no column constraint requested
+                elif fcsLine = sL && fcsLine = eL then sC <= col && col <= eC
+                elif fcsLine = sL then sC <= col
+                elif fcsLine = eL then col <= eC
+                else true
+
+            // Prefer an error covering the position; then any diagnostic covering it;
+            // then any diagnostic on the same line.
+            let pick =
+                allDiagnostics
+                |> Array.filter (fun d -> d.Severity = FSharpDiagnosticSeverity.Error)
+                |> Array.tryFind covers
+                |> Option.orElseWith (fun () -> allDiagnostics |> Array.tryFind covers)
+                |> Option.orElseWith (fun () ->
+                    allDiagnostics |> Array.tryFind (fun d -> d.StartLine <= fcsLine && fcsLine <= d.EndLine))
+
+            match pick with
+            | Some d -> return Ok(d.ErrorNumber, Some d.Message)
+            | None ->
+                return
+                    Error(
+                        jobj
+                            [ "status", jstr "no_diagnostic_at_position"
+                              "message", jstr "No FCS diagnostic was found at the given path/line/character."
+                              "path", jstr (normalizePath path)
+                              "line", (line |> Option.map jint |> Option.defaultValue null)
+                              "character", (character |> Option.map jint |> Option.defaultValue null) ]
+                        :> JsonNode
+                    )
+        }
+
+    /// Explain an F# compiler diagnostic (issue #61). Resolves the diagnostic code from
+    /// `code` / `errorNumber`, or auto-fetches it at a path+position via FCS, then returns
+    /// a curated plain-language explanation plus repair context. Pairs with `check`.
+    member this.ExplainDiagnostic(args: FcsExplainDiagnosticArgs) : Task<JsonNode> =
+        task {
+            // ── 1. Resolve the numeric error code from `code` when present ──
+            let codeFromString =
+                match args.code with
+                | Some raw ->
+                    match parseDiagnosticCode raw with
+                    | Some n -> Ok(Some n)
+                    | None -> Error raw // present but unparseable
+                | None -> Ok None
+
+            match codeFromString with
+            | Error raw ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr $"code \"{raw}\" is not a recognized F# diagnostic code (expected e.g. \"FS0039\" or 39)" ]
+                    :> JsonNode
+            | Ok parsedCode ->
+
+            // `code` takes precedence over `errorNumber`.
+            let directNumber = parsedCode |> Option.orElse args.errorNumber
+
+            // ── 2. No explicit number → try the path+position auto-fetch via FCS ──
+            // Build the Task in a plain `let` (the FCS path lives in its own member),
+            // then bind a direct identifier so the `let!` continuation stays statically
+            // compilable — a `match` directly in the `let!` source trips FS3511.
+            let resolveTask: Task<Result<int * string option, JsonNode>> =
+                match directNumber with
+                | Some n -> Task.FromResult(Ok(n, (None: string option)))
+                | None ->
+                    match args.path with
+                    | Some path ->
+                        this.ResolveDiagnosticFromPosition(path, args.line, args.character, args.text, args.projectPath)
+                    | None ->
+                        Task.FromResult(
+                            Error(
+                                jobj
+                                    [ "status", jstr "invalid_args"
+                                      "message",
+                                      jstr
+                                          "Provide one of: code (e.g. \"FS0039\"), errorNumber (e.g. 39), or path+line+character to auto-fetch the diagnostic." ]
+                                :> JsonNode
+                            )
+                        )
+
+            let! resolved = resolveTask
+
+            // ── 3+4. Render the curated explanation (or pass an error envelope through).
+            // The rendering is a pure synchronous helper so this continuation reduces.
+            return renderExplanation args.message resolved
         }

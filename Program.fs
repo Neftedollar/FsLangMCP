@@ -540,6 +540,18 @@ let main argv =
                     |> unwrapResult
                 )
 
+                tool (
+                    TypedTool.define<FcsExplainDiagnosticArgs>
+                        "fcs_explain_diagnostic"
+                        "Explain an F# compiler diagnostic in plain language with repair context: title, explanation, likelyCauses, repairHints, relatedTools. Pass `code` (\"FS0039\"), `errorNumber` (39), or path+line+character to auto-fetch it via FCS. Use this when `check` reports an FS error you need to turn into a fix — feed it check's errorNumberText. Curated map of ~25 common diagnostics; pass the raw `message` to enrich hints (FS0039 → fcs_suggest_open). Unknown codes return status=unknown_code."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.ExplainDiagnostic args)))
+                    |> unwrapResult
+                )
+
                 useStdio
             }
 
