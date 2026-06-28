@@ -338,6 +338,58 @@ type CheckTests(fx: CheckFixture) =
         }
 
     [<Fact>]
+    member _.``speed=fast totalDiagnostics counts all severities so it agrees with the surfaced list (#133)``
+        ()
+        : Task =
+        task {
+            let bridge = FcsBridge()
+
+            // A ready snapshot holding ONLY an info-severity (LSP code 3) diagnostic and
+            // ZERO errors/warnings. Before #133 the fast path set
+            // totalDiagnostics = ErrorCount + WarningCount = 0, yet severity="all"/"information"
+            // surfaced the info node — a non-empty list with a zero count.
+            let json =
+                "{ \"lspState\": \"ready\", \"mostRecentAnalyzedAt\": \"2026-01-01T00:00:00Z\","
+                + " \"diagnosticsFileCount\": 1, \"result\": { \"/probe/Info.fs\": ["
+                + " { \"severity\": 3, \"message\": \"naming hint\", \"file\": \"/probe/Info.fs\","
+                + " \"range\": { \"startLine\": 1, \"startColumn\": 0, \"endLine\": 1, \"endColumn\": 5 } } ] } }"
+
+            let snap = CheckFsacSnapshot.ofDiagnosticsResponse (JsonNode.Parse json)
+
+            let fastCheck (severity: string option) =
+                bridge.Check(
+                    { bareCheck with
+                        projectPath = Some fx.ProbeFsproj
+                        speed = Some "fast"
+                        scope = Some "project"
+                        severity = severity },
+                    fsacSnapshot = (fun () -> Task.FromResult snap)
+                )
+
+            // severity=all: the info node is surfaced AND counted — list length == totalDiagnostics.
+            let! atAll = fastCheck (Some "all")
+            let allDiags = atAll["diagnostics"] :?> JsonArray
+            Assert.Equal(1, allDiags.Count)
+            Assert.Equal(allDiags.Count, gi atAll "totalDiagnostics")
+            // Verdict stays error-based and the full-set error/warning tallies are unaffected.
+            Assert.Equal("clean", gs atAll "verdict")
+            Assert.Equal(0, gi atAll "errorCount")
+            Assert.Equal(0, gi atAll "warningCount")
+
+            // severity=information: same node, same agreement.
+            let! atInfo = fastCheck (Some "information")
+            let infoDiags = atInfo["diagnostics"] :?> JsonArray
+            Assert.Equal(1, infoDiags.Count)
+            Assert.Equal(infoDiags.Count, gi atInfo "totalDiagnostics")
+
+            // Default floor = error: the info node is below the floor (empty list), but the
+            // full-set total still counts it — list ⊆ total, never list > total.
+            let! atError = fastCheck None
+            Assert.Equal(0, (atError["diagnostics"] :?> JsonArray).Count)
+            Assert.Equal(1, gi atError "totalDiagnostics")
+        }
+
+    [<Fact>]
     member _.``invalid speed is rejected with invalid_args``() : Task =
         task {
             let bridge = FcsBridge()
