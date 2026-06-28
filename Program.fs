@@ -540,6 +540,14 @@ let main argv =
                     |> unwrapResult
                 )
 
+                tool (
+                    TypedTool.define<RenamePreviewArgs>
+                        "fcs_rename_preview"
+                        "Preview a semantic rename's full impact WITHOUT applying it — non-destructive, writes nothing. Runs the same FSAC machinery as `textDocument_rename` but returns edits grouped by file, each with originalLineText and previewLineText, plus totalEdits, fileCount, and a crossProject flag. Use it to inspect blast radius before `textDocument_rename` applies the change. Requires `set_project`. Returns `no_symbol` when the position has no renamable symbol. Pass `text` for unsaved buffers."
+                        (fun args -> toolResult (runLimited lspGate (fun () -> bridge.RenamePreview args)))
+                    |> unwrapResult
+                )
+
                 useStdio
             }
 
