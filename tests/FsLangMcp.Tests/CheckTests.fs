@@ -404,3 +404,53 @@ type CheckTests(fx: CheckFixture) =
             Assert.Equal("invalid_args", gs result "status")
             Assert.Contains("speed", gs result "message")
         }
+
+    // ── #138: diagnostics array is always capped so a large error wall can't overflow ──
+    [<Fact>]
+    member _.``OVERFLOW-GUARD: a project with 60+ errors caps diagnostics at 50 but keeps counts accurate``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+
+            // 60 independent bool-to-int bindings → 60 distinct type errors.
+            let manyErrors =
+                String.concat "\n" ([ "module Probe.Main"; "" ] @ [ for i in 1..60 -> $"let v{i}: int = true" ])
+
+            File.WriteAllText(fx.MainFs, manyErrors)
+            let bridge = FcsBridge()
+
+            let! result = bridge.Check({ bareCheck with projectPath = Some fx.ProbeFsproj })
+
+            Assert.Equal("errors", gs result "verdict")
+            // Counts stay FULL-set accurate — the cap is presentation-only.
+            let errorCount = gi result "errorCount"
+            Assert.True(errorCount > 50, $"errorCount should reflect all 60 errors, got {errorCount}")
+            Assert.True(gi result "totalDiagnostics" > 50, "totalDiagnostics must count the full set")
+
+            // The surfaced array is capped to 50 and flagged truncated.
+            let diagnostics = result["diagnostics"] :?> JsonArray
+            Assert.Equal(50, diagnostics.Count)
+            Assert.True(gb result "diagnosticsTruncated", "a 60-error wall must report diagnosticsTruncated=true")
+        }
+
+    // ── #138: the restore-aware early-return must NOT fire on a restored project ──
+    [<Fact>]
+    member _.``RESTORED-GUARD: a restored project takes the normal clean path, never the unrestored verdict``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            let! result = bridge.Check({ bareCheck with projectPath = Some fx.ProbeFsproj })
+
+            // The fixture is restored/built, so the probe sees resolved references and the
+            // verdict is the genuine ground-truth — NOT the unrestored short-circuit.
+            Assert.Equal("clean", gs result "verdict")
+            Assert.True(gb result "analyzed", "a restored project must be genuinely analyzed")
+            Assert.Null(result["restoreStatus"]) // the unrestored extra must be absent
+            Assert.False(gb result "diagnosticsTruncated", "a clean project has nothing to truncate")
+        }

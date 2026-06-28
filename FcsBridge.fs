@@ -1485,9 +1485,14 @@ type internal FcsBridge() =
             | Some checkResults ->
                 let includeLocal = args.includeLocal |> Option.defaultValue false
                 let includePrivate = args.includePrivate |> Option.defaultValue true
+                let summaryOnly = args.summaryOnly |> Option.defaultValue true
                 let maxResults = args.maxResults |> Option.defaultValue 200
 
-                let entries =
+                // Full, untruncated definition set (lightweight symbol uses — no node
+                // building yet). memberCounts is derived from THIS so it reports true
+                // per-kind totals, while only the truncated slice pays for signature
+                // formatting — mirrors fcs_project_outline's count-vs-truncate split.
+                let allUses =
                     checkResults.GetAllUsesOfAllSymbolsInFile()
                     |> Seq.filter _.IsFromDefinition
                     |> Seq.filter (fun symbolUse -> includeLocal || not (isNoisyLocalSymbol symbolUse))
@@ -1501,8 +1506,26 @@ type internal FcsBridge() =
                     |> Seq.sortBy (fun symbolUse ->
                         let r = symbolUse.Range
                         r.StartLine, r.StartColumn)
-                    |> Seq.truncate maxResults
-                    |> Seq.map (fun symbolUse ->
+                    |> Seq.toArray
+
+                // memberCounts: kind → count over the FULL (untruncated) definition set,
+                // so an agent sees true totals (e.g. "this 5k-line file has 320 functions")
+                // even when summaryOnly drops signatures and maxResults caps the array.
+                // Kind classification is cheap — no signature strings are formatted here.
+                let memberCounts =
+                    allUses
+                    |> Array.countBy (fun symbolUse -> symbolKind symbolUse.Symbol)
+                    |> Array.sortBy fst
+                    |> Array.map (fun (kind, n) -> kind, jint n)
+                    |> Array.toList
+                    |> jobj
+
+                // entries: only the surfaced slice is mapped to full nodes, so signature
+                // formatting cost stays bounded by maxResults.
+                let entries =
+                    allUses
+                    |> Array.truncate maxResults
+                    |> Array.map (fun symbolUse ->
                         jobj
                             [ "name", jstr symbolUse.Symbol.DisplayName
                               "fullName", jstrOrNull symbolUse.Symbol.FullName
@@ -1512,7 +1535,38 @@ type internal FcsBridge() =
                               "signature", jstr (symbolTypeString symbolUse.Symbol)
                               "declarationRange", tryDeclarationRange symbolUse.Symbol ]
                         :> JsonNode)
-                    |> Seq.toArray
+
+                let containerKinds =
+                    [| "module"; "record"; "union"; "class"; "interface"; "enum"; "delegate"; "namespace" |]
+
+                // summaryOnly (default): keep only module/type headers with name/kind/
+                // fullName/range (no per-member signatures). summaryOnly=false restores
+                // the full per-member output.
+                let outEntries: JsonNode =
+                    if summaryOnly then
+                        let headers =
+                            entries
+                            |> Array.filter (fun e ->
+                                match e["kind"] with
+                                | null -> false
+                                | k -> containerKinds |> Array.contains (k.GetValue<string>()))
+                            |> Array.map (fun e ->
+                                jobj
+                                    [ "name", e["name"].DeepClone()
+                                      "kind", e["kind"].DeepClone()
+                                      "fullName",
+                                      (match e["fullName"] with
+                                       | null -> null
+                                       | fn -> fn.DeepClone())
+                                      "range",
+                                      (match e["range"] with
+                                       | null -> null
+                                       | r -> r.DeepClone()) ]
+                                :> JsonNode)
+
+                        JsonArray(headers) :> JsonNode
+                    else
+                        JsonArray(entries) :> JsonNode
 
                 return
                     jobj
@@ -1521,8 +1575,10 @@ type internal FcsBridge() =
                           "optionsSource", jstr optionsSource
                           "includePrivate", jbool includePrivate
                           "includeLocal", jbool includeLocal
+                          "summaryOnly", jbool summaryOnly
                           "count", jint entries.Length
-                          "entries", JsonArray(entries) :> JsonNode
+                          "memberCounts", memberCounts
+                          "entries", outEntries
                           "parseDiagnostics",
                           JsonArray(parseResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode
                           "checkDiagnostics",
@@ -2957,6 +3013,21 @@ type internal FcsBridge() =
             | ex -> return Error ex.Message
         }
 
+    /// Deterministic reference-resolution probe over a project's resolved OtherOptions
+    /// (#138). Returns (existing, total) `-r:`/`--reference:` targets that exist on disk.
+    /// Used to tell an unrestored/unbuilt project apart from a genuinely-erroring one
+    /// before running the FCS re-check. Resolution is cached, so this warms the same
+    /// options FreshProjectCheck reuses. Never throws — an unloadable project yields
+    /// (0, 0), which the caller treats as "could not probe" and falls through.
+    member private this.ProbeReferenceResolution(fsproj: string) : Task<int * int> =
+        task {
+            try
+                let! options, _ = this.ResolveFsprojOptions(normalizePath fsproj)
+                return ReferenceResolution.probe options.OtherOptions
+            with _ ->
+                return 0, 0
+        }
+
     // ── check: one trustworthy verdict for the active context (issue #128) ───────
     // Consolidates the 5 check-cluster tools (workspace_diagnostics, fsharp_compile,
     // fcs_check_file, fcs_parse_and_check_file, fcs_validate_snippet) behind ONE field
@@ -3068,6 +3139,14 @@ type internal FcsBridge() =
                 (reason: string option)
                 (extra: (string * JsonNode) list)
                 : JsonNode =
+                // Hard cap the surfaced `diagnostics` array so a genuinely-erroring large
+                // project (or an unrestored false-error wall that slips past the probe)
+                // can never overflow the MCP token ceiling. errorCount/warningCount/
+                // totalDiagnostics stay FULL-set accurate — only the array is truncated.
+                let diagnosticsCap = 50
+                let cappedDiagNodes = diagNodes |> Array.truncate diagnosticsCap
+                let diagnosticsTruncated = diagNodes.Length > diagnosticsCap
+
                 jobj (
                     [ "status", jstr "succeeded"
                       "verdict", jstr verdict
@@ -3078,7 +3157,8 @@ type internal FcsBridge() =
                       "warningCount", jint warningCount
                       "diagnosticsFileCount", jint files.Length
                       "files", JsonArray(files |> Array.map jstr) :> JsonNode
-                      "diagnostics", JsonArray(diagNodes) :> JsonNode
+                      "diagnostics", JsonArray(cappedDiagNodes) :> JsonNode
+                      "diagnosticsTruncated", jbool diagnosticsTruncated
                       // debug-only
                       "escalated", (match escalated with Some e -> jstr e | None -> null)
                       "via", jstr via
@@ -3342,6 +3422,37 @@ type internal FcsBridge() =
                     match fsproj with
                     | None -> return invalid $"check could not resolve a single .fsproj to check from: {target}"
                     | Some proj ->
+                        // Restore-awareness (#138): an unrestored/unbuilt project still
+                        // evaluates its .fsproj, so FCS emits HUNDREDS of spurious FS0039
+                        // "is not defined" diagnostics at `open` lines (the real cause is
+                        // missing external reference assemblies, not the source). Detect
+                        // that deterministically and return an honest "unknown" instead of
+                        // a misleading false-error wall.
+                        let! refExisting, refTotal = this.ProbeReferenceResolution(proj)
+
+                        if ReferenceResolution.looksUnrestored refExisting refTotal then
+                            let frac = ReferenceResolution.fraction refExisting refTotal
+
+                            return
+                                build
+                                    "unknown"
+                                    false
+                                    "fcs"
+                                    None
+                                    0
+                                    0
+                                    0
+                                    [||]
+                                    [||]
+                                    (Some
+                                        $"project not built/restored — external references unresolved (existing {refExisting}/total {refTotal}); run dotnet restore && dotnet build")
+                                    [ "projectsSwept", jint 1
+                                      "restoreStatus", jstr "unrestored"
+                                      "referencesResolved", JsonValue.Create(Math.Round(frac, 3)) :> JsonNode
+                                      "referencesExisting", jint refExisting
+                                      "referencesTotal", jint refTotal ]
+                        else
+
                         let! result = this.FreshProjectCheck(proj, timeoutMs)
 
                         match result with
@@ -3415,35 +3526,60 @@ type internal FcsBridge() =
                         let allDiags = ResizeArray<FSharpDiagnostic>()
                         let perProject = ResizeArray<JsonNode>()
                         let mutable failCount = 0
+                        let mutable unrestoredCount = 0
 
                         for proj in projects do
-                            let! result = this.FreshProjectCheck(proj, timeoutMs)
+                            // Restore-awareness (#138): skip the FCS re-check for an
+                            // unrestored project — it would only produce a spurious
+                            // FS0039 false-error wall. Mark it unrestored instead.
+                            let! refExisting, refTotal = this.ProbeReferenceResolution(proj)
 
-                            match result with
-                            | Ok(diags, _, _) ->
-                                allDiags.AddRange diags
-                                let e, w = countDiagnosticsBySeverity diags
-
-                                perProject.Add(
-                                    jobj
-                                        [ "project", jstr (Path.GetFileNameWithoutExtension proj)
-                                          "fsproj", jstr (normalizePath proj)
-                                          "errorCount", jint e
-                                          "warningCount", jint w
-                                          "analyzed", jbool true ]
-                                    :> JsonNode
-                                )
-                            | Error msg ->
-                                failCount <- failCount + 1
+                            if ReferenceResolution.looksUnrestored refExisting refTotal then
+                                unrestoredCount <- unrestoredCount + 1
+                                let frac = ReferenceResolution.fraction refExisting refTotal
 
                                 perProject.Add(
                                     jobj
                                         [ "project", jstr (Path.GetFileNameWithoutExtension proj)
                                           "fsproj", jstr (normalizePath proj)
-                                          "error", jstr msg
-                                          "analyzed", jbool false ]
+                                          "analyzed", jbool false
+                                          "restoreStatus", jstr "unrestored"
+                                          "referencesResolved", JsonValue.Create(Math.Round(frac, 3)) :> JsonNode
+                                          "referencesExisting", jint refExisting
+                                          "referencesTotal", jint refTotal
+                                          "reason",
+                                          jstr
+                                              "project not built/restored — external references unresolved; run dotnet restore && dotnet build" ]
                                     :> JsonNode
                                 )
+                            else
+                                let! result = this.FreshProjectCheck(proj, timeoutMs)
+
+                                match result with
+                                | Ok(diags, _, _) ->
+                                    allDiags.AddRange diags
+                                    let e, w = countDiagnosticsBySeverity diags
+
+                                    perProject.Add(
+                                        jobj
+                                            [ "project", jstr (Path.GetFileNameWithoutExtension proj)
+                                              "fsproj", jstr (normalizePath proj)
+                                              "errorCount", jint e
+                                              "warningCount", jint w
+                                              "analyzed", jbool true ]
+                                        :> JsonNode
+                                    )
+                                | Error msg ->
+                                    failCount <- failCount + 1
+
+                                    perProject.Add(
+                                        jobj
+                                            [ "project", jstr (Path.GetFileNameWithoutExtension proj)
+                                              "fsproj", jstr (normalizePath proj)
+                                              "error", jstr msg
+                                              "analyzed", jbool false ]
+                                        :> JsonNode
+                                    )
 
                         let diags = allDiags.ToArray()
                         let errorCount, warningCount = countDiagnosticsBySeverity diags
@@ -3451,10 +3587,11 @@ type internal FcsBridge() =
                         let verdict, analyzed, reason =
                             if errorCount > 0 then
                                 "errors", true, None
-                            elif failCount > 0 then
+                            elif unrestoredCount > 0 || failCount > 0 then
                                 "unknown",
                                 false,
-                                Some $"{failCount} of {projects.Length} project(s) failed to analyze; cannot confirm clean."
+                                Some
+                                    $"{unrestoredCount} unrestored + {failCount} failed of {projects.Length} project(s); run dotnet restore && dotnet build — cannot confirm clean."
                             else
                                 "clean", true, None
 
@@ -3473,6 +3610,7 @@ type internal FcsBridge() =
                                 files
                                 reason
                                 [ "projectsSwept", jint projects.Length
+                                  "unrestoredCount", jint unrestoredCount
                                   "perProject", JsonArray(perProject.ToArray()) :> JsonNode ]
 
             | _ -> return invalid $"unsupported scope '{resolvedScope}'"
@@ -4189,6 +4327,10 @@ type internal FcsBridge() =
                           projectOptions = None
                           includePrivate = args.includePrivate
                           includeLocal = Some false
+                          // Always request the full per-member output: ProjectOutline does
+                          // its own summaryOnly shaping + memberCounts over these entries,
+                          // so FileOutline's own summary default must NOT pre-collapse them.
+                          summaryOnly = Some false
                           maxResults = None }
                     )
 
@@ -4778,14 +4920,20 @@ type internal FcsBridge() =
     /// project when a swept source file is edited. Exposed for cache-behaviour tests.
     member _.ProjectUsesCacheCount = projectUsesCache.Count
 
-    member this.ProbeProjectOptions(fsprojPath: string) : Task<Result<string, string>> =
+    member this.ProbeProjectOptions(fsprojPath: string) : Task<Result<ProjectOptionsInfo, string>> =
         task {
             try
                 let! result = this.LoadProjectOptionsFromFsproj(fsprojPath)
 
                 return
                     match result with
-                    | Some _ -> Ok "ionide-proj-info"
+                    | Some options ->
+                        let existing, total = ReferenceResolution.probe options.OtherOptions
+
+                        Ok
+                            { Source = "ionide-proj-info"
+                              ReferencesExisting = existing
+                              ReferencesTotal = total }
                     | None -> Error "Ionide.ProjInfo could not load project options."
             with ex ->
                 return Error ex.Message
