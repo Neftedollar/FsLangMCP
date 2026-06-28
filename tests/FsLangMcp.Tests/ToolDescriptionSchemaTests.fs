@@ -25,7 +25,9 @@ let private overlapPairs : (string * string) list =
       "fcs_explain_diagnostic", "check"
       "fcs_tests_for_symbol", "find"
       "fcs_rename_preview", "textDocument_rename"
-      "fcs_diagnostic_fixes", "textDocument_codeAction" ]
+      "fcs_diagnostic_fixes", "textDocument_codeAction"
+      "fcs_check_compile_order", "fcs_suggest_open"
+      "fcs_public_api", "fcs_project_outline" ]
 
 let private preferRegex =
     Regex(

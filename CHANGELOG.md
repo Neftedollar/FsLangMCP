@@ -16,10 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`fcs_tests_for_symbol` (#60)** — list the tests that likely cover a symbol: sweeps the solution's test projects (`<IsTestProject>` / xunit·nunit·expecto refs), filters FCS symbol-uses to test files, and tags each site with its enclosing test. Complements `find` (the test-coverage slice).
 - **`fcs_rename_preview` (#64)** — preview a semantic rename's full impact (edits grouped by file with original + post-rename lines, `totalEdits`, `fileCount`, `crossProject`) **without applying it**. Non-destructive; inspect blast radius before `textDocument_rename`.
 - **`fcs_diagnostic_fixes` (#53)** — agent-friendly diagnostics→fixes for a file: fetches the file's diagnostics and requests code-actions **with the real diagnostic context** that raw `textDocument_codeAction` leaves empty, grouped per diagnostic.
+- **`fcs_check_compile_order` (#58)** — detect F#'s file-ordering gotcha: a symbol used before the file that **defines** it in `<Compile>` order reads as `FS0039` "not defined" though it exists. Correlates each `FS0039` with a later-compiling definition and reports the reorder fix. Use when `check` reports "not defined" to tell an order problem from a missing `open`.
+- **`fcs_public_api` (#59)** — emit a project's public API surface (every public type + member with signatures, stable-sorted) for snapshot/diff breaking-change detection. Public-only by default (`includeInternal` adds internals); `namespaceFilter` + pagination.
 
 ### Fixed
 
 - **FSAC `initialize` handshake now declares `codeActionLiteralSupport` / `publishDiagnostics` / `synchronization` client capabilities** — without them FSAC returned null code-actions and pushed zero diagnostics, which also silently degraded the existing `textDocument_codeAction` and `workspace_diagnostics` tools. (#53)
+- **`check` (project/workspace) no longer returns a wall of spurious `FS0039` "not defined" cascades on an unrestored/unbuilt project** (#100, #138). A deterministic reference-resolution probe (how many `-r:` reference assemblies exist on disk) detects the unrestored state and returns `verdict: "unknown"` + a "run dotnet restore/build" reason instead. Independently, the surfaced `diagnostics` array is now always capped (≤50 + `diagnosticsTruncated`) so a large erroring project can't overflow the MCP token ceiling. The restored/normal clean+errors verdict path is unchanged.
+- **`fcs_file_outline` gained `summaryOnly` (default true)** — headers + per-kind member counts only — so a large file no longer overflows the token ceiling and pushes agents back to `grep`. `summaryOnly=false` restores full per-member output. (#100)
+- **`set_project` / `project_health` now surface `restoreStatus: "unrestored"` + a hint when reference assemblies are missing** — so an empty `symbolIndex` after `ready` is no longer mistaken for "no symbols" / cryptic `FSharp.Core not found`. (#138)
 
 ### Changed
 
