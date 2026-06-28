@@ -253,6 +253,20 @@ type internal FcsBridge() =
     let optionsCache = BoundedCache<string, FSharpProjectOptions * string>(50)
     let projectResultsCache = BoundedCache<string, FSharpCheckProjectResults>(3)
 
+    // find sweep (issue #131): memoize each project's whole-symbol-use enumeration +
+    // diagnostics. FCS's project cache keeps ParseAndCheckProject warm, but
+    // GetAllUsesOfAllSymbols() is NOT memoized — it re-walks every recorded symbol use
+    // (~16-18k/project) on EVERY call, so a warm `find` re-paid ~3s/project. The cache
+    // key is (resolved-options key + source-file write-time stamp): any on-disk source
+    // edit moves a file's mtime → the stamp changes → cache MISS → the original
+    // ParseAndCheckProject + GetAllUsesOfAllSymbols path runs. A cached `find` is
+    // therefore never staler than an uncached one (a miss is byte-for-byte the prior
+    // behaviour) — correctness comes first, speed is the unchanged-project fast path.
+    // Cleared by ClearCaches() (so set_project invalidates it). Sized to the same
+    // solution scale as optionsCache so a whole solution stays warm between sweeps.
+    let projectUsesCache =
+        BoundedCache<string, FSharpSymbolUse array * FSharpDiagnostic array>(50)
+
     let asTask (workflow: Async<'T>) : Task<'T> =
         Async.StartAsTask(workflow, cancellationToken = CancellationToken.None)
 
@@ -860,6 +874,27 @@ type internal FcsBridge() =
     let makeResolvedProjectCacheKey (projectOptions: FSharpProjectOptions) =
         let optionsHash = String.concat "|" projectOptions.OtherOptions
         $"%s{projectOptions.ProjectFileName}::%s{optionsHash}"
+
+    // Per-file write-time vector for the find use-cache (issue #131). The stamp changes
+    // when ANY source file's on-disk mtime changes (not just the newest), so an edit to
+    // an older file still invalidates. One stat per source file — sub-millisecond even
+    // for large projects, and the same signal FCS itself uses to decide staleness, so a
+    // cache miss and an FCS re-check stay in lockstep. Missing/unreadable files map to
+    // -1 (a removed file changes the vector; the .fsproj re-resolve changes the options
+    // key independently).
+    let sourceFilesStamp (projectOptions: FSharpProjectOptions) =
+        let sb = System.Text.StringBuilder()
+
+        for f in projectOptions.SourceFiles do
+            let ticks =
+                try
+                    if File.Exists f then File.GetLastWriteTimeUtc(f).Ticks else -1L
+                with _ ->
+                    -1L
+
+            sb.Append(ticks).Append('|') |> ignore
+
+        sb.ToString()
 
     let countDiagnosticsBySeverity (diagnostics: FSharpDiagnostic array) =
         let errors =
@@ -2129,6 +2164,99 @@ type internal FcsBridge() =
     // Returns Ok displayName (fed to the union sweep as an exact query) or Error
     // envelope. Mirrors fcs_symbol_at_word's tolerant resolution: line + optional
     // word/occurrence/character.
+    //
+    // Extracted from ResolveQueryAtPosition to keep the outer task {} state machine
+    // simple enough for static compilation (FS3511 fix: same pattern as ProjectSweepUses).
+    // All computation here is synchronous — no awaits — so the return type is plain Result.
+    member private _.ResolvePositionInFile
+        (path: string,
+         line: int,
+         source: string,
+         checkedResults: FSharpCheckFileResults option,
+         args: FindArgs)
+        : Result<string, JsonNode> =
+        match checkedResults with
+        | None ->
+            Error(
+                jobj
+                    [ "status", jstr "aborted"
+                      "message", jstr "Type checking was aborted at the requested position." ]
+                :> JsonNode
+            )
+        | Some checkResults ->
+            let lines = sourceLines source
+
+            if line < 0 || line >= lines.Length then
+                Error(
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr $"line {line} is out of range (file has {lines.Length} lines)." ]
+                    :> JsonNode
+                )
+            else
+                let lineText = lines[line]
+                let candidates = wordSpans args.word lineText
+
+                if candidates.Length = 0 then
+                    Error(
+                        jobj
+                            [ "status", jstr "no_candidate"
+                              "message", jstr "No identifier found at the requested position." ]
+                        :> JsonNode
+                    )
+                else
+                    let occurrence = args.occurrence |> Option.defaultValue -1
+
+                    let candidateIndex =
+                        match args.character with
+                        | Some ch ->
+                            candidates
+                            |> Array.tryFindIndex (fun (s, e, _) -> ch >= s && ch <= e)
+                            |> Option.defaultValue 0
+                        | None -> if occurrence < 0 then 0 else min occurrence (candidates.Length - 1)
+
+                    let startColumn, endColumn, text = candidates[candidateIndex]
+                    let fcsLine = line + 1
+                    let columnsToTry = [| endColumn; startColumn + 1; startColumn |] |> Array.distinct
+
+                    let symbolUse =
+                        columnsToTry
+                        |> Array.tryPick (fun column ->
+                            checkResults.GetSymbolUseAtLocation(fcsLine, column, lineText, [ text ]))
+
+                    match symbolUse with
+                    | Some u ->
+                        // kind=position resolved THE specific symbol under the cursor.
+                        // Key the subsequent sweep on its FullName so the match stays
+                        // precise: DisplayName alone would also sweep an unrelated
+                        // `Config` in another namespace (or every same-named overload).
+                        // Locals / synthetic symbols may carry no useful FullName, so
+                        // fall back to DisplayName there.
+                        let key =
+                            try
+                                match u.Symbol.FullName with
+                                | null -> u.Symbol.DisplayName
+                                | fn when String.IsNullOrWhiteSpace fn -> u.Symbol.DisplayName
+                                | fn -> fn
+                            with _ ->
+                                u.Symbol.DisplayName
+
+                        Ok key
+                    | None ->
+                        Error(
+                            jobj
+                                [ "status", jstr "no_symbol"
+                                  "message",
+                                  jstr
+                                      $"Could not resolve a symbol at {Path.GetFileName path}:{line}." ]
+                            :> JsonNode
+                        )
+
+    // Outer shell: validates args and awaits type-check, then delegates the purely
+    // synchronous symbol resolution to ResolvePositionInFile. Keeping this task {}
+    // free of nested match-over-task-result branches makes it statically compilable
+    // (FS3511 fix — same technique as ProjectSweepUses).
     member private this.ResolveQueryAtPosition(args: FindArgs) : Task<Result<string, JsonNode>> =
         task {
             match args.path with
@@ -2166,87 +2294,7 @@ type internal FcsBridge() =
                         let! _, source, _, _, _, checkedResults =
                             this.PrepareCheckContext(path, None, args.projectPath, None)
 
-                        match checkedResults with
-                        | None ->
-                            return
-                                Error(
-                                    jobj
-                                        [ "status", jstr "aborted"
-                                          "message", jstr "Type checking was aborted at the requested position." ]
-                                    :> JsonNode
-                                )
-                        | Some checkResults ->
-                            let lines = sourceLines source
-
-                            if line < 0 || line >= lines.Length then
-                                return
-                                    Error(
-                                        jobj
-                                            [ "status", jstr "invalid_args"
-                                              "message",
-                                              jstr $"line {line} is out of range (file has {lines.Length} lines)." ]
-                                        :> JsonNode
-                                    )
-                            else
-                                let lineText = lines[line]
-                                let candidates = wordSpans args.word lineText
-
-                                if candidates.Length = 0 then
-                                    return
-                                        Error(
-                                            jobj
-                                                [ "status", jstr "no_candidate"
-                                                  "message", jstr "No identifier found at the requested position." ]
-                                            :> JsonNode
-                                        )
-                                else
-                                    let occurrence = args.occurrence |> Option.defaultValue -1
-
-                                    let candidateIndex =
-                                        match args.character with
-                                        | Some ch ->
-                                            candidates
-                                            |> Array.tryFindIndex (fun (s, e, _) -> ch >= s && ch <= e)
-                                            |> Option.defaultValue 0
-                                        | None -> if occurrence < 0 then 0 else min occurrence (candidates.Length - 1)
-
-                                    let startColumn, endColumn, text = candidates[candidateIndex]
-                                    let fcsLine = line + 1
-                                    let columnsToTry = [| endColumn; startColumn + 1; startColumn |] |> Array.distinct
-
-                                    let symbolUse =
-                                        columnsToTry
-                                        |> Array.tryPick (fun column ->
-                                            checkResults.GetSymbolUseAtLocation(fcsLine, column, lineText, [ text ]))
-
-                                    match symbolUse with
-                                    | Some u ->
-                                        // kind=position resolved THE specific symbol under the cursor.
-                                        // Key the subsequent sweep on its FullName so the match stays
-                                        // precise: DisplayName alone would also sweep an unrelated
-                                        // `Config` in another namespace (or every same-named overload).
-                                        // Locals / synthetic symbols may carry no useful FullName, so
-                                        // fall back to DisplayName there.
-                                        let key =
-                                            try
-                                                match u.Symbol.FullName with
-                                                | null -> u.Symbol.DisplayName
-                                                | fn when String.IsNullOrWhiteSpace fn -> u.Symbol.DisplayName
-                                                | fn -> fn
-                                            with _ ->
-                                                u.Symbol.DisplayName
-
-                                        return Ok key
-                                    | None ->
-                                        return
-                                            Error(
-                                                jobj
-                                                    [ "status", jstr "no_symbol"
-                                                      "message",
-                                                      jstr
-                                                          $"Could not resolve a symbol at {Path.GetFileName path}:{line}." ]
-                                                :> JsonNode
-                                            )
+                        return this.ResolvePositionInFile(path, line, source, checkedResults, args)
         }
 
     // ── find: multi-project union sweep (issue #128, Stage 1) ───────────────────
@@ -2267,6 +2315,25 @@ type internal FcsBridge() =
     // FullName via symbolMatches; DeclaringEntity.DisplayName for fields/members)
     // and de-dup by source LOCATION, never by symbol identity. FSharpSymbolUse is a
     // struct, so we bind `let r = u.Range` before reading r.FileName (FS0052).
+
+    // issue #131: cache-or-compute one project's whole-symbol-use enumeration +
+    // diagnostics, keyed by (resolved-options + source-stamp). Kept in its own method
+    // so Find's per-project loop awaits a plain Task instead of nesting a task CE
+    // (which is not statically compilable under Release optimization → FS3511).
+    member private _.ProjectSweepUses
+        (usesKey: string, options: FSharpProjectOptions)
+        : Task<FSharpSymbolUse array * FSharpDiagnostic array> =
+        task {
+            match projectUsesCache.TryGet(usesKey) with
+            | Some cached -> return cached
+            | None ->
+                let! results = checker.ParseAndCheckProject(options) |> asTask
+                let uses = results.GetAllUsesOfAllSymbols()
+                let diags = results.Diagnostics
+                projectUsesCache.Set(usesKey, (uses, diags))
+                return uses, diags
+        }
+
     member this.Find(args: FindArgs, ?fsacProbe: string -> Task<int>) : Task<JsonNode> =
         task {
             match ArgsValidation.requireNonBlank "query" args.query with
@@ -2473,9 +2540,18 @@ type internal FcsBridge() =
 
                 try
                     let! options, _ = this.ResolveFsprojOptions(fsproj)
-                    let! results = checker.ParseAndCheckProject(options) |> asTask
-                    let allUses = results.GetAllUsesOfAllSymbols()
-                    aggregatedDiagnostics.AddRange(results.Diagnostics)
+
+                    // issue #131: memoize the whole-symbol-use enumeration per (project,
+                    // source-stamp). A cache HIT on an unchanged project skips BOTH
+                    // ParseAndCheckProject AND the ~3s GetAllUsesOfAllSymbols re-walk; a
+                    // MISS (first sweep, or any source edit moves the stamp) runs the
+                    // identical original path, so results are never served stale. The
+                    // cache-or-compute lives in its own method (ProjectSweepUses) so this
+                    // outer state machine stays statically compilable under Release
+                    // optimization (a nested task CE inside the loop trips FS3511).
+                    let usesKey = $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}"
+                    let! allUses, projDiagnostics = this.ProjectSweepUses(usesKey, options)
+                    aggregatedDiagnostics.AddRange(projDiagnostics)
 
                     // Per-file record-field form classifier (literal vs with-update).
                     let parsingOptions, _ = checker.GetParsingOptionsFromProjectOptions(options)
@@ -3064,6 +3140,23 @@ type internal FcsBridge() =
                         | _ -> None)
                     |> Array.distinct
 
+                // issue #133: totalDiagnostics must count the FULL snapshot across ALL
+                // severities — the snapshot now retains severity-3/4 entries (#130), so
+                // `snap.ErrorCount + snap.WarningCount` undercounts and an info-only
+                // snapshot surfaced a non-empty `diagnostics` list with totalDiagnostics=0.
+                // Mirrors the trusted path's allDiags.Length: with severity="all" the
+                // surfaced list and this count agree exactly.
+                let totalSnapshotDiagnostics =
+                    match snap.Diagnostics with
+                    | :? JsonArray as arr ->
+                        arr
+                        |> Seq.filter (fun n ->
+                            match n with
+                            | :? JsonObject as obj -> severityCode obj >= 1
+                            | _ -> false)
+                        |> Seq.length
+                    | _ -> 0
+
                 return
                     build
                         verdict
@@ -3072,7 +3165,7 @@ type internal FcsBridge() =
                         None
                         snap.ErrorCount
                         snap.WarningCount
-                        (snap.ErrorCount + snap.WarningCount)
+                        totalSnapshotDiagnostics
                         nodes
                         files
                         reason
@@ -4569,6 +4662,10 @@ type internal FcsBridge() =
     member _.ClearCaches() =
         optionsCache.Clear()
         projectResultsCache.Clear()
+        // issue #131: a new set_project (or any explicit cache clear) must drop the
+        // memoized find sweeps too, so a project switch never serves a prior project's
+        // symbol uses.
+        projectUsesCache.Clear()
 
     /// Returns configuration flags captured at checker creation time, for use by RuntimeStatus.
     member _.CheckerConfig: FcsCheckerConfig =
@@ -4579,6 +4676,11 @@ type internal FcsBridge() =
 
     /// Returns the number of entries currently held in the project-results cache.
     member _.ProjectResultsCacheCount = projectResultsCache.Count
+
+    /// Number of entries in the find sweep use-cache (issue #131). One per (project,
+    /// source-stamp); unchanged between sweeps of the same projects, grows by one per
+    /// project when a swept source file is edited. Exposed for cache-behaviour tests.
+    member _.ProjectUsesCacheCount = projectUsesCache.Count
 
     member this.ProbeProjectOptions(fsprojPath: string) : Task<Result<string, string>> =
         task {

@@ -457,6 +457,83 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
             Assert.True(anyContextEmitted, "contextLines=2 must emit surrounding lines on at least one site")
         }
 
+    // ── #131: the find sweep memoizes GetAllUsesOfAllSymbols per project ──────────
+    [<Fact>]
+    member _.``find caches the per-project sweep: a second find on unchanged projects reuses it (#131)``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // COLD: first sweep pays GetAllUsesOfAllSymbols and populates the use-cache —
+            // one entry per swept member project.
+            let! cold = bridge.Find(findArgs fx.Slnx "TraderRole")
+            Assert.Equal("succeeded", gs cold "status")
+            let coldSites = gi cold "totalSites"
+            let coldSweepMs = gi cold "sweepElapsedMs"
+            let coldCacheCount = bridge.ProjectUsesCacheCount
+            Assert.Equal(gi cold "projectsSwept", coldCacheCount)
+
+            // WARM: same projects, no edits → every project is a cache HIT → no new
+            // entries, identical site total.
+            let! warm = bridge.Find(findArgs fx.Slnx "TraderRole")
+            let warmSites = gi warm "totalSites"
+            let warmSweepMs = gi warm "sweepElapsedMs"
+            Assert.Equal(coldSites, warmSites)
+            Assert.Equal(coldCacheCount, bridge.ProjectUsesCacheCount)
+
+            // A DIFFERENT query on the same unchanged projects also reuses the cache —
+            // the memo holds the raw all-uses enumeration, independent of the query.
+            let! warm2 = bridge.Find(findArgs fx.Slnx "Propose")
+            Assert.Equal("succeeded", gs warm2 "status")
+            Assert.Equal(coldCacheCount, bridge.ProjectUsesCacheCount)
+
+            output.WriteLine($"#131 cache: coldSweepMs={coldSweepMs}, warmSweepMs={warmSweepMs}, cacheEntries={coldCacheCount}")
+        }
+
+    [<Fact>]
+    member _.``find use-cache invalidates when a swept file is edited on disk — next find reflects the edit (#131)``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            try
+                // Warm the cache against the baseline Domain.fs.
+                let! before = bridge.Find(findArgs fx.Slnx "TraderRole")
+                let beforeSites = gi before "totalSites"
+                let beforeCacheCount = bridge.ProjectUsesCacheCount
+
+                // Edit Domain.fs on disk: add a module that references TraderRole, so the
+                // "TraderRole" query gains at least one new site. Push the mtime forward so
+                // the source-stamp provably changes (and FCS re-checks the project).
+                let edited =
+                    domainFs
+                    + String.concat "\n" [ "module Usage ="; "    let again (r: TraderRole) : int = r.Propose 1 2"; "" ]
+
+                File.WriteAllText(fx.DomainFs, edited)
+                File.SetLastWriteTimeUtc(fx.DomainFs, DateTime.UtcNow.AddSeconds 2.0)
+
+                let! after = bridge.Find(findArgs fx.Slnx "TraderRole")
+                let afterSites = gi after "totalSites"
+
+                // CORRECTNESS: the edit is reflected — the cached sweep is NOT served stale.
+                Assert.True(
+                    afterSites > beforeSites,
+                    $"edit must be reflected: before={beforeSites}, after={afterSites}"
+                )
+
+                // The edited project's stamp changed → a fresh cache entry was added
+                // alongside the (now-stale) baseline one, so the count grew.
+                Assert.True(
+                    bridge.ProjectUsesCacheCount > beforeCacheCount,
+                    $"an edit must create a new cache entry: before={beforeCacheCount}, after={bridge.ProjectUsesCacheCount}"
+                )
+            finally
+                // Restore the shared fixture so method ordering cannot leak this edit.
+                File.WriteAllText(fx.DomainFs, domainFs)
+        }
+
 // ── kind=position FullName disambiguation (Codex P2 #1) ──────────────────────────
 //
 // Two types both named `Config` in DIFFERENT namespaces. kind=position resolves THE
