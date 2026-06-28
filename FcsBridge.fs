@@ -257,11 +257,15 @@ type internal FcsBridge() =
     // diagnostics. FCS's project cache keeps ParseAndCheckProject warm, but
     // GetAllUsesOfAllSymbols() is NOT memoized — it re-walks every recorded symbol use
     // (~16-18k/project) on EVERY call, so a warm `find` re-paid ~3s/project. The cache
-    // key is (resolved-options key + source-file write-time stamp): any on-disk source
-    // edit moves a file's mtime → the stamp changes → cache MISS → the original
-    // ParseAndCheckProject + GetAllUsesOfAllSymbols path runs. A cached `find` is
-    // therefore never staler than an uncached one (a miss is byte-for-byte the prior
-    // behaviour) — correctness comes first, speed is the unchanged-project fast path.
+    // key is (resolved-options key + source-file write-time stamp + referenced-assembly
+    // write-time stamp): any on-disk source edit moves a file's mtime → the stamp changes
+    // → cache MISS; and any rebuild of a referenced project (P2P) or assembly moves THAT
+    // file's mtime → the consumer's stamp changes → cache MISS (0.10.1 Codex P1 fix:
+    // without the referenced-assembly stamp a dependency rebuild left consumers stale).
+    // Either MISS runs the original ParseAndCheckProject + GetAllUsesOfAllSymbols path. A
+    // cached `find` is therefore never staler than an uncached one (a miss is byte-for-byte
+    // the prior behaviour) — correctness comes first, speed is the unchanged-project fast
+    // path.
     // Cleared by ClearCaches() (so set_project invalidates it). Sized to the same
     // solution scale as optionsCache so a whole solution stays warm between sweeps.
     let projectUsesCache =
@@ -893,6 +897,51 @@ type internal FcsBridge() =
                     -1L
 
             sb.Append(ticks).Append('|') |> ignore
+
+        sb.ToString()
+
+    // Per-reference write-time vector for the find use-cache (issue #131; 0.10.1 Codex
+    // P1). sourceFilesStamp alone is BLIND to cross-project rebuilds: when project A
+    // references project B (P2P) — or any other assembly — a rebuild of B leaves A's own
+    // SourceFiles untouched, so A's source-stamp (and therefore A's cache key) would NOT
+    // move, and ProjectSweepUses would serve A's sweep STALE even though a fresh
+    // ParseAndCheckProject would see B's new metadata. Folding the referenced-assembly
+    // mtimes into the key closes that gap: B's rebuilt output (the -r: target a consumer
+    // resolves to — for a P2P that is B's obj/.../ref/B.dll reference assembly) moves its
+    // mtime → every consumer's key changes → cache MISS → fresh sweep.
+    //
+    // We stamp EVERY -r:/--reference: target, framework and NuGet refs included.
+    // Correctness-first by deliberate choice: a path-based "this ref is immutable" skip
+    // would risk misclassifying a mutable ref (relocated NuGet caches via NUGET_PACKAGES,
+    // non-standard SDK install roots, copied-local DLLs) and reintroducing exactly this
+    // staleness bug, while the saving is marginal — the stats are OS-metadata-cached and
+    // sub-millisecond in aggregate even for ~150 BCL refs, so a warm find stays in the
+    // cache-hit fast path. A reference *path* change (NuGet/SDK version bump) already moves
+    // the options key via makeResolvedProjectCacheKey, which concatenates OtherOptions;
+    // this stamp adds the orthogonal *content-at-a-fixed-path* signal. Missing/unreadable
+    // files map to -1, mirroring sourceFilesStamp — never throws.
+    let referencedAssembliesStamp (projectOptions: FSharpProjectOptions) =
+        let sb = System.Text.StringBuilder()
+
+        for opt in projectOptions.OtherOptions do
+            let refPath =
+                if opt.StartsWith("-r:", StringComparison.Ordinal) then
+                    Some(opt.Substring 3)
+                elif opt.StartsWith("--reference:", StringComparison.Ordinal) then
+                    Some(opt.Substring 12)
+                else
+                    None
+
+            match refPath with
+            | Some path ->
+                let ticks =
+                    try
+                        if File.Exists path then File.GetLastWriteTimeUtc(path).Ticks else -1L
+                    with _ ->
+                        -1L
+
+                sb.Append(ticks).Append('|') |> ignore
+            | None -> ()
 
         sb.ToString()
 
@@ -2542,14 +2591,17 @@ type internal FcsBridge() =
                     let! options, _ = this.ResolveFsprojOptions(fsproj)
 
                     // issue #131: memoize the whole-symbol-use enumeration per (project,
-                    // source-stamp). A cache HIT on an unchanged project skips BOTH
-                    // ParseAndCheckProject AND the ~3s GetAllUsesOfAllSymbols re-walk; a
-                    // MISS (first sweep, or any source edit moves the stamp) runs the
-                    // identical original path, so results are never served stale. The
-                    // cache-or-compute lives in its own method (ProjectSweepUses) so this
-                    // outer state machine stays statically compilable under Release
-                    // optimization (a nested task CE inside the loop trips FS3511).
-                    let usesKey = $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}"
+                    // source-stamp, referenced-assembly-stamp). A cache HIT on an unchanged
+                    // project skips BOTH ParseAndCheckProject AND the ~3s
+                    // GetAllUsesOfAllSymbols re-walk; a MISS (first sweep, any source edit,
+                    // OR any rebuild of a referenced project/assembly — 0.10.1 Codex P1)
+                    // moves the stamp and runs the identical original path, so results are
+                    // never served stale. The cache-or-compute lives in its own method
+                    // (ProjectSweepUses) so this outer state machine stays statically
+                    // compilable under Release optimization (a nested task CE inside the
+                    // loop trips FS3511).
+                    let usesKey =
+                        $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}"
                     let! allUses, projDiagnostics = this.ProjectSweepUses(usesKey, options)
                     aggregatedDiagnostics.AddRange(projDiagnostics)
 

@@ -534,6 +534,84 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                 File.WriteAllText(fx.DomainFs, domainFs)
         }
 
+    // ── 0.10.1 Codex P1: cross-project invalidation via referenced-assembly mtime ──
+    //
+    // The #131 invalidation test above only edits a file in the SAME project, so it never
+    // exercised the path the original key got wrong: a CONSUMER's key was keyed on its own
+    // source-stamp ALONE — blind to a REBUILD of a referenced project. Here we warm the
+    // cache, then move the mtime of Domain's referenced output (the obj/.../ref/Domain.dll
+    // assembly that Stubs + App resolve via -r:) FORWARD without touching any consumer's
+    // SOURCE. Under the OLD key the consumer entries would be served stale (cache count
+    // unchanged); under the fixed key the bumped reference mtime moves each consumer's key
+    // → cache MISS → fresh entries, so the count grows. Domain itself references no fixture
+    // project, so it stays a HIT — any growth necessarily comes from the consumers, which
+    // is exactly the cross-project staleness the P1 fix closes.
+    [<Fact>]
+    member _.``find use-cache invalidates a CONSUMER when a referenced assembly is rebuilt — no stale cross-project results (0.10.1 Codex P1)``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // Domain output assemblies the consumer projects reference via -r:.
+            // ProduceReferenceAssembly (SDK default) means the resolved -r: target is
+            // obj/.../ref/Domain.dll; bump EVERY Domain.dll under the fixture so whichever
+            // path the consumers resolve is moved. Bumping copies that are NOT in any
+            // OtherOptions (e.g. consumer bin/ copies) is a harmless no-op for the key.
+            let domainDlls = Directory.GetFiles(fx.Root, "Domain.dll", SearchOption.AllDirectories)
+
+            Assert.True(
+                (domainDlls.Length > 0),
+                $"fixture build must have produced a Domain.dll to reference (root: {fx.Root})"
+            )
+
+            // Capture originals so the shared fixture is left pristine for sibling tests.
+            let originalMtimes = domainDlls |> Array.map (fun p -> p, File.GetLastWriteTimeUtc p)
+
+            try
+                // WARM: one cache entry per swept member project (Domain, Stubs, App).
+                let! before = bridge.Find(findArgs fx.Slnx "TraderRole")
+                Assert.Equal("succeeded", gs before "status")
+                let beforeSites = gi before "totalSites"
+                let beforeCacheCount = bridge.ProjectUsesCacheCount
+                Assert.Equal(gi before "projectsSwept", beforeCacheCount)
+
+                // Rebuild signal: move the referenced Domain assembly mtime FORWARD. No
+                // consumer SOURCE is touched — only the dependency's output mtime moves.
+                let bump = DateTime.UtcNow.AddSeconds 5.0
+
+                for dll in domainDlls do
+                    File.SetLastWriteTimeUtc(dll, bump)
+
+                let! after = bridge.Find(findArgs fx.Slnx "TraderRole")
+                Assert.Equal("succeeded", gs after "status")
+
+                // CORRECTNESS (cache key): the consumer projects (Stubs, App) re-keyed on
+                // the moved reference mtime → cache MISS → fresh entries added alongside the
+                // now-stale baseline ones → the count GREW. On the OLD source-only key the
+                // consumer keys were unchanged → no new entries → this assertion FAILS.
+                Assert.True(
+                    bridge.ProjectUsesCacheCount > beforeCacheCount,
+                    $"a referenced-assembly rebuild must invalidate the consumer cache entries: before={beforeCacheCount}, after={bridge.ProjectUsesCacheCount}"
+                )
+
+                // The Domain assembly CONTENT is unchanged (only its mtime moved), so the
+                // fresh sweep returns the SAME sites — invalidation must not corrupt results.
+                Assert.Equal(beforeSites, gi after "totalSites")
+
+                output.WriteLine(
+                    $"0.10.1 P1 cross-project: beforeCache={beforeCacheCount}, afterCache={bridge.ProjectUsesCacheCount}, sites={beforeSites} (touched {domainDlls.Length} Domain.dll)"
+                )
+            finally
+                // Restore reference mtimes so test ordering cannot leak the bump.
+                for (p, t) in originalMtimes do
+                    try
+                        File.SetLastWriteTimeUtc(p, t)
+                    with _ ->
+                        ()
+        }
+
 // ── kind=position FullName disambiguation (Codex P2 #1) ──────────────────────────
 //
 // Two types both named `Config` in DIFFERENT namespaces. kind=position resolves THE
