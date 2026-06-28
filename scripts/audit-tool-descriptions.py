@@ -31,6 +31,7 @@ TAGS = ("[FSAC]", "[FCS in-process]", "[meta]")
 OVERLAP_PAIRS: list[tuple[str, str]] = [
     ("workspace_symbol", "fcs_find_symbol"),
     ("fcs_referenced_symbols", "fcs_nuget_types"),
+    ("fcs_nuget_types", "fcs_nuget_members"),
     ("fcs_validate_snippet", "fcs_parse_and_check_file"),
     ("fcs_signature_help", "fsharp_signature_data"),
     ("fcs_symbol_at_word", "fcs_type_at_position"),

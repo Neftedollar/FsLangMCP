@@ -294,6 +294,20 @@ type FcsNugetTypesArgs =
       maxResults: int option
       cursor: string option }
 
+type FcsNugetMembersArgs =
+    { /// Package id matched against assembly SimpleName (case-insensitive, exact match).
+      /// Same matching logic as fcs_nuget_types — "System.Text.Json" resolves only to that assembly.
+      packageId: string
+      /// Type to look up within the matched assembly. Matched case-insensitively against
+      /// DisplayName and FullName. Example: "String", "FSharpList", "JsonSerializer".
+      typeName: string
+      projectPath: string option
+      /// When true, include private/internal members. Default false.
+      includeNonPublic: bool option
+      /// Maximum entries per page. Default 500, hard ceiling 2000.
+      maxResults: int option
+      cursor: string option }
+
 type FcsValidateSnippetArgs =
     { /// F# source text to validate against the project's references.
       content: string
