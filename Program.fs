@@ -525,6 +525,14 @@ let main argv =
                 )
 
                 tool (
+                    TypedTool.define<DiagnosticFixesArgs>
+                        "fcs_diagnostic_fixes"
+                        "Fetch a file's diagnostics, then request code-action fixes for each and group them per diagnostic: range, severity, code, message, fixes [{title, kind, editSummary}], plus diagnosticCount/fixCount. Agent-friendly wrapper over raw textDocument_codeAction: supplies the diagnostic context the raw proxy leaves empty and groups the fixes. Requires set_project first. Pass line(+character) to narrow to one position, else all; pass text for unsaved content."
+                        (fun args -> toolResult (runLimited lspGate (fun () -> bridge.DiagnosticFixes args)))
+                    |> unwrapResult
+                )
+
+                tool (
                     TypedTool.define<RuntimeStatusArgs>
                         "fsharp_runtime_status"
                         "Read-only observational snapshot of the FsLangMCP process runtime state: managed-heap sizes by generation/LOH/POH, GC collection counts, isServerGC flag, assembly load count, FCS checker configuration flags and project-results cache size, and the FSAC child-process working set. Returns numbers only — no interpretation. Never triggers a GC collection, never walks the heap, never attaches diagnostic listeners."
