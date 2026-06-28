@@ -364,6 +364,205 @@ type internal FcsBridge() =
               "isObsolete", jbool (isObsoleteEntity entity) ]
         :> JsonNode
 
+    // ─── Helpers for member enumeration (fcs_nuget_members, #125) ───────────────
+
+    let memberKindString (m: FSharpMemberOrFunctionOrValue) : string =
+        try
+            if m.IsConstructor then "constructor"
+            elif m.IsEvent then "event"
+            elif m.IsProperty then "property"
+            elif m.IsMember then "method"
+            else "function"
+        with _ ->
+            "member"
+
+    let memberAccessibilityString (m: FSharpMemberOrFunctionOrValue) : string =
+        try
+            let acc = m.Accessibility
+
+            if acc.IsPrivate then "private"
+            elif acc.IsInternal then "internal"
+            elif acc.IsPublic then "public"
+            else "unknown"
+        with _ ->
+            "unknown"
+
+    let isObsoleteMember (m: FSharpMemberOrFunctionOrValue) : bool =
+        try
+            m.Attributes
+            |> Seq.exists (fun a ->
+                try
+                    let tn = a.AttributeType.FullName
+
+                    not (isNull tn)
+                    && (tn = "System.ObsoleteAttribute"
+                        || tn.EndsWith(".ObsoleteAttribute", StringComparison.Ordinal))
+                with _ ->
+                    false)
+        with _ ->
+            false
+
+    let memberSignature (m: FSharpMemberOrFunctionOrValue) : string =
+        try
+            let paramGroups = m.CurriedParameterGroups
+
+            let paramStr =
+                paramGroups
+                |> Seq.collect id
+                |> Seq.map (fun p ->
+                    let pName = p.Name |> Option.defaultValue "_"
+                    let pType = try typeName p.Type with _ -> "?"
+                    $"{pName}: {pType}")
+                |> String.concat ", "
+
+            let returnType =
+                try
+                    typeName m.ReturnParameter.Type
+                with _ ->
+                    "?"
+
+            $"{m.DisplayName}({paramStr}) -> {returnType}"
+        with _ ->
+            try
+                m.DisplayName
+            with _ ->
+                "<unknown>"
+
+    let tryExtractXmlSummary (xmlDoc: FSharpXmlDoc) : JsonNode =
+        try
+            match xmlDoc with
+            | FSharpXmlDoc.FromXmlText xmlText ->
+                let text = xmlText.GetXmlText()
+
+                if String.IsNullOrWhiteSpace text then
+                    null
+                else
+                    let startTag = "<summary>"
+                    let endTag = "</summary>"
+                    let si = text.IndexOf(startTag, StringComparison.OrdinalIgnoreCase)
+
+                    if si < 0 then
+                        null
+                    else
+                        let contentStart = si + startTag.Length
+                        let ei = text.IndexOf(endTag, contentStart, StringComparison.OrdinalIgnoreCase)
+
+                        if ei < 0 then
+                            null
+                        else
+                            let summary = text.Substring(contentStart, ei - contentStart).Trim()
+
+                            if String.IsNullOrWhiteSpace summary then null
+                            else jstr summary
+            | _ -> null
+        with _ ->
+            null
+
+    let referencedMemberToJson (m: FSharpMemberOrFunctionOrValue) : JsonNode =
+        let xmlDocNode : JsonNode =
+            try tryExtractXmlSummary m.XmlDoc with _ -> null
+
+        jobj
+            [ "name", jstr (try m.DisplayName with _ -> "<unknown>")
+              "kind", jstr (memberKindString m)
+              "signature", jstr (memberSignature m)
+              "accessibility", jstr (memberAccessibilityString m)
+              "isObsolete", jbool (isObsoleteMember m)
+              "xmlDocSummary", xmlDocNode ]
+        :> JsonNode
+
+    let fieldAccessibilityString (f: FSharpField) : string =
+        try
+            let acc = f.Accessibility
+
+            if acc.IsPrivate then "private"
+            elif acc.IsInternal then "internal"
+            elif acc.IsPublic then "public"
+            else "unknown"
+        with _ ->
+            "unknown"
+
+    let referencedFieldToJson (f: FSharpField) : JsonNode =
+        let signature =
+            try
+                $"{f.Name}: {typeName f.FieldType}"
+            with _ ->
+                try f.Name with _ -> "<unknown>"
+
+        let isObsolete =
+            try
+                f.Attributes
+                |> Seq.exists (fun a ->
+                    try
+                        let tn = a.AttributeType.FullName
+
+                        not (isNull tn)
+                        && (tn = "System.ObsoleteAttribute"
+                            || tn.EndsWith(".ObsoleteAttribute", StringComparison.Ordinal))
+                    with _ ->
+                        false)
+            with _ ->
+                false
+
+        jobj
+            [ "name", jstr (try f.Name with _ -> "<unknown>")
+              "kind", jstr "field"
+              "signature", jstr signature
+              "accessibility", jstr (fieldAccessibilityString f)
+              "isObsolete", jbool isObsolete
+              "xmlDocSummary", null ]
+        :> JsonNode
+
+    let referencedUnionCaseToJson (uc: FSharpUnionCase) : JsonNode =
+        let signature =
+            try
+                if uc.Fields.Count = 0 then
+                    uc.Name
+                else
+                    let fieldTypes =
+                        uc.Fields
+                        |> Seq.map (fun f -> try typeName f.FieldType with _ -> "?")
+                        |> String.concat " * "
+
+                    $"{uc.Name} of {fieldTypes}"
+            with _ ->
+                try uc.Name with _ -> "<unknown>"
+
+        let accessibility =
+            try
+                let acc = uc.Accessibility
+
+                if acc.IsPrivate then "private"
+                elif acc.IsInternal then "internal"
+                elif acc.IsPublic then "public"
+                else "unknown"
+            with _ ->
+                "unknown"
+
+        let isObsolete =
+            try
+                uc.Attributes
+                |> Seq.exists (fun a ->
+                    try
+                        let tn = a.AttributeType.FullName
+
+                        not (isNull tn)
+                        && (tn = "System.ObsoleteAttribute"
+                            || tn.EndsWith(".ObsoleteAttribute", StringComparison.Ordinal))
+                    with _ ->
+                        false)
+            with _ ->
+                false
+
+        jobj
+            [ "name", jstr (try uc.Name with _ -> "<unknown>")
+              "kind", jstr "union-case"
+              "signature", jstr signature
+              "accessibility", jstr accessibility
+              "isObsolete", jbool isObsolete
+              "xmlDocSummary", null ]
+        :> JsonNode
+
     let isNoisyLocalSymbol (symbolUse: FSharpSymbolUse) =
         let name = symbolUse.Symbol.DisplayName
         let kind = symbolKind symbolUse.Symbol
@@ -2825,6 +3024,217 @@ type internal FcsBridge() =
 
             let paginationFields =
                 Cursor.paginationFields "types" allEntities.Length pageOffset pageSize pageEntries.Length
+
+            return jobj (baseFields @ paginationFields) :> JsonNode
+        }
+
+    /// Enumerate members of one specific type from a referenced assembly.
+    /// Companion to NugetTypes: resolves the assembly by packageId (exact SimpleName),
+    /// finds the entity by typeName (case-insensitive DisplayName or FullName match),
+    /// then lists MembersFunctionsAndValues, FSharpFields, and UnionCases.
+    member this.NugetMembers(args: FcsNugetMembersArgs) : Task<JsonNode> =
+        task {
+            match ArgsValidation.requireNonBlank "packageId" args.packageId with
+            | Error envelope -> return envelope
+            | Ok packageId ->
+
+            match ArgsValidation.requireNonBlank "typeName" args.typeName with
+            | Error envelope -> return envelope
+            | Ok typeName ->
+
+            if args.projectPath.IsNone then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr
+                              "projectPath is required (or call set_project first to set the active project)" ]
+                    :> JsonNode
+            else
+
+            let includeNonPublic = defaultArg args.includeNonPublic false
+            let requested = defaultArg args.maxResults 500
+            let pageSize = min (max 1 requested) 2000
+
+            let pageOffsetResult =
+                match args.cursor with
+                | None -> Ok 0
+                | Some cursorStr ->
+                    match Cursor.tryDecode cursorStr with
+                    | Ok payload -> Ok payload.offset
+                    | Error reason -> Error reason
+
+            match pageOffsetResult with
+            | Error reason ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr $"Invalid cursor: %s{reason}" ]
+                    :> JsonNode
+            | Ok pageOffset ->
+
+            let! results, options, optionsSource = this.EnsureProjectResults args.projectPath
+
+            let assemblies =
+                try
+                    results.ProjectContext.GetReferencedAssemblies()
+                with _ ->
+                    []
+
+            let matchingAssemblies =
+                assemblies
+                |> List.filter (fun asm -> assemblyMatchesPackageId asm packageId)
+
+            // FCS exposes generic types with a CLR arity suffix (e.g. `FSharpOption`1`).
+            // Strip a trailing `N so callers can pass the bare compiled name (`FSharpOption`).
+            let stripArity (s: string) =
+                let idx = s.LastIndexOf('`')
+
+                if idx > 0
+                   && idx < s.Length - 1
+                   && s.Substring(idx + 1) |> Seq.forall Char.IsDigit then
+                    s.Substring(0, idx)
+                else
+                    s
+
+            let typeNameLower = (stripArity typeName).ToLowerInvariant()
+
+            // Case-insensitive match on DisplayName (exact) or FullName (exact or segment-boundary suffix),
+            // with the generic-arity suffix stripped from both sides.
+            let matchesTypeName (entity: FSharpEntity) =
+                try
+                    let displayName =
+                        try entity.DisplayName |> Option.ofObj |> Option.defaultValue "" with _ -> ""
+
+                    let fullName =
+                        try entity.FullName |> Option.ofObj |> Option.defaultValue "" with _ -> ""
+
+                    let displayLower = (stripArity displayName).ToLowerInvariant()
+                    let fullLower = (stripArity fullName).ToLowerInvariant()
+
+                    displayLower = typeNameLower
+                    || fullLower = typeNameLower
+                    || (not (String.IsNullOrEmpty fullLower)
+                        && fullLower.EndsWith($".{typeNameLower}"))
+                with _ ->
+                    false
+
+            let matchedEntities =
+                seq {
+                    for asm in matchingAssemblies do
+                        for entity in allEntitiesFromAssembly asm do
+                            if matchesTypeName entity then
+                                yield entity
+                }
+                |> Seq.toList
+
+            let passesMemberAccessibility (m: FSharpMemberOrFunctionOrValue) =
+                if includeNonPublic then
+                    true
+                else
+                    let acc = memberAccessibilityString m
+                    acc = "public" || acc = "unknown"
+
+            let passesFieldAccessibility (f: FSharpField) =
+                if includeNonPublic then
+                    true
+                else
+                    let acc = fieldAccessibilityString f
+                    acc = "public" || acc = "unknown"
+
+            let passesUnionCaseAccessibility (uc: FSharpUnionCase) =
+                if includeNonPublic then
+                    true
+                else
+                    try
+                        let acc = uc.Accessibility
+                        acc.IsPublic || (not acc.IsPrivate && not acc.IsInternal)
+                    with _ ->
+                        true
+
+            let allMembers =
+                seq {
+                    for entity in matchedEntities do
+                        // Methods, properties, constructors, events
+                        let mfvs : seq<FSharpMemberOrFunctionOrValue> =
+                            try
+                                entity.MembersFunctionsAndValues :> seq<_>
+                            with _ ->
+                                Seq.empty
+
+                        for m in mfvs do
+                            // Skip compiler-generated property accessors — the property itself is
+                            // already listed, and the get_/set_ method duplicates it.
+                            let isAccessor =
+                                try
+                                    m.IsPropertyGetterMethod || m.IsPropertySetterMethod
+                                with _ ->
+                                    false
+
+                            if passesMemberAccessibility m && not isAccessor then
+                                yield referencedMemberToJson m
+
+                        // Record fields / struct fields
+                        try
+                            if entity.IsFSharpRecord || entity.IsValueType then
+                                for f in entity.FSharpFields do
+                                    if passesFieldAccessibility f then
+                                        yield referencedFieldToJson f
+                        with _ ->
+                            ()
+
+                        // F# union cases
+                        try
+                            if entity.IsFSharpUnion then
+                                for uc in entity.UnionCases do
+                                    if passesUnionCaseAccessibility uc then
+                                        yield referencedUnionCaseToJson uc
+                        with _ ->
+                            ()
+                }
+                |> Seq.toArray
+
+            // FCS can surface the same logical member twice (e.g. a property and its
+            // compiler-generated accessor) that render to an identical row — collapse those.
+            let dedupedMembers =
+                allMembers
+                |> Array.distinctBy (fun (node: JsonNode) ->
+                    let field (name: string) =
+                        try
+                            match node[name] with
+                            | null -> ""
+                            | v -> v.GetValue<string>()
+                        with _ ->
+                            ""
+
+                    field "name", field "kind", field "signature")
+
+            let pageEntries =
+                dedupedMembers
+                |> Array.skip (min pageOffset dedupedMembers.Length)
+                |> Array.truncate pageSize
+
+            let matchedTypeFullNames =
+                matchedEntities
+                |> List.map (fun e ->
+                    try
+                        e.FullName |> Option.ofObj |> Option.defaultValue e.DisplayName
+                    with _ ->
+                        "")
+                |> List.filter (fun s -> s <> "")
+
+            let baseFields =
+                [ "status", jstr "ok"
+                  "packageId", jstr packageId
+                  "typeName", jstr typeName
+                  "matchedTypes", JsonArray(matchedTypeFullNames |> List.map jstr |> List.toArray) :> JsonNode
+                  "projectFileName", jstr options.ProjectFileName
+                  "optionsSource", jstr optionsSource
+                  "includeNonPublic", jbool includeNonPublic
+                  "results", JsonArray(pageEntries) :> JsonNode ]
+
+            let paginationFields =
+                Cursor.paginationFields "members" dedupedMembers.Length pageOffset pageSize pageEntries.Length
 
             return jobj (baseFields @ paginationFields) :> JsonNode
         }

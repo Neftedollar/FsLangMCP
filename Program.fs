@@ -411,6 +411,18 @@ let main argv =
                 )
 
                 tool (
+                    TypedTool.define<FcsNugetMembersArgs>
+                        "fcs_nuget_members"
+                        "[FCS in-process] Enumerate members of one type from a referenced assembly (matched by packageId + typeName). Prefer `fcs_nuget_types` to discover available type names first. Each entry: name, kind, signature, accessibility, isObsolete, xmlDocSummary. Paginated; default 500, max 2000. Returns `matchedTypes=[]` on no type match. Mechanics: docs/tools-detailed.md#fcs_nuget_members."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.NugetMembers args)))
+                    |> unwrapResult
+                )
+
+                tool (
                     TypedTool.define<FcsValidateSnippetArgs>
                         "fcs_validate_snippet"
                         "[FCS in-process] Compile arbitrary F# (`mode=\"fs\"|\"fsi\"`) against the active project's references without writing to the source tree. Use for 'does this signature type-check?' probes before scaffolding. Prefer `fcs_parse_and_check_file` when the file already exists on disk. Returns FCS diagnostics + errorCount/warningCount. `projectPath` falls back to active `set_project`. Caveats: docs/tools-detailed.md#fcs_validate_snippet."

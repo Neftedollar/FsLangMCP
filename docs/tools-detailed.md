@@ -78,6 +78,60 @@ Paginated; default 500, max 2000. Returns `matchedAssemblies=[]` on no match.
 
 - `fcs_referenced_symbols` — substring search across all referenced assemblies; use to discover
   assembly names before calling this tool.
+- `fcs_nuget_members` — drill into one specific type's members after finding it with this tool.
+
+---
+
+## fcs_nuget_members
+
+**Routing description:** `[FCS in-process]` Enumerate members of one type from a referenced
+assembly (matched by `packageId` + `typeName`). Use after `fcs_nuget_types` to discover type
+names. Each entry: `name`, `kind`, `signature`, `accessibility`, `isObsolete`, `xmlDocSummary`.
+Paginated; default 500, max 2000. Returns `matchedTypes=[]` on no type match.
+
+### How it works internally
+
+1. Resolves the project via `EnsureProjectResults` (same warm-cache path as `fcs_nuget_types`).
+2. Matches assemblies whose `SimpleName` equals `packageId` (exact, case-insensitive).
+3. Walks all entities in the matched assembly via `allEntitiesFromAssembly` and filters those
+   whose `DisplayName` equals `typeName` (case-insensitive) OR whose `FullName` equals or ends
+   with `.typeName` at a segment boundary.
+4. For each matched entity, enumerates three member sources:
+   - `MembersFunctionsAndValues` — methods, properties, constructors, events
+   - `FSharpFields` — record and struct fields (only for record/value types)
+   - `UnionCases` — F# union cases (only for union types)
+5. Overloaded methods appear as separate entries with distinct `signature` strings.
+6. Filters by accessibility (public-only by default; `includeNonPublic=true` for private/internal).
+7. Returns a paginated list with cursor mechanics identical to `fcs_nuget_types`.
+
+### Response shape per entry
+
+| Field | Type | Notes |
+|---|---|---|
+| `name` | string | `DisplayName` of the member |
+| `kind` | string | `"method"`, `"property"`, `"constructor"`, `"event"`, `"field"`, `"union-case"`, `"function"` |
+| `signature` | string | Formatted as `Name(param: Type, …) -> ReturnType` for methods; `Name: Type` for fields |
+| `accessibility` | string | `"public"`, `"internal"`, `"private"`, `"unknown"` |
+| `isObsolete` | bool | `true` if `[<Obsolete>]` attribute is present |
+| `xmlDocSummary` | string\|null | `<summary>` content from `///` XML doc, if available in-source; null for compiled-only assemblies |
+
+### Caveats
+
+1. **Type matching is case-insensitive** but the matched type must appear in the matched assembly.
+   Use `fcs_nuget_types` with the same `packageId` to discover the correct `DisplayName`/`FullName`.
+2. **No type match → empty, not error** — when `matchedTypes=[]`, the tool did NOT fall back to a
+   fuzzy match. Verify `packageId` (exact SimpleName) and `typeName`.
+3. **xmlDocSummary is null for compiled BCL/NuGet types** — XML doc is only available for F# source
+   files in the loaded project with `///` comments. For BCL types, use the official documentation.
+4. **Signature formatting** — uses FCS `BasicQualifiedName` for types; generic type parameters may
+   appear as `'T` or fully-qualified names depending on the FCS representation.
+5. **Warm-up** — first call after `set_project` triggers `ParseAndCheckProject`.
+
+### Related tools
+
+- `fcs_nuget_types` — enumerate all types in an assembly first to discover the correct `typeName`.
+- `fcs_referenced_symbols` — substring search across all assemblies when you don't know which
+  assembly a type lives in.
 
 ---
 

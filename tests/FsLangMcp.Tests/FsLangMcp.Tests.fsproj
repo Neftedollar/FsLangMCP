@@ -43,7 +43,10 @@
     </PackageReference>
     <PackageReference Include="Ionide.ProjInfo.FCS" Version="0.74.*" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.*" />
-    <PackageReference Include="StreamJsonRpc" Version="2.24.*" />
+    <PackageReference Include="StreamJsonRpc" Version="2.25.*" />
+    <!-- Pin StringTools to the SDK-matching 17.14.x; see FsLangMcp.fsproj for rationale
+         (MessagePack's transitive 17.6.3 breaks Ionide.ProjInfo project loading). -->
+    <PackageReference Include="Microsoft.NET.StringTools" Version="18.4.0" />
     <PackageReference Include="xunit" Version="2.9.*" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.0.*">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>

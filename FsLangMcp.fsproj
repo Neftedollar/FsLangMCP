@@ -4,7 +4,7 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <PackageId>FsLangMcp</PackageId>
-    <Version>0.9.2</Version>
+    <Version>0.9.3</Version>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>fslangmcp</ToolCommandName>
     <PackageOutputPath>./nupkg</PackageOutputPath>
@@ -62,9 +62,18 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="Ionide.ProjInfo.FCS" Version="0.74.*" />
-    <PackageReference Include="StreamJsonRpc" Version="2.24.*" />
-    <!-- override transitive 1.0.2 from StreamJsonRpc (GHSA-2cwq-pwfr-wcw3) -->
-    <PackageReference Include="Nerdbank.MessagePack" Version="1.1.62" />
+    <!-- 2.25.* pulls patched MessagePack 2.5.302, clearing the NU1902/NU1903
+         advisories on the 2.5.198 that 2.24.* dragged in transitively. -->
+    <PackageReference Include="StreamJsonRpc" Version="2.25.*" />
+    <!-- Override transitive Nerdbank.MessagePack to a patched build:
+         1.1.62 carries GHSA-92vj-hp7m-gwcj / GHSA-qjvr-435c-5fjh. -->
+    <PackageReference Include="Nerdbank.MessagePack" Version="1.2.30" />
+    <!-- MessagePack drags a stale Microsoft.NET.StringTools 17.6.3 (2023) that lacks
+         SpanBasedStringBuilder.Equals(string, StringComparison), breaking the .NET SDK
+         MSBuild that Ionide.ProjInfo loads (project load fails with MethodNotFound).
+         Nerdbank.MessagePack 1.1.62 masked it by pulling 18.4.0 transitively; 1.2.30 drops
+         that dependency, so pin 18.4.0 explicitly to keep project loading working. -->
+    <PackageReference Include="Microsoft.NET.StringTools" Version="18.4.0" />
     <!-- Pin the transitive load so the bind is satisfied at startup probing
          rather than first-use of StreamJsonRpc internals. Without this pin,
          fresh fslangmcp host processes (e.g. those spawned by Claude Code

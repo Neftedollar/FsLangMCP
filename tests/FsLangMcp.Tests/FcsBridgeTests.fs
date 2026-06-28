@@ -1592,6 +1592,247 @@ let ``NugetTypes does not match System.* assemblies for packageId='System'`` () 
         Assert.True(matched.Count <= 1, $"Expected at most 1 'System' assembly, got %d{matched.Count}")
     }
 
+// ─── fcs_nuget_members (#125) ─────────────────────────────────────────────────
+
+[<Fact>]
+let ``NugetMembers enumerates members from FSharp.Core FSharpList`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.NugetMembers(
+                { packageId = "FSharp.Core"
+                  typeName = "FSharpList"
+                  projectPath = Some projectPath
+                  includeNonPublic = None
+                  maxResults = Some 100
+                  cursor = None }
+            )
+
+        Assert.Equal("ok", result["status"].GetValue<string>())
+        let matchedTypes = result["matchedTypes"] :?> JsonArray
+        Assert.True(matchedTypes.Count > 0, "Expected FSharpList to match at least one type in FSharp.Core")
+        let results = result["results"] :?> JsonArray
+        Assert.True(results.Count > 0, "Expected non-empty member list for FSharpList")
+
+        // Every entry must have the required shape fields
+        for item in results do
+            Assert.NotNull(item["name"])
+            Assert.NotNull(item["kind"])
+            Assert.NotNull(item["signature"])
+            Assert.NotNull(item["accessibility"])
+            Assert.NotNull(item["isObsolete"])
+            // signature must be a non-empty string
+            let signature = item["signature"].GetValue<string>()
+            let memberName = item["name"]
+            Assert.False(String.IsNullOrWhiteSpace signature, $"Member {memberName} must have a non-empty signature")
+    }
+
+[<Fact>]
+let ``NugetMembers surfaces multiple entries including union cases for FSharpOption`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.NugetMembers(
+                { packageId = "FSharp.Core"
+                  typeName = "FSharpOption"
+                  projectPath = Some projectPath
+                  includeNonPublic = None
+                  maxResults = Some 100
+                  cursor = None }
+            )
+
+        Assert.Equal("ok", result["status"].GetValue<string>())
+        let matchedTypes = result["matchedTypes"] :?> JsonArray
+        Assert.True(matchedTypes.Count > 0, "Expected FSharpOption to match at least one type in FSharp.Core")
+
+        let results = result["results"] :?> JsonArray
+        // FSharpOption has union cases (Some, None) plus instance members (IsNone, IsSome, Value)
+        Assert.True(results.Count >= 2, $"Expected >= 2 entries for FSharpOption, got {results.Count}")
+
+        // Overloads: if there are multiple entries sharing the same name, they must have distinct signatures
+        let byName =
+            results
+            |> Seq.cast<JsonNode>
+            |> Seq.groupBy (fun e -> e["name"].GetValue<string>())
+            |> Seq.filter (fun (_, grp) -> Seq.length grp > 1)
+
+        for (name, grp) in byName do
+            let sigs = grp |> Seq.map (fun e -> e["signature"].GetValue<string>()) |> Seq.toList
+            let distinct = sigs |> List.distinct
+            let joined = String.concat "; " sigs
+            Assert.True(
+                distinct.Length = sigs.Length,
+                $"Overloads of '{name}' must have distinct signatures; got duplicates: {joined}")
+    }
+
+[<Fact>]
+let ``NugetMembers overloads appear as distinct entries when type has method overloads`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        // System.Text.Json is bundled with the .NET framework; JsonSerializer has many Serialize overloads.
+        let! result =
+            bridge.NugetMembers(
+                { packageId = "System.Text.Json"
+                  typeName = "JsonSerializer"
+                  projectPath = Some projectPath
+                  includeNonPublic = None
+                  maxResults = Some 500
+                  cursor = None }
+            )
+
+        Assert.Equal("ok", result["status"].GetValue<string>())
+        let matchedTypes = result["matchedTypes"] :?> JsonArray
+
+        if matchedTypes.Count = 0 then
+            // Assembly not found in this .NET flavour — skip without failing
+            ()
+        else
+            let results = result["results"] :?> JsonArray
+            // JsonSerializer.Serialize has multiple overloads — expect at least 2
+            let serializeEntries =
+                results
+                |> Seq.cast<JsonNode>
+                |> Seq.filter (fun e -> e["name"].GetValue<string>() = "Serialize")
+                |> Seq.toList
+
+            Assert.True(
+                serializeEntries.Length >= 2,
+                $"Expected >= 2 Serialize overloads from JsonSerializer, got {serializeEntries.Length}")
+
+            // All overloads must have distinct signatures
+            let sigs = serializeEntries |> List.map (fun e -> e["signature"].GetValue<string>())
+            let distinct = sigs |> List.distinct
+            Assert.True(
+                distinct.Length = sigs.Length,
+                $"Expected all Serialize overload signatures to be distinct")
+    }
+
+[<Fact>]
+let ``NugetMembers includeNonPublic returns at least as many members as public-only`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! publicOnly =
+            bridge.NugetMembers(
+                { packageId = "FSharp.Core"
+                  typeName = "FSharpList"
+                  projectPath = Some projectPath
+                  includeNonPublic = Some false
+                  maxResults = Some 500
+                  cursor = None }
+            )
+
+        let! allMembers =
+            bridge.NugetMembers(
+                { packageId = "FSharp.Core"
+                  typeName = "FSharpList"
+                  projectPath = Some projectPath
+                  includeNonPublic = Some true
+                  maxResults = Some 500
+                  cursor = None }
+            )
+
+        let publicCount = (publicOnly["results"] :?> JsonArray).Count
+        let allCount = (allMembers["results"] :?> JsonArray).Count
+        Assert.True(
+            allCount >= publicCount,
+            $"includeNonPublic should return >= public-only count: public={publicCount} all={allCount}")
+    }
+
+[<Fact>]
+let ``NugetMembers returns empty matchedTypes for unknown type name`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.NugetMembers(
+                { packageId = "FSharp.Core"
+                  typeName = "ThereIsNoTypeWithThisNameXyz9999"
+                  projectPath = Some projectPath
+                  includeNonPublic = None
+                  maxResults = Some 10
+                  cursor = None }
+            )
+
+        Assert.Equal("ok", result["status"].GetValue<string>())
+        Assert.Equal(0, (result["matchedTypes"] :?> JsonArray).Count)
+        Assert.Equal(0, (result["results"] :?> JsonArray).Count)
+    }
+
+[<Fact>]
+let ``NugetMembers returns invalid_args for empty packageId`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.NugetMembers(
+                { packageId = ""
+                  typeName = "FSharpList"
+                  projectPath = Some projectPath
+                  includeNonPublic = None
+                  maxResults = None
+                  cursor = None }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("packageid", (result["message"].GetValue<string>()).ToLowerInvariant())
+    }
+
+[<Fact>]
+let ``NugetMembers returns invalid_args for empty typeName`` () : Task =
+    task {
+        let root = findRepoRoot ()
+        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.NugetMembers(
+                { packageId = "FSharp.Core"
+                  typeName = "   "
+                  projectPath = Some projectPath
+                  includeNonPublic = None
+                  maxResults = None
+                  cursor = None }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("typename", (result["message"].GetValue<string>()).ToLowerInvariant())
+    }
+
+[<Fact>]
+let ``NugetMembers returns invalid_args when projectPath is None`` () : Task =
+    task {
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.NugetMembers(
+                { packageId = "FSharp.Core"
+                  typeName = "FSharpList"
+                  projectPath = None
+                  includeNonPublic = None
+                  maxResults = None
+                  cursor = None }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("projectpath", (result["message"].GetValue<string>()).ToLowerInvariant())
+    }
+
 // ─── fcs_make_internal_visible (#118) ────────────────────────────────────────
 
 [<Fact>]

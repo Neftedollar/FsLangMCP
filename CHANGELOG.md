@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-06-28
+
+### Added
+
+- **`fcs_nuget_members <packageId> <typeName>` — member-level companion to `fcs_nuget_types` (#125).** Enumerates the members of one type from a referenced NuGet assembly (methods, properties, fields, constructors, events, union cases) with formatted FCS signatures, accessibility, `[Obsolete]` flag, and XML-doc summary. Resolves the assembly through the same `GetReferencedAssemblies()` path as `fcs_nuget_types`; paginated (default 500, max 2000), returns an empty `matchedTypes` marker (not an error) on no match. Type matching is generic-arity-aware (a bare `FSharpOption` resolves the arity-suffixed compiled type), compiler-generated property accessors (`get_`/`set_`) are filtered so a property isn't duplicated by its accessor, and identical member rows are de-duplicated. +7 tests; the tool description passes the `docs/tool-description-schema.md` audit.
+
+### Security
+
+- **Patched the MessagePack serialization chain behind the StreamJsonRpc transport (DoS advisories).** `StreamJsonRpc` 2.24.\* → 2.25.\* (pulls patched `MessagePack` 2.5.302) and `Nerdbank.MessagePack` 1.1.62 → 1.2.30 (clears GHSA-92vj-hp7m-gwcj and GHSA-qjvr-435c-5fjh). Pinned `Microsoft.NET.StringTools` to 18.4.0: `Nerdbank.MessagePack` 1.2.30 drops the transitive StringTools 18.4.0 that had been masking MessagePack's stale 17.6.3 — which lacks `SpanBasedStringBuilder.Equals(string, StringComparison)` and silently breaks Ionide.ProjInfo's MSBuild project loading. `dotnet restore` now passes with NuGet audit enabled; 301/301 tests green.
+
 ## [0.9.2] - 2026-05-21
 
 ### Changed
