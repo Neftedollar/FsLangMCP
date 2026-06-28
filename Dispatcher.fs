@@ -30,6 +30,10 @@ type FindRequest =
     | ProjectSymbolUses of FcsProjectSymbolUsesArgs
     | References of ReferencesArgs
     | Definition of PositionArgs
+    /// Consolidated multi-project symbol search (issue #128, Stage 1). Routes to the
+    /// FCS union sweep; the FSAC workspace/symbol index is consulted only as the
+    /// matched=false tie-breaker, injected here so the substrate stays LSP-agnostic.
+    | Find of FindArgs
 
 /// Internal request representation for the "check" tool cluster.
 /// check-cluster spans both FCS (fcsBridge) and FSAC (lspBridge); the dispatcher
@@ -40,6 +44,10 @@ type CheckRequest =
     | CheckFile of FcsParseAndCheckArgs
     | ParseAndCheckFile of FcsParseAndCheckArgs
     | ValidateSnippet of FcsValidateSnippetArgs
+    /// Consolidated one-verdict check (issue #128, Stage 1). Routes to the fresh FCS
+    /// re-check substrate; the FSAC cached snapshot is projected in here as the
+    /// speed="fast"-only signal, keeping the FCS substrate LSP-agnostic.
+    | Check of CheckArgs
 
 [<RequireQualifiedAccess>]
 module FindDispatch =
@@ -55,6 +63,23 @@ module FindDispatch =
         | ProjectSymbolUses args -> fcsBridge.ProjectSymbolUses args
         | References args -> lspBridge.References args
         | Definition args -> lspBridge.Definition args
+        | Find args ->
+            // FSAC symbol-index probe: the ONLY consulted signal when the FCS sweep is
+            // empty. Defensive — any FSAC error (not ready, RPC failure) counts as 0,
+            // so matched=false still requires a genuinely empty index.
+            let fsacProbe (q: string) : Task<int> =
+                task {
+                    try
+                        let! response = lspBridge.WorkspaceSymbol { query = q }
+
+                        match response["result"] with
+                        | :? JsonArray as arr -> return arr.Count
+                        | _ -> return 0
+                    with _ ->
+                        return 0
+                }
+
+            fcsBridge.Find(args, fsacProbe = fsacProbe)
 
 [<RequireQualifiedAccess>]
 module CheckDispatch =
@@ -68,3 +93,23 @@ module CheckDispatch =
         | CheckFile args -> fcsBridge.CheckFile args
         | ParseAndCheckFile args -> fcsBridge.ParseAndCheckFile args
         | ValidateSnippet args -> fcsBridge.ValidateSnippet args
+        | Check args ->
+            // speed="fast" reads the cheap cached FSAC snapshot; project it from a
+            // workspace_diagnostics response so the FCS substrate stays LSP-agnostic.
+            // Defensive — any FSAC error (not ready, RPC failure) degrades to `empty`,
+            // which the fast path honestly reports as verdict="unknown".
+            let fsacSnapshot () : Task<CheckFsacSnapshot> =
+                task {
+                    try
+                        let diagArgs: DiagnosticsArgs =
+                            { path = args.path
+                              fileGlob = args.fileGlob
+                              severity = None }
+
+                        let! response = lspBridge.Diagnostics diagArgs
+                        return CheckFsacSnapshot.ofDiagnosticsResponse response
+                    with _ ->
+                        return CheckFsacSnapshot.empty
+                }
+
+            fcsBridge.Check(args, fsacSnapshot = fsacSnapshot)

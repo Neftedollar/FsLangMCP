@@ -5,7 +5,7 @@
 [![Downloads](https://img.shields.io/nuget/dt/FsLangMcp.svg)](https://www.nuget.org/packages/FsLangMcp/)
 [![Target](https://img.shields.io/badge/target-net10.0-blue.svg)](https://dotnet.microsoft.com/)
 
-FsLangMcp is an MCP server for AI coding agents working on F# projects. It combines `fsautocomplete` (LSP-shaped editor semantics) and `FSharp.Compiler.Service` (in-process compiler semantics) into a single stdio process with 32 tools designed for agent workflows. Responses are paginated, errors are returned as structured `invalid_args` envelopes, `fcs_check_file` invalidates stale caches after edits, `fcs_validate_snippet` compiles arbitrary F# against your project's references, and `fcs_record_field_audit` catches the record-construction sites that textual search misses.
+FsLangMcp is an MCP server for AI coding agents working on F# projects. It combines `fsautocomplete` (LSP-shaped editor semantics) and `FSharp.Compiler.Service` (in-process compiler semantics) into a single stdio process designed for agent workflows. Start with **`find`** (one multi-project symbol search) and **`check`** (one trustworthy type-check verdict); the lower-level `textDocument_*` / `workspace_*` / `fcs_*` tools stay available when you need a specific knob. Responses are paginated, errors are returned as structured `invalid_args` envelopes, `fcs_check_file` invalidates stale caches after edits, `fcs_validate_snippet` compiles arbitrary F# against your project's references, and `fcs_record_field_audit` catches the record-construction sites that textual search misses.
 
 See the [Quickstart](#quickstart) for the 60-second on-ramp.
 
@@ -82,6 +82,15 @@ LSP positions (`line`, `character`) are **0-based**.
 
 The `textDocument_*` and `workspace_*` tools are raw LSP/IDE-shaped proxies — useful for exact-position editor operations and FSAC debugging. Prefer the FCS tools and `project_health` for agent-friendly project understanding.
 
+### Primary entry points
+
+Two tools cover the most common agent questions and should be your default. The twelve lower-level "cluster" tools below them are marked _(prefer `find`)_ / _(prefer `check`)_ — reach for them only when you need a specific knob these two don't expose. Full mechanics: [`docs/tools-detailed.md`](docs/tools-detailed.md#find).
+
+| Tool | What it does |
+|------|--------------|
+| `find` | **Recommended for "where is X used?"** Multi-project symbol search — sweeps every member `.fsproj` of the solution and unions definitions, references, record-field set sites, and member-usage sites, recovering cross-project sites the single-project search tools miss. Bare `find(query)` suffices; optional `kind` / `scope` narrow it. Supersedes the seven `find`-cluster tools. |
+| `check` | **Recommended for "did my edit compile?"** One trustworthy `verdict` (`clean` / `errors` / `unknown`) from a FRESH in-process type-check, so it never reports a stale-`{}` false-clean and you don't fall back to `dotnet build`. Bare `check()` suffices; optional `scope` / `path` / `snippet` / `speed`. Supersedes the five `check`-cluster tools. |
+
 ### LSP-proxy tools (FSAC-backed)
 
 All require a prior `set_project`. Tagged `[FSAC]` in tool descriptions.
@@ -89,13 +98,13 @@ All require a prior `set_project`. Tagged `[FSAC]` in tool descriptions.
 | Tool | What it does |
 |------|--------------|
 | `textDocument_completion` | Raw LSP proxy for completion at an exact position. |
-| `textDocument_definition` | Raw LSP proxy for go-to-definition at an exact position. |
-| `textDocument_references` | Raw LSP proxy for find-references at an exact position. For query-based agent workflows prefer `fcs_project_symbol_uses` / `fcs_find_symbol`. |
+| `textDocument_definition` | Raw LSP proxy for go-to-definition at an exact position. _(prefer `find`)_ |
+| `textDocument_references` | Raw LSP proxy for find-references at an exact position. For query-based agent workflows prefer `fcs_project_symbol_uses` / `fcs_find_symbol`. _(prefer `find`)_ |
 | `textDocument_formatting` | Raw LSP formatting proxy via Fantomas. Returns formatted text and edits; does not write to disk. |
 | `textDocument_codeAction` | Raw LSP codeAction proxy at an exact position with empty diagnostic context. Useful for debugging FSAC. |
 | `textDocument_rename` | Raw LSP semantic rename at an exact position. Returns raw `WorkspaceEdit`. |
-| `workspace_symbol` | Quick lookup after `set_project`. IDE-shaped results without source context. |
-| `workspace_diagnostics` | Cached LSP `publishDiagnostics` payload, scoped to one file or to the whole workspace. Optional `path`, `fileGlob`, `severity` filters. |
+| `workspace_symbol` | Quick lookup after `set_project`. IDE-shaped results without source context. _(prefer `find`)_ |
+| `workspace_diagnostics` | Cached LSP `publishDiagnostics` payload, scoped to one file or to the whole workspace. Optional `path`, `fileGlob`, `severity` filters. _(prefer `check`)_ |
 | `fsharp_signature_data` | Structured FSAC signature help via `fsharp/signatureData` at an exact call-site position. |
 
 ### FCS in-process tools (compiler semantics)
@@ -103,30 +112,31 @@ All require a prior `set_project`. Tagged `[FSAC]` in tool descriptions.
 Tagged `[FCS in-process]` in tool descriptions. Most accept an optional `projectPath` that falls back to the active `set_project`.
 
 **Which "check this code" tool should I use?**
-- `fcs_parse_and_check_file` — default. Parse + typecheck one file, returns diagnostics. Cached.
+- `check` — **start here.** One trustworthy `verdict` (`clean` / `errors` / `unknown`) from a FRESH in-process type-check; bare `check()` covers the active project. The four tools below are its lower-level building blocks.
+- `fcs_parse_and_check_file` — parse + typecheck one file, returns diagnostics. Cached.
 - `fcs_check_file` — same as above, but invalidates the project's cached options + results first. Use when `workspace_diagnostics` looks stale right after an Edit/Write.
 - `fsharp_compile` — full project `ParseAndCheckProject`. Slowest but most thorough for project-wide validation. For absolute ground-truth across project boundaries, `dotnet build` is still authoritative.
 
 | Tool | What it does |
 |------|--------------|
-| `fcs_parse_and_check_file` | Parse + typecheck one file. Pass `text` for unsaved content. |
-| `fcs_check_file` | Cache-invalidating parse + typecheck for one file. Surgically drops cached project-options + project-results entries for THIS project and calls `InvalidateConfiguration` before re-running. Use when `workspace_diagnostics` looks stale right after an `Edit` / `Write`. |
+| `fcs_parse_and_check_file` | Parse + typecheck one file. Pass `text` for unsaved content. _(prefer `check`)_ |
+| `fcs_check_file` | Cache-invalidating parse + typecheck for one file. Surgically drops cached project-options + project-results entries for THIS project and calls `InvalidateConfiguration` before re-running. Use when `workspace_diagnostics` looks stale right after an `Edit` / `Write`. _(prefer `check`)_ |
 | `fcs_file_symbols` | Raw FCS symbol extraction for one file. `includeAllUses` adds locals / parameters / usages. Prefer `fcs_file_outline` for normal navigation. |
 | `fcs_file_outline` | Compact per-file outline filtered to definitions: name, kind, range, signature/type, accessibility, declaration range. |
 | `fcs_project_outline` | Compact project-wide outline over filtered compile files. Use `maxFiles` / `maxResultsPerFile` on large projects. |
-| `fcs_project_symbol_uses` | Project-wide symbol-use search by symbol name / full name. Cached by resolved project options. |
-| `fcs_find_symbol` | Project-wide search with grouped definitions / references and source line context. Better than chaining `workspace_symbol` + `fcs_project_symbol_uses` + shell line reads. Misses record-field-set construction sites — for those, use `fcs_record_field_audit`. |
-| `fcs_find_member_usages` | Find all usage sites of a specific `(typeName, memberName)`. FCS-resolved so dotted access, pipeline application, and overload resolution are handled correctly (unlike a textual `rg`). |
-| `fcs_record_field_audit` | Find every construction site for a `(typeName, fieldName)` pair — both `{ Field = expr; ... }` literal form and `{ x with Field = expr }` update form. Closes the gap where `fcs_find_symbol` / `textDocument_references` look up the type name and miss field-set uses. |
+| `fcs_project_symbol_uses` | Project-wide symbol-use search by symbol name / full name. Cached by resolved project options. _(prefer `find`)_ |
+| `fcs_find_symbol` | Project-wide search with grouped definitions / references and source line context. Better than chaining `workspace_symbol` + `fcs_project_symbol_uses` + shell line reads. Misses record-field-set construction sites — for those, use `fcs_record_field_audit`. _(prefer `find`)_ |
+| `fcs_find_member_usages` | Find all usage sites of a specific `(typeName, memberName)`. FCS-resolved so dotted access, pipeline application, and overload resolution are handled correctly (unlike a textual `rg`). _(prefer `find`)_ |
+| `fcs_record_field_audit` | Find every construction site for a `(typeName, fieldName)` pair — both `{ Field = expr; ... }` literal form and `{ x with Field = expr }` update form. Closes the gap where `fcs_find_symbol` / `textDocument_references` look up the type name and miss field-set uses. _(prefer `find`)_ |
 | `fcs_symbol_at_word` | Tolerant FCS symbol lookup by line + word + occurrence. Prefer over exact-position hover/type queries. |
 | `fcs_type_at_position` | Low-level exact-position FCS type/symbol query. Requires `set_project` (or explicit `projectPath` / `projectOptions`). Pass `fuzzy=true` to snap to nearest symbol within ±2 lines / ±5 cols. |
 | `fcs_signature_help` | Exact-position FCS signature help around a call site. |
 | `fcs_make_internal_visible` | Drops the `private` keyword from a `let` / `module` / `type` / `member` / `val` / `new` / `static` / `abstract` / `override` declaration at a given position. Returns a workspace edit; does NOT write the file. |
-| `fcs_validate_snippet` | Compile an arbitrary F# snippet (`.fs` or `.fsi` mode) against the loaded project's references without modifying the project on disk. |
+| `fcs_validate_snippet` | Compile an arbitrary F# snippet (`.fs` or `.fsi` mode) against the loaded project's references without modifying the project on disk. _(prefer `check`)_ |
 | `fcs_referenced_symbols` | Search across the project's *referenced* assemblies (NuGet + framework) for types whose `DisplayName` / `FullName` contains the query (case-insensitive). Reports assembly, kind, accessibility, `isObsolete`. |
 | `fcs_nuget_types` | Enumerate types exported by one referenced assembly, matched by **exact** `SimpleName` (case-insensitive). Does NOT silently fall back to a less-specific assembly. To discover assembly names, use `fcs_referenced_symbols` first. |
 | `fcs_get_project_options` | Get `OtherOptions` for a `.fsproj` via `proj-info`; use the result as `projectOptions` in other FCS tools. |
-| `fsharp_compile` | FCS project validation. Loads `.fsproj` options through `Ionide.ProjInfo`, then runs `FSharpChecker.ParseAndCheckProject`. Does not run `dotnet build`, emit assemblies, or run tests. |
+| `fsharp_compile` | FCS project validation. Loads `.fsproj` options through `Ionide.ProjInfo`, then runs `FSharpChecker.ParseAndCheckProject`. Does not run `dotnet build`, emit assemblies, or run tests. _(prefer `check`)_ |
 | `fsharp_project_inspect` | Read-only `.fsproj` inspection: compile order, references, source summary, and signature/implementation pairing. |
 
 ### Meta / workflow tools
@@ -270,6 +280,8 @@ Then ask for a health report:
 
 Typical next calls:
 
+- `find` with a `query` when you need every use of a symbol across the whole solution (the default "where is X used?" call).
+- `check` for a single `clean` / `errors` / `unknown` verdict after an edit (the default "did it compile?" call).
 - `fcs_parse_and_check_file` with `projectPath` for one file.
 - `fcs_file_outline` for a compact map of a file.
 - `fcs_find_symbol` when you need definitions/references plus source context.
