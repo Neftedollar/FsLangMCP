@@ -288,6 +288,18 @@ type internal FcsBridge() =
               "endColumn", jint r.EndColumn ]
         :> JsonNode
 
+    // Range WITHOUT the `file` field, for sites whose enclosing object already
+    // carries `file` (find sites, symbol-uses, record-field audit, diagnostics) —
+    // dropping the duplicate trims payload on hot symbols. Standalone ranges that
+    // are the sole carrier of the path (declaration locations) keep rangeToJson. (#139)
+    let rangeToJsonNoFile (r: range) : JsonNode =
+        jobj
+            [ "startLine", jint r.StartLine
+              "startColumn", jint r.StartColumn
+              "endLine", jint r.EndLine
+              "endColumn", jint r.EndColumn ]
+        :> JsonNode
+
     let positionToJson (p: Position) : JsonNode =
         jobj [ "line", jint p.Line; "column", jint p.Column ] :> JsonNode
 
@@ -303,7 +315,7 @@ type internal FcsBridge() =
               "errorNumber", jint d.ErrorNumber
               "errorNumberText", jstr d.ErrorNumberText
               "subcategory", jstr d.Subcategory
-              "range", rangeToJson d.Range
+              "range", rangeToJsonNoFile d.Range
               "start", positionToJson d.Start
               "end", positionToJson d.End ]
         :> JsonNode
@@ -338,7 +350,7 @@ type internal FcsBridge() =
     let symbolUseToJson (symbolUse: FSharpSymbolUse) : JsonNode =
         jobj
             [ "file", jstr (normalizePath symbolUse.FileName)
-              "range", rangeToJson symbolUse.Range
+              "range", rangeToJsonNoFile symbolUse.Range
               "isFromDefinition", jbool symbolUse.IsFromDefinition
               "isFromUse", jbool symbolUse.IsFromUse
               "isFromPattern", jbool symbolUse.IsFromPattern
@@ -2046,7 +2058,7 @@ type internal FcsBridge() =
 
                 jobj
                     [ "file", jstr (normalizePath symbolUse.FileName)
-                      "range", rangeToJson r
+                      "range", rangeToJsonNoFile r
                       "form", jstr form
                       "context", context ]
                 :> JsonNode
@@ -2125,7 +2137,7 @@ type internal FcsBridge() =
 
                 jobj
                     [ "file", jstr (normalizePath symbolUse.FileName)
-                      "range", rangeToJson r
+                      "range", rangeToJsonNoFile r
                       "isDefinition", jbool symbolUse.IsFromDefinition
                       "isReference", jbool symbolUse.IsFromUse
                       "lineText", context["lineText"].DeepClone()
@@ -2830,8 +2842,7 @@ type internal FcsBridge() =
 
                 let rangeNode =
                     jobj
-                        [ "file", jstr s.File
-                          "startLine", jint s.StartLine
+                        [ "startLine", jint s.StartLine
                           "startColumn", jint s.StartCol
                           "endLine", jint s.EndLine
                           "endColumn", jint s.EndCol ]

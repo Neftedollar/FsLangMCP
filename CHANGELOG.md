@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Dropped the redundant `file` from nested `range` objects in site-list responses** — `find`, `fcs_project_symbol_uses`, `fcs_find_member_usages`, `fcs_record_field_audit`, and diagnostics each already carry a top-level `file`, so `range.file` duplicated it (a hot `find` = 75 sites × one redundant absolute path each). Added `rangeToJsonNoFile` and applied it **only** where the enclosing object already has `file`. **Standalone ranges that are the sole carrier of the path — declaration locations (`declarationLocation`, `declarationRange`) and the symbol-at-position map — keep `file` unchanged.** Response-shape trim only (consumers read the parent `file`); ships in 0.12.0. (#139)
+
 ## [0.11.0] - 2026-06-28
 
 ### Removed
