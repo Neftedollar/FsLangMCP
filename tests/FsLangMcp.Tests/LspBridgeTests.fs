@@ -562,3 +562,39 @@ let ``mostRecentAnalyzedAt with fileGlob matching zero files is null`` () =
     let analyzedAtByUri = JsonObject()
     let result = diagnosticsResponseForWorkspace true 0 root mostRecent analyzedAtByUri
     Assert.Null(result["mostRecentAnalyzedAt"])
+
+// ─── set_project arg validation (#100) ───────────────────────────────────────
+
+[<Fact>]
+let ``SetProject with null projectPath returns invalid_args naming projectPath`` () : System.Threading.Tasks.Task =
+    task {
+        // A wrong/missing JSON key deserializes projectPath to null. The guard must
+        // return the standard invalid_args envelope naming the public field, not let
+        // Path.GetFullPath(null) throw ArgumentNullException naming the internal 'path'.
+        use bridge = new FsAutoCompleteBridge()
+
+        let! result =
+            bridge.SetProject(
+                { projectPath = null
+                  workspacePath = None
+                  restartLsp = Some false }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("projectPath", result["message"].GetValue<string>())
+    }
+
+[<Fact>]
+let ``SetProject with blank projectPath returns invalid_args`` () : System.Threading.Tasks.Task =
+    task {
+        use bridge = new FsAutoCompleteBridge()
+
+        let! result =
+            bridge.SetProject(
+                { projectPath = "   "
+                  workspacePath = None
+                  restartLsp = Some false }
+            )
+
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+    }

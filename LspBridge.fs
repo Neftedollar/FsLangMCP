@@ -551,7 +551,14 @@ type internal FsAutoCompleteBridge() =
 
     member this.SetProject(args: SetProjectArgs) : Task<JsonNode> =
         task {
-            let inputPath = Path.GetFullPath(args.projectPath)
+            // Guard before Path.GetFullPath: a wrong/missing key deserializes projectPath to
+            // null, and Path.GetFullPath(null) throws ArgumentNullException naming the internal
+            // 'path' param — misleading callers who passed the wrong key. Surface 'projectPath'.
+            match ArgsValidation.requireNonBlank "projectPath" args.projectPath with
+            | Error envelope -> return envelope
+            | Ok projectPathArg ->
+
+            let inputPath = Path.GetFullPath(projectPathArg)
 
             if not (File.Exists(inputPath) || Directory.Exists(inputPath)) then
                 invalidArg (nameof args.projectPath) $"Path does not exist: %s{inputPath}"
