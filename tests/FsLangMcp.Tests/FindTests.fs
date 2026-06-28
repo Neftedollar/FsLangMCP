@@ -612,6 +612,75 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                         ()
         }
 
+    // ── 0.10.1 Codex P2: cross-project consumer re-keys when DEPENDENCY SOURCE changes ─
+    //
+    // P1 stamped the -r: DLL mtimes, catching dependency REBUILDS. P2 (this test) covers
+    // the complementary scenario: a dependency's SOURCE is edited on disk WITHOUT a rebuild
+    // — the DLL mtime therefore stays the same. FCS's ParseAndCheckProject for a consumer
+    // reads P2P referenced project sources via ReferencedProjects[FSharpReference].SourceFiles
+    // directly, so a fresh consumer check WOULD see the edit. Without the P2 stamp, the
+    // consumer key is unchanged → stale cached result → stale find. With the fix
+    // (referencedProjectSourcesStamp), the dependency source mtime is folded into the
+    // consumer key → consumer MISS → fresh sweep.
+    //
+    // Setup: warm the cache (3 entries), then touch ONLY Domain.fs mtime forward (simulating
+    // a developer edit) WITHOUT touching any consumer source AND WITHOUT rebuilding any DLL.
+    // - OLD key (P2 bug present): only Domain's own sourceFilesStamp changes → Domain re-keys
+    //   → count goes from 3 to 4 (one new entry); consumer entries stay — assertion FAILS.
+    // - New key (P2 fix): Domain re-keys (own source) AND Stubs/App re-key (their
+    //   referencedProjectSourcesStamp includes Domain.fs) → count goes from 3 to 6 (3 new
+    //   entries); assertion PASSES. A count > beforeCacheCount + 1 proves consumers were
+    //   re-keyed, not just Domain's own entry.
+    [<Fact>]
+    member _.``find use-cache invalidates a CONSUMER when a referenced project SOURCE is edited on disk — no stale cross-project results (0.10.1 Codex P2)``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let originalMtime = File.GetLastWriteTimeUtc fx.DomainFs
+
+            try
+                // WARM: one cache entry per swept member project (Domain, Stubs, App).
+                let! before = bridge.Find(findArgs fx.Slnx "TraderRole")
+                Assert.Equal("succeeded", gs before "status")
+                let beforeSites = gi before "totalSites"
+                let beforeCacheCount = bridge.ProjectUsesCacheCount
+                Assert.Equal(gi before "projectsSwept", beforeCacheCount)
+
+                // Simulate a developer edit to Domain.fs: bump its mtime forward WITHOUT
+                // touching any consumer source and WITHOUT rebuilding any DLL. The -r: target
+                // paths (obj/.../ref/Domain.dll) are NOT modified — only the .fs mtime moves.
+                File.SetLastWriteTimeUtc(fx.DomainFs, DateTime.UtcNow.AddSeconds 5.0)
+
+                let! after = bridge.Find(findArgs fx.Slnx "TraderRole")
+                Assert.Equal("succeeded", gs after "status")
+
+                // CORRECTNESS (P2 key): the consumer projects (Stubs, App) each hold Domain.fs
+                // in their referencedProjectSourcesStamp → both re-key on the mtime bump.
+                // Domain itself re-keys via its own sourceFilesStamp. Together that is 3 new
+                // entries (1 Domain + 2 consumers). On the OLD key (no referencedProjectSourcesStamp)
+                // only Domain re-keyed → count = before+1; this assertion would FAIL.
+                Assert.True(
+                    bridge.ProjectUsesCacheCount > beforeCacheCount + 1,
+                    $"a dependency source edit must re-key CONSUMER entries (not just the edited project): before={beforeCacheCount}, after={bridge.ProjectUsesCacheCount} (expected > {beforeCacheCount + 1})"
+                )
+
+                // The Domain source was ONLY mtime-bumped (content unchanged), so results match.
+                Assert.Equal(beforeSites, gi after "totalSites")
+
+                output.WriteLine(
+                    $"0.10.1 P2 dep-source: beforeCache={beforeCacheCount}, afterCache={bridge.ProjectUsesCacheCount}, sites={beforeSites}"
+                )
+            finally
+                // Restore Domain.fs mtime so the edit doesn't bleed into sibling tests.
+                try
+                    File.SetLastWriteTimeUtc(fx.DomainFs, originalMtime)
+                with _ ->
+                    ()
+        }
+
 // ── kind=position FullName disambiguation (Codex P2 #1) ──────────────────────────
 //
 // Two types both named `Config` in DIFFERENT namespaces. kind=position resolves THE

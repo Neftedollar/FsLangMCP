@@ -257,15 +257,14 @@ type internal FcsBridge() =
     // diagnostics. FCS's project cache keeps ParseAndCheckProject warm, but
     // GetAllUsesOfAllSymbols() is NOT memoized — it re-walks every recorded symbol use
     // (~16-18k/project) on EVERY call, so a warm `find` re-paid ~3s/project. The cache
-    // key is (resolved-options key + source-file write-time stamp + referenced-assembly
-    // write-time stamp): any on-disk source edit moves a file's mtime → the stamp changes
-    // → cache MISS; and any rebuild of a referenced project (P2P) or assembly moves THAT
-    // file's mtime → the consumer's stamp changes → cache MISS (0.10.1 Codex P1 fix:
-    // without the referenced-assembly stamp a dependency rebuild left consumers stale).
-    // Either MISS runs the original ParseAndCheckProject + GetAllUsesOfAllSymbols path. A
-    // cached `find` is therefore never staler than an uncached one (a miss is byte-for-byte
-    // the prior behaviour) — correctness comes first, speed is the unchanged-project fast
-    // path.
+    // key is (resolved-options key + own source-file stamp + referenced-assembly stamp +
+    // referenced-project source stamp): any own-source edit moves a file's mtime → MISS;
+    // a dependency REBUILD moves the -r: DLL mtime → consumer MISS (0.10.1 Codex P1); a
+    // dependency SOURCE EDIT without a rebuild doesn't move the DLL but DOES change the
+    // referenced F# project's source file mtimes → consumer MISS via the new
+    // referencedProjectSourcesStamp (0.10.1 Codex P2). Every MISS runs the original
+    // ParseAndCheckProject + GetAllUsesOfAllSymbols path — a cached `find` is never staler
+    // than an uncached one (correctness first, speed is the unchanged-project fast path).
     // Cleared by ClearCaches() (so set_project invalidates it). Sized to the same
     // solution scale as optionsCache so a whole solution stays warm between sweeps.
     let projectUsesCache =
@@ -943,6 +942,50 @@ type internal FcsBridge() =
                 sb.Append(ticks).Append('|') |> ignore
             | None -> ()
 
+        sb.ToString()
+
+    // Source-file write-time vector for the directly AND transitively referenced F# projects
+    // (issue #131; 0.10.1 Codex P2). referencedAssembliesStamp (P1) stamps the -r: DLL
+    // mtimes and catches a REBUILD of a dependency. But an EDIT to a dependency's source
+    // WITHOUT a rebuild doesn't move the DLL mtime — yet FCS's ParseAndCheckProject for a
+    // consumer reads referenced F# project sources directly via ReferencedProjects, so a
+    // fresh consumer check WOULD see the edit. Without this stamp the consumer's key is
+    // unchanged after a dependency source edit → ProjectSweepUses serves the consumer STALE.
+    //
+    // Fix: walk ReferencedProjects for each consumer project. For every FSharpReference case
+    // (an F# P2P project, carrying the referenced project's FSharpProjectOptions), stamp its
+    // SourceFiles the same way sourceFilesStamp does. Recurse transitively (FCS's
+    // ReferencedProjects is NOT pre-flattened — only direct references appear at each level)
+    // using a visited-set keyed on ProjectFileName to avoid re-stamping shared deps and
+    // breaking on any hypothetical cycle. The root project itself is added to visited first
+    // so it's not double-stamped from a transitive back-reference.
+    //
+    // PEReference and ILModuleReference carry no FSharpProjectOptions (they're prebuilt
+    // binaries); those cases fall through to `| _ -> ()` — their mtime is already covered
+    // by referencedAssembliesStamp. Missing/unreadable files map to -1, never throws.
+    let referencedProjectSourcesStamp (projectOptions: FSharpProjectOptions) =
+        let sb = System.Text.StringBuilder()
+        let visited = System.Collections.Generic.HashSet<string>()
+        visited.Add(projectOptions.ProjectFileName) |> ignore
+
+        let rec stampProject (opts: FSharpProjectOptions) =
+            for refProj in opts.ReferencedProjects do
+                match refProj with
+                | FSharpReferencedProject.FSharpReference(_outputFile, refOpts) ->
+                    if visited.Add(refOpts.ProjectFileName) then
+                        for f in refOpts.SourceFiles do
+                            let ticks =
+                                try
+                                    if File.Exists f then File.GetLastWriteTimeUtc(f).Ticks else -1L
+                                with _ ->
+                                    -1L
+
+                            sb.Append(ticks).Append('|') |> ignore
+
+                        stampProject refOpts
+                | _ -> ()
+
+        stampProject projectOptions
         sb.ToString()
 
     let countDiagnosticsBySeverity (diagnostics: FSharpDiagnostic array) =
@@ -2591,17 +2634,18 @@ type internal FcsBridge() =
                     let! options, _ = this.ResolveFsprojOptions(fsproj)
 
                     // issue #131: memoize the whole-symbol-use enumeration per (project,
-                    // source-stamp, referenced-assembly-stamp). A cache HIT on an unchanged
-                    // project skips BOTH ParseAndCheckProject AND the ~3s
-                    // GetAllUsesOfAllSymbols re-walk; a MISS (first sweep, any source edit,
-                    // OR any rebuild of a referenced project/assembly — 0.10.1 Codex P1)
-                    // moves the stamp and runs the identical original path, so results are
-                    // never served stale. The cache-or-compute lives in its own method
-                    // (ProjectSweepUses) so this outer state machine stays statically
-                    // compilable under Release optimization (a nested task CE inside the
-                    // loop trips FS3511).
+                    // source-stamp, referenced-assembly-stamp, referenced-project-sources-
+                    // stamp). A cache HIT on an unchanged project skips BOTH
+                    // ParseAndCheckProject AND the ~3s GetAllUsesOfAllSymbols re-walk; a
+                    // MISS (first sweep, any own-source edit, any rebuild of a referenced
+                    // project/assembly [Codex P1], OR any source edit of a referenced F#
+                    // project without a rebuild [Codex P2]) runs the identical original path,
+                    // so results are never served stale. The cache-or-compute lives in its
+                    // own method (ProjectSweepUses) so this outer state machine stays
+                    // statically compilable under Release optimization (a nested task CE
+                    // inside the loop trips FS3511).
                     let usesKey =
-                        $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}"
+                        $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}|{referencedProjectSourcesStamp options}"
                     let! allUses, projDiagnostics = this.ProjectSweepUses(usesKey, options)
                     aggregatedDiagnostics.AddRange(projDiagnostics)
 
