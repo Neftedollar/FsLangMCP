@@ -31,6 +31,10 @@ OVERLAP_PAIRS: list[tuple[str, str]] = [
     ("fcs_referenced_symbols", "fcs_nuget_types"),
     ("fcs_nuget_types", "fcs_nuget_members"),
     ("fcs_signature_help", "fsharp_signature_data"),
+    ("fcs_explain_diagnostic", "check"),
+    ("fcs_tests_for_symbol", "find"),
+    ("fcs_rename_preview", "textDocument_rename"),
+    ("fcs_diagnostic_fixes", "textDocument_codeAction"),
 ]
 
 PREFER_PATTERNS = re.compile(

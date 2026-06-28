@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-06-29
+
+### Added
+
+- **`fcs_explain_diagnostic` (#61)** — explain an F# compiler diagnostic in plain language with repair context (title, explanation, likelyCauses, repairHints, relatedTools). Pass an FS code / errorNumber or a file position to auto-fetch via FCS; curated map of ~24 common diagnostics; enriches hints from the raw message. Pairs with `check`.
+- **`fcs_tests_for_symbol` (#60)** — list the tests that likely cover a symbol: sweeps the solution's test projects (`<IsTestProject>` / xunit·nunit·expecto refs), filters FCS symbol-uses to test files, and tags each site with its enclosing test. Complements `find` (the test-coverage slice).
+- **`fcs_rename_preview` (#64)** — preview a semantic rename's full impact (edits grouped by file with original + post-rename lines, `totalEdits`, `fileCount`, `crossProject`) **without applying it**. Non-destructive; inspect blast radius before `textDocument_rename`.
+- **`fcs_diagnostic_fixes` (#53)** — agent-friendly diagnostics→fixes for a file: fetches the file's diagnostics and requests code-actions **with the real diagnostic context** that raw `textDocument_codeAction` leaves empty, grouped per diagnostic.
+
+### Fixed
+
+- **FSAC `initialize` handshake now declares `codeActionLiteralSupport` / `publishDiagnostics` / `synchronization` client capabilities** — without them FSAC returned null code-actions and pushed zero diagnostics, which also silently degraded the existing `textDocument_codeAction` and `workspace_diagnostics` tools. (#53)
+
 ### Changed
 
 - **Dropped the redundant `file` from nested `range` objects in site-list responses** — `find`, `fcs_project_symbol_uses`, `fcs_find_member_usages`, `fcs_record_field_audit`, and diagnostics each already carry a top-level `file`, so `range.file` duplicated it (a hot `find` = 75 sites × one redundant absolute path each). Added `rangeToJsonNoFile` and applied it **only** where the enclosing object already has `file`. **Standalone ranges that are the sole carrier of the path — declaration locations (`declarationLocation`, `declarationRange`) and the symbol-at-position map — keep `file` unchanged.** Response-shape trim only (consumers read the parent `file`); ships in 0.12.0. (#139)
