@@ -630,6 +630,18 @@ let main argv =
                     |> unwrapResult
                 )
 
+                tool (
+                    TypedTool.define<FcsReviewScanArgs>
+                        "fcs_review_scan"
+                        "Scan F# source for review CANDIDATES from the untyped AST — interesting spots to eyeball, not a linter and never bugs. Categories: match_wildcard, try_with, raise_or_failwith, mutable_binding, blocking_call, cast_or_box, reflection, large_function. Pass `path` (one file) or `projectPath` (whole project; falls back to set_project), narrow with `categories`, cap with `maxResults`. Parse-only, writes nothing; candidates carry range, lineText and a neutral note, plus counts.byCategory."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.ReviewScan args)))
+                    |> unwrapResult
+                )
+
                 useStdio
             }
 

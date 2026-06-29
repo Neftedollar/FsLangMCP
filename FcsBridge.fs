@@ -631,6 +631,208 @@ let internal renderExplanation
                   "message", messageNode ]
             :> JsonNode
 
+// ─── ReviewScanner ──────────────────────────────────────────────────────────────
+// AST-based review-candidate inventory backing fcs_review_scan. Walks the FCS untyped
+// parse tree with ParsedInput.fold (FCS 43.12+, the same full-tree accumulator used by
+// FieldFormClassifier) and tags structurally interesting sites — review CANDIDATES, never
+// "bugs". Each tag carries a category, the site range, and a short neutral note. Parse-only:
+// no type-checking, no project resolution, no IO beyond the source already in hand.
+
+module private ReviewScanner =
+
+    /// A single review candidate: a category, the source range, and a neutral note.
+    [<NoComparison; NoEquality>]
+    type Candidate =
+        { Category: string
+          Range: range
+          Note: string }
+
+    // Category names — these are exactly the values accepted by the `categories` filter.
+    [<Literal>]
+    let MatchWildcard = "match_wildcard"
+
+    [<Literal>]
+    let TryWith = "try_with"
+
+    [<Literal>]
+    let RaiseOrFailwith = "raise_or_failwith"
+
+    [<Literal>]
+    let MutableBinding = "mutable_binding"
+
+    [<Literal>]
+    let BlockingCall = "blocking_call"
+
+    [<Literal>]
+    let CastOrBox = "cast_or_box"
+
+    [<Literal>]
+    let Reflection = "reflection"
+
+    [<Literal>]
+    let LargeFunction = "large_function"
+
+    /// Bindings whose RHS spans more than this many source lines are flagged.
+    [<Literal>]
+    let LargeFunctionLineThreshold = 60
+
+    /// Every category this scanner can emit, in a stable display order.
+    let allCategories =
+        [ MatchWildcard
+          TryWith
+          RaiseOrFailwith
+          MutableBinding
+          BlockingCall
+          CastOrBox
+          Reflection
+          LargeFunction ]
+
+    let private allCategorySet = Set.ofList allCategories
+
+    /// Is this a category this scanner knows how to emit?
+    let isKnownCategory (category: string) = allCategorySet.Contains category
+
+    /// Functions/operators that raise instead of returning a Result.
+    let private raiseNames =
+        set [ "failwith"; "failwithf"; "raise"; "reraise"; "invalidArg"; "invalidOp"; "nullArg" ]
+
+    /// Member names whose access typically blocks an async path.
+    let private blockingMembers = set [ "Result"; "Wait"; "GetResult" ]
+
+    /// Reflection entry points reached through a `.` member access.
+    let private reflectionMembers =
+        set
+            [ "GetType"
+              "GetProperty"
+              "GetProperties"
+              "GetMethod"
+              "GetMethods"
+              "GetField"
+              "GetFields"
+              "GetMember"
+              "GetMembers"
+              "InvokeMember"
+              "GetCustomAttributes"
+              "GetCustomAttribute"
+              "MakeGenericType"
+              "GetConstructor"
+              "GetConstructors" ]
+
+    /// Identifiers that box/unbox.
+    let private boxNames = set [ "box"; "unbox" ]
+
+    /// Identifiers that reflect over a type.
+    let private reflectionIdents = set [ "typeof"; "typedefof" ]
+
+    /// Last identifier segment of a long identifier (e.g. `task.Result` → "Result").
+    let private lastIdent (lid: SynLongIdent) : string option =
+        lid.LongIdent |> List.tryLast |> Option.map (fun ident -> ident.idText)
+
+    /// True when the pattern is a bare `_` wildcard, looking through parentheses, type
+    /// annotations, and attributes but NOT through `as`/`|` (which bind or branch and so
+    /// are not a plain catch-all).
+    let rec private isWildcardPat (pat: SynPat) : bool =
+        match pat with
+        | SynPat.Wild _ -> true
+        | SynPat.Paren(inner, _) -> isWildcardPat inner
+        | SynPat.Typed(inner, _, _) -> isWildcardPat inner
+        | SynPat.Attrib(inner, _, _) -> isWildcardPat inner
+        | _ -> false
+
+    /// Ranges of the bare-wildcard clauses among a match/function clause list.
+    let private wildcardClauseRanges (clauses: SynMatchClause list) : range list =
+        clauses
+        |> List.choose (fun (SynMatchClause(pat, _, _, _, _, _)) ->
+            if isWildcardPat pat then Some pat.Range else None)
+
+    /// Walk one parsed input, accumulating candidates whose category is in `wanted`.
+    let scan (wanted: Set<string>) (input: ParsedInput) : Candidate list =
+        let acc = ResizeArray<Candidate>()
+
+        let add (category: string) (range: range) (note: string) =
+            if wanted.Contains category then
+                acc.Add { Category = category; Range = range; Note = note }
+
+        let scanExpr (expr: SynExpr) =
+            match expr with
+            | SynExpr.TryWith(_, _, range, _, _, _) ->
+                add TryWith range "try/with handler — confirm it surfaces (or deliberately swallows) the error"
+            | SynExpr.Match(_, _, clauses, _, _)
+            | SynExpr.MatchBang(_, _, clauses, _, _) ->
+                for r in wildcardClauseRanges clauses do
+                    add MatchWildcard r "wildcard `_` branch — confirm the collapsed cases are intentional"
+            | SynExpr.MatchLambda(_, _, clauses, _, _) ->
+                for r in wildcardClauseRanges clauses do
+                    add MatchWildcard r "wildcard `_` branch — confirm the collapsed cases are intentional"
+            | SynExpr.Ident ident ->
+                let name = ident.idText
+
+                if raiseNames.Contains name then
+                    add
+                        RaiseOrFailwith
+                        ident.idRange
+                        "raises instead of returning Result — fine for invariants, reconsider for business errors"
+                elif boxNames.Contains name then
+                    add CastOrBox ident.idRange "box/unbox — confirm the runtime type round-trips"
+                elif reflectionIdents.Contains name then
+                    add Reflection ident.idRange "typeof/typedefof — reflection can resist AOT/trimming"
+            | SynExpr.LongIdent(_, lid, _, range) ->
+                // A dotted value access like `task.Result` or `o.GetType` parses as a
+                // LongIdent (not DotGet) when the receiver is a simple identifier, so the
+                // member-access categories are matched here on the trailing segment too.
+                match lastIdent lid with
+                | Some name when raiseNames.Contains name ->
+                    add
+                        RaiseOrFailwith
+                        range
+                        "raises instead of returning Result — fine for invariants, reconsider for business errors"
+                | Some name when blockingMembers.Contains name ->
+                    add
+                        BlockingCall
+                        range
+                        "blocking call (.Result/.Wait/.GetResult) — confirm it isn't blocking an async path"
+                | Some name when reflectionMembers.Contains name ->
+                    add Reflection range "reflection member access — reflection can resist AOT/trimming"
+                | _ -> ()
+            | SynExpr.DotGet(_, _, lid, range) ->
+                match lastIdent lid with
+                | Some name when blockingMembers.Contains name ->
+                    add
+                        BlockingCall
+                        range
+                        "blocking call (.Result/.Wait/.GetResult) — confirm it isn't blocking an async path"
+                | Some name when reflectionMembers.Contains name ->
+                    add Reflection range "reflection member access — reflection can resist AOT/trimming"
+                | _ -> ()
+            | SynExpr.Downcast(_, _, range) -> add CastOrBox range ":?> downcast — confirm the cast holds at runtime"
+            | SynExpr.InferredDowncast(_, range) -> add CastOrBox range "downcast — confirm the cast holds at runtime"
+            | _ -> ()
+
+        let scanBinding (binding: SynBinding) =
+            let (SynBinding(_, _, _, isMutable, _, _, _, headPat, _, _, _, _, _)) = binding
+
+            if isMutable then
+                add MutableBinding headPat.Range "mutable binding — confirm the mutation stays local and is necessary"
+
+            let rhs = binding.RangeOfBindingWithRhs
+            let span = rhs.EndLine - rhs.StartLine + 1
+
+            if span > LargeFunctionLineThreshold then
+                add LargeFunction headPat.Range $"large binding (~{span} lines) — consider decomposing for readability"
+
+        (acc, input)
+        ||> ParsedInput.fold (fun acc _path node ->
+            match node with
+            | SyntaxNode.SynExpr expr -> scanExpr expr
+            | SyntaxNode.SynBinding binding -> scanBinding binding
+            | _ -> ()
+
+            acc)
+        |> ignore
+
+        List.ofSeq acc
+
+
 // ─── FcsBridge ─────────────────────────────────────────────────────────────────
 
 type internal FcsBridge() =
@@ -6942,4 +7144,167 @@ type internal FcsBridge() =
             let verifyProp = [ "verify", JsonArray(verify.ToArray() |> Array.map jstr) :> JsonNode ]
 
             return jobj (baseProps @ optionalProps @ verifyProp) :> JsonNode
+        }
+
+    /// fcs_review_scan — read-only, AST-based review-candidate inventory. Parses each
+    /// target file (parse-only, no type-check) and emits structurally interesting sites
+    /// for a human/agent to eyeball: review CANDIDATES, never asserted bugs. Writes nothing.
+    member this.ReviewScan(args: FcsReviewScanArgs) : Task<JsonNode> =
+        task {
+            // ── Resolve the wanted-category set (None / [] ⇒ every category) ─────
+            let wantedResult =
+                match args.categories with
+                | None
+                | Some [] -> Ok(Set.ofList ReviewScanner.allCategories)
+                | Some requested ->
+                    let normalized =
+                        requested
+                        |> List.choose (fun c -> if String.IsNullOrWhiteSpace c then None else Some(c.Trim()))
+
+                    let unknown = normalized |> List.filter (ReviewScanner.isKnownCategory >> not)
+
+                    if not unknown.IsEmpty then
+                        let unknownList = String.concat ", " unknown
+                        let validList = String.concat ", " ReviewScanner.allCategories
+                        Error $"Unknown categories: %s{unknownList}. Valid categories: %s{validList}."
+                    else
+                        Ok(Set.ofList normalized)
+
+            match wantedResult with
+            | Error message -> return jobj [ "status", jstr "invalid_args"; "message", jstr message ] :> JsonNode
+            | Ok wanted ->
+
+            let maxResults = args.maxResults |> Option.defaultValue 200 |> max 1 |> min 1000
+
+            // ── Decide the file set: single file (path) vs whole project (projectPath) ─
+            let pathArg = args.path |> Option.filter (String.IsNullOrWhiteSpace >> not)
+            let projectArg = args.projectPath |> Option.filter (String.IsNullOrWhiteSpace >> not)
+
+            let filesResult: Result<string * string list, JsonNode> =
+                match pathArg with
+                | Some path ->
+                    match validateSourcePath "fcs_review_scan" None path with
+                    | Some err -> Error err
+                    | None -> Ok("file", [ normalizePath path ])
+                | None ->
+                    match projectArg with
+                    | None ->
+                        Error(
+                            jobj
+                                [ "status", jstr "invalid_args"
+                                  "message",
+                                  jstr
+                                      "fcs_review_scan needs a target: pass `path` (one file) or `projectPath` (a .fsproj), or call set_project first." ]
+                            :> JsonNode
+                        )
+                    | Some projectPath ->
+                        let fullProject = normalizePath projectPath
+
+                        if not (File.Exists fullProject) then
+                            Error(
+                                jobj
+                                    [ "status", jstr "invalid_args"
+                                      "message", jstr $"fcs_review_scan: project file does not exist: %s{fullProject}" ]
+                                :> JsonNode
+                            )
+                        else
+                            match tryReadProject fullProject with
+                            | Error reason ->
+                                Error(
+                                    jobj
+                                        [ "status", jstr "error"
+                                          "message", jstr $"fcs_review_scan: project file cannot be read: %s{reason}" ]
+                                    :> JsonNode
+                                )
+                            | Ok doc ->
+                                let workspaceRoot = Path.GetDirectoryName fullProject
+
+                                let included =
+                                    filterProjectFiles workspaceRoot (defaultFilterOptions Review) (compileFiles fullProject doc)
+                                    |> fun result ->
+                                        result.Included
+                                        |> List.map (fun f -> f.Path)
+                                        |> List.filter File.Exists
+                                        |> List.distinct
+                                        |> List.sort
+
+                                Ok("project", included)
+
+            match filesResult with
+            | Error err -> return err
+            | Ok(mode, files) ->
+
+            // ── Parse each file (parse-only) and collect candidates ──────────────
+            let scanned = ResizeArray<string>()
+            let parseErrors = ResizeArray<JsonNode>()
+            // (category, file, sortLine, sortColumn, node) — node pre-built, the rest for ordering + counting.
+            let collected = ResizeArray<string * string * int * int * JsonNode>()
+
+            for file in files do
+                try
+                    let source = File.ReadAllText file
+                    let sourceText = SourceText.ofString source
+
+                    let parsingOptions =
+                        { FSharpParsingOptions.Default with
+                            SourceFiles = [| file |] }
+
+                    let! parseResults = checker.ParseFile(file, sourceText, parsingOptions) |> asTask
+                    scanned.Add file
+
+                    let lines = source.Replace("\r\n", "\n").Split('\n')
+
+                    let lineTextAt (oneBasedLine: int) =
+                        if oneBasedLine >= 1 && oneBasedLine <= lines.Length then
+                            let raw = lines[oneBasedLine - 1].Trim()
+                            if raw.Length > 200 then raw.Substring(0, 200) + "..." else raw
+                        else
+                            ""
+
+                    for candidate in ReviewScanner.scan wanted parseResults.ParseTree do
+                        let r = candidate.Range
+
+                        let node =
+                            jobj
+                                [ "category", jstr candidate.Category
+                                  "file", jstr file
+                                  "range", rangeToJsonNoFile r
+                                  "lineText", jstr (lineTextAt r.StartLine)
+                                  "note", jstr candidate.Note ]
+                            :> JsonNode
+
+                        collected.Add(candidate.Category, file, r.StartLine, r.StartColumn, node)
+                with ex ->
+                    parseErrors.Add(jobj [ "file", jstr file; "message", jstr ex.Message ] :> JsonNode)
+
+            // ── Order, count over the FULL set, then cap to maxResults ───────────
+            let ordered =
+                collected |> Seq.sortBy (fun (_, file, line, col, _) -> file, line, col) |> Seq.toList
+
+            let byCategory =
+                ordered
+                |> List.countBy (fun (category, _, _, _, _) -> category)
+                |> List.sortBy fst
+                |> List.map (fun (category, n) -> category, jint n)
+                |> jobj
+
+            let total = ordered.Length
+
+            let pageNodes =
+                ordered |> List.truncate maxResults |> List.map (fun (_, _, _, _, node) -> node)
+
+            let countsNode =
+                jobj [ "total", jint total; "returned", jint pageNodes.Length; "byCategory", byCategory ]
+                :> JsonNode
+
+            return
+                jobj
+                    [ "status", jstr "succeeded"
+                      "mode", jstr mode
+                      "scanned", JsonArray(scanned.ToArray() |> Array.map jstr) :> JsonNode
+                      "candidates", JsonArray(pageNodes |> List.toArray) :> JsonNode
+                      "counts", countsNode
+                      "truncated", jbool (total > pageNodes.Length)
+                      "parseErrors", JsonArray(parseErrors.ToArray()) :> JsonNode ]
+                :> JsonNode
         }

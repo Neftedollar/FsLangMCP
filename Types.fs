@@ -431,6 +431,23 @@ type FcsRefactorImpactArgs =
       /// .fsproj / .sln / .slnx to sweep. Falls back to the active set_project.
       projectPath: string option }
 
+/// Arguments for fcs_review_scan — a read-only, AST-based review inventory. Surfaces
+/// structurally interesting spots (review CANDIDATES, not bugs) for an agent/human to
+/// eyeball during F# review. Parse-only; writes nothing.
+type FcsReviewScanArgs =
+    { /// Single F# source file to scan. Use this OR projectPath; when both are set, path wins.
+      path: string option
+      /// .fsproj whose compiled files to scan. Falls back to the active set_project when
+      /// both path and projectPath are omitted.
+      projectPath: string option
+      /// Restrict to these categories (e.g. ["try_with"; "mutable_binding"]). Omit for all.
+      /// Known: match_wildcard, try_with, raise_or_failwith, mutable_binding, blocking_call,
+      /// cast_or_box, reflection, large_function.
+      categories: string list option
+      /// Maximum candidates returned. Default 200, hard ceiling 1000. counts.byCategory
+      /// still reports true totals across every scanned file even when the list is capped.
+      maxResults: int option }
+
 type FcsNugetTypesArgs =
     { /// Package id (matched against referenced assembly SimpleName, case-insensitive).
       /// Example: "Spectre.Console", "Newtonsoft.Json", "System.Text.Json".
