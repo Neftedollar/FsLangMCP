@@ -39,6 +39,7 @@
     <Compile Include="ReviewScanTests.fs" />
     <Compile Include="DeadCodeTests.fs" />
     <Compile Include="CreateFilePlanTests.fs" />
+    <Compile Include="AnalyzerDiagnosticsTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

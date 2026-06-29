@@ -27,6 +27,7 @@
     <Compile Include="Cursor.fs" />
     <Compile Include="ProjectInspection.fs" />
     <Compile Include="ProjectHealth.fs" />
+    <Compile Include="AnalyzerDiagnostics.fs" />
     <Compile Include="LspBridge.fs" />
     <Compile Include="FcsBridge.fs" />
     <Compile Include="Tools.fs" />

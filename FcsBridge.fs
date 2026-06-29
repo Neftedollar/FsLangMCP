@@ -8273,3 +8273,79 @@ type internal FcsBridge() =
                       "caveats", JsonArray(caveats |> List.map jstr |> List.toArray) :> JsonNode ]
                 :> JsonNode
         }
+
+    // ── fcs_analyzer_diagnostics (#72): report F# ANALYZER diagnostics, grouped ───────────
+    // F# analyzers are NOT run by FCS — they run via the fsharp-analyzers CLI / Analyzers.SDK.
+    // This member detects the analyzer configuration exactly as project_health does
+    // (ProjectHealth.detectAnalyzerConfig), then — when a runner is available — invokes the
+    // CLI and parses its SARIF into a grouped, agent-friendly shape. When no runner is
+    // available it does NOT fake diagnostics: it reports the configured analyzer packages
+    // truthfully plus a clear note. Read-only; writes nothing. The SARIF parser + grouping
+    // (AnalyzerDiagnostics module) carry the tested logic; the live run is environment-gated.
+    // Fully synchronous (no FCS await): project-XML detection plus an optional, env-gated
+    // CLI run. Returned via Task.FromResult like the other synchronous tools
+    // (fsharp_project_inspect / fsharp_runtime_status) — a `task {}` with no `let!`/`do!`
+    // would not statically compile to a resumable state machine (FS3511 under Release).
+    member _.AnalyzerDiagnostics(args: FcsAnalyzerDiagnosticsArgs) : Task<JsonNode> =
+        let invalidArgs (message: string) : JsonNode =
+            jobj [ "status", jstr "invalid_args"; "message", jstr message ] :> JsonNode
+
+        let result: JsonNode =
+            match
+                args.projectPath
+                |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.map normalizePath
+            with
+            | None ->
+                invalidArgs
+                    "fcs_analyzer_diagnostics needs a project context: pass projectPath (.fsproj/.sln/.slnx) or call set_project first."
+            | Some target ->
+                let projects = SolutionParsing.listProjects target
+
+                if projects.Length = 0 then
+                    invalidArgs $"fcs_analyzer_diagnostics could not resolve any .fsproj from: {target}"
+                else
+                    // Detect analyzer config across every resolved project; union the packages.
+                    let configs =
+                        projects
+                        |> Array.choose (fun p ->
+                            match ProjectHealth.detectAnalyzerConfig p with
+                            | Ok cfg -> Some(p, cfg)
+                            | Error _ -> None)
+
+                    let configured = configs |> Array.exists (fun (_, c) -> c.Configured)
+
+                    let packagesJson =
+                        configs
+                        |> Array.collect (fun (_, c) -> c.Packages |> List.toArray)
+                        |> Array.distinctBy (fun p -> p.PackageId)
+                        |> Array.map ProjectHealth.analyzerPackageInfoToJson
+
+                    if not configured then
+                        AnalyzerDiagnostics.noAnalyzersResponse ()
+                    else
+                        match AnalyzerDiagnostics.detectRunner () with
+                        | None -> AnalyzerDiagnostics.configuredNotRunResponse packagesJson
+                        | Some command ->
+                            // Run the CLI per configured project and merge the SARIF diagnostics.
+                            let collected = ResizeArray<AnalyzerDiagnostics.AnalyzerDiagnostic>()
+                            let runErrors = ResizeArray<string>()
+
+                            for projectPath, _ in configs do
+                                match AnalyzerDiagnostics.runAnalyzers command projectPath with
+                                | Ok sarif -> collected.AddRange(AnalyzerDiagnostics.parseSarif sarif)
+                                | Error e -> runErrors.Add e
+
+                            if collected.Count = 0 && runErrors.Count > 0 then
+                                AnalyzerDiagnostics.runFailedResponse packagesJson (String.concat "; " runErrors)
+                            else
+                                let maxResults =
+                                    args.maxResults |> Option.defaultValue 200 |> max 1 |> min 1000
+
+                                AnalyzerDiagnostics.okResponse
+                                    packagesJson
+                                    (List.ofSeq collected)
+                                    args.severity
+                                    maxResults
+
+        Task.FromResult result

@@ -678,6 +678,18 @@ let main argv =
                     |> unwrapResult
                 )
 
+                tool (
+                    TypedTool.define<FcsAnalyzerDiagnosticsArgs>
+                        "fcs_analyzer_diagnostics"
+                        "Report F# ANALYZER diagnostics (not compiler diagnostics), grouped: analyzersConfigured, analyzerPackages, diagnostics [{analyzer, code, severity, message, file, range}], counts {byAnalyzer, bySeverity}. Detects analyzer config like project_health, runs the fsharp-analyzers CLI when available, parses its SARIF; none configured → no_analyzers. Use to read analyzer DIAGNOSTICS; project_health reports whether analyzers are CONFIGURED. severity filters; projectPath falls back to set_project."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.AnalyzerDiagnostics args)))
+                    |> unwrapResult
+                )
+
                 useStdio
             }
 

@@ -494,6 +494,22 @@ type FcsDeadCodeArgs =
       /// is reported in candidateCount; the `truncated` flag marks when the page was capped.
       maxResults: int option }
 
+/// Arguments for fcs_analyzer_diagnostics (#72) — reports F# *analyzer* diagnostics
+/// (distinct from compiler diagnostics) for a project, grouped for agents. Detects the
+/// analyzer configuration the same way project_health does, then runs the fsharp-analyzers
+/// CLI when one is available and parses its SARIF; otherwise it reports what is configured.
+/// Read-only; writes nothing. Pairs with project_health (which reports analyzer SETUP).
+type FcsAnalyzerDiagnosticsArgs =
+    { /// .fsproj / .sln / .slnx to inspect. Falls back to the active set_project when omitted.
+      projectPath: string option
+      /// Filter diagnostics by normalized severity: "error" | "warning" | "info" | "hint".
+      /// When omitted, every severity passes through.
+      severity: string option
+      /// Maximum diagnostics returned in one page. Default 200, hard ceiling 1000.
+      /// counts.byAnalyzer / counts.bySeverity still report true totals across the full
+      /// (severity-filtered) set even when the returned list is capped.
+      maxResults: int option }
+
 type FcsNugetTypesArgs =
     { /// Package id (matched against referenced assembly SimpleName, case-insensitive).
       /// Example: "Spectre.Console", "Newtonsoft.Json", "System.Text.Json".
