@@ -229,6 +229,10 @@ type FindArgs =
       includeDeclaration: bool option
       /// Include Info/Hint diagnostics in projectDiagnostics. Default false.
       includeInfo: bool option
+      /// Include the per-project sweep breakdown (`perProject`). Default true. Even when
+      /// true, projects with zero matches and no error are omitted to cut token noise;
+      /// pass false to drop the array entirely on repeated sweeps.
+      includePerProject: bool option
       /// .fsproj / .sln / .slnx / directory to sweep. Falls back to active set_project.
       projectPath: string option
       /// Maximum sites returned per page. Default 40 (keeps the compact payload well

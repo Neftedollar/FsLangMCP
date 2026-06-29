@@ -196,6 +196,7 @@ let private findArgs (projectPath: string) (query: string) : FindArgs =
       contextLines = Some 0
       includeDeclaration = None
       includeInfo = None
+      includePerProject = None
       projectPath = Some projectPath
       maxResults = Some 500
       cursor = None }
@@ -679,6 +680,51 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                     File.SetLastWriteTimeUtc(fx.DomainFs, originalMtime)
                 with _ ->
                     ()
+        }
+
+    // ── F1 (#100): module-qualified (dotted) query resolves via dotted-suffix match ──
+    [<Fact>]
+    member _.``F1 (#100): dotted-suffix query matches; bare unchanged; genuine miss carries a hint``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // App.Roles.appRole — a dotted SUFFIX query ("Roles.appRole") used to silently
+            // miss (equality-only matching), now matches on the '.' boundary.
+            let! dotted = bridge.Find(findArgs fx.Slnx "Roles.appRole")
+            Assert.Equal("succeeded", gs dotted "status")
+            Assert.True(gb dotted["resolution"] "matched", "dotted suffix query must match App.Roles.appRole")
+            Assert.True((gi dotted "totalSites" > 0), "dotted query must return sites")
+
+            // Bare identifier still matches (behaviour unchanged for non-dotted queries).
+            let! bare = bridge.Find(findArgs fx.Slnx "appRole")
+            Assert.True(gb bare["resolution"] "matched", "bare query must still match")
+
+            // A genuine miss on a dotted query carries a hint pointing at the bare identifier.
+            let! miss = bridge.Find(findArgs fx.Slnx "Nowhere.noSuchSymbol_4827")
+            Assert.False(gb miss["resolution"] "matched", "bogus dotted query must not match")
+            Assert.True(miss.AsObject().ContainsKey("hint"), "a dotted miss must carry a hint")
+            Assert.Contains("noSuchSymbol_4827", gs miss "hint")
+        }
+
+    // ── F5 (#100): perProject drops zero-match noise; includePerProject=false omits it ──
+    [<Fact>]
+    member _.``F5 (#100): perProject trims zero-match projects and is omitted when includePerProject=false``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // appRole lives only in App; Domain + Stubs match nothing and must be trimmed,
+            // while projectsSwept still reports the full sweep breadth.
+            let! find = bridge.Find(findArgs fx.Slnx "appRole")
+            Assert.Equal(3, gi find "projectsSwept")
+            let perProject = find["perProject"].AsArray()
+            Assert.True((perProject.Count >= 1), "the matching project must remain in perProject")
+            Assert.True((perProject.Count < 3), "zero-match projects must be trimmed from perProject")
+
+            // includePerProject=false omits the array entirely.
+            let! lean = bridge.Find({ findArgs fx.Slnx "appRole" with includePerProject = Some false })
+            Assert.False(lean.AsObject().ContainsKey("perProject"), "includePerProject=false must omit perProject")
         }
 
 // ── kind=position FullName disambiguation (Codex P2 #1) ──────────────────────────

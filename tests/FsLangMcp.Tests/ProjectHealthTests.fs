@@ -96,7 +96,7 @@ let ``project_health blocks missing explicit fsproj`` () =
     Assert.Equal("blocked", (((result["toolingReadiness"])["lsp"])["status"]).GetValue<string>())
 
 [<Fact>]
-let ``project_health blocks directory with multiple fsproj files`` () =
+let ``project_health summarizes a directory with multiple fsproj files (#100)`` () =
     let runId = System.Guid.NewGuid().ToString("N")
     let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_multi_%s{runId}")
 
@@ -107,9 +107,10 @@ let ``project_health blocks directory with multiple fsproj files`` () =
 
         let result = report (healthArgs root (Some root)) (readySnapshot root root)
 
-        Assert.Equal("blocked", ((result["toolingReadiness"])["overall"]).GetValue<string>())
-        Assert.Equal("blocked", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
-        Assert.Contains("Multiple .fsproj", ((((result["toolingReadiness"])["fcs"])["reason"]).GetValue<string>()))
+        // #100: a directory with multiple projects is summarized, not blocked.
+        Assert.Equal("solution", (result["reportKind"]).GetValue<string>())
+        Assert.Equal("solution", ((result["toolingReadiness"])["overall"]).GetValue<string>())
+        Assert.Equal(2, ((result["solution"])["projectCount"]).GetValue<int>())
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
@@ -290,7 +291,7 @@ let ``project_health accepts .sln path and resolves to the single fsproj inside`
             Directory.Delete(root, true)
 
 [<Fact>]
-let ``project_health blocks .slnx with multiple fsproj files`` () =
+let ``project_health summarizes a .slnx with multiple fsproj files (#100)`` () =
     let runId = System.Guid.NewGuid().ToString("N")
     let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_slnx_multi_%s{runId}")
 
@@ -315,14 +316,15 @@ let ``project_health blocks .slnx with multiple fsproj files`` () =
 
         let result = report (healthArgs slnxPath None) snapshot
 
-        Assert.Equal("blocked", ((result["toolingReadiness"])["overall"]).GetValue<string>())
-        Assert.Contains("Multiple .fsproj", (((result["toolingReadiness"])["fcs"])["reason"]).GetValue<string>())
+        Assert.Equal("solution", (result["reportKind"]).GetValue<string>())
+        Assert.Equal("solution", ((result["toolingReadiness"])["overall"]).GetValue<string>())
+        Assert.Equal(2, ((result["solution"])["projectCount"]).GetValue<int>())
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
 
 [<Fact>]
-let ``project_health blocks .sln with multiple fsproj files`` () =
+let ``project_health summarizes a .sln with multiple fsproj files (#100)`` () =
     let runId = System.Guid.NewGuid().ToString("N")
     let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_sln_multi_%s{runId}")
 
@@ -347,8 +349,9 @@ let ``project_health blocks .sln with multiple fsproj files`` () =
 
         let result = report (healthArgs slnPath None) snapshot
 
-        Assert.Equal("blocked", ((result["toolingReadiness"])["overall"]).GetValue<string>())
-        Assert.Contains("Multiple .fsproj", (((result["toolingReadiness"])["fcs"])["reason"]).GetValue<string>())
+        Assert.Equal("solution", (result["reportKind"]).GetValue<string>())
+        Assert.Equal("solution", ((result["toolingReadiness"])["overall"]).GetValue<string>())
+        Assert.Equal(2, ((result["solution"])["projectCount"]).GetValue<int>())
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
@@ -753,5 +756,55 @@ let ``project_health reports a restored project as restored with high references
         Assert.Equal(1.0, projectOptions["referencesResolved"].GetValue<float>())
         // No restore warning means the FCS axis stays ready.
         Assert.Equal("ready", (((result["toolingReadiness"])["fcs"])["status"]).GetValue<string>())
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health summarizes a multi-project solution instead of blocking (#100)`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_sln_%s{runId}")
+
+    try
+        Directory.CreateDirectory(root) |> ignore
+
+        let writeProj name =
+            let dir = Path.Combine(root, name)
+            Directory.CreateDirectory(dir) |> ignore
+            File.WriteAllText(Path.Combine(dir, name + ".fs"), $"module %s{name}\n\nlet v = 1\n")
+            let p = Path.Combine(dir, name + ".fsproj")
+
+            File.WriteAllText(
+                p,
+                String.concat
+                    "\n"
+                    [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+                      "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+                      $"  <ItemGroup><Compile Include=\"%s{name}.fs\" /></ItemGroup>"
+                      "</Project>" ]
+            )
+
+        writeProj "Alpha"
+        writeProj "Beta"
+
+        let slnx = Path.Combine(root, "Sln.slnx")
+
+        File.WriteAllText(
+            slnx,
+            String.concat
+                "\n"
+                [ "<Solution>"
+                  "  <Project Path=\"Alpha/Alpha.fsproj\" />"
+                  "  <Project Path=\"Beta/Beta.fsproj\" />"
+                  "</Solution>" ]
+        )
+
+        let result = report (healthArgs slnx None) (readySnapshot slnx root)
+
+        Assert.Equal("ok", (result["status"]).GetValue<string>())
+        Assert.Equal("solution", (result["reportKind"]).GetValue<string>())
+        // The whole point of #100: a solution must NOT read as blocked.
+        Assert.Equal("solution", ((result["toolingReadiness"])["overall"]).GetValue<string>())
+        Assert.Equal(2, ((result["solution"])["projectCount"]).GetValue<int>())
+        Assert.Equal(2, ((result["solution"])["projects"]).AsArray().Count)
     finally
         if Directory.Exists root then Directory.Delete(root, true)
