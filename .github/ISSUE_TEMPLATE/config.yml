@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 📖 Documentation
+    url: https://github.com/Neftedollar/FsLangMCP/tree/main/docs
+    about: Getting started, per-client configuration, the full tool reference, and troubleshooting.
+  - name: 🚀 Quickstart example
+    url: https://github.com/Neftedollar/FsLangMCP/tree/main/examples
+    about: A runnable 2-project F# solution — go from install to a cross-project `find` in ~3 minutes.
+  - name: 💬 Discussions (questions & ideas)
+    url: https://github.com/Neftedollar/FsLangMCP/discussions
+    about: Ask a question, share how you use FsLangMCP, or float an idea before opening an issue.

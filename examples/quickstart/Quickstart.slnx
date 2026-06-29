@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="Domain/Domain.fsproj" />
+  <Project Path="App/App.fsproj" />
+</Solution>

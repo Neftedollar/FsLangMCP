@@ -1,0 +1,21 @@
+name: 💡 Feature request
+description: Suggest a new tool, argument, or capability.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the agent workflow or question you couldn't answer with the current tools. Concrete beats abstract.
+    validations:
+      required: true
+  - type: textarea
+    id: fallback
+    attributes:
+      label: What did you fall back to?
+      description: If the agent dropped to `rg`/`grep`, a textual read, or `dotnet build` — say so. That fallback is the signal we most want.
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed shape (optional)
+      description: A tool name, arguments, and the response you'd expect. Rough is fine.

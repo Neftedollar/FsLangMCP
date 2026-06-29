@@ -1,0 +1,4 @@
+<Project>
+  <!-- Isolates the quickstart example from the parent repository's build settings.
+       Intentionally does NOT import the parent Directory.Build.props. -->
+</Project>
