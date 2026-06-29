@@ -1,0 +1,36 @@
+name: 🤖 Agent UX feedback
+description: How did FsLangMCP feel to an AI agent on a real task? (friction, surprises, what worked)
+labels: ["ux-feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project lives or dies on whether agents reach for it **instead of `grep`**. Honest field reports from real
+        agent runs are the single most valuable signal we get — including "didn't need it for this task." Thank you.
+  - type: input
+    id: version
+    attributes:
+      label: FsLangMCP version
+      description: From the `fslangmcp_version` tool. (In-session MCP = the **installed** tool, not your local build.)
+      placeholder: "0.12.1"
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Task & codebase
+      description: What was the agent doing, on what kind of F# project (size, single vs multi-project, restored or not)?
+    validations:
+      required: true
+  - type: textarea
+    id: friction
+    attributes:
+      label: Friction / surprises
+      description: Where did the agent fall back to `rg`/`grep`/build? Confusing response? Missing tool? Empty result that should have matched?
+    validations:
+      required: true
+  - type: textarea
+    id: worked
+    attributes:
+      label: What worked well
+      description: Which tools/calls were high-value? (So we don't regress them.)

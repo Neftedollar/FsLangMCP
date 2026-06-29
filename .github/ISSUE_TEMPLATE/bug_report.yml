@@ -1,0 +1,59 @@
+name: 🐞 Bug report
+description: Something in FsLangMCP behaves incorrectly (wrong result, crash, confusing error).
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a report — a clear repro makes a fix dramatically faster.
+  - type: input
+    id: version
+    attributes:
+      label: FsLangMCP version
+      description: |
+        Run the `fslangmcp_version` tool (or `fslangmcp --version`) and paste the value.
+        ⚠️ Your agent's in-session MCP tests the **installed** tool, not a local build — check the version it actually runs.
+      placeholder: "0.12.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: client
+    attributes:
+      label: MCP client
+      options:
+        - Claude Code
+        - Cursor
+        - Codex
+        - GitHub Copilot
+        - Other / direct stdio
+    validations:
+      required: true
+  - type: input
+    id: tool
+    attributes:
+      label: Tool involved
+      description: Which FsLangMCP tool? (e.g. `find`, `check`, `set_project`)
+      placeholder: "find"
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Exact tool name + JSON arguments, the project shape (single .fsproj / .slnx / multi-project), and whether it was `dotnet restore`d.
+      placeholder: |
+        1. set_project { "projectPath": "/path/MySolution.slnx" }
+        2. find { "query": "MyType" }
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected-actual
+    attributes:
+      label: Expected vs actual
+      description: What you expected, and what actually came back (paste the relevant JSON, trimmed).
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, .NET SDK version (`dotnet --version`), and whether `fslangmcp --bootstrap-tools` was run.
