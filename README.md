@@ -8,6 +8,12 @@
 [![Target](https://img.shields.io/badge/target-net10.0-blue.svg)](https://dotnet.microsoft.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
+<p align="center">
+  <img src="docs/assets/find-vs-grep.svg" width="820"
+       alt="Terminal demo — rg scoped to Domain/ finds only the Order definition; FsLangMCP find resolves 17 cross-project sites including 9 in App that grep missed." />
+</p>
+<p align="center"><sub>Real output from <a href="examples/quickstart"><code>examples/quickstart</code></a>: <code>grep Domain/</code> finds the definition; <code>find</code> resolves all 17 cross-project uses the agent actually needs.</sub></p>
+
 ## Why
 
 Text search misses the semantics F# depends on — partial application, aliased `open`s, shadowed bindings, cross-project uses, record-field set-sites, CE custom-operations — and over-matches comments and strings. FsLangMCP resolves symbols via the real compiler (FCS in-process + FSAC LSP), so your agent gets trustworthy answers instead of grep noise.
