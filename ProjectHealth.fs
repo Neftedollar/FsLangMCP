@@ -412,6 +412,30 @@ let private resolveHealthProjectPath (input: string option) =
         else
             Error "project_health expects a .fsproj, .sln, .slnx path, or a directory containing exactly one .fsproj."
 
+/// A solution (.slnx/.sln) or directory with MORE THAN ONE .fsproj can't be reduced to a
+/// single project to report on. Rather than block (#100 — `overall:"blocked"` read like an
+/// error), project_health emits a lightweight solution summary from this list. Returns None
+/// for single-project / non-solution inputs, which the normal single-project path handles.
+let private listSolutionProjects (input: string option) : (string * string array) option =
+    match input with
+    | Some inputPath when not (System.String.IsNullOrWhiteSpace inputPath) ->
+        let fullPath = Path.GetFullPath inputPath
+        let ext = Path.GetExtension fullPath
+
+        let projects =
+            if File.Exists fullPath && ext.Equals(".slnx", StringComparison.OrdinalIgnoreCase) then
+                FsLangMcp.ProjectFiles.SolutionParsing.fsprojsFromSlnx fullPath
+            elif File.Exists fullPath && ext.Equals(".sln", StringComparison.OrdinalIgnoreCase) then
+                FsLangMcp.ProjectFiles.SolutionParsing.fsprojsFromSln fullPath
+            elif Directory.Exists fullPath then
+                Directory.GetFiles(fullPath, "*.fsproj", SearchOption.TopDirectoryOnly)
+                |> Array.map Path.GetFullPath
+            else
+                [||]
+
+        if projects.Length > 1 then Some(fullPath, projects) else None
+    | _ -> None
+
 let createReport
     (args: ProjectHealthArgs)
     (lspSnapshot: LspHealthSnapshot)
@@ -419,6 +443,36 @@ let createReport
     : Async<JsonNode> =
     async {
         let compileCheck = args.compileCheck |> Option.defaultValue "Skip"
+
+        match listSolutionProjects args.projectPath with
+        | Some(source, projects) ->
+            // Solution mode: don't block — summarize the member projects and direct the
+            // caller to pass one .fsproj for full FCS/LSP readiness. (#100)
+            let projectNodes =
+                projects
+                |> Array.map (fun p ->
+                    jobj
+                        [ "name", jstr (Path.GetFileNameWithoutExtension p)
+                          "fsproj", jstr p
+                          "exists", jbool (File.Exists p) ]
+                    :> JsonNode)
+
+            return
+                jobj
+                    [ "status", jstr "ok"
+                      "reportKind", jstr "solution"
+                      "toolingReadiness", jobj [ "overall", jstr "solution" ]
+                      "compileStatus", jobj [ "status", jstr "not_checked" ]
+                      "solution",
+                      jobj
+                          [ "source", jstr source
+                            "projectCount", jint projects.Length
+                            "projects", JsonArray projectNodes :> JsonNode ]
+                      "hint",
+                      jstr
+                          "project_health reports one project at a time — pass a specific .fsproj for full FCS/LSP readiness. (set_project + find/check already operate solution-wide.)" ]
+                :> JsonNode
+        | None ->
 
         match resolveHealthProjectPath args.projectPath with
         | Error reason ->

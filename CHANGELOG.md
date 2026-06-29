@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-06-29
+
+Patch release — three fixes from a 0.12.0-binary reproducibility pass over the #100 UX backlog (most prior findings turned out to be stale-version artifacts; these three reproduced).
+
+### Fixed
+
+- **`find` now resolves a module-qualified (dotted) query** (#100). A query like `Roles.appRole` for `App.Roles.appRole` previously matched nothing and returned a silent `matched:false` — which reads like "symbol doesn't exist" and can mislead a dead-code/refactor decision. `symbolMatches` now also accepts a dotted suffix on a `.` boundary (gated on the query containing a `.`, so bare-name matching is byte-for-byte unchanged). A genuine dotted miss now also carries a `hint` pointing at the bare identifier.
+- **`project_health` understands solution mode** (#100). Pointed at a `.slnx`/`.sln`/directory with multiple projects it previously returned `overall:"blocked"` ("Multiple .fsproj found"), which read as an error. It now returns `reportKind:"solution"` with `toolingReadiness.overall:"solution"` and a `solution` summary (`projectCount` + per-project `{name, fsproj, exists}`) plus a hint to pass one `.fsproj` for full readiness. Single-project inputs are unchanged.
+
+### Changed
+
+- **`find` trims per-project noise** (#100). The `perProject` breakdown now omits projects that matched nothing and didn't error (on a large solution that was one noise line per project, dwarfing a small result); `projectsSwept` still reports the full sweep breadth. New `includePerProject` arg (default `true`) drops the array entirely when set to `false` for repeated sweeps. Additive — no field renamed or removed.
+
 ## [0.12.0] - 2026-06-29
 
 ### Added

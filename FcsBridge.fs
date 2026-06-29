@@ -1396,9 +1396,22 @@ type internal FcsBridge() =
         let displayName = symbol.DisplayName
         let fullName = symbol.FullName
 
+        // A module-qualified query ("Roles.appRole" for App.Roles.appRole) is a dot-boundary
+        // SUFFIX of the full name, not equal to it and not equal to the unqualified DisplayName,
+        // so plain equality silently misses it (#100). Accept a dotted suffix on a '.' boundary —
+        // gated on the query actually containing a '.' so bare-name matching stays byte-identical.
+        let dottedSuffixMatch () =
+            not (isNull (query: string))
+            && query.Contains('.')
+            && not (isNull fullName)
+            && fullName.EndsWith(query, StringComparison.Ordinal)
+            && fullName.Length > query.Length
+            && fullName[fullName.Length - query.Length - 1] = '.'
+
         if exact then
             String.Equals(displayName, query, StringComparison.Ordinal)
             || String.Equals(fullName, query, StringComparison.Ordinal)
+            || dottedSuffixMatch ()
         else
             displayName.Contains(query, StringComparison.OrdinalIgnoreCase)
             || (if isNull fullName then
@@ -3122,6 +3135,7 @@ type internal FcsBridge() =
             let contextLines = args.contextLines |> Option.defaultValue 0
             let includeDeclaration = args.includeDeclaration |> Option.defaultValue true
             let includeInfo = args.includeInfo |> Option.defaultValue false
+            let includePerProject = args.includePerProject |> Option.defaultValue true
             // Default page size keeps the compact payload well under the MCP token
             // ceiling on a cap-case hit. Each site is now serialized ONCE — the flat
             // `sites` list — after the grouped definitions/references/fieldSites/
@@ -3295,6 +3309,10 @@ type internal FcsBridge() =
                  >()
 
             let perProject = ResizeArray<JsonNode>()
+            // Lockstep with perProject: false for a project that matched nothing and didn't
+            // error, so the output can drop pure-noise entries (one per swept project on a
+            // large solution) without losing the matched/errored ones (#100 token-tax).
+            let perProjectKeep = ResizeArray<bool>()
             let aggregatedDiagnostics = ResizeArray<FSharpDiagnostic>()
             let sweepSw = System.Diagnostics.Stopwatch.StartNew()
 
@@ -3427,6 +3445,8 @@ type internal FcsBridge() =
                               "elapsedMs", jint (int projSw.ElapsedMilliseconds) ]
                         :> JsonNode
                     )
+
+                    perProjectKeep.Add(nameCount > 0 || fieldCount > 0 || memberCount > 0)
                 with ex ->
                     projSw.Stop()
 
@@ -3438,6 +3458,8 @@ type internal FcsBridge() =
                               "elapsedMs", jint (int projSw.ElapsedMilliseconds) ]
                         :> JsonNode
                     )
+
+                    perProjectKeep.Add(true)
 
             sweepSw.Stop()
 
@@ -3590,6 +3612,34 @@ type internal FcsBridge() =
             let paginationFields =
                 Cursor.paginationFields "sites" totalSites pageOffset pageSize pageSites.Length
 
+            // F5 (#100): drop per-project entries that matched nothing and didn't error —
+            // on a large solution they are one-noise-line-per-project that dwarfs a small
+            // result. includePerProject=false omits the array entirely. `projectsSwept`
+            // still conveys the full sweep breadth either way.
+            let perProjectField =
+                if includePerProject then
+                    let kept =
+                        Seq.zip perProject perProjectKeep
+                        |> Seq.choose (fun (node, keep) -> if keep then Some node else None)
+                        |> Seq.toArray
+
+                    [ "perProject", JsonArray(kept) :> JsonNode ]
+                else
+                    []
+
+            // F1 (#100): a dotted query that resolved to nothing reads like "symbol absent".
+            // symbolMatches now accepts a dotted suffix, so this only fires for a genuine miss
+            // — point the caller at the bare identifier rather than leaving a silent empty.
+            let hintField =
+                if (not matched) && not (String.IsNullOrEmpty query) && query.Contains('.') then
+                    let bare = query.Substring(query.LastIndexOf('.') + 1)
+
+                    [ "hint",
+                      jstr
+                          $"No match for the module-qualified query '{query}'. find matches by simple name or a dotted suffix on a module boundary — try the bare identifier '{bare}'." ]
+                else
+                    []
+
             let baseFields =
                 [ "status", jstr "succeeded"
                   "query", jstr query
@@ -3602,10 +3652,11 @@ type internal FcsBridge() =
                   "totalSites", jint totalSites
                   "matchedUseCount", jint totalSites
                   "breakdown", breakdown
-                  "sites", JsonArray(siteNodes) :> JsonNode
-                  "perProject", JsonArray(perProject.ToArray()) :> JsonNode
-                  "sweepElapsedMs", jint (int sweepSw.ElapsedMilliseconds)
-                  "projectDiagnostics", JsonArray(diagNodes) :> JsonNode ]
+                  "sites", JsonArray(siteNodes) :> JsonNode ]
+                @ perProjectField
+                @ [ "sweepElapsedMs", jint (int sweepSw.ElapsedMilliseconds)
+                    "projectDiagnostics", JsonArray(diagNodes) :> JsonNode ]
+                @ hintField
 
             return jobj (baseFields @ paginationFields) :> JsonNode
         }
@@ -7054,6 +7105,7 @@ type internal FcsBridge() =
                   contextLines = Some 0
                   includeDeclaration = Some true
                   includeInfo = Some false
+                  includePerProject = None
                   projectPath = args.projectPath
                   maxResults = Some 1000
                   cursor = None }
