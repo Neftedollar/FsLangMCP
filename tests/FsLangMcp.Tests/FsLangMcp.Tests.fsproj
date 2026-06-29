@@ -34,6 +34,7 @@
     <Compile Include="DiagnosticFixesTests.fs" />
     <Compile Include="PublicApiTests.fs" />
     <Compile Include="RefactorImpactTests.fs" />
+    <Compile Include="DeadCodeTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -431,6 +431,21 @@ type FcsRefactorImpactArgs =
       /// .fsproj / .sln / .slnx to sweep. Falls back to the active set_project.
       projectPath: string option }
 
+/// Arguments for fcs_dead_code — a conservative dead-code candidate pass. Sweeps the
+/// project (ParseAndCheckProject → GetAllUsesOfAllSymbols) and reports module/type-level
+/// value &amp; function bindings whose ONLY recorded use is their own definition. These are
+/// candidates, NOT deletions: the tool writes nothing and always emits caveats.
+type FcsDeadCodeArgs =
+    { /// .fsproj / .sln / .slnx to sweep. Falls back to the active set_project when omitted.
+      projectPath: string option
+      /// Include public symbols too. Default false — public API is presumed reachable by
+      /// external callers, so flagging it would over-report. Set true for a leaf executable
+      /// or a closed codebase with no external consumers.
+      includePublic: bool option
+      /// Max candidates returned in one page. Default 100, hard ceiling 500. The full count
+      /// is reported in candidateCount; the `truncated` flag marks when the page was capped.
+      maxResults: int option }
+
 type FcsNugetTypesArgs =
     { /// Package id (matched against referenced assembly SimpleName, case-insensitive).
       /// Example: "Spectre.Console", "Newtonsoft.Json", "System.Text.Json".
