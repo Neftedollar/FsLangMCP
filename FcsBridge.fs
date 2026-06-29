@@ -7599,3 +7599,280 @@ type internal FcsBridge() =
                       "parseErrors", JsonArray(parseErrors.ToArray()) :> JsonNode ]
                 :> JsonNode
         }
+
+    // ── fcs_dead_code (#70): conservative dead-code candidate analysis ────────────────
+    // A CLEANUP/REVIEW pass — candidates, NOT deletions, NOT navigation. Reuses the same
+    // project-sweep machinery as `find` (ResolveFsprojOptions → ProjectSweepUses →
+    // GetAllUsesOfAllSymbols). For every DEFINED module/type-level value or function
+    // binding it counts NON-definition uses of that symbol across the swept projects; zero
+    // non-def uses → a candidate. CONSERVATIVE by construction (prefers false negatives):
+    //   • only private/internal bindings by default — public is presumed reachable by
+    //     external callers (includePublic widens to public too);
+    //   • a definition is matched to its uses by BOTH declaration-location AND FullName, so
+    //     any plausible reference (incl. a self-recursive call) keeps a symbol live;
+    //   • skips compiler-generated, [<EntryPoint>], constructors, property/event accessors,
+    //     overrides / interface implementations, active patterns, and every non-mfv symbol
+    //     (union cases, record fields, type definitions) — categories whose real usage FCS
+    //     may under-attribute.
+    // Writes nothing; always emits caveats. Use `find` to verify each candidate.
+    member this.DeadCode(args: FcsDeadCodeArgs) : Task<JsonNode> =
+        task {
+            let includePublic = args.includePublic |> Option.defaultValue false
+            let maxResults = args.maxResults |> Option.defaultValue 100 |> max 0 |> min 500
+
+            // Resolve the sweep target like Find/TestsForSymbol: explicit projectPath
+            // (Program.fs already falls back to the active set_project), else nothing.
+            let sweepTargetOpt =
+                args.projectPath
+                |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.map normalizePath
+
+            match sweepTargetOpt with
+            | None ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr
+                              "fcs_dead_code needs a project context: pass projectPath (.fsproj/.sln/.slnx) or call set_project first." ]
+                    :> JsonNode
+            | Some sweepTarget ->
+
+            let projects = SolutionParsing.listProjects sweepTarget
+
+            if projects.Length = 0 then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr $"fcs_dead_code could not resolve any .fsproj to sweep from: {sweepTarget}" ]
+                    :> JsonNode
+            else
+
+            // ── Skip predicates over an mfv (every read guarded — FCS throws on synthetics) ──
+            // `flag onError f` evaluates a boolean property; on an FCS throw it yields the
+            // caller-chosen default so an unreadable symbol is treated CONSERVATIVELY
+            // (positive requirement defaults false; each skip-flag defaults true).
+            let flag (onError: bool) (f: unit -> bool) =
+                try
+                    f ()
+                with _ ->
+                    onError
+
+            let isEntryPoint (m: FSharpMemberOrFunctionOrValue) =
+                try
+                    m.Attributes
+                    |> Seq.exists (fun a ->
+                        try
+                            let tn = a.AttributeType.FullName
+
+                            not (isNull tn)
+                            && (tn = "Microsoft.FSharp.Core.EntryPointAttribute"
+                                || tn.EndsWith(".EntryPointAttribute", StringComparison.Ordinal))
+                        with _ ->
+                            false)
+                with _ ->
+                    false
+
+            let declaringIsInterface (m: FSharpMemberOrFunctionOrValue) =
+                try
+                    match m.DeclaringEntity with
+                    | Some e -> e.IsInterface
+                    | None -> false
+                with _ ->
+                    false
+
+            // A symbol is a dead-code CANDIDATE shape iff it is a module/type-level value or
+            // function binding that is none of the skip categories. Non-mfv symbols (union
+            // cases, record fields, type/module entities) are excluded outright.
+            let isCandidateShape (sym: FSharpSymbol) =
+                match sym with
+                | :? FSharpMemberOrFunctionOrValue as m ->
+                    flag false (fun () -> m.IsModuleValueOrMember)
+                    && not (flag true (fun () -> m.IsCompilerGenerated))
+                    && not (flag true (fun () -> m.IsConstructor))
+                    && not (flag true (fun () -> m.IsImplicitConstructor))
+                    && not (flag true (fun () -> m.IsPropertyGetterMethod))
+                    && not (flag true (fun () -> m.IsPropertySetterMethod))
+                    && not (flag true (fun () -> m.IsEventAddMethod))
+                    && not (flag true (fun () -> m.IsEventRemoveMethod))
+                    && not (flag true (fun () -> m.IsOverrideOrExplicitInterfaceImplementation))
+                    && not (flag true (fun () -> m.IsExplicitInterfaceImplementation))
+                    && not (flag true (fun () -> m.IsActivePattern))
+                    && not (flag true (fun () -> m.IsExtensionMember))
+                    && not (declaringIsInterface m)
+                    && not (isEntryPoint m)
+                | _ -> false
+
+            // Keep only the accessibilities in scope: private/internal always, public only
+            // under includePublic. "unknown" (synthetic / unreadable) is never a candidate.
+            let accKeep (sym: FSharpSymbol) =
+                match accessibilityString sym with
+                | "private"
+                | "internal" -> true
+                | "public" -> includePublic
+                | _ -> false
+
+            let declRangeOf (sym: FSharpSymbol) : range option =
+                try
+                    sym.DeclarationLocation
+                with _ ->
+                    None
+
+            let fullNameOf (sym: FSharpSymbol) : string option =
+                try
+                    match sym.FullName with
+                    | null -> None
+                    | fn when String.IsNullOrWhiteSpace fn -> None
+                    | fn -> Some fn
+                with _ ->
+                    None
+
+            let keyOfRange (dr: range) =
+                $"{normalizePath dr.FileName}:{dr.StartLine}:{dr.StartColumn}:{dr.EndLine}:{dr.EndColumn}"
+
+            // Accumulate across ALL swept projects FIRST, then filter — so a use in a
+            // later-swept project still rescues a definition swept earlier.
+            let nonDefDeclKeys = System.Collections.Generic.HashSet<string>()
+            let nonDefFullNames = System.Collections.Generic.HashSet<string>()
+
+            let defByKey =
+                System.Collections.Generic.Dictionary<
+                    string,
+                    {| Name: string
+                       FullName: string
+                       Kind: string
+                       Accessibility: string
+                       File: string
+                       StartLine: int
+                       StartCol: int
+                       EndLine: int
+                       EndCol: int
+                       Project: string |}
+                 >()
+
+            for fsproj in projects do
+                try
+                    let projDisplay = Path.GetFileNameWithoutExtension fsproj
+                    let! options, _ = this.ResolveFsprojOptions(fsproj)
+
+                    let usesKey =
+                        $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}|{referencedProjectSourcesStamp options}"
+
+                    let! allUses, _ = this.ProjectSweepUses(usesKey, options)
+
+                    for u in allUses do
+                        let sym = u.Symbol
+
+                        if u.IsFromDefinition then
+                            // Record a candidate-shape definition, keyed by its own
+                            // declaration location (the stable cross-compilation anchor).
+                            if accKeep sym && isCandidateShape sym then
+                                match declRangeOf sym with
+                                | Some dr ->
+                                    let key = keyOfRange dr
+
+                                    if not (defByKey.ContainsKey key) then
+                                        defByKey[key] <-
+                                            {| Name = sym.DisplayName
+                                               FullName = (fullNameOf sym |> Option.defaultValue "")
+                                               Kind = symbolKind sym
+                                               Accessibility = accessibilityString sym
+                                               File = normalizePath dr.FileName
+                                               StartLine = dr.StartLine
+                                               StartCol = dr.StartColumn
+                                               EndLine = dr.EndLine
+                                               EndCol = dr.EndColumn
+                                               Project = projDisplay |}
+                                | None -> ()
+                        else
+                            // A NON-definition use marks its target symbol LIVE — by both the
+                            // target's declaration location and its FullName (either match
+                            // keeps the symbol off the candidate list).
+                            match declRangeOf sym with
+                            | Some dr -> nonDefDeclKeys.Add(keyOfRange dr) |> ignore
+                            | None -> ()
+
+                            match fullNameOf sym with
+                            | Some fn -> nonDefFullNames.Add fn |> ignore
+                            | None -> ()
+                with _ ->
+                    // A project that fails to resolve/check is skipped — the candidate scan
+                    // is best-effort, never a hard failure for one bad project.
+                    ()
+
+            let candidatesAll =
+                defByKey
+                |> Seq.filter (fun kv ->
+                    let v = kv.Value
+
+                    not (nonDefDeclKeys.Contains kv.Key)
+                    && (v.FullName = "" || not (nonDefFullNames.Contains v.FullName)))
+                |> Seq.map (fun kv -> kv.Value)
+                |> Seq.sortBy (fun v -> v.File, v.StartLine, v.StartCol, v.Name)
+                |> Seq.toArray
+
+            let total = candidatesAll.Length
+            let page = candidatesAll |> Array.truncate maxResults
+            let truncated = total > page.Length
+
+            let candidateToJson
+                (v:
+                    {| Name: string
+                       FullName: string
+                       Kind: string
+                       Accessibility: string
+                       File: string
+                       StartLine: int
+                       StartCol: int
+                       EndLine: int
+                       EndCol: int
+                       Project: string |})
+                =
+                let rangeNode =
+                    jobj
+                        [ "startLine", jint v.StartLine
+                          "startColumn", jint v.StartCol
+                          "endLine", jint v.EndLine
+                          "endColumn", jint v.EndCol ]
+                    :> JsonNode
+
+                let declaredIn =
+                    jobj [ "file", jstr v.File; "range", rangeNode ] :> JsonNode
+
+                let note =
+                    $"{v.Accessibility} {v.Kind} '{v.Name}' has no non-definition use across the swept project(s) — verify with `find` before removing"
+
+                jobj
+                    [ "name", jstr v.Name
+                      "fullName", jstrOrNull v.FullName
+                      "kind", jstr v.Kind
+                      "accessibility", jstr v.Accessibility
+                      "declaredIn", declaredIn
+                      "note", jstr note ]
+                :> JsonNode
+
+            let caveats =
+                [ "candidates only — a conservative cleanup pass, NOT a deletion list; run `find` on each before removing"
+                  "reflection, dynamic invocation, serialization, and DI wiring can use a symbol that has no static reference"
+                  "interface implementations, overrides, and [<EntryPoint>] are excluded, but indirect reachability is not modeled"
+                  "a symbol used ONLY by tests still appears as a candidate — check the test projects too"
+                  (if includePublic then
+                       "includePublic=true: public symbols are included; any external or published consumer makes them live"
+                   else
+                       "public symbols are excluded by default (presumed reachable by external callers); pass includePublic=true to include them")
+                  "union cases, record fields, and type definitions are NOT analyzed (FCS may under-attribute their pattern/usage sites)" ]
+                @ (if truncated then
+                       [ $"results capped at {maxResults}; {total - page.Length} more candidate(s) not shown — raise maxResults" ]
+                   else
+                       [])
+
+            return
+                jobj
+                    [ "status", jstr "succeeded"
+                      "projectsScanned", jint projects.Length
+                      "candidates", JsonArray(page |> Array.map candidateToJson) :> JsonNode
+                      "candidateCount", jint total
+                      "truncated", jbool truncated
+                      "caveats", JsonArray(caveats |> List.map jstr |> List.toArray) :> JsonNode ]
+                :> JsonNode
+        }

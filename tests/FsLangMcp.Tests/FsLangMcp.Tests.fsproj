@@ -36,6 +36,7 @@
     <Compile Include="RefactorImpactTests.fs" />
     <Compile Include="SignatureStatusTests.fs" />
     <Compile Include="ReviewScanTests.fs" />
+    <Compile Include="DeadCodeTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
