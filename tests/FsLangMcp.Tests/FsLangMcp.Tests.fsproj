@@ -35,6 +35,7 @@
     <Compile Include="PublicApiTests.fs" />
     <Compile Include="RefactorImpactTests.fs" />
     <Compile Include="SignatureStatusTests.fs" />
+    <Compile Include="ReviewScanTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
