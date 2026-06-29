@@ -630,6 +630,18 @@ let main argv =
                     |> unwrapResult
                 )
 
+                tool (
+                    TypedTool.define<FcsCreateFilePlanArgs>
+                        "fcs_create_file_plan"
+                        "Plan WHERE a new .fs file belongs WITHOUT creating it — read-only, writes nothing. Loads the resolved <Compile> order, recommends an insertion index (right after `afterFile`, else namespace-neighbour/end), infers the namespace/module convention from neighbours, and emits the exact <Compile Include=...> edit plus a dependency note (a file may only reference EARLIER files). Use before adding an .fs file to pick the right <Compile> position; pair with `fcs_check_compile_order` after."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.CreateFilePlan args)))
+                    |> unwrapResult
+                )
+
                 useStdio
             }
 

@@ -6943,3 +6943,400 @@ type internal FcsBridge() =
 
             return jobj (baseProps @ optionalProps @ verifyProp) :> JsonNode
         }
+
+    // ── fcs_create_file_plan (#66): read-only "where should this new .fs file go?" ────
+    // PLANNING ONLY — never creates files, writes source, or edits the .fsproj. Given a
+    // proposed file name (and optionally a sibling it should follow + an intended
+    // namespace/module), it loads the project's resolved <Compile> order (SourceFiles),
+    // recommends an insertion index, reads the top namespace/module declaration of the
+    // neighbouring files to infer the house convention, and spells out the exact
+    // <Compile Include=...> edit. F# compile order is load-bearing: a file may only
+    // reference symbols DEFINED in earlier files, so the recommended index governs what
+    // the new file can use. Pairs with fcs_check_compile_order (run it AFTER the edit).
+    //
+    // The async half mirrors CheckCompileOrder's proven shape (a for-loop with `let!`
+    // inside try/with, then a single `return`). All the heavy synchronous planning lives
+    // in the pure BuildFilePlan member so this state machine stays statically compilable
+    // (sidesteps the FS3511 "await-in-loop then control flow" shape). Writes nothing.
+    member this.CreateFilePlan(args: FcsCreateFilePlanArgs) : Task<JsonNode> =
+        task {
+            let targetOpt =
+                args.projectPath
+                |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.map normalizePath
+
+            match targetOpt with
+            | None ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr
+                              "fcs_create_file_plan needs a project: pass projectPath (.fsproj/.sln/.slnx) or call set_project first." ]
+                    :> JsonNode
+            | Some target ->
+
+            let fileNameRaw = if isNull args.fileName then "" else args.fileName.Trim()
+
+            if fileNameRaw = "" then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr "fcs_create_file_plan requires a non-empty fileName (e.g. \"Validation.fs\")." ]
+                    :> JsonNode
+            else
+
+            let projectsToScan = SolutionParsing.listProjects target
+
+            if projectsToScan.Length = 0 then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr $"fcs_create_file_plan could not resolve any .fsproj from: {target}" ]
+                    :> JsonNode
+            else
+
+            // Load options for every resolved project; a project that fails to resolve is
+            // skipped (we plan against whatever loaded). Awaiting inside the loop only.
+            let loaded = ResizeArray<string * FSharpProjectOptions>()
+
+            for fsproj in projectsToScan do
+                try
+                    let! options, _ = this.ResolveFsprojOptions fsproj
+                    loaded.Add(fsproj, options)
+                with _ ->
+                    ()
+
+            return this.BuildFilePlan(args, fileNameRaw, projectsToScan, loaded)
+        }
+
+    // The pure (non-async) half of fcs_create_file_plan: given the already-loaded project
+    // options, compute the recommended <Compile> position, infer the namespace convention,
+    // and spell out the edit. Kept OFF the task state machine (FS3511). Writes nothing.
+    member private _.BuildFilePlan
+        (
+            args: FcsCreateFilePlanArgs,
+            fileNameRaw: string,
+            projects: string array,
+            loaded: ResizeArray<string * FSharpProjectOptions>
+        ) : JsonNode =
+        let nullNode: JsonNode = null
+        let strOrNull (s: string option) : JsonNode = match s with Some v -> jstr v | None -> nullNode
+        let notBlank (s: string) = not (String.IsNullOrWhiteSpace s)
+        let baseNameLower (p: string) = (Path.GetFileName p).ToLowerInvariant()
+
+        let looksLikeTest (p: string) =
+            (Path.GetFileNameWithoutExtension p).IndexOf("test", StringComparison.OrdinalIgnoreCase) >= 0
+
+        if loaded.Count = 0 then
+            jobj
+                [ "status", jstr "invalid_args"
+                  "message",
+                  jstr
+                      $"fcs_create_file_plan resolved {projects.Length} project(s) but could not load options for any. Restore the project first." ]
+            :> JsonNode
+        else
+
+        let afterArg = args.afterFile |> Option.filter notBlank
+        let afterBaseLower = afterArg |> Option.map baseNameLower
+
+        // Plan against the project that already contains afterFile (so the recommended
+        // index is meaningful), else the first non-test project, else simply the first.
+        let chosenFsproj, options =
+            let byAfter =
+                afterBaseLower
+                |> Option.bind (fun afb ->
+                    loaded
+                    |> Seq.tryFind (fun (_, o) -> o.SourceFiles |> Array.exists (fun f -> baseNameLower f = afb)))
+
+            match byAfter with
+            | Some chosen -> chosen
+            | None ->
+                loaded
+                |> Seq.tryFind (fun (p, _) -> not (looksLikeTest p))
+                |> Option.defaultValue loaded[0]
+
+        let notes = ResizeArray<string>()
+
+        if projects.Length > 1 then
+            notes.Add
+                $"projectPath resolved to {projects.Length} projects; planned against {Path.GetFileName chosenFsproj}"
+
+        // FCS SourceFiles augments the project's <Compile> items with MSBuild-injected
+        // generated sources (obj/ AssemblyInfo, *.g.fs, designer files). Those never appear
+        // in the .fsproj the agent will edit, so plan against the USER-VISIBLE compile set:
+        // the recommended index, sibling files and namespace inference must mirror what the
+        // .fsproj actually lists, not FCS's augmented view.
+        let underObjOrBin (p: string) =
+            let np = p.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar)
+            let sep = string Path.DirectorySeparatorChar
+
+            np.Contains($"{sep}obj{sep}", StringComparison.OrdinalIgnoreCase)
+            || np.Contains($"{sep}bin{sep}", StringComparison.OrdinalIgnoreCase)
+
+        let isUserVisible (p: string) =
+            not (underObjOrBin p || isGeneratedFile p || isAssemblyInfoFile p || isDesignerFile p)
+
+        let sourceFiles = options.SourceFiles |> Array.map normalizePath |> Array.filter isUserVisible
+        let len = sourceFiles.Length
+
+        // Read a file's first significant `namespace X` / `module X.Y` line, skipping blank
+        // lines, // comments, (* block comments *), #directives and [<attributes>]. One read
+        // per file, capped at 80 lines, so even a large solution stays cheap.
+        let readTopDecl (file: string) : string option =
+            let lines =
+                try
+                    if File.Exists file then File.ReadLines file |> Seq.truncate 80 |> Seq.toArray else [||]
+                with _ ->
+                    [||]
+
+            let firstToken (s: string) =
+                let cut = let i = s.IndexOf "//" in if i >= 0 then s.Substring(0, i) else s
+                let i = cut.IndexOfAny [| ' '; '\t'; '='; '('; ')' |]
+                (if i >= 0 then cut.Substring(0, i) else cut).Trim()
+
+            let stripLeading (words: string list) (s: string) =
+                let mutable cur = s
+                let mutable changed = true
+
+                while changed do
+                    changed <- false
+
+                    for w in words do
+                        if cur.StartsWith(w + " ") || cur.StartsWith(w + "\t") then
+                            cur <- cur.Substring(w.Length).Trim()
+                            changed <- true
+
+                cur
+
+            let parseDecl (line: string) : string option =
+                let afterKw (kw: string) =
+                    if line.StartsWith(kw + " ") || line.StartsWith(kw + "\t") then
+                        Some(line.Substring(kw.Length).Trim())
+                    else
+                        None
+
+                match afterKw "namespace" with
+                | Some rest ->
+                    let nm = rest |> stripLeading [ "rec"; "global" ] |> firstToken
+                    Some(if nm = "" then "namespace" else $"namespace {nm}")
+                | None ->
+                    match afterKw "module" with
+                    | Some rest ->
+                        let nm = rest |> stripLeading [ "rec"; "public"; "internal"; "private" ] |> firstToken
+                        if nm = "" then None else Some $"module {nm}"
+                    | None -> None
+
+            let mutable result = None
+            let mutable inBlock = false
+            let mutable i = 0
+
+            while result.IsNone && i < lines.Length do
+                let line = lines[i].Trim()
+
+                if inBlock then
+                    if line.Contains "*)" then inBlock <- false
+                elif line = "" || line.StartsWith "//" || line.StartsWith "#" || line.StartsWith "[<" then
+                    ()
+                elif line.StartsWith "(*" then
+                    if not (line.Contains "*)") then inBlock <- true
+                else
+                    // First significant line: it is the top decl, or there is none.
+                    result <- Some(parseDecl line |> Option.defaultValue "")
+
+                i <- i + 1
+
+            match result with
+            | Some "" -> None
+            | other -> other
+
+        let topDecls = sourceFiles |> Array.map readTopDecl
+
+        // Namespace root the neighbours share. For `module A.B.C` the namespace is `A.B`
+        // (drop the module leaf); for `module C` (single segment) there is no namespace.
+        let declToNamespaceParts (decl: string) : string list =
+            let parts = decl.Split(' ')
+
+            if parts.Length < 2 then
+                []
+            else
+                let segs = parts[1].Split('.') |> Array.toList
+
+                match parts[0] with
+                | "namespace" -> segs
+                | "module" -> (if segs.Length <= 1 then [] else segs |> List.take (segs.Length - 1))
+                | _ -> []
+
+        let longestCommonPrefix (lists: string list list) : string list =
+            match lists with
+            | [] -> []
+            | first :: rest ->
+                rest
+                |> List.fold
+                    (fun acc cur ->
+                        Seq.zip acc cur |> Seq.takeWhile (fun (a, b) -> a = b) |> Seq.map fst |> Seq.toList)
+                    first
+
+        let decls = topDecls |> Array.choose id
+        let kindOf (d: string) = (d.Split(' '))[0]
+        let namespaceKindCount = decls |> Array.filter (fun d -> kindOf d = "namespace") |> Array.length
+        let moduleKindCount = decls |> Array.filter (fun d -> kindOf d = "module") |> Array.length
+
+        let nsPartLists =
+            decls |> Array.map declToNamespaceParts |> Array.filter (List.isEmpty >> not) |> Array.toList
+
+        let rootStr = longestCommonPrefix nsPartLists |> String.concat "."
+        let moduleName = Path.GetFileNameWithoutExtension fileNameRaw
+        let modulePreferred = moduleKindCount >= namespaceKindCount
+
+        let inferredConvention =
+            if decls.Length = 0 then
+                "unknown — no neighbour namespace/module declarations were readable"
+            elif modulePreferred && rootStr <> "" then
+                $"module {rootStr}.<ModuleName> (one top-level module per file under namespace {rootStr})"
+            elif modulePreferred then
+                "module <ModuleName> (one top-level module per file)"
+            elif rootStr <> "" then
+                $"namespace {rootStr}"
+            else
+                "namespace <Name>"
+
+        let suggestedDecl =
+            match args.namespaceOrModule |> Option.filter notBlank with
+            | Some ns -> ns.Trim()
+            | None ->
+                if modulePreferred && rootStr <> "" then $"module {rootStr}.{moduleName}"
+                elif modulePreferred then $"module {moduleName}"
+                elif rootStr <> "" then $"namespace {rootStr}"
+                else ""
+
+        // Placement: after afterFile when matched; else after the last neighbour sharing the
+        // intended namespace root; else end-of-project (can reference everything).
+        let afterMatchIdx =
+            afterBaseLower
+            |> Option.bind (fun afb -> sourceFiles |> Array.tryFindIndex (fun f -> baseNameLower f = afb))
+
+        let nsArgFirstSeg =
+            args.namespaceOrModule
+            |> Option.filter notBlank
+            |> Option.map (fun s ->
+                let t = s.Trim()
+
+                let stripped =
+                    if t.StartsWith "namespace " then t.Substring(10).Trim()
+                    elif t.StartsWith "module " then t.Substring(7).Trim()
+                    else t
+
+                (stripped.Split('.'))[0])
+
+        let heuristicIdx =
+            match afterArg, nsArgFirstSeg with
+            | None, Some seg when seg <> "" ->
+                let mutable found = None
+
+                topDecls
+                |> Array.iteri (fun idx d ->
+                    match d |> Option.map declToNamespaceParts with
+                    | Some(firstSeg :: _) when String.Equals(firstSeg, seg, StringComparison.Ordinal) ->
+                        found <- Some idx
+                    | _ -> ())
+
+                found
+            | _ -> None
+
+        let segDisplay = nsArgFirstSeg |> Option.defaultValue ""
+
+        let recIndex, insertAfterOpt, insertBeforeOpt =
+            match afterMatchIdx with
+            | Some i ->
+                notes.Add $"placed immediately after afterFile '{Path.GetFileName sourceFiles[i]}' (compile index {i})"
+                let before = if i + 1 < len then Some sourceFiles[i + 1] else None
+                (i + 1), Some sourceFiles[i], before
+            | None ->
+                match afterArg with
+                | Some af ->
+                    notes.Add
+                        $"afterFile '{af}' was not found in {Path.GetFileName chosenFsproj}'s compile order — defaulted to end-of-project insertion"
+                | None -> ()
+
+                match heuristicIdx with
+                | Some i ->
+                    notes.Add
+                        $"no afterFile given — placed after the last neighbour sharing namespace root '{segDisplay}' (compile index {i})"
+
+                    let before = if i + 1 < len then Some sourceFiles[i + 1] else None
+                    (i + 1), Some sourceFiles[i], before
+                | None ->
+                    if len > 0 then
+                        notes.Add
+                            "no afterFile or namespace match — defaulted to end-of-project insertion (the new file can reference every existing file)"
+
+                        len, Some sourceFiles[len - 1], None
+                    else
+                        notes.Add "project has no source files — the new file would be the first <Compile> entry"
+                        0, None, None
+
+        let proposedBaseLower = baseNameLower fileNameRaw
+
+        match sourceFiles |> Array.tryFindIndex (fun f -> baseNameLower f = proposedBaseLower) with
+        | Some i ->
+            notes.Add
+                $"a file named '{Path.GetFileName fileNameRaw}' already exists at compile index {i} — this plan assumes a NEW file; pick a different name to avoid a duplicate <Compile> include"
+        | None -> ()
+
+        if
+            not (
+                fileNameRaw.EndsWith(".fs", StringComparison.OrdinalIgnoreCase)
+                || fileNameRaw.EndsWith(".fsi", StringComparison.OrdinalIgnoreCase)
+            )
+        then
+            notes.Add $"'{fileNameRaw}' does not end in .fs/.fsi — F# <Compile> items are normally .fs source files"
+
+        if suggestedDecl <> "" then
+            notes.Add $"suggested top declaration for {Path.GetFileName fileNameRaw}: {suggestedDecl}"
+
+        let windowLo = max 0 (recIndex - 3)
+        let windowHi = min (len - 1) (recIndex + 2)
+
+        let nearby =
+            [ for idx in windowLo..windowHi ->
+                  jobj
+                      [ "file", jstr sourceFiles[idx]
+                        "compileIndex", jint idx
+                        "topNamespaceOrModule", strOrNull topDecls[idx] ]
+                  :> JsonNode ]
+
+        let earlierCount = recIndex
+        let laterCount = len - recIndex
+
+        let dependencyNote =
+            $"At compile index {recIndex}, {Path.GetFileName fileNameRaw} can reference symbols from the {earlierCount} earlier file(s) but NOT the {laterCount} later file(s). F# resolves names strictly in <Compile> order, so a forward or cyclic reference is a compile error (FS0039). Run fcs_check_compile_order after editing the .fsproj to confirm the order holds."
+
+        let projDir = Path.GetDirectoryName chosenFsproj
+
+        let relInclude (absPath: string) =
+            try
+                Path.GetRelativePath(projDir, absPath)
+            with _ ->
+                Path.GetFileName absPath
+
+        let fsprojOp =
+            match insertAfterOpt with
+            | Some after ->
+                $"add <Compile Include=\"{fileNameRaw}\" /> immediately after <Compile Include=\"{relInclude after}\" /> in {Path.GetFileName chosenFsproj}"
+            | None -> $"add <Compile Include=\"{fileNameRaw}\" /> as the first <Compile> item in {Path.GetFileName chosenFsproj}"
+
+        jobj
+            [ "status", jstr "succeeded"
+              "project", jstr chosenFsproj
+              "fileName", jstr fileNameRaw
+              "recommendedCompileIndex", jint recIndex
+              "totalCompileFiles", jint len
+              "insertAfter", strOrNull insertAfterOpt
+              "insertBefore", strOrNull insertBeforeOpt
+              "nearbyFiles", JsonArray(List.toArray nearby) :> JsonNode
+              "inferredNamespaceConvention", jstr inferredConvention
+              "dependencyNote", jstr dependencyNote
+              "fsprojOp", jstr fsprojOp
+              "notes", JsonArray(notes.ToArray() |> Array.map jstr) :> JsonNode ]
+        :> JsonNode
