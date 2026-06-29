@@ -5817,6 +5817,297 @@ type internal FcsBridge() =
             return jobj (baseFields @ paginationFields) :> JsonNode
         }
 
+    /// Read-only ".fsi drift" preview for one implementation file. Type-checks the .fs
+    /// WITHOUT its sibling .fsi so the impl's true public surface is visible, then diffs
+    /// that surface against the .fsi (parsed as a signature file): members public in the
+    /// impl but absent from the .fsi are silently hidden from the public surface (the #74
+    /// core pain) and land in missingFromSig; .fsi entries with no impl match → staleInSig.
+    member this.SignatureStatus(args: FcsSignatureStatusArgs) : Task<JsonNode> =
+        // Collect declared leaf names (val/type/module) from a parsed .fsi signature tree.
+        // Defined OUTSIDE `task {}` so the resumable state machine stays statically
+        // compilable (FS3511); it closes over no task-local state.
+        let rec collectSigDecls (decls: SynModuleSigDecl list) : (string * string) list =
+            decls
+            |> List.collect (fun d ->
+                match d with
+                | SynModuleSigDecl.Val(valSig = SynValSig(ident = SynIdent(id, _))) -> [ id.idText, "val" ]
+                | SynModuleSigDecl.Types(types = types) ->
+                    types
+                    |> List.choose (fun (SynTypeDefnSig(typeInfo = SynComponentInfo(longId = lid))) ->
+                        lid |> List.tryLast |> Option.map (fun i -> i.idText, "type"))
+                | SynModuleSigDecl.NestedModule(moduleInfo = SynComponentInfo(longId = lid); moduleDecls = nested) ->
+                    let inner = collectSigDecls nested
+
+                    match lid |> List.tryLast with
+                    | Some i -> (i.idText, "module") :: inner
+                    | None -> inner
+                // Open / HashDirective / Exception / ModuleAbbrev / NamespaceFragment carry
+                // no module-level surface names to diff against the impl.
+                | _ -> [])
+
+        task {
+            match ArgsValidation.requireNonBlank "path" args.path with
+            | Error envelope -> return envelope
+            | Ok rawPath ->
+
+            let implPath = normalizePath rawPath
+
+            // Guard: the input must be an implementation .fs, not a signature .fsi.
+            let isFsi = implPath.EndsWith(".fsi", StringComparison.OrdinalIgnoreCase)
+            let isFs = implPath.EndsWith(".fs", StringComparison.OrdinalIgnoreCase)
+
+            if isFsi || not isFs then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr "path must be an implementation .fs file (not a .fsi signature file)" ]
+                    :> JsonNode
+            else
+
+            let textProvided = args.text |> Option.filter (fun t -> not (String.IsNullOrEmpty t))
+
+            if textProvided.IsNone && not (File.Exists implPath) then
+                return
+                    jobj
+                        [ "status", jstr "file_not_found"
+                          "message", jstr $"Implementation file not found: %s{implPath}"
+                          "implPath", jstr implPath ]
+                    :> JsonNode
+            else
+
+            let sigPath = Path.ChangeExtension(implPath, ".fsi") |> normalizePath
+            let hasSignatureFile = File.Exists sigPath
+
+            let source = textProvided |> Option.defaultWith (fun () -> File.ReadAllText implPath)
+            let sourceText = SourceText.ofString source
+
+            // Resolve options (projectPath → nearest .fsproj → script), then strip the sibling
+            // .fsi from the compile inputs so the impl is checked unconstrained — that exposes
+            // the public members a present .fsi would otherwise hide.
+            let! options, optionsSource = this.ResolveProjectOptions(implPath, source, args.projectPath, None)
+
+            let implOnlyOptions =
+                { options with
+                    SourceFiles =
+                        options.SourceFiles
+                        |> Array.filter (fun f ->
+                            not (String.Equals(normalizePath f, sigPath, StringComparison.OrdinalIgnoreCase))) }
+
+            let! _, checkAnswer =
+                checker.ParseAndCheckFileInProject(implPath, 0, sourceText, implOnlyOptions) |> asTask
+
+            match checkAnswer with
+            | FSharpCheckFileAnswer.Aborted ->
+                return
+                    jobj
+                        [ "status", jstr "check_aborted"
+                          "implPath", jstr implPath
+                          "sigPath", (if hasSignatureFile then jstr sigPath else null)
+                          "hasSignatureFile", jbool hasSignatureFile
+                          "message", jstr "Type checking was aborted; the public surface is unavailable." ]
+                    :> JsonNode
+            | FSharpCheckFileAnswer.Succeeded checkResults ->
+
+            // ── Local .fsi-ready preview helpers ───────────────────────────────────
+            let fmtType (t: FSharpType) =
+                try
+                    t.Format(FSharpDisplayContext.Empty)
+                with _ ->
+                    try typeName t with _ -> "?"
+
+            let valPreview (m: FSharpMemberOrFunctionOrValue) =
+                let t = try fmtType m.FullType with _ -> "?"
+                $"val {m.DisplayName}: {t}"
+
+            let moduleMemberKind (m: FSharpMemberOrFunctionOrValue) =
+                try
+                    if m.CurriedParameterGroups |> Seq.exists (fun g -> g.Count > 0) then "function" else "value"
+                with _ ->
+                    "value"
+
+            let typePreview (e: FSharpEntity) =
+                try
+                    if e.IsFSharpRecord then
+                        let fields =
+                            e.FSharpFields
+                            |> Seq.filter (fun f -> not (try f.IsCompilerGenerated || f.IsNameGenerated with _ -> false))
+                            |> Seq.map (fun f -> $"{f.Name}: {fmtType f.FieldType}")
+                            |> String.concat "; "
+
+                        $"type {e.DisplayName} = {{ {fields} }}"
+                    elif e.IsFSharpUnion then
+                        let cases =
+                            e.UnionCases
+                            |> Seq.map (fun uc ->
+                                if uc.Fields.Count = 0 then
+                                    uc.Name
+                                else
+                                    let ts =
+                                        uc.Fields |> Seq.map (fun f -> fmtType f.FieldType) |> String.concat " * "
+
+                                    $"{uc.Name} of {ts}")
+                            |> String.concat " | "
+
+                        $"type {e.DisplayName} = {cases}"
+                    else
+                        $"type {e.DisplayName}"
+                with _ ->
+                    $"type {e.DisplayName}"
+
+            let isPublicAcc (acc: string) = acc = "public" || acc = "unknown"
+
+            // ── The impl's own definitions (this file only) ────────────────────────
+            let definitionUses =
+                try
+                    checkResults.GetAllUsesOfAllSymbolsInFile()
+                    |> Seq.filter (fun su ->
+                        su.IsFromDefinition
+                        && String.Equals(normalizePath su.FileName, implPath, StringComparison.OrdinalIgnoreCase))
+                    |> Seq.toList
+                with _ ->
+                    []
+
+            // Curated public surface: top-level module values/functions + types, each with
+            // a .fsi-ready preview line. Nested-module members flatten in by leaf name.
+            let publicMembers =
+                definitionUses
+                |> List.choose (fun su ->
+                    match su.Symbol with
+                    | :? FSharpMemberOrFunctionOrValue as m ->
+                        let isTopLevelLet =
+                            try
+                                m.IsModuleValueOrMember
+                                && not m.IsMember
+                                && not m.IsPropertyGetterMethod
+                                && not m.IsPropertySetterMethod
+                                && not m.IsCompilerGenerated
+                                && (match m.DeclaringEntity with
+                                    | Some e -> (try e.IsFSharpModule with _ -> false)
+                                    | None -> false)
+                            with _ ->
+                                false
+
+                        if isTopLevelLet && isPublicAcc (memberAccessibilityString m) then
+                            Some
+                                {| name = (try m.DisplayName with _ -> "<unknown>")
+                                   kind = moduleMemberKind m
+                                   preview = valPreview m |}
+                        else
+                            None
+                    | :? FSharpEntity as e ->
+                        let isType = try not e.IsNamespace && not e.IsFSharpModule with _ -> false
+
+                        if isType && isPublicAcc (entityAccessibilityString e) then
+                            Some
+                                {| name = (try e.DisplayName with _ -> "<unknown>")
+                                   kind = entityKindString e
+                                   preview = typePreview e |}
+                        else
+                            None
+                    // Fields, union cases, and other symbol kinds are surfaced through their
+                    // enclosing type, not as standalone signature lines.
+                    | _ -> None)
+                |> List.distinctBy (fun m -> m.name, m.kind)
+                |> List.sortBy (fun m -> m.name, m.kind)
+
+            // implNameSet (used only for stale detection) also carries module names, so a
+            // `module Foo` present in both impl and .fsi is never mis-flagged as stale.
+            let implNameSet =
+                definitionUses
+                |> List.choose (fun su ->
+                    match su.Symbol with
+                    | :? FSharpMemberOrFunctionOrValue as m ->
+                        if isPublicAcc (memberAccessibilityString m) then
+                            Some(try m.DisplayName with _ -> "")
+                        else
+                            None
+                    | :? FSharpEntity as e ->
+                        if isPublicAcc (entityAccessibilityString e) then
+                            Some(try e.DisplayName with _ -> "")
+                        else
+                            None
+                    | _ -> None)
+                |> List.filter (fun n -> n <> "")
+                |> Set.ofList
+
+            // ── Parse the .fsi (if present) and collect its declared leaf names ────
+            let parsingOptions, _ = checker.GetParsingOptionsFromProjectOptions(options)
+
+            let! sigDecls =
+                task {
+                    if not hasSignatureFile then
+                        return []
+                    else
+                        try
+                            let sigText = SourceText.ofString (File.ReadAllText sigPath)
+                            let! parsed = checker.ParseFile(sigPath, sigText, parsingOptions) |> asTask
+
+                            match parsed.ParseTree with
+                            | ParsedInput.SigFile(ParsedSigFileInput(contents = modules)) ->
+                                return
+                                    modules
+                                    |> List.collect (fun (SynModuleOrNamespaceSig(decls = decls)) -> collectSigDecls decls)
+                                    |> List.distinct
+                            | _ -> return []
+                        with _ ->
+                            return []
+                }
+
+            // ── Diff impl surface against the signature ────────────────────────────
+            let sigNameSet = sigDecls |> List.map fst |> Set.ofList
+
+            let missingFromSig =
+                publicMembers |> List.filter (fun m -> not (sigNameSet.Contains m.name))
+
+            let staleInSig =
+                sigDecls |> List.filter (fun (name, _) -> not (implNameSet.Contains name))
+
+            let status =
+                if not hasSignatureFile then "no_signature_file"
+                elif List.isEmpty missingFromSig && List.isEmpty staleInSig then "clean"
+                else "drift"
+
+            let sigFileName = Path.GetFileName sigPath
+
+            let suggestion =
+                if not hasSignatureFile then
+                    $"No signature file. Create {sigFileName} from missingFromSig ({publicMembers.Length} declaration(s)) to pin the public surface."
+                elif not (List.isEmpty missingFromSig) && not (List.isEmpty staleInSig) then
+                    $"{missingFromSig.Length} public member(s) hidden from {sigFileName}; {staleInSig.Length} stale .fsi entr(ies) with no impl match. Add the missing lines, remove/fix the stale ones."
+                elif not (List.isEmpty missingFromSig) then
+                    $"{missingFromSig.Length} public member(s) are hidden from the public surface by {sigFileName}. Add the listed val/type lines."
+                elif not (List.isEmpty staleInSig) then
+                    $"{staleInSig.Length} {sigFileName} entr(ies) have no matching impl member (stale signature or a compile error). Remove or correct them."
+                else
+                    $"{sigFileName} is in sync with the implementation's public surface ({publicMembers.Length} member(s))."
+
+            let memberNode (m: {| name: string; kind: string; preview: string |}) =
+                jobj
+                    [ "name", jstr m.name
+                      "kind", jstr m.kind
+                      "signaturePreview", jstr m.preview ]
+                :> JsonNode
+
+            let staleNode (name: string, kind: string) =
+                jobj [ "name", jstr name; "kind", jstr kind ] :> JsonNode
+
+            return
+                jobj
+                    [ "status", jstr status
+                      "implPath", jstr implPath
+                      "sigPath", (if hasSignatureFile then jstr sigPath else null)
+                      "hasSignatureFile", jbool hasSignatureFile
+                      "project", jstr options.ProjectFileName
+                      "optionsSource", jstr optionsSource
+                      "publicMemberCount", jint publicMembers.Length
+                      "publicMembers", JsonArray(publicMembers |> List.map memberNode |> List.toArray) :> JsonNode
+                      "missingFromSig", JsonArray(missingFromSig |> List.map memberNode |> List.toArray) :> JsonNode
+                      "staleInSig", JsonArray(staleInSig |> List.map staleNode |> List.toArray) :> JsonNode
+                      "suggestion", jstr suggestion ]
+                :> JsonNode
+        }
+
     member _.ClearCaches() =
         optionsCache.Clear()
         projectResultsCache.Clear()

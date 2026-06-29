@@ -630,6 +630,18 @@ let main argv =
                     |> unwrapResult
                 )
 
+                tool (
+                    TypedTool.define<FcsSignatureStatusArgs>
+                        "fcs_signature_status"
+                        "Report the .fsi-vs-impl public-surface gap for one .fs WITHOUT editing: type-checks the impl with its sibling .fsi stripped, then diffs — members public in the impl but missing from the .fsi (silently hidden) → missingFromSig; .fsi entries with no impl match → staleInSig, each with a val/type signaturePreview. No .fsi? lists the would-be signature. Use for .fsi drift (members hidden/stale); prefer `fcs_public_api` for the whole public surface. projectPath falls back to set_project."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.SignatureStatus args)))
+                    |> unwrapResult
+                )
+
                 useStdio
             }
 

@@ -367,6 +367,18 @@ type FcsPublicApiArgs =
       /// Opaque cursor from a prior call's `nextCursor`. Omit for the first page.
       cursor: string option }
 
+/// Arguments for fcs_signature_status — a read-only ".fsi drift" preview. Type-checks an
+/// implementation .fs WITHOUT its sibling signature file, enumerates the public surface,
+/// and diffs it against the paired .fsi (if present) to surface members hidden from the
+/// signature (missingFromSig) and stale .fsi entries with no impl match (staleInSig).
+type FcsSignatureStatusArgs =
+    { /// The implementation .fs file whose public surface to inspect (NOT the .fsi).
+      path: string
+      /// .fsproj for project context. Falls back to active set_project; else the nearest .fsproj.
+      projectPath: string option
+      /// Unsaved buffer content for the .fs; when omitted the file is read from disk.
+      text: string option }
+
 type FcsSuggestOpenArgs =
     { /// Bare unresolved symbol name from an FS0039-style diagnostic (e.g. "File", "List", "Encoding").
       symbolName: string
