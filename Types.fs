@@ -172,6 +172,10 @@ type FcsFileOutlineArgs =
       includePrivate: bool option
       /// When true, include local bindings and parameters (noisy). Default false.
       includeLocal: bool option
+      /// When true (default), return module/type headers + per-kind member counts
+      /// only (no per-member signatures) — safe on very large files that would
+      /// otherwise overflow the MCP token ceiling. Set false for full signatures.
+      summaryOnly: bool option
       /// Maximum symbols returned. Default 200.
       maxResults: int option }
 
@@ -232,6 +236,20 @@ type FindArgs =
       maxResults: int option
       /// Opaque cursor from a prior call's nextCursor. Omit for the first page.
       cursor: string option }
+
+type FcsTestsForSymbolArgs =
+    { /// Symbol, type, or member name whose covering tests to find. Required.
+      symbolQuery: string
+      /// When true (default), match symbolQuery exactly; false = case-insensitive substring.
+      exact: bool option
+      /// File context: derives the sweep target (nearest .fsproj) when projectPath is absent.
+      path: string option
+      /// Unsaved buffer content for `path`; when omitted, the file is read from disk.
+      text: string option
+      /// .fsproj / .sln / .slnx / directory to sweep. Falls back to active set_project.
+      projectPath: string option
+      /// Maximum test sites returned. Default 100.
+      maxResults: int option }
 
 type CheckArgs =
     { /// What to check: "auto" (default) | "file" | "project" | "workspace" | "snippet".
@@ -334,6 +352,33 @@ type FcsReferencedSymbolsArgs =
       /// Opaque cursor from a prior call's `nextCursor`. Omit for first page.
       cursor: string option }
 
+type FcsPublicApiArgs =
+    { /// .fsproj whose own public API surface to emit. Falls back to active set_project.
+      projectPath: string option
+      /// When true, include `internal` entities and members alongside public ones.
+      /// `private` is never emitted. Default false (public-only surface).
+      includeInternal: bool option
+      /// Case-insensitive substring filter applied to each entity's FullName.
+      /// Omit to emit the whole surface.
+      namespaceFilter: string option
+      /// Maximum entities per page. Default 100, hard ceiling 1000. Members are
+      /// never split across pages — an entity carries its full member list.
+      maxResults: int option
+      /// Opaque cursor from a prior call's `nextCursor`. Omit for the first page.
+      cursor: string option }
+
+/// Arguments for fcs_signature_status — a read-only ".fsi drift" preview. Type-checks an
+/// implementation .fs WITHOUT its sibling signature file, enumerates the public surface,
+/// and diffs it against the paired .fsi (if present) to surface members hidden from the
+/// signature (missingFromSig) and stale .fsi entries with no impl match (staleInSig).
+type FcsSignatureStatusArgs =
+    { /// The implementation .fs file whose public surface to inspect (NOT the .fsi).
+      path: string
+      /// .fsproj for project context. Falls back to active set_project; else the nearest .fsproj.
+      projectPath: string option
+      /// Unsaved buffer content for the .fs; when omitted the file is read from disk.
+      text: string option }
+
 type FcsSuggestOpenArgs =
     { /// Bare unresolved symbol name from an FS0039-style diagnostic (e.g. "File", "List", "Encoding").
       symbolName: string
@@ -346,6 +391,138 @@ type FcsSuggestOpenArgs =
       /// When true (default), also search referenced assemblies (BCL + NuGet). Set false to search project-local only.
       includeReferences: bool option
       /// Maximum candidates per source. Default 20, hard ceiling 100.
+      maxResults: int option }
+
+type FcsExplainDiagnosticArgs =
+    { /// Numeric error code WITHOUT the "FS" prefix (e.g. 39 for FS0039). Use this OR `code`.
+      errorNumber: int option
+      /// Full diagnostic code WITH the "FS" prefix (e.g. "FS0039"). Takes precedence over `errorNumber`.
+      code: string option
+      /// The raw FCS diagnostic message. Used to enrich repairHints — e.g. the undefined
+      /// name is extracted from an FS0039 message to suggest `fcs_suggest_open`.
+      message: string option
+      /// File context: when neither `code` nor `errorNumber` is given, the diagnostic at
+      /// (line, character) is auto-fetched by type-checking this file via FCS.
+      path: string option
+      /// 0-based line (LSP convention) for the position-based auto-fetch. Pairs with `path`.
+      line: int option
+      /// 0-based column (LSP convention) for the position-based auto-fetch. Pairs with `path`.
+      character: int option
+      /// Unsaved buffer content for the auto-fetch path; when omitted, the file is read from disk.
+      text: string option
+      /// .fsproj for project context on the auto-fetch path. Falls back to active set_project.
+      projectPath: string option }
+
+type FcsCheckCompileOrderArgs =
+    { /// .fsproj / .sln / .slnx to scan. Falls back to the active set_project when omitted.
+      projectPath: string option
+      /// When set, only report compile-order problems for this unresolved name (the
+      /// leftmost identifier in an FS0039 "X is not defined" error). Omit to check all.
+      symbol: string option }
+
+/// Arguments for fcs_create_file_plan (#66) — a read-only "where should this new .fs file
+/// go, and how?" planner. PLANNING ONLY: it never creates files, writes source, or edits
+/// the .fsproj. It loads the project's resolved <Compile> order, recommends an insertion
+/// index, infers the namespace/module convention from neighbouring files, and spells out
+/// the exact <Compile Include=...> edit. Pairs with fcs_check_compile_order (run AFTER).
+type FcsCreateFilePlanArgs =
+    { /// Proposed new file name (e.g. "Validation.fs"). The leaf name drives matching and the
+      /// suggested module name; a directory prefix, if any, is preserved verbatim in fsprojOp.
+      fileName: string
+      /// Existing sibling the new file should compile AFTER (by name or path). When matched in
+      /// the compile order, the recommended index sits right after it. Omit to let the
+      /// namespace heuristic (or end-of-project insertion) decide.
+      afterFile: string option
+      /// Intended namespace or module for the new file. Compared against the neighbour
+      /// convention to seed the namespace-grouping heuristic; advisory, never enforced.
+      namespaceOrModule: string option
+      /// .fsproj / .sln / .slnx to plan against. Falls back to the active set_project.
+      projectPath: string option }
+
+/// Arguments for fcs_analyzer_setup_preview (#75) — a read-only "what do I need to add to
+/// turn on F# analyzers?" planner. Reads the target .fsproj + the nearest
+/// Directory.Build.props/.targets + dotnet-tools.json (textual, no FCS), diffs the present
+/// wiring against the required set (analyzer package refs + GeneratePathProperty,
+/// FSharp.Analyzers.Build, the FSharpAnalyzersOtherFlags property, and a local
+/// fsharp-analyzers tool manifest), and emits the exact XML/JSON snippets to add. Applies
+/// nothing. Pairs with fcs_analyzer_diagnostics (run AFTER applying the changes).
+type FcsAnalyzerSetupPreviewArgs =
+    { /// .fsproj / .sln / .slnx / directory to plan analyzer setup for. Falls back to the
+      /// active set_project when omitted.
+      projectPath: string option
+      /// Analyzer NuGet packages to wire up. Defaults to
+      /// ["G-Research.FSharp.Analyzers"; "Ionide.Analyzers"] when omitted or empty.
+      analyzerPackages: string list option }
+
+/// Arguments for fcs_refactor_impact — a read-only "what will this change affect, and
+/// what should I verify?" planning preview. Orchestrates the existing find sweep,
+/// tests-for-symbol, compile-order, public-api, and (optionally) rename-preview backends
+/// into one blast-radius + verification-checklist synthesis. Writes nothing.
+type FcsRefactorImpactArgs =
+    { /// The symbol about to change (by name). Use this OR a position (path + line + character).
+      symbol: string option
+      /// File context for a position-anchored target (e.g. the symbol under the cursor for a
+      /// rename). Pairs with line/character; the symbol name is resolved at that position.
+      path: string option
+      /// 0-based line (LSP convention) of the position-anchored target. Pairs with path.
+      line: int option
+      /// 0-based column (LSP convention) of the position-anchored target. Pairs with path.
+      character: int option
+      /// New identifier, when a rename is contemplated. Enables the best-effort rename-preview
+      /// edit set (requires a position) and selects kind=rename under kind="auto".
+      newName: string option
+      /// Intended change: "rename" | "signature" | "move" | "delete" | "auto" (default).
+      /// auto infers from inputs (newName ⇒ rename, else a generic blast-radius sweep).
+      kind: string option
+      /// .fsproj / .sln / .slnx to sweep. Falls back to the active set_project.
+      projectPath: string option }
+
+/// Arguments for fcs_review_scan — a read-only, AST-based review inventory. Surfaces
+/// structurally interesting spots (review CANDIDATES, not bugs) for an agent/human to
+/// eyeball during F# review. Parse-only; writes nothing.
+type FcsReviewScanArgs =
+    { /// Single F# source file to scan. Use this OR projectPath; when both are set, path wins.
+      path: string option
+      /// .fsproj whose compiled files to scan. Falls back to the active set_project when
+      /// both path and projectPath are omitted.
+      projectPath: string option
+      /// Restrict to these categories (e.g. ["try_with"; "mutable_binding"]). Omit for all.
+      /// Known: match_wildcard, try_with, raise_or_failwith, mutable_binding, blocking_call,
+      /// cast_or_box, reflection, large_function.
+      categories: string list option
+      /// Maximum candidates returned. Default 200, hard ceiling 1000. counts.byCategory
+      /// still reports true totals across every scanned file even when the list is capped.
+      maxResults: int option }
+
+/// Arguments for fcs_dead_code — a conservative dead-code candidate pass. Sweeps the
+/// project (ParseAndCheckProject → GetAllUsesOfAllSymbols) and reports module/type-level
+/// value &amp; function bindings whose ONLY recorded use is their own definition. These are
+/// candidates, NOT deletions: the tool writes nothing and always emits caveats.
+type FcsDeadCodeArgs =
+    { /// .fsproj / .sln / .slnx to sweep. Falls back to the active set_project when omitted.
+      projectPath: string option
+      /// Include public symbols too. Default false — public API is presumed reachable by
+      /// external callers, so flagging it would over-report. Set true for a leaf executable
+      /// or a closed codebase with no external consumers.
+      includePublic: bool option
+      /// Max candidates returned in one page. Default 100, hard ceiling 500. The full count
+      /// is reported in candidateCount; the `truncated` flag marks when the page was capped.
+      maxResults: int option }
+
+/// Arguments for fcs_analyzer_diagnostics (#72) — reports F# *analyzer* diagnostics
+/// (distinct from compiler diagnostics) for a project, grouped for agents. Detects the
+/// analyzer configuration the same way project_health does, then runs the fsharp-analyzers
+/// CLI when one is available and parses its SARIF; otherwise it reports what is configured.
+/// Read-only; writes nothing. Pairs with project_health (which reports analyzer SETUP).
+type FcsAnalyzerDiagnosticsArgs =
+    { /// .fsproj / .sln / .slnx to inspect. Falls back to the active set_project when omitted.
+      projectPath: string option
+      /// Filter diagnostics by normalized severity: "error" | "warning" | "info" | "hint".
+      /// When omitted, every severity passes through.
+      severity: string option
+      /// Maximum diagnostics returned in one page. Default 200, hard ceiling 1000.
+      /// counts.byAnalyzer / counts.bySeverity still report true totals across the full
+      /// (severity-filtered) set even when the returned list is capped.
       maxResults: int option }
 
 type FcsNugetTypesArgs =
@@ -409,6 +586,18 @@ type CodeActionArgs =
       /// Unsaved buffer content; when omitted, file is read from disk.
       text: string option }
 
+type DiagnosticFixesArgs =
+    { /// Absolute path to an existing F# source file (.fs or .fsi).
+      path: string
+      /// Unsaved buffer content; when omitted, file is read from disk.
+      text: string option
+      /// 0-based line (LSP convention). With character, narrows to diagnostics
+      /// covering that exact position; with line alone, to diagnostics on that line.
+      /// Omit both to report every diagnostic in the file.
+      line: int option
+      /// 0-based column (LSP convention). Pairs with line to pin one position.
+      character: int option }
+
 type RenameArgs =
     { /// Absolute path to the F# source file containing the symbol to rename.
       path: string
@@ -417,6 +606,18 @@ type RenameArgs =
       /// 0-based column number of the symbol (LSP convention).
       character: int
       /// New identifier to assign across the workspace. Required.
+      newName: string
+      /// Unsaved buffer content; when omitted, file is read from disk.
+      text: string option }
+
+type RenamePreviewArgs =
+    { /// Absolute path to the F# source file containing the symbol to preview a rename for.
+      path: string
+      /// 0-based line number of the symbol (LSP convention).
+      line: int
+      /// 0-based column number of the symbol (LSP convention).
+      character: int
+      /// New identifier the preview pretends to assign across the workspace. Required.
       newName: string
       /// Unsaved buffer content; when omitted, file is read from disk.
       text: string option }
@@ -506,3 +707,47 @@ module ArgsValidation =
             Ok trimmed
 
 let normalizePath (path: string) = Path.GetFullPath(path)
+
+// ─── Reference-resolution probe ────────────────────────────────────────────────
+
+/// Deterministic "is this project restored/built?" probe over an FCS OtherOptions
+/// list. Counts how many `-r:`/`--reference:` target assemblies actually exist on
+/// disk. An unrestored/unbuilt project evaluates its .fsproj (so OtherOptions are
+/// populated) but its external reference assemblies (FSharp.Core.dll, BCL refs,
+/// NuGet packages) are absent — yielding total > 0 with existing far below total.
+/// Shared by check (FcsBridge) and project_health/set_project readiness so both can
+/// tell "not restored" apart from "no symbols".
+module ReferenceResolution =
+
+    /// Returns (existing, total): how many `-r:`/`--reference:` targets resolve on
+    /// disk, out of how many were requested.
+    let probe (otherOptions: string seq) : int * int =
+        let refTargets =
+            otherOptions
+            |> Seq.choose (fun opt ->
+                if isNull opt then None
+                elif opt.StartsWith("-r:", StringComparison.Ordinal) then Some(opt.Substring(3))
+                elif opt.StartsWith("--reference:", StringComparison.Ordinal) then Some(opt.Substring(12))
+                else None)
+            |> Seq.toArray
+
+        let existing = refTargets |> Array.filter File.Exists |> Array.length
+        existing, refTargets.Length
+
+    /// Fraction of references resolved on disk. Returns 1.0 when total = 0 (nothing
+    /// to resolve) so callers can gate the "unrestored" verdict on `total > 0`.
+    let fraction (existing: int) (total: int) : float =
+        if total <= 0 then 1.0 else float existing / float total
+
+    /// True when the project looks effectively unrestored/unbuilt: it declares
+    /// external references but fewer than 20% of them exist on disk.
+    let looksUnrestored (existing: int) (total: int) : bool =
+        total > 0 && fraction existing total < 0.2
+
+/// Resolved project-options summary shared by ProbeProjectOptions (FcsBridge) and
+/// createReport (ProjectHealth). Carries the reference-resolution counts so readiness
+/// reporting can surface "unrestored" instead of a bare "available".
+type ProjectOptionsInfo =
+    { Source: string
+      ReferencesExisting: int
+      ReferencesTotal: int }

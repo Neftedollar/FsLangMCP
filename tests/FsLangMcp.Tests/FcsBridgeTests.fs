@@ -449,6 +449,7 @@ let ``fcs_file_outline returns compact definitions without local noise`` () : Ta
                       projectOptions = None
                       includePrivate = None
                       includeLocal = Some false
+                      summaryOnly = Some false
                       maxResults = Some 50 }
                 )
 
@@ -657,6 +658,7 @@ let ``fcs_file_outline returns InvalidArgument error when path is a directory`` 
                   projectOptions = None
                   includePrivate = None
                   includeLocal = None
+                  summaryOnly = None
                   maxResults = None }
             )
 
@@ -724,6 +726,7 @@ let ``fcs_file_outline bypasses File.Exists gate when non-empty text is supplied
                   projectOptions = None
                   includePrivate = None
                   includeLocal = None
+                  summaryOnly = None
                   maxResults = None }
             )
 
@@ -746,6 +749,7 @@ let ``fcs_file_outline still rejects a directory path even when text is supplied
                   projectOptions = None
                   includePrivate = None
                   includeLocal = None
+                  summaryOnly = None
                   maxResults = None }
             )
 
@@ -3587,3 +3591,116 @@ let ``SuggestOpen project-local candidates appear before reference candidates`` 
                 Directory.Delete(tempRoot, true)
     }
 
+
+// ─── fcs_file_outline summaryOnly (#100) ──────────────────────────────────────
+// Default summaryOnly=true emits module/type headers + per-kind memberCounts only
+// (no per-member signatures), so a 5k-line file never overflows the token ceiling.
+
+[<Fact>]
+let ``fcs_file_outline defaults to summaryOnly: headers + memberCounts, no signatures`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_outline_summary_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let source =
+                String.concat
+                    "\n"
+                    [ "module OutlineSummary.Library"
+                      ""
+                      "type Rec = { Name: string }"
+                      ""
+                      "type Choice ="
+                      "    | A"
+                      "    | B"
+                      ""
+                      "let f (x: int) = x + 1"
+                      ""
+                      "let g (y: int) = y * 2" ]
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "OutlineSummary" source
+
+            // Default: summaryOnly omitted → true at runtime.
+            let! result =
+                bridge.FileOutline(
+                    { path = sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      includePrivate = None
+                      includeLocal = None
+                      summaryOnly = None
+                      maxResults = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.True(result["summaryOnly"].GetValue<bool>(), "the default must be summaryOnly=true")
+
+            let entries = result["entries"] :?> JsonArray
+            let kinds = entries |> Seq.map (fun e -> e["kind"].GetValue<string>()) |> Seq.toList
+
+            // Only container headers survive — functions are collapsed into memberCounts.
+            Assert.Contains("module", kinds)
+            Assert.DoesNotContain("function_or_value", kinds)
+
+            // Header entries carry no per-member signature payload.
+            for e in entries do
+                Assert.Null(e["signature"])
+
+            // memberCounts tallies the dropped functions (true totals).
+            let counts = result["memberCounts"] :?> JsonObject
+            Assert.NotNull(counts)
+            Assert.True(counts.ContainsKey("function_or_value"), "memberCounts must tally the dropped functions")
+            Assert.True(counts["function_or_value"].GetValue<int>() >= 2, "f and g must both be counted")
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``fcs_file_outline summaryOnly=false restores full per-member entries with signatures`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_outline_full_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let source =
+                String.concat
+                    "\n"
+                    [ "module OutlineFull.Library"; ""; "let f (x: int) = x + 1"; ""; "let g (y: int) = y * 2" ]
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "OutlineFull" source
+
+            let! result =
+                bridge.FileOutline(
+                    { path = sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      includePrivate = None
+                      includeLocal = None
+                      summaryOnly = Some false
+                      maxResults = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.False(result["summaryOnly"].GetValue<bool>(), "summaryOnly=false was requested")
+
+            let entries = result["entries"] :?> JsonArray
+            let names = entries |> Seq.map (fun e -> e["name"].GetValue<string>()) |> Seq.toList
+
+            // Full mode keeps the function members AND their signatures.
+            Assert.Contains("f", names)
+            Assert.Contains("g", names)
+
+            for e in entries do
+                Assert.NotNull(e["signature"])
+
+            // memberCounts is present in BOTH modes so callers can rely on the shape.
+            Assert.NotNull(result["memberCounts"])
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }

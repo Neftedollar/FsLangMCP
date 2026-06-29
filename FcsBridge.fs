@@ -221,6 +221,618 @@ module internal CheckFsacSnapshot =
         with _ ->
             empty
 
+// ─── Curated F# diagnostic explanations (issue #61) ─────────────────────────────
+// Plain-language explanation + actionable repair context for the compiler
+// diagnostics agents hit most. Keyed by numeric ErrorNumber (FS0039 -> 39).
+// Titles and explanations are grounded in the real FCS resource messages —
+// the wording for the verified codes was captured from live FCS output.
+
+type internal DiagnosticExplanation =
+    { Title: string
+      Explanation: string
+      LikelyCauses: string list
+      RepairHints: string list
+      RelatedTools: string list }
+
+let internal curatedDiagnostics: Map<int, DiagnosticExplanation> =
+    Map.ofList
+        [ 1,
+          { Title = "Type mismatch"
+            Explanation =
+              "An expression has a different type than the surrounding context requires. F# is statically typed and inserts no implicit conversions, so the inferred type and the expected type must line up exactly."
+            LikelyCauses =
+              [ "A value of the wrong type passed to a function, operator, or binding"
+                "A missing conversion (int vs float, string vs char, list vs array)"
+                "A type annotation that contradicts the inferred type"
+                "A unit-of-measure or generic-parameter mismatch" ]
+            RepairHints =
+              [ "Read the 'Expecting X but given Y' line — it names both the expected and actual type"
+                "Add an explicit conversion (e.g. `float`, `string`, `int`) or correct the annotation"
+                "Inspect the offending sub-expression's inferred type with fcs_symbol_at_word" ]
+            RelatedTools = [ "check"; "fcs_symbol_at_word"; "fcs_signature_help" ] }
+
+          3,
+          { Title = "Value applied as if it were a function"
+            Explanation =
+              "You wrote `f x` where `f` is a value, not a function, so it cannot be applied to an argument. F# reads juxtaposition as function application."
+            LikelyCauses =
+              [ "Too many arguments passed to a function"
+                "A name shadowed by a non-function value"
+                "A missing operator or comma between expressions"
+                "Indexing with `xs i` instead of `xs[i]`" ]
+            RepairHints =
+              [ "Check the arity of the function you meant to call"
+                "Use fcs_signature_help at the call site to see the expected parameters" ]
+            RelatedTools = [ "fcs_signature_help"; "fcs_symbol_at_word"; "check" ] }
+
+          10,
+          { Title = "Syntax error — unexpected token or incomplete construct"
+            Explanation =
+              "The parser hit a token it did not expect, or a structured construct (let/match/type/module) was left incomplete. This is a syntax error, not a type error."
+            LikelyCauses =
+              [ "Incorrect indentation (the offside rule) under let/match/if/module"
+                "A missing keyword such as `then`, `->`, `=`, `in`, or `done`"
+                "Unbalanced parentheses, brackets, or quotation marks"
+                "A `let`/`member` placed at the wrong scope" ]
+            RepairHints =
+              [ "Check the indentation of the line the error points at — F# is whitespace-sensitive"
+                "Run textDocument_formatting to normalize layout and reveal the structural mistake" ]
+            RelatedTools = [ "check"; "textDocument_formatting"; "fcs_file_outline" ] }
+
+          20,
+          { Title = "Expression result is implicitly ignored"
+            Explanation =
+              "A non-unit expression sits in statement position (e.g. its own line in a sequence), so its result is discarded. F# flags this because a silently dropped value is usually a bug."
+            LikelyCauses =
+              [ "Calling a function for a side effect but forgetting it returns a value"
+                "Writing `=` (comparison) where `<-` (assignment) was intended"
+                "A forgotten `let` binding, or a missing `return`/`return!` in a computation expression" ]
+            RepairHints =
+              [ "If the result is genuinely unwanted, discard it explicitly: `expr |> ignore`"
+                "If you meant to keep it, bind it: `let result = expr`"
+                "If you meant assignment, use `<-` not `=`" ]
+            RelatedTools = [ "check"; "fcs_symbol_at_word" ] }
+
+          25,
+          { Title = "Incomplete pattern match"
+            Explanation =
+              "A `match` (or `function`) does not cover every possible case of the value's type. At runtime an uncovered value raises MatchFailureException."
+            LikelyCauses =
+              [ "A missing DU case, None/Some arm, or empty/non-empty list arm"
+                "A `when` guard that makes an arm non-total"
+                "A newly added DU case that left existing matches stale" ]
+            RepairHints =
+              [ "Add the missing case(s) the message names (e.g. 'None may indicate a case not covered')"
+                "Add a catch-all `| _ ->` only if a default is truly intended — otherwise enumerate cases explicitly"
+                "List the type's cases with fcs_file_outline or find" ]
+            RelatedTools = [ "check"; "fcs_file_outline"; "find" ] }
+
+          26,
+          { Title = "Unreachable pattern-match rule"
+            Explanation =
+              "A match arm can never be reached because an earlier arm already matches everything it would. The dead arm is almost always a logic error."
+            LikelyCauses =
+              [ "A catch-all `| _ ->` or variable pattern placed before more specific arms"
+                "Duplicate or subsumed patterns"
+                "An overly broad guard on an earlier arm" ]
+            RepairHints =
+              [ "Reorder arms so specific patterns precede general ones"
+                "Remove the duplicate arm, or tighten the earlier pattern" ]
+            RelatedTools = [ "check" ] }
+
+          30,
+          { Title = "Value restriction"
+            Explanation =
+              "A top-level value was inferred to be generic, but the value restriction forbids generalizing something that is not a syntactic function. F# cannot safely make it polymorphic."
+            LikelyCauses =
+              [ "A partially applied function bound to a value (e.g. `let f = List.map id`)"
+                "An empty collection or `None` bound without enough type information"
+                "A point-free definition the compiler cannot generalize" ]
+            RepairHints =
+              [ "Add a type annotation pinning the generic parameter (e.g. `let f : int list -> int list = ...`)"
+                "Make the argument explicit: `let f x = List.map id x`" ]
+            RelatedTools = [ "check"; "fcs_symbol_at_word" ] }
+
+          35,
+          { Title = "Deprecated construct"
+            Explanation =
+              "The code uses a construct marked deprecated (via an Obsolete attribute or a legacy language form). It still compiles but should be replaced."
+            LikelyCauses =
+              [ "Calling an API annotated [<Obsolete>]"
+                "Using a legacy F# syntax form kept only for compatibility" ]
+            RepairHints =
+              [ "Read the deprecation message — it usually names the replacement"
+                "Find the recommended API with fcs_referenced_symbols or fcs_nuget_members" ]
+            RelatedTools = [ "fcs_referenced_symbols"; "fcs_nuget_members"; "check" ] }
+
+          39,
+          { Title = "Name is not defined"
+            Explanation =
+              "An identifier (value, constructor, namespace, module, type, field, or record label) could not be resolved in the current scope. The name is unknown to the compiler here."
+            LikelyCauses =
+              [ "A missing `open` for the namespace/module that declares the name"
+                "A typo or wrong casing in the identifier"
+                "Using a name before its declaration (F# resolves top-to-bottom)"
+                "A missing project or package reference" ]
+            RepairHints =
+              [ "Run fcs_suggest_open with the unresolved name to get the exact `open` directive"
+                "Check spelling and that the declaration appears earlier in compile order"
+                "Confirm the defining project/package is referenced" ]
+            RelatedTools = [ "fcs_suggest_open"; "find"; "fcs_referenced_symbols"; "check" ] }
+
+          40,
+          { Title = "Recursive object reference checked at runtime"
+            Explanation =
+              "You defined one or more recursive objects (not functions) with `let rec`, so the compiler inserts a runtime initialization check: a recursive value can be observed before it is fully constructed."
+            LikelyCauses =
+              [ "A `let rec` binding a value (recursive record/closure) rather than a function"
+                "Mutually recursive values that reference each other during construction" ]
+            RepairHints =
+              [ "Restructure into recursive functions instead of recursive values where possible"
+                "Defer the self-reference with `lazy`/`Lazy<_>` or a function indirection" ]
+            RelatedTools = [ "check"; "fcs_file_outline" ] }
+
+          41,
+          { Title = "No overload matches the arguments"
+            Explanation =
+              "A method has several overloads but none accepts the argument types (or count) you supplied, so overload resolution failed."
+            LikelyCauses =
+              [ "An argument of the wrong type for every overload"
+                "The wrong number of arguments"
+                "An ambiguous numeric literal that fits no overload without an annotation" ]
+            RepairHints =
+              [ "Read the listed candidate overloads and annotate the offending argument's type"
+                "Use fcs_signature_help at the call site to see all overloads and their parameters" ]
+            RelatedTools = [ "fcs_signature_help"; "fcs_nuget_members"; "check" ] }
+
+          49,
+          { Title = "Uppercase identifier used as a pattern variable"
+            Explanation =
+              "An uppercase identifier in a pattern is being bound as a fresh variable (capturing everything) rather than matched against an existing case or literal. F# warns because this usually means a case name is misspelled or its module is not opened."
+            LikelyCauses =
+              [ "A DU case or literal whose module is not `open`ed, so the name binds as a variable"
+                "A misspelled pattern or case name"
+                "Intending to match a constant but writing it as a bare identifier" ]
+            RepairHints =
+              [ "`open` the module that declares the case, or qualify it (e.g. `MyDu.CaseName`)"
+                "Match a constant via a `[<Literal>]` value or a `when` guard"
+                "Run fcs_suggest_open for the intended case name" ]
+            RelatedTools = [ "fcs_suggest_open"; "find"; "check" ] }
+
+          64,
+          { Title = "Construct is less generic than annotated"
+            Explanation =
+              "A type annotation promises a generic type parameter, but the body forces it to a concrete type, so the value is not as generic as written. The message names the variable and the type it was constrained to."
+            LikelyCauses =
+              [ "Using a type-specific operation (e.g. `+`, `.Length`) on a value annotated as generic `'a`"
+                "An annotation promising more polymorphism than the implementation delivers" ]
+            RepairHints =
+              [ "Either drop the generic annotation and let the type be concrete, or use `inline` + SRTP to genuinely generalize the operation"
+                "Replace `'a` with the concrete type the message reports" ]
+            RelatedTools = [ "check"; "fcs_symbol_at_word" ] }
+
+          66,
+          { Title = "Unnecessary upcast"
+            Explanation =
+              "An upcast (`:>`) converts a value to a type it already has, so the coercion does nothing. F# flags it as redundant."
+            LikelyCauses =
+              [ "An explicit `:> SomeType` where the expression is already that type"
+                "A leftover coercion after a refactor changed the inferred type" ]
+            RepairHints = [ "Remove the `:>` coercion" ]
+            RelatedTools = [ "check" ] }
+
+          67,
+          { Title = "Type test or downcast that always succeeds"
+            Explanation =
+              "A runtime type test (`:?`) or downcast checks for a type the value statically already has, so it is always true and therefore redundant."
+            LikelyCauses =
+              [ "A `:?` test against the value's own static type"
+                "A downcast the type system already guarantees" ]
+            RepairHints =
+              [ "Remove the redundant test/cast, or widen the static type if a real test was intended" ]
+            RelatedTools = [ "check"; "fcs_symbol_at_word" ] }
+
+          72,
+          { Title = "Member lookup on a value of indeterminate type"
+            Explanation =
+              "You accessed a member (`x.Foo`) before the compiler knew the type of `x`. F# infers types top-to-bottom and left-to-right, so at this point the object's type is still unknown and the member cannot be resolved."
+            LikelyCauses =
+              [ "A lambda or function parameter whose type is only inferred from a later use"
+                "Pipelining into a member access before the type is fixed"
+                "A missing type annotation on a parameter" ]
+            RepairHints =
+              [ "Annotate the parameter (e.g. `fun (x: string) -> x.Length`)"
+                "Reorder so the type-determining use comes first" ]
+            RelatedTools = [ "check"; "fcs_symbol_at_word"; "fcs_signature_help" ] }
+
+          193,
+          { Title = "Type constraint mismatch"
+            Explanation =
+              "A type was used where it does not satisfy a required constraint — for example an interface, default-constructor, comparison, or byref constraint demanded by a generic parameter or member. The supplied type is incompatible with the constraint."
+            LikelyCauses =
+              [ "A type argument that does not implement the required interface or constraint"
+                "An SRTP/member constraint not satisfied by the concrete type"
+                "A byref or struct constraint violation" ]
+            RepairHints =
+              [ "Check the constraint the message names and supply a type that satisfies it"
+                "Confirm which interfaces a type implements with fcs_referenced_symbols" ]
+            RelatedTools = [ "fcs_referenced_symbols"; "fcs_signature_help"; "check" ] }
+
+          493,
+          { Title = "Member is static, not an instance method"
+            Explanation =
+              "You called a member through an instance (`obj.Member`), but the member is declared `static`. Static members are invoked on the type, not on a value."
+            LikelyCauses =
+              [ "Calling a static member via an instance variable"
+                "Confusing a static factory/helper with an instance method" ]
+            RepairHints =
+              [ "Call it on the type: `TypeName.Member(...)` instead of `instance.Member(...)`"
+                "Confirm whether the member is static with fcs_nuget_members or fcs_referenced_symbols" ]
+            RelatedTools = [ "fcs_nuget_members"; "fcs_referenced_symbols"; "fcs_signature_help" ] }
+
+          505,
+          { Title = "Wrong number of arguments to a member"
+            Explanation =
+              "A method or constructor was called with an argument count no overload accepts. The message reports the arity you supplied and an arity that exists."
+            LikelyCauses =
+              [ "Passing too many or too few arguments to a .NET method"
+                "Forgetting that a member takes a tuple `(a, b)` vs curried arguments"
+                "Calling a parameterless member with arguments, or vice-versa" ]
+            RepairHints =
+              [ "Match the call to one of the overloads the message reports"
+                "Use fcs_signature_help at the call site to see the exact parameter lists" ]
+            RelatedTools = [ "fcs_signature_help"; "fcs_nuget_members"; "check" ] }
+
+          588,
+          { Title = "Block after 'let' is not indented enough"
+            Explanation =
+              "The expression that should follow a `let` binding is indented at or before the `let`, so the offside rule does not treat it as the binding's body or continuation."
+            LikelyCauses =
+              [ "The line after `let x = ...` is indented less than the `let`"
+                "A dedented continuation in a sequence of bindings"
+                "Mixed tabs and spaces breaking the indentation" ]
+            RepairHints =
+              [ "Indent the following block more than the `let` keyword"
+                "Run textDocument_formatting to normalize indentation" ]
+            RelatedTools = [ "textDocument_formatting"; "check" ] }
+
+          759,
+          { Title = "Cannot create an instance of an abstract type"
+            Explanation =
+              "You tried to construct a type marked abstract (or one with unimplemented abstract members), so no instances can be created directly."
+            LikelyCauses =
+              [ "`new` on an [<AbstractClass>] type"
+                "Instantiating an interface, or a type with unimplemented abstract members" ]
+            RepairHints =
+              [ "Use (or define) a concrete subclass that implements the abstract members"
+                "Supply the members inline with an object expression: `{ new AbstractType with ... }`" ]
+            RelatedTools = [ "fcs_referenced_symbols"; "fcs_file_outline"; "check" ] }
+
+          760,
+          { Title = "Create IDisposable with 'new'"
+            Explanation =
+              "An object whose type implements IDisposable was created without the `new` keyword. F# recommends `new Type(args)` for disposables to make clear the value owns a resource that should be disposed."
+            LikelyCauses = [ "Constructing a disposable as `Type(args)` instead of `new Type(args)`" ]
+            RepairHints =
+              [ "Add the `new` keyword: `use x = new Type(args)`"
+                "Bind it with `use` (not `let`) so it is disposed at scope exit" ]
+            RelatedTools = [ "check" ] }
+
+          1182,
+          { Title = "Unused value"
+            Explanation =
+              "A bound value or function parameter is never used. This warning is off by default (enabled with --warnon:1182) and flags likely dead code or a typo."
+            LikelyCauses =
+              [ "A `let` binding or parameter that is never referenced"
+                "A parameter kept only for signature compatibility"
+                "A typo that references a different name than the one bound" ]
+            RepairHints =
+              [ "Remove the unused binding, or prefix it with `_` (e.g. `_unused`) to signal intent"
+                "If it is a typo, fix the reference to match the bound name" ]
+            RelatedTools = [ "find"; "check" ] }
+
+          3261,
+          { Title = "Nullness warning"
+            Explanation =
+              "With nullable reference types enabled, a possibly-null value is used where a non-null value is expected (or vice-versa). The nullability annotations do not line up."
+            LikelyCauses =
+              [ "Passing a `T | null` value where a non-null `T` is required"
+                "Dereferencing a value that may be null without a check"
+                "Interop with a .NET API whose nullability annotations differ" ]
+            RepairHints =
+              [ "Null-check before use (pattern-match on null, or `Option.ofObj`)"
+                "Adjust the annotation (`T?`) to reflect the true nullability"
+                "Wrap external boundaries that may return null in `Option.ofObj`" ]
+            RelatedTools = [ "check"; "fcs_symbol_at_word" ] } ]
+
+// ── Resolution + enrichment helpers for fcs_explain_diagnostic ───────────────────
+
+/// Parse a diagnostic code such as "FS0039", "fs39", or "39" into its numeric part.
+let internal parseDiagnosticCode (raw: string) : int option =
+    if String.IsNullOrWhiteSpace raw then
+        None
+    else
+        let trimmed = raw.Trim()
+
+        let digits =
+            if trimmed.StartsWith("FS", StringComparison.OrdinalIgnoreCase) then
+                trimmed.Substring(2)
+            else
+                trimmed
+
+        match Int32.TryParse digits with
+        | true, n -> Some n
+        | _ -> None
+
+/// Render a numeric error number back into canonical "FS0039" form.
+let internal formatDiagnosticCode (n: int) : string = $"FS%04d{n}"
+
+/// First single-quoted token in an FCS message, e.g. 'Encoding' from an FS0039 text.
+let internal firstQuotedToken (message: string) : string option =
+    let m = System.Text.RegularExpressions.Regex.Match(message, "'([^']+)'")
+    if m.Success then Some m.Groups[1].Value else None
+
+/// Enrich the base repair hints from the raw message. For name-resolution diagnostics
+/// (FS0039 / FS0049) the offending name is extracted and a fcs_suggest_open hint is
+/// prepended as the most actionable next step.
+let internal enrichRepairHints (errorNumber: int) (message: string option) (baseHints: string list) : string list =
+    match errorNumber, message with
+    | (39 | 49), Some msg ->
+        match firstQuotedToken msg with
+        | Some name ->
+            $"The unresolved name is '{name}' — run fcs_suggest_open with symbolName=\"{name}\" to get the right `open` directive."
+            :: baseHints
+        | None -> baseHints
+    | _ -> baseHints
+
+/// Build a one-line-per-string JSON array.
+let internal jstrArray (xs: string list) : JsonNode =
+    JsonArray(xs |> List.map jstr |> List.toArray) :> JsonNode
+
+/// Render the final explain-diagnostic envelope from a resolved code, or pass an
+/// already-built error envelope straight through. Pure and synchronous so the task
+/// continuation that calls it stays a statically compilable state machine (FS3511).
+let internal renderExplanation
+    (explicitMessage: string option)
+    (resolved: Result<int * string option, JsonNode>)
+    : JsonNode =
+    match resolved with
+    | Error envelope -> envelope
+    | Ok(errorNumber, fetchedMessage) ->
+        let effectiveMessage = explicitMessage |> Option.orElse fetchedMessage
+        let codeText = formatDiagnosticCode errorNumber
+        let messageNode = effectiveMessage |> Option.map jstr |> Option.defaultValue null
+
+        match Map.tryFind errorNumber curatedDiagnostics with
+        | Some entry ->
+            let repairHints = enrichRepairHints errorNumber effectiveMessage entry.RepairHints
+
+            jobj
+                [ "status", jstr "ok"
+                  "code", jstr codeText
+                  "title", jstr entry.Title
+                  "explanation", jstr entry.Explanation
+                  "likelyCauses", jstrArray entry.LikelyCauses
+                  "repairHints", jstrArray repairHints
+                  "relatedTools", jstrArray entry.RelatedTools
+                  "message", messageNode ]
+            :> JsonNode
+        | None ->
+            jobj
+                [ "status", jstr "unknown_code"
+                  "code", jstr codeText
+                  "title", jstr ""
+                  "explanation", jstr "No curated entry for this diagnostic code."
+                  "likelyCauses", jstrArray []
+                  "repairHints",
+                  jstrArray
+                      [ $"Run `check` to see the full diagnostic, then consult the F# error reference for {codeText}." ]
+                  "relatedTools", jstrArray [ "check" ]
+                  "message", messageNode ]
+            :> JsonNode
+
+// ─── ReviewScanner ──────────────────────────────────────────────────────────────
+// AST-based review-candidate inventory backing fcs_review_scan. Walks the FCS untyped
+// parse tree with ParsedInput.fold (FCS 43.12+, the same full-tree accumulator used by
+// FieldFormClassifier) and tags structurally interesting sites — review CANDIDATES, never
+// "bugs". Each tag carries a category, the site range, and a short neutral note. Parse-only:
+// no type-checking, no project resolution, no IO beyond the source already in hand.
+
+module private ReviewScanner =
+
+    /// A single review candidate: a category, the source range, and a neutral note.
+    [<NoComparison; NoEquality>]
+    type Candidate =
+        { Category: string
+          Range: range
+          Note: string }
+
+    // Category names — these are exactly the values accepted by the `categories` filter.
+    [<Literal>]
+    let MatchWildcard = "match_wildcard"
+
+    [<Literal>]
+    let TryWith = "try_with"
+
+    [<Literal>]
+    let RaiseOrFailwith = "raise_or_failwith"
+
+    [<Literal>]
+    let MutableBinding = "mutable_binding"
+
+    [<Literal>]
+    let BlockingCall = "blocking_call"
+
+    [<Literal>]
+    let CastOrBox = "cast_or_box"
+
+    [<Literal>]
+    let Reflection = "reflection"
+
+    [<Literal>]
+    let LargeFunction = "large_function"
+
+    /// Bindings whose RHS spans more than this many source lines are flagged.
+    [<Literal>]
+    let LargeFunctionLineThreshold = 60
+
+    /// Every category this scanner can emit, in a stable display order.
+    let allCategories =
+        [ MatchWildcard
+          TryWith
+          RaiseOrFailwith
+          MutableBinding
+          BlockingCall
+          CastOrBox
+          Reflection
+          LargeFunction ]
+
+    let private allCategorySet = Set.ofList allCategories
+
+    /// Is this a category this scanner knows how to emit?
+    let isKnownCategory (category: string) = allCategorySet.Contains category
+
+    /// Functions/operators that raise instead of returning a Result.
+    let private raiseNames =
+        set [ "failwith"; "failwithf"; "raise"; "reraise"; "invalidArg"; "invalidOp"; "nullArg" ]
+
+    /// Member names whose access typically blocks an async path.
+    let private blockingMembers = set [ "Result"; "Wait"; "GetResult" ]
+
+    /// Reflection entry points reached through a `.` member access.
+    let private reflectionMembers =
+        set
+            [ "GetType"
+              "GetProperty"
+              "GetProperties"
+              "GetMethod"
+              "GetMethods"
+              "GetField"
+              "GetFields"
+              "GetMember"
+              "GetMembers"
+              "InvokeMember"
+              "GetCustomAttributes"
+              "GetCustomAttribute"
+              "MakeGenericType"
+              "GetConstructor"
+              "GetConstructors" ]
+
+    /// Identifiers that box/unbox.
+    let private boxNames = set [ "box"; "unbox" ]
+
+    /// Identifiers that reflect over a type.
+    let private reflectionIdents = set [ "typeof"; "typedefof" ]
+
+    /// Last identifier segment of a long identifier (e.g. `task.Result` → "Result").
+    let private lastIdent (lid: SynLongIdent) : string option =
+        lid.LongIdent |> List.tryLast |> Option.map (fun ident -> ident.idText)
+
+    /// True when the pattern is a bare `_` wildcard, looking through parentheses, type
+    /// annotations, and attributes but NOT through `as`/`|` (which bind or branch and so
+    /// are not a plain catch-all).
+    let rec private isWildcardPat (pat: SynPat) : bool =
+        match pat with
+        | SynPat.Wild _ -> true
+        | SynPat.Paren(inner, _) -> isWildcardPat inner
+        | SynPat.Typed(inner, _, _) -> isWildcardPat inner
+        | SynPat.Attrib(inner, _, _) -> isWildcardPat inner
+        | _ -> false
+
+    /// Ranges of the bare-wildcard clauses among a match/function clause list.
+    let private wildcardClauseRanges (clauses: SynMatchClause list) : range list =
+        clauses
+        |> List.choose (fun (SynMatchClause(pat, _, _, _, _, _)) ->
+            if isWildcardPat pat then Some pat.Range else None)
+
+    /// Walk one parsed input, accumulating candidates whose category is in `wanted`.
+    let scan (wanted: Set<string>) (input: ParsedInput) : Candidate list =
+        let acc = ResizeArray<Candidate>()
+
+        let add (category: string) (range: range) (note: string) =
+            if wanted.Contains category then
+                acc.Add { Category = category; Range = range; Note = note }
+
+        let scanExpr (expr: SynExpr) =
+            match expr with
+            | SynExpr.TryWith(_, _, range, _, _, _) ->
+                add TryWith range "try/with handler — confirm it surfaces (or deliberately swallows) the error"
+            | SynExpr.Match(_, _, clauses, _, _)
+            | SynExpr.MatchBang(_, _, clauses, _, _) ->
+                for r in wildcardClauseRanges clauses do
+                    add MatchWildcard r "wildcard `_` branch — confirm the collapsed cases are intentional"
+            | SynExpr.MatchLambda(_, _, clauses, _, _) ->
+                for r in wildcardClauseRanges clauses do
+                    add MatchWildcard r "wildcard `_` branch — confirm the collapsed cases are intentional"
+            | SynExpr.Ident ident ->
+                let name = ident.idText
+
+                if raiseNames.Contains name then
+                    add
+                        RaiseOrFailwith
+                        ident.idRange
+                        "raises instead of returning Result — fine for invariants, reconsider for business errors"
+                elif boxNames.Contains name then
+                    add CastOrBox ident.idRange "box/unbox — confirm the runtime type round-trips"
+                elif reflectionIdents.Contains name then
+                    add Reflection ident.idRange "typeof/typedefof — reflection can resist AOT/trimming"
+            | SynExpr.LongIdent(_, lid, _, range) ->
+                // A dotted value access like `task.Result` or `o.GetType` parses as a
+                // LongIdent (not DotGet) when the receiver is a simple identifier, so the
+                // member-access categories are matched here on the trailing segment too.
+                match lastIdent lid with
+                | Some name when raiseNames.Contains name ->
+                    add
+                        RaiseOrFailwith
+                        range
+                        "raises instead of returning Result — fine for invariants, reconsider for business errors"
+                | Some name when blockingMembers.Contains name ->
+                    add
+                        BlockingCall
+                        range
+                        "blocking call (.Result/.Wait/.GetResult) — confirm it isn't blocking an async path"
+                | Some name when reflectionMembers.Contains name ->
+                    add Reflection range "reflection member access — reflection can resist AOT/trimming"
+                | _ -> ()
+            | SynExpr.DotGet(_, _, lid, range) ->
+                match lastIdent lid with
+                | Some name when blockingMembers.Contains name ->
+                    add
+                        BlockingCall
+                        range
+                        "blocking call (.Result/.Wait/.GetResult) — confirm it isn't blocking an async path"
+                | Some name when reflectionMembers.Contains name ->
+                    add Reflection range "reflection member access — reflection can resist AOT/trimming"
+                | _ -> ()
+            | SynExpr.Downcast(_, _, range) -> add CastOrBox range ":?> downcast — confirm the cast holds at runtime"
+            | SynExpr.InferredDowncast(_, range) -> add CastOrBox range "downcast — confirm the cast holds at runtime"
+            | _ -> ()
+
+        let scanBinding (binding: SynBinding) =
+            let (SynBinding(_, _, _, isMutable, _, _, _, headPat, _, _, _, _, _)) = binding
+
+            if isMutable then
+                add MutableBinding headPat.Range "mutable binding — confirm the mutation stays local and is necessary"
+
+            let rhs = binding.RangeOfBindingWithRhs
+            let span = rhs.EndLine - rhs.StartLine + 1
+
+            if span > LargeFunctionLineThreshold then
+                add LargeFunction headPat.Range $"large binding (~{span} lines) — consider decomposing for readability"
+
+        (acc, input)
+        ||> ParsedInput.fold (fun acc _path node ->
+            match node with
+            | SyntaxNode.SynExpr expr -> scanExpr expr
+            | SyntaxNode.SynBinding binding -> scanBinding binding
+            | _ -> ()
+
+            acc)
+        |> ignore
+
+        List.ofSeq acc
+
+
 // ─── FcsBridge ─────────────────────────────────────────────────────────────────
 
 type internal FcsBridge() =
@@ -288,6 +900,18 @@ type internal FcsBridge() =
               "endColumn", jint r.EndColumn ]
         :> JsonNode
 
+    // Range WITHOUT the `file` field, for sites whose enclosing object already
+    // carries `file` (find sites, symbol-uses, record-field audit, diagnostics) —
+    // dropping the duplicate trims payload on hot symbols. Standalone ranges that
+    // are the sole carrier of the path (declaration locations) keep rangeToJson. (#139)
+    let rangeToJsonNoFile (r: range) : JsonNode =
+        jobj
+            [ "startLine", jint r.StartLine
+              "startColumn", jint r.StartColumn
+              "endLine", jint r.EndLine
+              "endColumn", jint r.EndColumn ]
+        :> JsonNode
+
     let positionToJson (p: Position) : JsonNode =
         jobj [ "line", jint p.Line; "column", jint p.Column ] :> JsonNode
 
@@ -303,7 +927,7 @@ type internal FcsBridge() =
               "errorNumber", jint d.ErrorNumber
               "errorNumberText", jstr d.ErrorNumberText
               "subcategory", jstr d.Subcategory
-              "range", rangeToJson d.Range
+              "range", rangeToJsonNoFile d.Range
               "start", positionToJson d.Start
               "end", positionToJson d.End ]
         :> JsonNode
@@ -338,7 +962,7 @@ type internal FcsBridge() =
     let symbolUseToJson (symbolUse: FSharpSymbolUse) : JsonNode =
         jobj
             [ "file", jstr (normalizePath symbolUse.FileName)
-              "range", rangeToJson symbolUse.Range
+              "range", rangeToJsonNoFile symbolUse.Range
               "isFromDefinition", jbool symbolUse.IsFromDefinition
               "isFromUse", jbool symbolUse.IsFromUse
               "isFromPattern", jbool symbolUse.IsFromPattern
@@ -1485,9 +2109,14 @@ type internal FcsBridge() =
             | Some checkResults ->
                 let includeLocal = args.includeLocal |> Option.defaultValue false
                 let includePrivate = args.includePrivate |> Option.defaultValue true
+                let summaryOnly = args.summaryOnly |> Option.defaultValue true
                 let maxResults = args.maxResults |> Option.defaultValue 200
 
-                let entries =
+                // Full, untruncated definition set (lightweight symbol uses — no node
+                // building yet). memberCounts is derived from THIS so it reports true
+                // per-kind totals, while only the truncated slice pays for signature
+                // formatting — mirrors fcs_project_outline's count-vs-truncate split.
+                let allUses =
                     checkResults.GetAllUsesOfAllSymbolsInFile()
                     |> Seq.filter _.IsFromDefinition
                     |> Seq.filter (fun symbolUse -> includeLocal || not (isNoisyLocalSymbol symbolUse))
@@ -1501,8 +2130,26 @@ type internal FcsBridge() =
                     |> Seq.sortBy (fun symbolUse ->
                         let r = symbolUse.Range
                         r.StartLine, r.StartColumn)
-                    |> Seq.truncate maxResults
-                    |> Seq.map (fun symbolUse ->
+                    |> Seq.toArray
+
+                // memberCounts: kind → count over the FULL (untruncated) definition set,
+                // so an agent sees true totals (e.g. "this 5k-line file has 320 functions")
+                // even when summaryOnly drops signatures and maxResults caps the array.
+                // Kind classification is cheap — no signature strings are formatted here.
+                let memberCounts =
+                    allUses
+                    |> Array.countBy (fun symbolUse -> symbolKind symbolUse.Symbol)
+                    |> Array.sortBy fst
+                    |> Array.map (fun (kind, n) -> kind, jint n)
+                    |> Array.toList
+                    |> jobj
+
+                // entries: only the surfaced slice is mapped to full nodes, so signature
+                // formatting cost stays bounded by maxResults.
+                let entries =
+                    allUses
+                    |> Array.truncate maxResults
+                    |> Array.map (fun symbolUse ->
                         jobj
                             [ "name", jstr symbolUse.Symbol.DisplayName
                               "fullName", jstrOrNull symbolUse.Symbol.FullName
@@ -1512,7 +2159,38 @@ type internal FcsBridge() =
                               "signature", jstr (symbolTypeString symbolUse.Symbol)
                               "declarationRange", tryDeclarationRange symbolUse.Symbol ]
                         :> JsonNode)
-                    |> Seq.toArray
+
+                let containerKinds =
+                    [| "module"; "record"; "union"; "class"; "interface"; "enum"; "delegate"; "namespace" |]
+
+                // summaryOnly (default): keep only module/type headers with name/kind/
+                // fullName/range (no per-member signatures). summaryOnly=false restores
+                // the full per-member output.
+                let outEntries: JsonNode =
+                    if summaryOnly then
+                        let headers =
+                            entries
+                            |> Array.filter (fun e ->
+                                match e["kind"] with
+                                | null -> false
+                                | k -> containerKinds |> Array.contains (k.GetValue<string>()))
+                            |> Array.map (fun e ->
+                                jobj
+                                    [ "name", e["name"].DeepClone()
+                                      "kind", e["kind"].DeepClone()
+                                      "fullName",
+                                      (match e["fullName"] with
+                                       | null -> null
+                                       | fn -> fn.DeepClone())
+                                      "range",
+                                      (match e["range"] with
+                                       | null -> null
+                                       | r -> r.DeepClone()) ]
+                                :> JsonNode)
+
+                        JsonArray(headers) :> JsonNode
+                    else
+                        JsonArray(entries) :> JsonNode
 
                 return
                     jobj
@@ -1521,8 +2199,10 @@ type internal FcsBridge() =
                           "optionsSource", jstr optionsSource
                           "includePrivate", jbool includePrivate
                           "includeLocal", jbool includeLocal
+                          "summaryOnly", jbool summaryOnly
                           "count", jint entries.Length
-                          "entries", JsonArray(entries) :> JsonNode
+                          "memberCounts", memberCounts
+                          "entries", outEntries
                           "parseDiagnostics",
                           JsonArray(parseResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode
                           "checkDiagnostics",
@@ -2046,7 +2726,7 @@ type internal FcsBridge() =
 
                 jobj
                     [ "file", jstr (normalizePath symbolUse.FileName)
-                      "range", rangeToJson r
+                      "range", rangeToJsonNoFile r
                       "form", jstr form
                       "context", context ]
                 :> JsonNode
@@ -2125,7 +2805,7 @@ type internal FcsBridge() =
 
                 jobj
                     [ "file", jstr (normalizePath symbolUse.FileName)
-                      "range", rangeToJson r
+                      "range", rangeToJsonNoFile r
                       "isDefinition", jbool symbolUse.IsFromDefinition
                       "isReference", jbool symbolUse.IsFromUse
                       "lineText", context["lineText"].DeepClone()
@@ -2830,8 +3510,7 @@ type internal FcsBridge() =
 
                 let rangeNode =
                     jobj
-                        [ "file", jstr s.File
-                          "startLine", jint s.StartLine
+                        [ "startLine", jint s.StartLine
                           "startColumn", jint s.StartCol
                           "endLine", jint s.EndLine
                           "endColumn", jint s.EndCol ]
@@ -2931,6 +3610,227 @@ type internal FcsBridge() =
             return jobj (baseFields @ paginationFields) :> JsonNode
         }
 
+    // ── fcs_tests_for_symbol (#60): the test-coverage slice of `find` ───────────
+    // Reuses the multi-project sweep machinery, but keeps ONLY the test projects of the
+    // active solution (detected the way project_health does — ProjectHealth.isTestProjectFile,
+    // i.e. <IsTestProject>true> OR an xunit/nunit/expecto package ref). Each test project's
+    // GetAllUsesOfAllSymbols() is filtered to uses of the queried symbol, and every use site
+    // is tagged with its nearest enclosing test ([<Fact>]/[<Theory>]/[<Test>]/testCase),
+    // located by scanning the source lines upward. Shares ProjectSweepUses' (#131) per-project
+    // use cache, so a `find` already run on the solution makes this nearly free.
+    member this.TestsForSymbol(args: FcsTestsForSymbolArgs) : Task<JsonNode> =
+        task {
+            match ArgsValidation.requireNonBlank "symbolQuery" args.symbolQuery with
+            | Error envelope -> return envelope
+            | Ok query ->
+
+            let exact = args.exact |> Option.defaultValue true
+            let maxResults = args.maxResults |> Option.defaultValue 100
+
+            // Resolve the sweep target like Find: explicit projectPath (Program.fs already
+            // falls back to the active set_project), else the nearest .fsproj to args.path.
+            let sweepTargetOpt =
+                args.projectPath
+                |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.map normalizePath
+                |> Option.orElseWith (fun () ->
+                    args.path |> Option.bind findNearestFsproj |> Option.map normalizePath)
+
+            match sweepTargetOpt with
+            | None ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr
+                              "fcs_tests_for_symbol needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first." ]
+                    :> JsonNode
+            | Some sweepTarget ->
+
+            // The test-coverage slice: sweep only the solution's TEST projects.
+            let testProjects =
+                SolutionParsing.listProjects sweepTarget
+                |> Array.filter FsLangMcp.ProjectHealth.isTestProjectFile
+
+            // ── Enclosing-test detection (best-effort, textual) ──────────────────
+            // Scan source lines upward from a use to the nearest test marker:
+            //   • an Expecto label   → the quoted label string is the test name;
+            //   • a test attribute   → the name of the let/member it decorates.
+            let testAttrRegex =
+                System.Text.RegularExpressions.Regex(
+                    """\[<\s*(?:[\w.]+\.)?(?:Fact|Theory|Test|TestCase|TestMethod|Property)(?:Attribute)?\b""",
+                    System.Text.RegularExpressions.RegexOptions.Compiled
+                )
+
+            let expectoLabelRegex =
+                System.Text.RegularExpressions.Regex(
+                    "\\b(?:ftestCaseAsync|ptestCaseAsync|testCaseAsync|ftestCase|ptestCase|testCase|ftestAsync|ptestAsync|testAsync|ftestProperty|ptestProperty|testProperty|test)\\s+\"([^\"]*)\"",
+                    System.Text.RegularExpressions.RegexOptions.Compiled
+                )
+
+            let bindingNameRegex =
+                System.Text.RegularExpressions.Regex(
+                    """\b(?:let|member)\s+(?:rec\s+|inline\s+|mutable\s+|private\s+|internal\s+|this\.|_\.)*(``[^`]+``|[A-Za-z_][\w']*)""",
+                    System.Text.RegularExpressions.RegexOptions.Compiled
+                )
+
+            let findEnclosingTest (lines: string array) (useLine1: int) : string option =
+                if lines.Length = 0 then
+                    None
+                else
+                    let startIdx = min (max 0 (useLine1 - 1)) (lines.Length - 1)
+                    let mutable result = None
+                    let mutable i = startIdx
+
+                    while result.IsNone && i >= 0 do
+                        let labelMatch = expectoLabelRegex.Match lines[i]
+
+                        if labelMatch.Success then
+                            result <- Some labelMatch.Groups[1].Value
+                        elif testAttrRegex.IsMatch lines[i] then
+                            // Scan downward from the attribute to the use for the decorated name.
+                            let mutable j = i
+                            let mutable name = None
+
+                            while name.IsNone && j <= startIdx do
+                                let bm = bindingNameRegex.Match lines[j]
+
+                                if bm.Success then
+                                    name <- Some(bm.Groups[1].Value.Trim('`'))
+                                else
+                                    j <- j + 1
+
+                            result <- Some(name |> Option.defaultValue "<test>")
+                        else
+                            i <- i - 1
+
+                    result
+
+            // Per-file line cache: read each test source once for lineText + enclosing test.
+            let linesCache = System.Collections.Generic.Dictionary<string, string array>()
+
+            let readLines (path: string) =
+                match linesCache.TryGetValue path with
+                | true, cached -> cached
+                | _ ->
+                    let lines =
+                        try
+                            if File.Exists path then File.ReadAllLines path else [||]
+                        with _ ->
+                            [||]
+
+                    linesCache[path] <- lines
+                    lines
+
+            // De-dup accumulator keyed by stable source location (mirrors Find).
+            let siteByKey =
+                System.Collections.Generic.Dictionary<
+                    string,
+                    {| File: string
+                       StartLine: int
+                       StartCol: int
+                       EndLine: int
+                       EndCol: int
+                       Project: string
+                       EnclosingTest: string option
+                       LineText: string |}
+                 >()
+
+            for fsproj in testProjects do
+                try
+                    let projDisplay = Path.GetFileNameWithoutExtension fsproj
+                    let! options, _ = this.ResolveFsprojOptions(fsproj)
+
+                    let usesKey =
+                        $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}|{referencedProjectSourcesStamp options}"
+
+                    let! allUses, _ = this.ProjectSweepUses(usesKey, options)
+
+                    for u in allUses do
+                        if symbolMatches query exact u.Symbol then
+                            // FSharpSymbolUse is a struct: bind Range before reading fields (FS0052).
+                            let r = u.Range
+                            let file = normalizePath r.FileName
+                            let key = $"{file}:{r.StartLine}:{r.StartColumn}:{r.EndLine}:{r.EndColumn}"
+
+                            if not (siteByKey.ContainsKey key) then
+                                let lines = readLines file
+                                let lineIdx = r.StartLine - 1
+
+                                let lineText =
+                                    if lineIdx >= 0 && lineIdx < lines.Length then
+                                        lines[lineIdx]
+                                    else
+                                        ""
+
+                                siteByKey[key] <-
+                                    {| File = file
+                                       StartLine = r.StartLine
+                                       StartCol = r.StartColumn
+                                       EndLine = r.EndLine
+                                       EndCol = r.EndColumn
+                                       Project = projDisplay
+                                       EnclosingTest = findEnclosingTest lines r.StartLine
+                                       LineText = lineText |}
+                with _ ->
+                    // A test project that fails to resolve/check is skipped — the coverage
+                    // slice is best-effort, never a hard failure for one bad project.
+                    ()
+
+            let sortedSites =
+                siteByKey.Values
+                |> Seq.toArray
+                |> Array.sortBy (fun s -> s.File, s.StartLine, s.StartCol, s.EndLine, s.EndCol)
+
+            let totalTests = sortedSites.Length
+            let pageSites = sortedSites |> Array.truncate (max 0 maxResults)
+
+            let testToJson
+                (s:
+                    {| File: string
+                       StartLine: int
+                       StartCol: int
+                       EndLine: int
+                       EndCol: int
+                       Project: string
+                       EnclosingTest: string option
+                       LineText: string |})
+                =
+                // range carries coordinates only — `file` is the sibling field above, so it
+                // is not duplicated inside the range object.
+                let rangeNode =
+                    jobj
+                        [ "startLine", jint s.StartLine
+                          "startColumn", jint s.StartCol
+                          "endLine", jint s.EndLine
+                          "endColumn", jint s.EndCol ]
+                    :> JsonNode
+
+                let enclosing =
+                    match s.EnclosingTest with
+                    | Some t -> jstr t
+                    | None -> null
+
+                jobj
+                    [ "file", jstr s.File
+                      "range", rangeNode
+                      "enclosingTest", enclosing
+                      "project", jstr s.Project
+                      "lineText", jstr s.LineText ]
+                :> JsonNode
+
+            let testNodes = pageSites |> Array.map testToJson
+
+            return
+                jobj
+                    [ "status", jstr "succeeded"
+                      "symbol", jstr query
+                      "tests", JsonArray(testNodes) :> JsonNode
+                      "testCount", jint totalTests
+                      "projectsScanned", jint testProjects.Length ]
+                :> JsonNode
+        }
+
     // ── check: one fresh project type-check (issue #128, Stage 1) ────────────────
     // Drops FCS's incremental builder + cached project results for THIS project so a
     // source edit on disk is re-read — this is what makes the `check` verdict
@@ -2955,6 +3855,21 @@ type internal FcsBridge() =
             | :? OperationCanceledException
             | :? TaskCanceledException -> return Error "timeout"
             | ex -> return Error ex.Message
+        }
+
+    /// Deterministic reference-resolution probe over a project's resolved OtherOptions
+    /// (#138). Returns (existing, total) `-r:`/`--reference:` targets that exist on disk.
+    /// Used to tell an unrestored/unbuilt project apart from a genuinely-erroring one
+    /// before running the FCS re-check. Resolution is cached, so this warms the same
+    /// options FreshProjectCheck reuses. Never throws — an unloadable project yields
+    /// (0, 0), which the caller treats as "could not probe" and falls through.
+    member private this.ProbeReferenceResolution(fsproj: string) : Task<int * int> =
+        task {
+            try
+                let! options, _ = this.ResolveFsprojOptions(normalizePath fsproj)
+                return ReferenceResolution.probe options.OtherOptions
+            with _ ->
+                return 0, 0
         }
 
     // ── check: one trustworthy verdict for the active context (issue #128) ───────
@@ -3068,6 +3983,14 @@ type internal FcsBridge() =
                 (reason: string option)
                 (extra: (string * JsonNode) list)
                 : JsonNode =
+                // Hard cap the surfaced `diagnostics` array so a genuinely-erroring large
+                // project (or an unrestored false-error wall that slips past the probe)
+                // can never overflow the MCP token ceiling. errorCount/warningCount/
+                // totalDiagnostics stay FULL-set accurate — only the array is truncated.
+                let diagnosticsCap = 50
+                let cappedDiagNodes = diagNodes |> Array.truncate diagnosticsCap
+                let diagnosticsTruncated = diagNodes.Length > diagnosticsCap
+
                 jobj (
                     [ "status", jstr "succeeded"
                       "verdict", jstr verdict
@@ -3078,7 +4001,8 @@ type internal FcsBridge() =
                       "warningCount", jint warningCount
                       "diagnosticsFileCount", jint files.Length
                       "files", JsonArray(files |> Array.map jstr) :> JsonNode
-                      "diagnostics", JsonArray(diagNodes) :> JsonNode
+                      "diagnostics", JsonArray(cappedDiagNodes) :> JsonNode
+                      "diagnosticsTruncated", jbool diagnosticsTruncated
                       // debug-only
                       "escalated", (match escalated with Some e -> jstr e | None -> null)
                       "via", jstr via
@@ -3342,6 +4266,37 @@ type internal FcsBridge() =
                     match fsproj with
                     | None -> return invalid $"check could not resolve a single .fsproj to check from: {target}"
                     | Some proj ->
+                        // Restore-awareness (#138): an unrestored/unbuilt project still
+                        // evaluates its .fsproj, so FCS emits HUNDREDS of spurious FS0039
+                        // "is not defined" diagnostics at `open` lines (the real cause is
+                        // missing external reference assemblies, not the source). Detect
+                        // that deterministically and return an honest "unknown" instead of
+                        // a misleading false-error wall.
+                        let! refExisting, refTotal = this.ProbeReferenceResolution(proj)
+
+                        if ReferenceResolution.looksUnrestored refExisting refTotal then
+                            let frac = ReferenceResolution.fraction refExisting refTotal
+
+                            return
+                                build
+                                    "unknown"
+                                    false
+                                    "fcs"
+                                    None
+                                    0
+                                    0
+                                    0
+                                    [||]
+                                    [||]
+                                    (Some
+                                        $"project not built/restored — external references unresolved (existing {refExisting}/total {refTotal}); run dotnet restore && dotnet build")
+                                    [ "projectsSwept", jint 1
+                                      "restoreStatus", jstr "unrestored"
+                                      "referencesResolved", JsonValue.Create(Math.Round(frac, 3)) :> JsonNode
+                                      "referencesExisting", jint refExisting
+                                      "referencesTotal", jint refTotal ]
+                        else
+
                         let! result = this.FreshProjectCheck(proj, timeoutMs)
 
                         match result with
@@ -3415,35 +4370,60 @@ type internal FcsBridge() =
                         let allDiags = ResizeArray<FSharpDiagnostic>()
                         let perProject = ResizeArray<JsonNode>()
                         let mutable failCount = 0
+                        let mutable unrestoredCount = 0
 
                         for proj in projects do
-                            let! result = this.FreshProjectCheck(proj, timeoutMs)
+                            // Restore-awareness (#138): skip the FCS re-check for an
+                            // unrestored project — it would only produce a spurious
+                            // FS0039 false-error wall. Mark it unrestored instead.
+                            let! refExisting, refTotal = this.ProbeReferenceResolution(proj)
 
-                            match result with
-                            | Ok(diags, _, _) ->
-                                allDiags.AddRange diags
-                                let e, w = countDiagnosticsBySeverity diags
-
-                                perProject.Add(
-                                    jobj
-                                        [ "project", jstr (Path.GetFileNameWithoutExtension proj)
-                                          "fsproj", jstr (normalizePath proj)
-                                          "errorCount", jint e
-                                          "warningCount", jint w
-                                          "analyzed", jbool true ]
-                                    :> JsonNode
-                                )
-                            | Error msg ->
-                                failCount <- failCount + 1
+                            if ReferenceResolution.looksUnrestored refExisting refTotal then
+                                unrestoredCount <- unrestoredCount + 1
+                                let frac = ReferenceResolution.fraction refExisting refTotal
 
                                 perProject.Add(
                                     jobj
                                         [ "project", jstr (Path.GetFileNameWithoutExtension proj)
                                           "fsproj", jstr (normalizePath proj)
-                                          "error", jstr msg
-                                          "analyzed", jbool false ]
+                                          "analyzed", jbool false
+                                          "restoreStatus", jstr "unrestored"
+                                          "referencesResolved", JsonValue.Create(Math.Round(frac, 3)) :> JsonNode
+                                          "referencesExisting", jint refExisting
+                                          "referencesTotal", jint refTotal
+                                          "reason",
+                                          jstr
+                                              "project not built/restored — external references unresolved; run dotnet restore && dotnet build" ]
                                     :> JsonNode
                                 )
+                            else
+                                let! result = this.FreshProjectCheck(proj, timeoutMs)
+
+                                match result with
+                                | Ok(diags, _, _) ->
+                                    allDiags.AddRange diags
+                                    let e, w = countDiagnosticsBySeverity diags
+
+                                    perProject.Add(
+                                        jobj
+                                            [ "project", jstr (Path.GetFileNameWithoutExtension proj)
+                                              "fsproj", jstr (normalizePath proj)
+                                              "errorCount", jint e
+                                              "warningCount", jint w
+                                              "analyzed", jbool true ]
+                                        :> JsonNode
+                                    )
+                                | Error msg ->
+                                    failCount <- failCount + 1
+
+                                    perProject.Add(
+                                        jobj
+                                            [ "project", jstr (Path.GetFileNameWithoutExtension proj)
+                                              "fsproj", jstr (normalizePath proj)
+                                              "error", jstr msg
+                                              "analyzed", jbool false ]
+                                        :> JsonNode
+                                    )
 
                         let diags = allDiags.ToArray()
                         let errorCount, warningCount = countDiagnosticsBySeverity diags
@@ -3451,10 +4431,11 @@ type internal FcsBridge() =
                         let verdict, analyzed, reason =
                             if errorCount > 0 then
                                 "errors", true, None
-                            elif failCount > 0 then
+                            elif unrestoredCount > 0 || failCount > 0 then
                                 "unknown",
                                 false,
-                                Some $"{failCount} of {projects.Length} project(s) failed to analyze; cannot confirm clean."
+                                Some
+                                    $"{unrestoredCount} unrestored + {failCount} failed of {projects.Length} project(s); run dotnet restore && dotnet build — cannot confirm clean."
                             else
                                 "clean", true, None
 
@@ -3473,6 +4454,7 @@ type internal FcsBridge() =
                                 files
                                 reason
                                 [ "projectsSwept", jint projects.Length
+                                  "unrestoredCount", jint unrestoredCount
                                   "perProject", JsonArray(perProject.ToArray()) :> JsonNode ]
 
             | _ -> return invalid $"unsupported scope '{resolvedScope}'"
@@ -4189,6 +5171,10 @@ type internal FcsBridge() =
                           projectOptions = None
                           includePrivate = args.includePrivate
                           includeLocal = Some false
+                          // Always request the full per-member output: ProjectOutline does
+                          // its own summaryOnly shaping + memberCounts over these entries,
+                          // so FileOutline's own summary default must NOT pre-collapse them.
+                          summaryOnly = Some false
                           maxResults = None }
                     )
 
@@ -4755,6 +5741,575 @@ type internal FcsBridge() =
             return jobj (baseFields @ paginationFields) :> JsonNode
         }
 
+    /// Emit the project's OWN public API surface — every public (and, when
+    /// includeInternal=true, internal) type plus its public members with signatures —
+    /// sorted stably by fullName then member name so two version snapshots diff cleanly.
+    /// Source is FSharpCheckProjectResults.AssemblySignature (the project's own inferred
+    /// signature), NOT referenced assemblies. `private` declarations are never emitted.
+    member this.PublicApi(args: FcsPublicApiArgs) : Task<JsonNode> =
+        task {
+            if args.projectPath.IsNone then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr "projectPath is required (or call set_project first to set the active project)" ]
+                    :> JsonNode
+            else
+
+            let includeInternal = defaultArg args.includeInternal false
+            let requested = defaultArg args.maxResults 100
+            let pageSize = min (max 1 requested) 1000
+
+            let pageOffsetResult =
+                match args.cursor with
+                | None -> Ok 0
+                | Some cursorStr -> Cursor.tryDecode cursorStr |> Result.map (fun p -> p.offset)
+
+            match pageOffsetResult with
+            | Error reason ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr $"Invalid cursor: %s{reason}" ]
+                    :> JsonNode
+            | Ok pageOffset ->
+
+            let! results, options, optionsSource = this.EnsureProjectResults args.projectPath
+
+            // Public-only by default; includeInternal also admits `internal`. `private`
+            // never passes. "unknown" (synthetic symbols FCS throws on) is treated as
+            // public-visible, matching fcs_referenced_symbols / fcs_nuget_types.
+            let accPasses (acc: string) =
+                if includeInternal then
+                    acc = "public" || acc = "internal" || acc = "unknown"
+                else
+                    acc = "public" || acc = "unknown"
+
+            let nsFilterLower =
+                args.namespaceFilter
+                |> Option.map (fun s -> s.Trim())
+                |> Option.filter (fun s -> s.Length > 0)
+                |> Option.map (fun s -> s.ToLowerInvariant())
+
+            // ── Per-member signature/accessibility helpers (reuse the shared kind/acc
+            //    helpers; only the bare signature strings are built locally) ──────────
+            let fieldSignature (f: FSharpField) =
+                try
+                    $"{f.Name}: {typeName f.FieldType}"
+                with _ ->
+                    try f.Name with _ -> "<unknown>"
+
+            let isBackingField (f: FSharpField) =
+                try
+                    f.IsCompilerGenerated
+                    || f.IsNameGenerated
+                    || (let n = f.Name in
+                        not (isNull n) && (n.Contains "k__BackingField" || n.Contains "@"))
+                with _ ->
+                    false
+
+            let unionCaseSignature (uc: FSharpUnionCase) =
+                try
+                    if uc.Fields.Count = 0 then
+                        uc.Name
+                    else
+                        let fieldTypes =
+                            uc.Fields
+                            |> Seq.map (fun f -> try typeName f.FieldType with _ -> "?")
+                            |> String.concat " * "
+
+                        $"{uc.Name} of {fieldTypes}"
+                with _ ->
+                    try uc.Name with _ -> "<unknown>"
+
+            let unionCaseAccessibility (uc: FSharpUnionCase) =
+                try
+                    let acc = uc.Accessibility
+
+                    if acc.IsPrivate then "private"
+                    elif acc.IsInternal then "internal"
+                    elif acc.IsPublic then "public"
+                    else "unknown"
+                with _ ->
+                    "unknown"
+
+            // Members of one entity: methods/properties/functions/values (skipping
+            // compiler-generated members and property accessors), record/struct/class
+            // fields (skipping backing fields), and union cases — accessibility-filtered,
+            // de-duplicated, and stably sorted by (name, kind, signature).
+            let membersOf (entity: FSharpEntity) =
+                // For records, the field-getter property duplicates the field row; drop
+                // those synthesized properties so a record's surface is its fields.
+                let recordFieldNames =
+                    try
+                        if entity.IsFSharpRecord then
+                            entity.FSharpFields |> Seq.map (fun f -> f.Name) |> Set.ofSeq
+                        else
+                            Set.empty
+                    with _ ->
+                        Set.empty
+
+                let fromMfvs =
+                    try
+                        entity.MembersFunctionsAndValues
+                        |> Seq.choose (fun m ->
+                            let isAccessor =
+                                try m.IsPropertyGetterMethod || m.IsPropertySetterMethod with _ -> false
+
+                            let isCompilerGenerated = try m.IsCompilerGenerated with _ -> false
+
+                            let isRecordFieldProperty =
+                                try entity.IsFSharpRecord && m.IsProperty && recordFieldNames.Contains m.DisplayName with _ -> false
+
+                            let acc = memberAccessibilityString m
+
+                            if not isAccessor && not isCompilerGenerated && not isRecordFieldProperty && accPasses acc then
+                                Some
+                                    {| name = (try m.DisplayName with _ -> "<unknown>")
+                                       kind = memberKindString m
+                                       signature = memberSignature m
+                                       accessibility = acc |}
+                            else
+                                None)
+                        |> Seq.toList
+                    with _ ->
+                        []
+
+                let fromFields =
+                    try
+                        if entity.IsFSharpRecord || entity.IsValueType || entity.IsClass then
+                            entity.FSharpFields
+                            |> Seq.choose (fun f ->
+                                let acc = fieldAccessibilityString f
+
+                                if not (isBackingField f) && accPasses acc then
+                                    Some
+                                        {| name = (try f.Name with _ -> "<unknown>")
+                                           kind = "field"
+                                           signature = fieldSignature f
+                                           accessibility = acc |}
+                                else
+                                    None)
+                            |> Seq.toList
+                        else
+                            []
+                    with _ ->
+                        []
+
+                let fromUnionCases =
+                    try
+                        if entity.IsFSharpUnion then
+                            entity.UnionCases
+                            |> Seq.choose (fun uc ->
+                                let acc = unionCaseAccessibility uc
+
+                                if accPasses acc then
+                                    Some
+                                        {| name = (try uc.Name with _ -> "<unknown>")
+                                           kind = "union-case"
+                                           signature = unionCaseSignature uc
+                                           accessibility = acc |}
+                                else
+                                    None)
+                            |> Seq.toList
+                        else
+                            []
+                    with _ ->
+                        []
+
+                fromMfvs @ fromFields @ fromUnionCases
+                |> List.distinctBy (fun m -> m.name, m.kind, m.signature)
+                |> List.sortBy (fun m -> m.name, m.kind, m.signature)
+
+            let entityFullName (e: FSharpEntity) =
+                try
+                    match e.FullName |> Option.ofObj with
+                    | Some fn when fn.Length > 0 -> fn
+                    | _ -> e.DisplayName
+                with _ ->
+                    try e.DisplayName with _ -> "<unknown>"
+
+            let topEntities =
+                try
+                    results.AssemblySignature.Entities :> seq<FSharpEntity>
+                with _ ->
+                    Seq.empty
+
+            // walkEntities flattens nested entities, so skipping a namespace container
+            // never drops the modules/types declared inside it.
+            let allEntities =
+                topEntities
+                |> Seq.collect walkEntities
+                |> Seq.choose (fun e ->
+                    let isNamespace = try e.IsNamespace with _ -> false
+
+                    if isNamespace then
+                        None
+                    else
+                        let acc = entityAccessibilityString e
+
+                        if not (accPasses acc) then
+                            None
+                        else
+                            let fullName = entityFullName e
+
+                            let nsOk =
+                                match nsFilterLower with
+                                | None -> true
+                                | Some f -> fullName.ToLowerInvariant().Contains(f)
+
+                            if not nsOk then
+                                None
+                            else
+                                Some
+                                    {| fullName = fullName
+                                       kind = entityKindString e
+                                       accessibility = acc
+                                       members = membersOf e |})
+                |> Seq.toList
+                |> List.sortBy (fun e -> e.fullName, e.kind)
+
+            let totalEntityCount = allEntities.Length
+            let totalMemberCount = allEntities |> List.sumBy (fun e -> e.members.Length)
+
+            let pageEntities =
+                allEntities
+                |> List.skip (min pageOffset totalEntityCount)
+                |> List.truncate pageSize
+
+            let entityNodes =
+                pageEntities
+                |> List.map (fun e ->
+                    let memberNodes =
+                        e.members
+                        |> List.map (fun m ->
+                            jobj
+                                [ "name", jstr m.name
+                                  "kind", jstr m.kind
+                                  "signature", jstr m.signature
+                                  "accessibility", jstr m.accessibility ]
+                            :> JsonNode)
+                        |> List.toArray
+
+                    jobj
+                        [ "fullName", jstr e.fullName
+                          "kind", jstr e.kind
+                          "accessibility", jstr e.accessibility
+                          "members", JsonArray(memberNodes) :> JsonNode ]
+                    :> JsonNode)
+                |> List.toArray
+
+            let baseFields =
+                [ "status", jstr "ok"
+                  "project", jstr options.ProjectFileName
+                  "optionsSource", jstr optionsSource
+                  "includeInternal", jbool includeInternal
+                  "namespaceFilter",
+                  (match args.namespaceFilter with
+                   | Some s when not (String.IsNullOrWhiteSpace s) -> jstr s
+                   | _ -> null)
+                  "entityCount", jint totalEntityCount
+                  "memberCount", jint totalMemberCount
+                  "entities", JsonArray(entityNodes) :> JsonNode ]
+
+            let paginationFields =
+                Cursor.paginationFields "entities" totalEntityCount pageOffset pageSize pageEntities.Length
+
+            return jobj (baseFields @ paginationFields) :> JsonNode
+        }
+
+    /// Read-only ".fsi drift" preview for one implementation file. Type-checks the .fs
+    /// WITHOUT its sibling .fsi so the impl's true public surface is visible, then diffs
+    /// that surface against the .fsi (parsed as a signature file): members public in the
+    /// impl but absent from the .fsi are silently hidden from the public surface (the #74
+    /// core pain) and land in missingFromSig; .fsi entries with no impl match → staleInSig.
+    member this.SignatureStatus(args: FcsSignatureStatusArgs) : Task<JsonNode> =
+        // Collect declared leaf names (val/type/module) from a parsed .fsi signature tree.
+        // Defined OUTSIDE `task {}` so the resumable state machine stays statically
+        // compilable (FS3511); it closes over no task-local state.
+        let rec collectSigDecls (decls: SynModuleSigDecl list) : (string * string) list =
+            decls
+            |> List.collect (fun d ->
+                match d with
+                | SynModuleSigDecl.Val(valSig = SynValSig(ident = SynIdent(id, _))) -> [ id.idText, "val" ]
+                | SynModuleSigDecl.Types(types = types) ->
+                    types
+                    |> List.choose (fun (SynTypeDefnSig(typeInfo = SynComponentInfo(longId = lid))) ->
+                        lid |> List.tryLast |> Option.map (fun i -> i.idText, "type"))
+                | SynModuleSigDecl.NestedModule(moduleInfo = SynComponentInfo(longId = lid); moduleDecls = nested) ->
+                    let inner = collectSigDecls nested
+
+                    match lid |> List.tryLast with
+                    | Some i -> (i.idText, "module") :: inner
+                    | None -> inner
+                // Open / HashDirective / Exception / ModuleAbbrev / NamespaceFragment carry
+                // no module-level surface names to diff against the impl.
+                | _ -> [])
+
+        task {
+            match ArgsValidation.requireNonBlank "path" args.path with
+            | Error envelope -> return envelope
+            | Ok rawPath ->
+
+            let implPath = normalizePath rawPath
+
+            // Guard: the input must be an implementation .fs, not a signature .fsi.
+            let isFsi = implPath.EndsWith(".fsi", StringComparison.OrdinalIgnoreCase)
+            let isFs = implPath.EndsWith(".fs", StringComparison.OrdinalIgnoreCase)
+
+            if isFsi || not isFs then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr "path must be an implementation .fs file (not a .fsi signature file)" ]
+                    :> JsonNode
+            else
+
+            let textProvided = args.text |> Option.filter (fun t -> not (String.IsNullOrEmpty t))
+
+            if textProvided.IsNone && not (File.Exists implPath) then
+                return
+                    jobj
+                        [ "status", jstr "file_not_found"
+                          "message", jstr $"Implementation file not found: %s{implPath}"
+                          "implPath", jstr implPath ]
+                    :> JsonNode
+            else
+
+            let sigPath = Path.ChangeExtension(implPath, ".fsi") |> normalizePath
+            let hasSignatureFile = File.Exists sigPath
+
+            let source = textProvided |> Option.defaultWith (fun () -> File.ReadAllText implPath)
+            let sourceText = SourceText.ofString source
+
+            // Resolve options (projectPath → nearest .fsproj → script), then strip the sibling
+            // .fsi from the compile inputs so the impl is checked unconstrained — that exposes
+            // the public members a present .fsi would otherwise hide.
+            let! options, optionsSource = this.ResolveProjectOptions(implPath, source, args.projectPath, None)
+
+            let implOnlyOptions =
+                { options with
+                    SourceFiles =
+                        options.SourceFiles
+                        |> Array.filter (fun f ->
+                            not (String.Equals(normalizePath f, sigPath, StringComparison.OrdinalIgnoreCase))) }
+
+            let! _, checkAnswer =
+                checker.ParseAndCheckFileInProject(implPath, 0, sourceText, implOnlyOptions) |> asTask
+
+            match checkAnswer with
+            | FSharpCheckFileAnswer.Aborted ->
+                return
+                    jobj
+                        [ "status", jstr "check_aborted"
+                          "implPath", jstr implPath
+                          "sigPath", (if hasSignatureFile then jstr sigPath else null)
+                          "hasSignatureFile", jbool hasSignatureFile
+                          "message", jstr "Type checking was aborted; the public surface is unavailable." ]
+                    :> JsonNode
+            | FSharpCheckFileAnswer.Succeeded checkResults ->
+
+            // ── Local .fsi-ready preview helpers ───────────────────────────────────
+            let fmtType (t: FSharpType) =
+                try
+                    t.Format(FSharpDisplayContext.Empty)
+                with _ ->
+                    try typeName t with _ -> "?"
+
+            let valPreview (m: FSharpMemberOrFunctionOrValue) =
+                let t = try fmtType m.FullType with _ -> "?"
+                $"val {m.DisplayName}: {t}"
+
+            let moduleMemberKind (m: FSharpMemberOrFunctionOrValue) =
+                try
+                    if m.CurriedParameterGroups |> Seq.exists (fun g -> g.Count > 0) then "function" else "value"
+                with _ ->
+                    "value"
+
+            let typePreview (e: FSharpEntity) =
+                try
+                    if e.IsFSharpRecord then
+                        let fields =
+                            e.FSharpFields
+                            |> Seq.filter (fun f -> not (try f.IsCompilerGenerated || f.IsNameGenerated with _ -> false))
+                            |> Seq.map (fun f -> $"{f.Name}: {fmtType f.FieldType}")
+                            |> String.concat "; "
+
+                        $"type {e.DisplayName} = {{ {fields} }}"
+                    elif e.IsFSharpUnion then
+                        let cases =
+                            e.UnionCases
+                            |> Seq.map (fun uc ->
+                                if uc.Fields.Count = 0 then
+                                    uc.Name
+                                else
+                                    let ts =
+                                        uc.Fields |> Seq.map (fun f -> fmtType f.FieldType) |> String.concat " * "
+
+                                    $"{uc.Name} of {ts}")
+                            |> String.concat " | "
+
+                        $"type {e.DisplayName} = {cases}"
+                    else
+                        $"type {e.DisplayName}"
+                with _ ->
+                    $"type {e.DisplayName}"
+
+            let isPublicAcc (acc: string) = acc = "public" || acc = "unknown"
+
+            // ── The impl's own definitions (this file only) ────────────────────────
+            let definitionUses =
+                try
+                    checkResults.GetAllUsesOfAllSymbolsInFile()
+                    |> Seq.filter (fun su ->
+                        su.IsFromDefinition
+                        && String.Equals(normalizePath su.FileName, implPath, StringComparison.OrdinalIgnoreCase))
+                    |> Seq.toList
+                with _ ->
+                    []
+
+            // Curated public surface: top-level module values/functions + types, each with
+            // a .fsi-ready preview line. Nested-module members flatten in by leaf name.
+            let publicMembers =
+                definitionUses
+                |> List.choose (fun su ->
+                    match su.Symbol with
+                    | :? FSharpMemberOrFunctionOrValue as m ->
+                        let isTopLevelLet =
+                            try
+                                m.IsModuleValueOrMember
+                                && not m.IsMember
+                                && not m.IsPropertyGetterMethod
+                                && not m.IsPropertySetterMethod
+                                && not m.IsCompilerGenerated
+                                && (match m.DeclaringEntity with
+                                    | Some e -> (try e.IsFSharpModule with _ -> false)
+                                    | None -> false)
+                            with _ ->
+                                false
+
+                        if isTopLevelLet && isPublicAcc (memberAccessibilityString m) then
+                            Some
+                                {| name = (try m.DisplayName with _ -> "<unknown>")
+                                   kind = moduleMemberKind m
+                                   preview = valPreview m |}
+                        else
+                            None
+                    | :? FSharpEntity as e ->
+                        let isType = try not e.IsNamespace && not e.IsFSharpModule with _ -> false
+
+                        if isType && isPublicAcc (entityAccessibilityString e) then
+                            Some
+                                {| name = (try e.DisplayName with _ -> "<unknown>")
+                                   kind = entityKindString e
+                                   preview = typePreview e |}
+                        else
+                            None
+                    // Fields, union cases, and other symbol kinds are surfaced through their
+                    // enclosing type, not as standalone signature lines.
+                    | _ -> None)
+                |> List.distinctBy (fun m -> m.name, m.kind)
+                |> List.sortBy (fun m -> m.name, m.kind)
+
+            // implNameSet (used only for stale detection) also carries module names, so a
+            // `module Foo` present in both impl and .fsi is never mis-flagged as stale.
+            let implNameSet =
+                definitionUses
+                |> List.choose (fun su ->
+                    match su.Symbol with
+                    | :? FSharpMemberOrFunctionOrValue as m ->
+                        if isPublicAcc (memberAccessibilityString m) then
+                            Some(try m.DisplayName with _ -> "")
+                        else
+                            None
+                    | :? FSharpEntity as e ->
+                        if isPublicAcc (entityAccessibilityString e) then
+                            Some(try e.DisplayName with _ -> "")
+                        else
+                            None
+                    | _ -> None)
+                |> List.filter (fun n -> n <> "")
+                |> Set.ofList
+
+            // ── Parse the .fsi (if present) and collect its declared leaf names ────
+            let parsingOptions, _ = checker.GetParsingOptionsFromProjectOptions(options)
+
+            let! sigDecls =
+                task {
+                    if not hasSignatureFile then
+                        return []
+                    else
+                        try
+                            let sigText = SourceText.ofString (File.ReadAllText sigPath)
+                            let! parsed = checker.ParseFile(sigPath, sigText, parsingOptions) |> asTask
+
+                            match parsed.ParseTree with
+                            | ParsedInput.SigFile(ParsedSigFileInput(contents = modules)) ->
+                                return
+                                    modules
+                                    |> List.collect (fun (SynModuleOrNamespaceSig(decls = decls)) -> collectSigDecls decls)
+                                    |> List.distinct
+                            | _ -> return []
+                        with _ ->
+                            return []
+                }
+
+            // ── Diff impl surface against the signature ────────────────────────────
+            let sigNameSet = sigDecls |> List.map fst |> Set.ofList
+
+            let missingFromSig =
+                publicMembers |> List.filter (fun m -> not (sigNameSet.Contains m.name))
+
+            let staleInSig =
+                sigDecls |> List.filter (fun (name, _) -> not (implNameSet.Contains name))
+
+            let status =
+                if not hasSignatureFile then "no_signature_file"
+                elif List.isEmpty missingFromSig && List.isEmpty staleInSig then "clean"
+                else "drift"
+
+            let sigFileName = Path.GetFileName sigPath
+
+            let suggestion =
+                if not hasSignatureFile then
+                    $"No signature file. Create {sigFileName} from missingFromSig ({publicMembers.Length} declaration(s)) to pin the public surface."
+                elif not (List.isEmpty missingFromSig) && not (List.isEmpty staleInSig) then
+                    $"{missingFromSig.Length} public member(s) hidden from {sigFileName}; {staleInSig.Length} stale .fsi entr(ies) with no impl match. Add the missing lines, remove/fix the stale ones."
+                elif not (List.isEmpty missingFromSig) then
+                    $"{missingFromSig.Length} public member(s) are hidden from the public surface by {sigFileName}. Add the listed val/type lines."
+                elif not (List.isEmpty staleInSig) then
+                    $"{staleInSig.Length} {sigFileName} entr(ies) have no matching impl member (stale signature or a compile error). Remove or correct them."
+                else
+                    $"{sigFileName} is in sync with the implementation's public surface ({publicMembers.Length} member(s))."
+
+            let memberNode (m: {| name: string; kind: string; preview: string |}) =
+                jobj
+                    [ "name", jstr m.name
+                      "kind", jstr m.kind
+                      "signaturePreview", jstr m.preview ]
+                :> JsonNode
+
+            let staleNode (name: string, kind: string) =
+                jobj [ "name", jstr name; "kind", jstr kind ] :> JsonNode
+
+            return
+                jobj
+                    [ "status", jstr status
+                      "implPath", jstr implPath
+                      "sigPath", (if hasSignatureFile then jstr sigPath else null)
+                      "hasSignatureFile", jbool hasSignatureFile
+                      "project", jstr options.ProjectFileName
+                      "optionsSource", jstr optionsSource
+                      "publicMemberCount", jint publicMembers.Length
+                      "publicMembers", JsonArray(publicMembers |> List.map memberNode |> List.toArray) :> JsonNode
+                      "missingFromSig", JsonArray(missingFromSig |> List.map memberNode |> List.toArray) :> JsonNode
+                      "staleInSig", JsonArray(staleInSig |> List.map staleNode |> List.toArray) :> JsonNode
+                      "suggestion", jstr suggestion ]
+                :> JsonNode
+        }
+
     member _.ClearCaches() =
         optionsCache.Clear()
         projectResultsCache.Clear()
@@ -4778,14 +6333,20 @@ type internal FcsBridge() =
     /// project when a swept source file is edited. Exposed for cache-behaviour tests.
     member _.ProjectUsesCacheCount = projectUsesCache.Count
 
-    member this.ProbeProjectOptions(fsprojPath: string) : Task<Result<string, string>> =
+    member this.ProbeProjectOptions(fsprojPath: string) : Task<Result<ProjectOptionsInfo, string>> =
         task {
             try
                 let! result = this.LoadProjectOptionsFromFsproj(fsprojPath)
 
                 return
                     match result with
-                    | Some _ -> Ok "ionide-proj-info"
+                    | Some options ->
+                        let existing, total = ReferenceResolution.probe options.OtherOptions
+
+                        Ok
+                            { Source = "ionide-proj-info"
+                              ReferencesExisting = existing
+                              ReferencesTotal = total }
                     | None -> Error "Ionide.ProjInfo could not load project options."
             with ex ->
                 return Error ex.Message
@@ -5075,3 +6636,1724 @@ type internal FcsBridge() =
                       "candidates",       JsonArray(enriched) :> JsonNode ]
                 :> JsonNode
         }
+
+    /// Auto-fetch the diagnostic at a path+position via a fresh FCS parse+check (issue #61).
+    /// Returns Ok(errorNumber, message) for the diagnostic covering the position, or an
+    /// Error JSON envelope when none is found. Kept in its own member so ExplainDiagnostic's
+    /// resolution `match` binds a plain Task and stays statically compilable (FS3511).
+    member private this.ResolveDiagnosticFromPosition
+        (path: string, line: int option, character: int option, text: string option, projectPath: string option)
+        : Task<Result<int * string option, JsonNode>> =
+        task {
+            let! _, _, _, _, parseResults, checkedResults =
+                this.PrepareCheckContext(path, text, projectPath, None)
+
+            // LSP coordinates are 0-based; FCS diagnostic lines are 1-based.
+            let fcsLine = defaultArg line -1 |> (+) 1
+            let col = defaultArg character -1
+
+            let allDiagnostics =
+                Array.append
+                    parseResults.Diagnostics
+                    (checkedResults |> Option.map (fun r -> r.Diagnostics) |> Option.defaultValue [||])
+
+            let covers (d: FSharpDiagnostic) =
+                let sL, sC, eL, eC = d.StartLine, d.StartColumn, d.EndLine, d.EndColumn
+
+                if fcsLine < sL || fcsLine > eL then false
+                elif col < 0 then true // no column constraint requested
+                elif fcsLine = sL && fcsLine = eL then sC <= col && col <= eC
+                elif fcsLine = sL then sC <= col
+                elif fcsLine = eL then col <= eC
+                else true
+
+            // Prefer an error covering the position; then any diagnostic covering it;
+            // then any diagnostic on the same line.
+            let pick =
+                allDiagnostics
+                |> Array.filter (fun d -> d.Severity = FSharpDiagnosticSeverity.Error)
+                |> Array.tryFind covers
+                |> Option.orElseWith (fun () -> allDiagnostics |> Array.tryFind covers)
+                |> Option.orElseWith (fun () ->
+                    allDiagnostics |> Array.tryFind (fun d -> d.StartLine <= fcsLine && fcsLine <= d.EndLine))
+
+            match pick with
+            | Some d -> return Ok(d.ErrorNumber, Some d.Message)
+            | None ->
+                return
+                    Error(
+                        jobj
+                            [ "status", jstr "no_diagnostic_at_position"
+                              "message", jstr "No FCS diagnostic was found at the given path/line/character."
+                              "path", jstr (normalizePath path)
+                              "line", (line |> Option.map jint |> Option.defaultValue null)
+                              "character", (character |> Option.map jint |> Option.defaultValue null) ]
+                        :> JsonNode
+                    )
+        }
+
+    /// Explain an F# compiler diagnostic (issue #61). Resolves the diagnostic code from
+    /// `code` / `errorNumber`, or auto-fetches it at a path+position via FCS, then returns
+    /// a curated plain-language explanation plus repair context. Pairs with `check`.
+    member this.ExplainDiagnostic(args: FcsExplainDiagnosticArgs) : Task<JsonNode> =
+        task {
+            // ── 1. Resolve the numeric error code from `code` when present ──
+            let codeFromString =
+                match args.code with
+                | Some raw ->
+                    match parseDiagnosticCode raw with
+                    | Some n -> Ok(Some n)
+                    | None -> Error raw // present but unparseable
+                | None -> Ok None
+
+            match codeFromString with
+            | Error raw ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr $"code \"{raw}\" is not a recognized F# diagnostic code (expected e.g. \"FS0039\" or 39)" ]
+                    :> JsonNode
+            | Ok parsedCode ->
+
+            // `code` takes precedence over `errorNumber`.
+            let directNumber = parsedCode |> Option.orElse args.errorNumber
+
+            // ── 2. No explicit number → try the path+position auto-fetch via FCS ──
+            // Build the Task in a plain `let` (the FCS path lives in its own member),
+            // then bind a direct identifier so the `let!` continuation stays statically
+            // compilable — a `match` directly in the `let!` source trips FS3511.
+            let resolveTask: Task<Result<int * string option, JsonNode>> =
+                match directNumber with
+                | Some n -> Task.FromResult(Ok(n, (None: string option)))
+                | None ->
+                    match args.path with
+                    | Some path ->
+                        this.ResolveDiagnosticFromPosition(path, args.line, args.character, args.text, args.projectPath)
+                    | None ->
+                        Task.FromResult(
+                            Error(
+                                jobj
+                                    [ "status", jstr "invalid_args"
+                                      "message",
+                                      jstr
+                                          "Provide one of: code (e.g. \"FS0039\"), errorNumber (e.g. 39), or path+line+character to auto-fetch the diagnostic." ]
+                                :> JsonNode
+                            )
+                        )
+
+            let! resolved = resolveTask
+
+            // ── 3+4. Render the curated explanation (or pass an error envelope through).
+            // The rendering is a pure synchronous helper so this continuation reduces.
+            return renderExplanation args.message resolved
+        }
+
+    // ── fcs_check_compile_order (issue #58) ──────────────────────────────────────
+    // Detects F#'s order-of-compilation gotcha: a symbol used in a file that is
+    // DEFINED in a file appearing LATER in the project's <Compile> order is "not
+    // defined" purely because of file ordering — distinct from a missing `open`.
+    //
+    // MECHANISM (verified against FCS 43.12.x): an out-of-order forward reference does
+    // NOT resolve — FCS drops the use and emits FS0039 "X is not defined". So the use
+    // never appears in GetAllUsesOfAllSymbols(); a naïve "resolved-use index vs def
+    // index" comparison would find nothing. Instead we CORRELATE each FS0039 error with
+    // the project's resolved DEFINITIONS: the offending file's compile index is compared
+    // against the compile index of any same-named definition that lives elsewhere in the
+    // SAME project. If a matching definition compiles LATER (cross-file: higher index;
+    // same-file: a later line), the FS0039 is an ordering problem, not a missing open —
+    // exactly the discrimination fcs_suggest_open can't make. Reuses the #131
+    // ProjectSweepUses memo for the definition index.
+    member this.CheckCompileOrder(args: FcsCheckCompileOrderArgs) : Task<JsonNode> =
+        task {
+            let targetOpt =
+                args.projectPath
+                |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.map normalizePath
+
+            match targetOpt with
+            | None ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr
+                              "fcs_check_compile_order needs a project: pass projectPath (.fsproj/.sln/.slnx) or call set_project first." ]
+                    :> JsonNode
+            | Some target ->
+
+            let symbolFilter = args.symbol |> Option.filter (String.IsNullOrWhiteSpace >> not)
+            let projectsToScan = SolutionParsing.listProjects target
+
+            if projectsToScan.Length = 0 then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr $"fcs_check_compile_order could not resolve any .fsproj from: {target}" ]
+                    :> JsonNode
+            else
+
+            // Read each source file's lines at most once for lineText emission.
+            let lineCache = System.Collections.Generic.Dictionary<string, string array>(StringComparer.Ordinal)
+
+            let lineTextAt (file: string) (oneBasedLine: int) =
+                let lines =
+                    match lineCache.TryGetValue file with
+                    | true, ls -> ls
+                    | _ ->
+                        let ls =
+                            try
+                                if File.Exists file then File.ReadAllLines file else [||]
+                            with _ ->
+                                [||]
+
+                        lineCache[file] <- ls
+                        ls
+
+                let idx = oneBasedLine - 1
+                if idx >= 0 && idx < lines.Length then lines[idx] else ""
+
+            // Pull the first single-quoted identifier out of an FS0039 message. The
+            // compiler emits straight quotes in the invariant culture; tolerate the
+            // typographic pair as well.
+            let extractUnresolvedName (message: string) : string option =
+                if isNull message then
+                    None
+                else
+                    let quotes = [| '\''; '‘'; '’' |]
+                    let startIdx = message.IndexOfAny quotes
+
+                    if startIdx < 0 then
+                        None
+                    else
+                        let endIdx = message.IndexOfAny(quotes, startIdx + 1)
+
+                        if endIdx <= startIdx + 1 then
+                            None
+                        else
+                            Some(message.Substring(startIdx + 1, endIdx - startIdx - 1))
+
+            let problems = ResizeArray<JsonNode>()
+            let mutable projectsScanned = 0
+
+            for fsproj in projectsToScan do
+                try
+                    let! options, _ = this.ResolveFsprojOptions fsproj
+                    projectsScanned <- projectsScanned + 1
+
+                    // <Compile> order: SourceFiles array index = compile index.
+                    let fileIndex =
+                        System.Collections.Generic.Dictionary<string, int>(StringComparer.Ordinal)
+
+                    options.SourceFiles |> Array.iteri (fun i f -> fileIndex[normalizePath f] <- i)
+
+                    let usesKey =
+                        $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}|{referencedProjectSourcesStamp options}"
+
+                    let! allUses, diagnostics = this.ProjectSweepUses(usesKey, options)
+
+                    // Index every IN-PROJECT definition by DisplayName → (file, declStartLine,
+                    // compileIndex). An out-of-order use resolves to its definition by name;
+                    // we match the unresolved FS0039 name against these. Only the declaration's
+                    // line is retained (not the `range` struct) so later filtering/sorting never
+                    // touches a struct field (avoids FS0052 defensive-copy warnings).
+                    let defsByName =
+                        System.Collections.Generic.Dictionary<string, ResizeArray<string * int * int>>(
+                            StringComparer.Ordinal
+                        )
+
+                    for u in allUses do
+                        if u.IsFromDefinition then
+                            match u.Symbol.DeclarationLocation with
+                            | Some r ->
+                                let f = normalizePath r.FileName
+                                let declStartLine = r.StartLine
+
+                                match fileIndex.TryGetValue f with
+                                | true, idx ->
+                                    let name = u.Symbol.DisplayName
+
+                                    if not (String.IsNullOrEmpty name) then
+                                        match defsByName.TryGetValue name with
+                                        | true, lst -> lst.Add(f, declStartLine, idx)
+                                        | _ ->
+                                            let lst = ResizeArray<string * int * int>()
+                                            lst.Add(f, declStartLine, idx)
+                                            defsByName[name] <- lst
+                                | _ -> ()
+                            | None -> ()
+
+                    // Correlate each FS0039 "not defined" error with a later-compiling
+                    // definition of the same name.
+                    let seen = System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
+
+                    for d in diagnostics do
+                        if d.Severity = FSharpDiagnosticSeverity.Error && d.ErrorNumber = 39 then
+                            match extractUnresolvedName d.Message with
+                            | Some name when
+                                symbolFilter
+                                |> Option.forall (fun s -> String.Equals(s, name, StringComparison.Ordinal))
+                                ->
+                                // Bind the diagnostic range once: chained `d.Range.X` access
+                                // would force a defensive struct copy (FS0052) under warnaserror.
+                                let useRange = d.Range
+                                let useStartLine = useRange.StartLine
+                                let useFile = normalizePath useRange.FileName
+
+                                match fileIndex.TryGetValue useFile with
+                                | true, useIdx ->
+                                    match defsByName.TryGetValue name with
+                                    | true, candidates ->
+                                        // Nearest definition that compiles AFTER the use
+                                        // (cross-file: higher index; same-file: later line).
+                                        let later =
+                                            candidates
+                                            |> Seq.filter (fun (_, defLine, didx) ->
+                                                didx > useIdx || (didx = useIdx && defLine > useStartLine))
+                                            |> Seq.sortBy (fun (_, defLine, didx) -> didx, defLine)
+                                            |> Seq.tryHead
+
+                                        match later with
+                                        | Some(defFile, _, defIdx) ->
+                                            let dedupKey =
+                                                $"{useFile}:{useStartLine}:{useRange.StartColumn}:{name}"
+
+                                            if seen.Add dedupKey then
+                                                let defBase = Path.GetFileName defFile
+                                                let useBase = Path.GetFileName useFile
+
+                                                let problem =
+                                                    jobj
+                                                        [ "symbol", jstr name
+                                                          "definedIn",
+                                                          jobj [ "file", jstr defFile; "compileIndex", jint defIdx ]
+                                                          :> JsonNode
+                                                          "usedIn",
+                                                          jobj
+                                                              [ "file", jstr useFile
+                                                                "compileIndex", jint useIdx
+                                                                "range", rangeToJson useRange
+                                                                "lineText", jstr (lineTextAt useFile useStartLine) ]
+                                                          :> JsonNode
+                                                          "fix",
+                                                          jstr
+                                                              $"definition compiles after use — move {defBase} before {useBase} in <Compile> order, or move the definition" ]
+                                                    :> JsonNode
+
+                                                problems.Add problem
+                                        | None -> () // defined earlier/elsewhere → not an order problem
+                                    | _ -> () // name not defined in this project → missing open / genuinely absent
+                                | _ -> ()
+                            | _ -> ()
+                with _ ->
+                    () // a project that fails to resolve is skipped; keep scanning the rest
+
+            return
+                jobj
+                    [ "status", jstr "succeeded"
+                      "projectsScanned", jint projectsScanned
+                      "compileOrderProblems", JsonArray(problems.ToArray()) :> JsonNode
+                      "problemCount", jint problems.Count ]
+                :> JsonNode
+        }
+
+    // ── fcs_refactor_impact (#71): read-only blast-radius + verification preview ──────
+    // ORCHESTRATES the existing backends — it adds no new analysis, only synthesis:
+    //   • Find          → all cross-project use sites, the projects + files they touch;
+    //   • TestsForSymbol → the tests that cover the symbol (run-these list);
+    //   • CheckCompileOrder (kind=move) → forward-reference / <Compile>-order risk;
+    //   • PublicApi (kind=signature|delete, target public) → breaking-surface flag;
+    //   • RenamePreview (kind=rename, injected FSAC probe) → exact edit count, best-effort.
+    // The `verify` array is a human-readable checklist distilled from the above. The
+    // RenamePreview probe is injected (mirrors Find's fsacProbe) so this FCS member stays
+    // LSP-agnostic and degrades cleanly when FSAC is unavailable. Writes nothing.
+    member this.RefactorImpact
+        (args: FcsRefactorImpactArgs, ?renamePreview: RenamePreviewArgs -> Task<JsonNode>)
+        : Task<JsonNode> =
+        task {
+            // ── Defensive JsonNode readers (orchestrated payloads are always objects) ──
+            let readStr (node: JsonNode) (key: string) : string option =
+                try
+                    match node[key] with
+                    | null -> None
+                    | v -> Some(v.GetValue<string>())
+                with _ ->
+                    None
+
+            let readInt (node: JsonNode) (key: string) : int option =
+                try
+                    match node[key] with
+                    | null -> None
+                    | v -> Some(v.GetValue<int>())
+                with _ ->
+                    None
+
+            let readBool (node: JsonNode) (key: string) : bool option =
+                try
+                    match node[key] with
+                    | null -> None
+                    | v -> Some(v.GetValue<bool>())
+                with _ ->
+                    None
+
+            let arrayOf (node: JsonNode) (key: string) : JsonNode array =
+                try
+                    match node[key] with
+                    | :? JsonArray as a -> a |> Seq.toArray
+                    | _ -> [||]
+                with _ ->
+                    [||]
+
+            // ── Resolve the target: a symbol name, or a position to resolve it from ──
+            let symbolValue = args.symbol |> Option.map (fun s -> s.Trim())
+            let hasSymbol = symbolValue |> Option.exists (String.IsNullOrWhiteSpace >> not)
+
+            let hasPosition =
+                (args.path |> Option.exists (String.IsNullOrWhiteSpace >> not)) && args.line.IsSome
+
+            if not hasSymbol && not hasPosition then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr "fcs_refactor_impact needs a target: pass `symbol`, or `path` + `line` (+ `character`)." ]
+                    :> JsonNode
+            else
+
+            let kindRaw = (args.kind |> Option.defaultValue "auto").Trim().ToLowerInvariant()
+
+            let kindKnown = set [ "rename"; "signature"; "move"; "delete"; "auto" ]
+
+            let kindResolved =
+                let k = if kindKnown.Contains kindRaw then kindRaw else "auto"
+
+                if k = "auto" then
+                    if args.newName |> Option.exists (String.IsNullOrWhiteSpace >> not) then
+                        "rename"
+                    else
+                        "auto"
+                else
+                    k
+
+            let resolvedVia = if hasSymbol then "symbol" else "position"
+
+            // One Find call gives BOTH the cross-project blast radius AND (for a position
+            // target) the resolved symbol name — Find echoes it back in `query`.
+            let baseFind: FindArgs =
+                { query = "_"
+                  kind = None
+                  scope = Some "workspace"
+                  exact = Some true
+                  ``member`` = None
+                  field = None
+                  path = args.path
+                  line = args.line
+                  word = None
+                  occurrence = None
+                  character = args.character
+                  contextLines = Some 0
+                  includeDeclaration = Some true
+                  includeInfo = Some false
+                  projectPath = args.projectPath
+                  maxResults = Some 1000
+                  cursor = None }
+
+            let findArgs =
+                if hasSymbol then
+                    { baseFind with
+                        query = symbolValue |> Option.defaultValue "_"
+                        kind = Some "auto" }
+                else
+                    { baseFind with kind = Some "position" }
+
+            let! findResult = this.Find(findArgs)
+            let findStatus = readStr findResult "status" |> Option.defaultValue "unknown"
+
+            if findStatus <> "succeeded" then
+                return
+                    jobj
+                        [ "status", jstr findStatus
+                          "stage", jstr "find-sweep"
+                          "message",
+                          (readStr findResult "message"
+                           |> Option.map jstr
+                           |> Option.defaultValue (jstr "could not resolve the target symbol from the given inputs")) ]
+                    :> JsonNode
+            else
+
+            let resolvedName =
+                readStr findResult "query"
+                |> Option.orElse symbolValue
+                |> Option.defaultValue ""
+
+            let totalSites = readInt findResult "totalSites" |> Option.defaultValue 0
+
+            let matched =
+                match findResult["resolution"] with
+                | null -> totalSites > 0
+                | res -> readBool res "matched" |> Option.defaultValue (totalSites > 0)
+
+            // ── Impact: files + projects the sites touch ─────────────────────────────
+            let sites = arrayOf findResult "sites"
+            let perProject = arrayOf findResult "perProject"
+
+            let fileOf (s: JsonNode) = readStr s "file" |> Option.defaultValue ""
+            let projOf (s: JsonNode) = readStr s "project" |> Option.defaultValue ""
+            let kindOf (s: JsonNode) = readStr s "kind" |> Option.defaultValue ""
+
+            let affectedFiles =
+                sites
+                |> Array.map fileOf
+                |> Array.filter (String.IsNullOrWhiteSpace >> not)
+                |> Array.distinct
+                |> Array.sort
+
+            let fileCount = affectedFiles.Length
+
+            let byProject =
+                sites
+                |> Array.map projOf
+                |> Array.filter (String.IsNullOrWhiteSpace >> not)
+                |> Array.countBy id
+                |> Array.sortByDescending snd
+
+            let projectCount = byProject.Length
+            let crossProject = projectCount > 1
+
+            let fsprojForProject (proj: string) =
+                perProject
+                |> Array.tryPick (fun p ->
+                    match readStr p "project" with
+                    | Some pn when String.Equals(pn, proj, StringComparison.Ordinal) -> readStr p "fsproj"
+                    | _ -> None)
+
+            let sitesByProjectNodes =
+                byProject
+                |> Array.map (fun (proj, n) ->
+                    let baseProps = [ "project", jstr proj; "sites", jint n ]
+
+                    let props =
+                        match fsprojForProject proj with
+                        | Some f -> baseProps @ [ "fsproj", jstr f ]
+                        | None -> baseProps
+
+                    jobj props :> JsonNode)
+
+            // The project that DEFINES the target — used to scope the public-API check.
+            let definingFsproj =
+                sites
+                |> Array.tryFind (fun s -> kindOf s = "definition")
+                |> Option.map fileOf
+                |> Option.bind (fun f -> if String.IsNullOrWhiteSpace f then None else findNearestFsproj f)
+                |> Option.map normalizePath
+                |> Option.orElseWith (fun () ->
+                    match args.projectPath with
+                    | Some p when p.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) -> Some(normalizePath p)
+                    | _ -> byProject |> Array.tryHead |> Option.bind (fst >> fsprojForProject))
+
+            // ── Tests that cover the symbol (always) ─────────────────────────────────
+            let! testsResult =
+                this.TestsForSymbol
+                    { symbolQuery = resolvedName
+                      exact = Some true
+                      path = None
+                      text = None
+                      projectPath = args.projectPath
+                      maxResults = Some 100 }
+
+            let testSites = arrayOf testsResult "tests"
+            let testCount = readInt testsResult "testCount" |> Option.defaultValue testSites.Length
+
+            let testNodes =
+                testSites
+                |> Array.map (fun t ->
+                    jobj
+                        [ "file", jstrOrNull (readStr t "file" |> Option.defaultValue "")
+                          "enclosingTest", jstrOrNull (readStr t "enclosingTest" |> Option.defaultValue "")
+                          "project", jstrOrNull (readStr t "project" |> Option.defaultValue "") ]
+                    :> JsonNode)
+
+            let enclosingTestNames =
+                testSites
+                |> Array.choose (fun t -> readStr t "enclosingTest")
+                |> Array.distinct
+                |> Array.sort
+
+            // ── Compile-order risk (kind=move) ───────────────────────────────────────
+            let mutable compileOrderNode: JsonNode option = None
+            let mutable compileProblemCount = 0
+            let mutable compileFirstFix = ""
+
+            if kindResolved = "move" then
+                let! co = this.CheckCompileOrder { projectPath = args.projectPath; symbol = Some resolvedName }
+                let probs = arrayOf co "compileOrderProblems"
+                compileProblemCount <- readInt co "problemCount" |> Option.defaultValue probs.Length
+
+                compileFirstFix <-
+                    if probs.Length > 0 then
+                        readStr probs[0] "fix" |> Option.defaultValue ""
+                    else
+                        ""
+
+                let problemsClone =
+                    match co["compileOrderProblems"] with
+                    | null -> JsonArray() :> JsonNode
+                    | n -> n.DeepClone()
+
+                compileOrderNode <-
+                    Some(jobj [ "problemCount", jint compileProblemCount; "problems", problemsClone ] :> JsonNode)
+
+            // ── Public-API breaking surface (kind=signature|delete) ──────────────────
+            let wantApi = kindResolved = "signature" || kindResolved = "delete"
+            let mutable apiSurfaceNode: JsonNode option = None
+            let mutable apiIsPublic = false
+
+            if wantApi then
+                match definingFsproj with
+                | None ->
+                    apiSurfaceNode <-
+                        Some(
+                            jobj
+                                [ "isPublic", jbool false
+                                  "affectedPublicMembers", JsonArray() :> JsonNode
+                                  "note", jstr "could not resolve the defining project for the target" ]
+                            :> JsonNode
+                        )
+                | Some fsproj ->
+                    let! api =
+                        this.PublicApi
+                            { projectPath = Some fsproj
+                              includeInternal = Some false
+                              namespaceFilter = None
+                              maxResults = Some 1000
+                              cursor = None }
+
+                    let entities = arrayOf api "entities"
+                    let affected = ResizeArray<JsonNode>()
+
+                    for e in entities do
+                        let efull = readStr e "fullName" |> Option.defaultValue ""
+
+                        let lastSeg =
+                            let idx = efull.LastIndexOf '.'
+
+                            if idx >= 0 && idx < efull.Length - 1 then
+                                efull.Substring(idx + 1)
+                            else
+                                efull
+
+                        if String.Equals(lastSeg, resolvedName, StringComparison.Ordinal) then
+                            affected.Add(
+                                jobj
+                                    [ "entity", jstr efull
+                                      "member", jstrOrNull ""
+                                      "kind", jstr (readStr e "kind" |> Option.defaultValue "")
+                                      "signature", jstr efull ]
+                                :> JsonNode
+                            )
+
+                        for m in arrayOf e "members" do
+                            match readStr m "name" with
+                            | Some mn when String.Equals(mn, resolvedName, StringComparison.Ordinal) ->
+                                affected.Add(
+                                    jobj
+                                        [ "entity", jstr efull
+                                          "member", jstr mn
+                                          "kind", jstr (readStr m "kind" |> Option.defaultValue "")
+                                          "signature", jstr (readStr m "signature" |> Option.defaultValue "") ]
+                                    :> JsonNode
+                                )
+                            | _ -> ()
+
+                    apiIsPublic <- affected.Count > 0
+
+                    apiSurfaceNode <-
+                        Some(
+                            jobj
+                                [ "isPublic", jbool apiIsPublic
+                                  "project", jstr fsproj
+                                  "affectedPublicMembers", JsonArray(affected.ToArray()) :> JsonNode ]
+                            :> JsonNode
+                        )
+
+            // ── Rename preview (kind=rename) — best-effort, injected FSAC probe ───────
+            let mutable renamePreviewNode: JsonNode option = None
+            let mutable renameAvailable = false
+            let mutable renameEdits = 0
+            let mutable renameFiles = 0
+
+            match renamePreview with
+            | Some probe when kindResolved = "rename" ->
+                match args.newName, args.path, args.line, args.character with
+                | Some nn, Some p, Some ln, Some ch when
+                    (not (String.IsNullOrWhiteSpace nn)) && (not (String.IsNullOrWhiteSpace p))
+                    ->
+                    try
+                        let! rp =
+                            probe
+                                { path = p
+                                  line = ln
+                                  character = ch
+                                  newName = nn
+                                  text = None }
+
+                        let st = readStr rp "status" |> Option.defaultValue "unknown"
+
+                        if st = "ok" then
+                            renameAvailable <- true
+                            renameEdits <- readInt rp "totalEdits" |> Option.defaultValue 0
+                            renameFiles <- readInt rp "fileCount" |> Option.defaultValue 0
+
+                            renamePreviewNode <-
+                                Some(
+                                    jobj
+                                        [ "status", jstr "ok"
+                                          "totalEdits", jint renameEdits
+                                          "fileCount", jint renameFiles
+                                          "crossProject", jbool (readBool rp "crossProject" |> Option.defaultValue false) ]
+                                    :> JsonNode
+                                )
+                        else
+                            renamePreviewNode <-
+                                Some(
+                                    jobj
+                                        [ "status", jstr st
+                                          "note", jstr "rename preview returned no edits — relying on find sites" ]
+                                    :> JsonNode
+                                )
+                    with ex ->
+                        renamePreviewNode <-
+                            Some(jobj [ "status", jstr "unavailable"; "note", jstr ex.Message ] :> JsonNode)
+                | _ ->
+                    renamePreviewNode <-
+                        Some(
+                            jobj
+                                [ "status", jstr "skipped"
+                                  "note", jstr "rename preview needs newName + path + line + character" ]
+                            :> JsonNode
+                        )
+            | _ -> ()
+
+            // ── verify: human-readable checklist distilled from the sections above ───
+            let verify = ResizeArray<string>()
+
+            if (not matched) || totalSites = 0 then
+                verify.Add(
+                    $"no use sites found for '{resolvedName}' — it may be unused, dynamically referenced, or the name is wrong; double-check before changing it"
+                )
+            elif crossProject then
+                let projectNamesStr = byProject |> Array.map fst |> String.concat ", "
+
+                verify.Add(
+                    $"{totalSites} cross-project site(s) across {projectCount} projects ({projectNamesStr}) — rebuild all affected projects"
+                )
+            else
+                verify.Add($"{totalSites} site(s) in {fileCount} file(s) within one project — re-check the project after the change")
+
+            if testCount > 0 then
+                let namesStr =
+                    if enclosingTestNames.Length > 0 then
+                        enclosingTestNames |> Array.truncate 10 |> String.concat ", "
+                    else
+                        "(see tests list)"
+
+                verify.Add($"{testCount} test reference(s) cover '{resolvedName}' — run: {namesStr}")
+
+            if wantApi then
+                if apiIsPublic then
+                    verify.Add(
+                        $"'{resolvedName}' is part of the public API surface — this is a BREAKING change; bump the minor version and update consumers"
+                    )
+                else
+                    verify.Add($"'{resolvedName}' is not on the public API surface — the change stays internal")
+
+            if kindResolved = "move" then
+                if compileProblemCount > 0 then
+                    let fixHint =
+                        if String.IsNullOrWhiteSpace compileFirstFix then
+                            "reorder the <Compile> entries"
+                        else
+                            compileFirstFix
+
+                    verify.Add($"compile-order risk: {compileProblemCount} forward-reference problem(s) — {fixHint}")
+                else
+                    verify.Add(
+                        "no compile-order problems at the current file positions; re-run `check` after moving the file or definition"
+                    )
+
+            if kindResolved = "rename" then
+                if renameAvailable then
+                    let renameTo = args.newName |> Option.defaultValue "?"
+
+                    verify.Add(
+                        $"rename '{resolvedName}' -> '{renameTo}' touches {renameEdits} edit(s) in {renameFiles} file(s); `fcs_rename_preview` has the exact edit set"
+                    )
+                else
+                    verify.Add("rename preview unavailable (FSAC) — use the find sites as the edit set")
+
+            // ── Assemble ─────────────────────────────────────────────────────────────
+            let targetNode =
+                jobj
+                    ([ "symbol", jstr resolvedName ]
+                     @ (match args.path with
+                        | Some p when not (String.IsNullOrWhiteSpace p) -> [ "path", jstr (normalizePath p) ]
+                        | _ -> [])
+                     @ (match args.line with
+                        | Some l -> [ "line", jint l ]
+                        | None -> [])
+                     @ (match args.character with
+                        | Some c -> [ "character", jint c ]
+                        | None -> [])
+                     @ [ "resolvedVia", jstr resolvedVia ])
+                :> JsonNode
+
+            let impactNode =
+                jobj
+                    [ "totalSites", jint totalSites
+                      "fileCount", jint fileCount
+                      "projectCount", jint projectCount
+                      "crossProject", jbool crossProject
+                      "sitesByProject", JsonArray(sitesByProjectNodes) :> JsonNode
+                      "affectedFiles", JsonArray(affectedFiles |> Array.map jstr) :> JsonNode ]
+                :> JsonNode
+
+            let testsNode =
+                jobj [ "count", jint testCount; "tests", JsonArray(testNodes) :> JsonNode ] :> JsonNode
+
+            let baseProps =
+                [ "status", jstr "succeeded"
+                  "target", targetNode
+                  "kind", jstr kindResolved
+                  "impact", impactNode
+                  "tests", testsNode ]
+
+            let optionalProps =
+                (compileOrderNode |> Option.map (fun n -> [ "compileOrder", n ]) |> Option.defaultValue [])
+                @ (apiSurfaceNode |> Option.map (fun n -> [ "apiSurface", n ]) |> Option.defaultValue [])
+                @ (renamePreviewNode |> Option.map (fun n -> [ "renamePreview", n ]) |> Option.defaultValue [])
+
+            let verifyProp = [ "verify", JsonArray(verify.ToArray() |> Array.map jstr) :> JsonNode ]
+
+            return jobj (baseProps @ optionalProps @ verifyProp) :> JsonNode
+        }
+
+    // ── fcs_create_file_plan (#66): read-only "where should this new .fs file go?" ────
+    // PLANNING ONLY — never creates files, writes source, or edits the .fsproj. Given a
+    // proposed file name (and optionally a sibling it should follow + an intended
+    // namespace/module), it loads the project's resolved <Compile> order (SourceFiles),
+    // recommends an insertion index, reads the top namespace/module declaration of the
+    // neighbouring files to infer the house convention, and spells out the exact
+    // <Compile Include=...> edit. F# compile order is load-bearing: a file may only
+    // reference symbols DEFINED in earlier files, so the recommended index governs what
+    // the new file can use. Pairs with fcs_check_compile_order (run it AFTER the edit).
+    //
+    // The async half mirrors CheckCompileOrder's proven shape (a for-loop with `let!`
+    // inside try/with, then a single `return`). All the heavy synchronous planning lives
+    // in the pure BuildFilePlan member so this state machine stays statically compilable
+    // (sidesteps the FS3511 "await-in-loop then control flow" shape). Writes nothing.
+    member this.CreateFilePlan(args: FcsCreateFilePlanArgs) : Task<JsonNode> =
+        task {
+            let targetOpt =
+                args.projectPath
+                |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.map normalizePath
+
+            match targetOpt with
+            | None ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr
+                              "fcs_create_file_plan needs a project: pass projectPath (.fsproj/.sln/.slnx) or call set_project first." ]
+                    :> JsonNode
+            | Some target ->
+
+            let fileNameRaw = if isNull args.fileName then "" else args.fileName.Trim()
+
+            if fileNameRaw = "" then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr "fcs_create_file_plan requires a non-empty fileName (e.g. \"Validation.fs\")." ]
+                    :> JsonNode
+            else
+
+            let projectsToScan = SolutionParsing.listProjects target
+
+            if projectsToScan.Length = 0 then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr $"fcs_create_file_plan could not resolve any .fsproj from: {target}" ]
+                    :> JsonNode
+            else
+
+            // Load options for every resolved project; a project that fails to resolve is
+            // skipped (we plan against whatever loaded). Awaiting inside the loop only.
+            let loaded = ResizeArray<string * FSharpProjectOptions>()
+
+            for fsproj in projectsToScan do
+                try
+                    let! options, _ = this.ResolveFsprojOptions fsproj
+                    loaded.Add(fsproj, options)
+                with _ ->
+                    ()
+
+            return this.BuildFilePlan(args, fileNameRaw, projectsToScan, loaded)
+        }
+
+    // The pure (non-async) half of fcs_create_file_plan: given the already-loaded project
+    // options, compute the recommended <Compile> position, infer the namespace convention,
+    // and spell out the edit. Kept OFF the task state machine (FS3511). Writes nothing.
+    member private _.BuildFilePlan
+        (
+            args: FcsCreateFilePlanArgs,
+            fileNameRaw: string,
+            projects: string array,
+            loaded: ResizeArray<string * FSharpProjectOptions>
+        ) : JsonNode =
+        let nullNode: JsonNode = null
+        let strOrNull (s: string option) : JsonNode = match s with Some v -> jstr v | None -> nullNode
+        let notBlank (s: string) = not (String.IsNullOrWhiteSpace s)
+        let baseNameLower (p: string) = (Path.GetFileName p).ToLowerInvariant()
+
+        let looksLikeTest (p: string) =
+            (Path.GetFileNameWithoutExtension p).IndexOf("test", StringComparison.OrdinalIgnoreCase) >= 0
+
+        if loaded.Count = 0 then
+            jobj
+                [ "status", jstr "invalid_args"
+                  "message",
+                  jstr
+                      $"fcs_create_file_plan resolved {projects.Length} project(s) but could not load options for any. Restore the project first." ]
+            :> JsonNode
+        else
+
+        let afterArg = args.afterFile |> Option.filter notBlank
+        let afterBaseLower = afterArg |> Option.map baseNameLower
+
+        // Plan against the project that already contains afterFile (so the recommended
+        // index is meaningful), else the first non-test project, else simply the first.
+        let chosenFsproj, options =
+            let byAfter =
+                afterBaseLower
+                |> Option.bind (fun afb ->
+                    loaded
+                    |> Seq.tryFind (fun (_, o) -> o.SourceFiles |> Array.exists (fun f -> baseNameLower f = afb)))
+
+            match byAfter with
+            | Some chosen -> chosen
+            | None ->
+                loaded
+                |> Seq.tryFind (fun (p, _) -> not (looksLikeTest p))
+                |> Option.defaultValue loaded[0]
+
+        let notes = ResizeArray<string>()
+
+        if projects.Length > 1 then
+            notes.Add
+                $"projectPath resolved to {projects.Length} projects; planned against {Path.GetFileName chosenFsproj}"
+
+        // FCS SourceFiles augments the project's <Compile> items with MSBuild-injected
+        // generated sources (obj/ AssemblyInfo, *.g.fs, designer files). Those never appear
+        // in the .fsproj the agent will edit, so plan against the USER-VISIBLE compile set:
+        // the recommended index, sibling files and namespace inference must mirror what the
+        // .fsproj actually lists, not FCS's augmented view.
+        let underObjOrBin (p: string) =
+            let np = p.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar)
+            let sep = string Path.DirectorySeparatorChar
+
+            np.Contains($"{sep}obj{sep}", StringComparison.OrdinalIgnoreCase)
+            || np.Contains($"{sep}bin{sep}", StringComparison.OrdinalIgnoreCase)
+
+        let isUserVisible (p: string) =
+            not (underObjOrBin p || isGeneratedFile p || isAssemblyInfoFile p || isDesignerFile p)
+
+        let sourceFiles = options.SourceFiles |> Array.map normalizePath |> Array.filter isUserVisible
+        let len = sourceFiles.Length
+
+        // Read a file's first significant `namespace X` / `module X.Y` line, skipping blank
+        // lines, // comments, (* block comments *), #directives and [<attributes>]. One read
+        // per file, capped at 80 lines, so even a large solution stays cheap.
+        let readTopDecl (file: string) : string option =
+            let lines =
+                try
+                    if File.Exists file then File.ReadLines file |> Seq.truncate 80 |> Seq.toArray else [||]
+                with _ ->
+                    [||]
+
+            let firstToken (s: string) =
+                let cut = let i = s.IndexOf "//" in if i >= 0 then s.Substring(0, i) else s
+                let i = cut.IndexOfAny [| ' '; '\t'; '='; '('; ')' |]
+                (if i >= 0 then cut.Substring(0, i) else cut).Trim()
+
+            let stripLeading (words: string list) (s: string) =
+                let mutable cur = s
+                let mutable changed = true
+
+                while changed do
+                    changed <- false
+
+                    for w in words do
+                        if cur.StartsWith(w + " ") || cur.StartsWith(w + "\t") then
+                            cur <- cur.Substring(w.Length).Trim()
+                            changed <- true
+
+                cur
+
+            let parseDecl (line: string) : string option =
+                let afterKw (kw: string) =
+                    if line.StartsWith(kw + " ") || line.StartsWith(kw + "\t") then
+                        Some(line.Substring(kw.Length).Trim())
+                    else
+                        None
+
+                match afterKw "namespace" with
+                | Some rest ->
+                    let nm = rest |> stripLeading [ "rec"; "global" ] |> firstToken
+                    Some(if nm = "" then "namespace" else $"namespace {nm}")
+                | None ->
+                    match afterKw "module" with
+                    | Some rest ->
+                        let nm = rest |> stripLeading [ "rec"; "public"; "internal"; "private" ] |> firstToken
+                        if nm = "" then None else Some $"module {nm}"
+                    | None -> None
+
+            let mutable result = None
+            let mutable inBlock = false
+            let mutable i = 0
+
+            while result.IsNone && i < lines.Length do
+                let line = lines[i].Trim()
+
+                if inBlock then
+                    if line.Contains "*)" then inBlock <- false
+                elif line = "" || line.StartsWith "//" || line.StartsWith "#" || line.StartsWith "[<" then
+                    ()
+                elif line.StartsWith "(*" then
+                    if not (line.Contains "*)") then inBlock <- true
+                else
+                    // First significant line: it is the top decl, or there is none.
+                    result <- Some(parseDecl line |> Option.defaultValue "")
+
+                i <- i + 1
+
+            match result with
+            | Some "" -> None
+            | other -> other
+
+        let topDecls = sourceFiles |> Array.map readTopDecl
+
+        // Namespace root the neighbours share. For `module A.B.C` the namespace is `A.B`
+        // (drop the module leaf); for `module C` (single segment) there is no namespace.
+        let declToNamespaceParts (decl: string) : string list =
+            let parts = decl.Split(' ')
+
+            if parts.Length < 2 then
+                []
+            else
+                let segs = parts[1].Split('.') |> Array.toList
+
+                match parts[0] with
+                | "namespace" -> segs
+                | "module" -> (if segs.Length <= 1 then [] else segs |> List.take (segs.Length - 1))
+                | _ -> []
+
+        let longestCommonPrefix (lists: string list list) : string list =
+            match lists with
+            | [] -> []
+            | first :: rest ->
+                rest
+                |> List.fold
+                    (fun acc cur ->
+                        Seq.zip acc cur |> Seq.takeWhile (fun (a, b) -> a = b) |> Seq.map fst |> Seq.toList)
+                    first
+
+        let decls = topDecls |> Array.choose id
+        let kindOf (d: string) = (d.Split(' '))[0]
+        let namespaceKindCount = decls |> Array.filter (fun d -> kindOf d = "namespace") |> Array.length
+        let moduleKindCount = decls |> Array.filter (fun d -> kindOf d = "module") |> Array.length
+
+        let nsPartLists =
+            decls |> Array.map declToNamespaceParts |> Array.filter (List.isEmpty >> not) |> Array.toList
+
+        let rootStr = longestCommonPrefix nsPartLists |> String.concat "."
+        let moduleName = Path.GetFileNameWithoutExtension fileNameRaw
+        let modulePreferred = moduleKindCount >= namespaceKindCount
+
+        let inferredConvention =
+            if decls.Length = 0 then
+                "unknown — no neighbour namespace/module declarations were readable"
+            elif modulePreferred && rootStr <> "" then
+                $"module {rootStr}.<ModuleName> (one top-level module per file under namespace {rootStr})"
+            elif modulePreferred then
+                "module <ModuleName> (one top-level module per file)"
+            elif rootStr <> "" then
+                $"namespace {rootStr}"
+            else
+                "namespace <Name>"
+
+        let suggestedDecl =
+            match args.namespaceOrModule |> Option.filter notBlank with
+            | Some ns -> ns.Trim()
+            | None ->
+                if modulePreferred && rootStr <> "" then $"module {rootStr}.{moduleName}"
+                elif modulePreferred then $"module {moduleName}"
+                elif rootStr <> "" then $"namespace {rootStr}"
+                else ""
+
+        // Placement: after afterFile when matched; else after the last neighbour sharing the
+        // intended namespace root; else end-of-project (can reference everything).
+        let afterMatchIdx =
+            afterBaseLower
+            |> Option.bind (fun afb -> sourceFiles |> Array.tryFindIndex (fun f -> baseNameLower f = afb))
+
+        let nsArgFirstSeg =
+            args.namespaceOrModule
+            |> Option.filter notBlank
+            |> Option.map (fun s ->
+                let t = s.Trim()
+
+                let stripped =
+                    if t.StartsWith "namespace " then t.Substring(10).Trim()
+                    elif t.StartsWith "module " then t.Substring(7).Trim()
+                    else t
+
+                (stripped.Split('.'))[0])
+
+        let heuristicIdx =
+            match afterArg, nsArgFirstSeg with
+            | None, Some seg when seg <> "" ->
+                let mutable found = None
+
+                topDecls
+                |> Array.iteri (fun idx d ->
+                    match d |> Option.map declToNamespaceParts with
+                    | Some(firstSeg :: _) when String.Equals(firstSeg, seg, StringComparison.Ordinal) ->
+                        found <- Some idx
+                    | _ -> ())
+
+                found
+            | _ -> None
+
+        let segDisplay = nsArgFirstSeg |> Option.defaultValue ""
+
+        let recIndex, insertAfterOpt, insertBeforeOpt =
+            match afterMatchIdx with
+            | Some i ->
+                notes.Add $"placed immediately after afterFile '{Path.GetFileName sourceFiles[i]}' (compile index {i})"
+                let before = if i + 1 < len then Some sourceFiles[i + 1] else None
+                (i + 1), Some sourceFiles[i], before
+            | None ->
+                match afterArg with
+                | Some af ->
+                    notes.Add
+                        $"afterFile '{af}' was not found in {Path.GetFileName chosenFsproj}'s compile order — defaulted to end-of-project insertion"
+                | None -> ()
+
+                match heuristicIdx with
+                | Some i ->
+                    notes.Add
+                        $"no afterFile given — placed after the last neighbour sharing namespace root '{segDisplay}' (compile index {i})"
+
+                    let before = if i + 1 < len then Some sourceFiles[i + 1] else None
+                    (i + 1), Some sourceFiles[i], before
+                | None ->
+                    if len > 0 then
+                        notes.Add
+                            "no afterFile or namespace match — defaulted to end-of-project insertion (the new file can reference every existing file)"
+
+                        len, Some sourceFiles[len - 1], None
+                    else
+                        notes.Add "project has no source files — the new file would be the first <Compile> entry"
+                        0, None, None
+
+        let proposedBaseLower = baseNameLower fileNameRaw
+
+        match sourceFiles |> Array.tryFindIndex (fun f -> baseNameLower f = proposedBaseLower) with
+        | Some i ->
+            notes.Add
+                $"a file named '{Path.GetFileName fileNameRaw}' already exists at compile index {i} — this plan assumes a NEW file; pick a different name to avoid a duplicate <Compile> include"
+        | None -> ()
+
+        if
+            not (
+                fileNameRaw.EndsWith(".fs", StringComparison.OrdinalIgnoreCase)
+                || fileNameRaw.EndsWith(".fsi", StringComparison.OrdinalIgnoreCase)
+            )
+        then
+            notes.Add $"'{fileNameRaw}' does not end in .fs/.fsi — F# <Compile> items are normally .fs source files"
+
+        if suggestedDecl <> "" then
+            notes.Add $"suggested top declaration for {Path.GetFileName fileNameRaw}: {suggestedDecl}"
+
+        let windowLo = max 0 (recIndex - 3)
+        let windowHi = min (len - 1) (recIndex + 2)
+
+        let nearby =
+            [ for idx in windowLo..windowHi ->
+                  jobj
+                      [ "file", jstr sourceFiles[idx]
+                        "compileIndex", jint idx
+                        "topNamespaceOrModule", strOrNull topDecls[idx] ]
+                  :> JsonNode ]
+
+        let earlierCount = recIndex
+        let laterCount = len - recIndex
+
+        let dependencyNote =
+            $"At compile index {recIndex}, {Path.GetFileName fileNameRaw} can reference symbols from the {earlierCount} earlier file(s) but NOT the {laterCount} later file(s). F# resolves names strictly in <Compile> order, so a forward or cyclic reference is a compile error (FS0039). Run fcs_check_compile_order after editing the .fsproj to confirm the order holds."
+
+        let projDir = Path.GetDirectoryName chosenFsproj
+
+        let relInclude (absPath: string) =
+            try
+                Path.GetRelativePath(projDir, absPath)
+            with _ ->
+                Path.GetFileName absPath
+
+        let fsprojOp =
+            match insertAfterOpt with
+            | Some after ->
+                $"add <Compile Include=\"{fileNameRaw}\" /> immediately after <Compile Include=\"{relInclude after}\" /> in {Path.GetFileName chosenFsproj}"
+            | None -> $"add <Compile Include=\"{fileNameRaw}\" /> as the first <Compile> item in {Path.GetFileName chosenFsproj}"
+
+        jobj
+            [ "status", jstr "succeeded"
+              "project", jstr chosenFsproj
+              "fileName", jstr fileNameRaw
+              "recommendedCompileIndex", jint recIndex
+              "totalCompileFiles", jint len
+              "insertAfter", strOrNull insertAfterOpt
+              "insertBefore", strOrNull insertBeforeOpt
+              "nearbyFiles", JsonArray(List.toArray nearby) :> JsonNode
+              "inferredNamespaceConvention", jstr inferredConvention
+              "dependencyNote", jstr dependencyNote
+              "fsprojOp", jstr fsprojOp
+              "notes", JsonArray(notes.ToArray() |> Array.map jstr) :> JsonNode ]
+        :> JsonNode
+
+    /// fcs_analyzer_setup_preview (#75) — read-only planner that reports what to ADD to
+    /// enable F# analyzers (analyzer package refs + GeneratePathProperty, FSharp.Analyzers.Build,
+    /// the FSharpAnalyzersOtherFlags property, a local fsharp-analyzers tool manifest) WITHOUT
+    /// applying anything. Pure .fsproj/.props/.json reads — no FCS — so it delegates to the
+    /// ProjectHealth helper, which reuses project_health's analyzer detection for the current view.
+    member _.AnalyzerSetupPreview(args: FcsAnalyzerSetupPreviewArgs) : Task<JsonNode> =
+        Task.FromResult(FsLangMcp.ProjectHealth.analyzerSetupPreview args)
+
+    /// fcs_review_scan — read-only, AST-based review-candidate inventory. Parses each
+    /// target file (parse-only, no type-check) and emits structurally interesting sites
+    /// for a human/agent to eyeball: review CANDIDATES, never asserted bugs. Writes nothing.
+    member this.ReviewScan(args: FcsReviewScanArgs) : Task<JsonNode> =
+        task {
+            // ── Resolve the wanted-category set (None / [] ⇒ every category) ─────
+            let wantedResult =
+                match args.categories with
+                | None
+                | Some [] -> Ok(Set.ofList ReviewScanner.allCategories)
+                | Some requested ->
+                    let normalized =
+                        requested
+                        |> List.choose (fun c -> if String.IsNullOrWhiteSpace c then None else Some(c.Trim()))
+
+                    let unknown = normalized |> List.filter (ReviewScanner.isKnownCategory >> not)
+
+                    if not unknown.IsEmpty then
+                        let unknownList = String.concat ", " unknown
+                        let validList = String.concat ", " ReviewScanner.allCategories
+                        Error $"Unknown categories: %s{unknownList}. Valid categories: %s{validList}."
+                    else
+                        Ok(Set.ofList normalized)
+
+            match wantedResult with
+            | Error message -> return jobj [ "status", jstr "invalid_args"; "message", jstr message ] :> JsonNode
+            | Ok wanted ->
+
+            let maxResults = args.maxResults |> Option.defaultValue 200 |> max 1 |> min 1000
+
+            // ── Decide the file set: single file (path) vs whole project (projectPath) ─
+            let pathArg = args.path |> Option.filter (String.IsNullOrWhiteSpace >> not)
+            let projectArg = args.projectPath |> Option.filter (String.IsNullOrWhiteSpace >> not)
+
+            let filesResult: Result<string * string list, JsonNode> =
+                match pathArg with
+                | Some path ->
+                    match validateSourcePath "fcs_review_scan" None path with
+                    | Some err -> Error err
+                    | None -> Ok("file", [ normalizePath path ])
+                | None ->
+                    match projectArg with
+                    | None ->
+                        Error(
+                            jobj
+                                [ "status", jstr "invalid_args"
+                                  "message",
+                                  jstr
+                                      "fcs_review_scan needs a target: pass `path` (one file) or `projectPath` (a .fsproj), or call set_project first." ]
+                            :> JsonNode
+                        )
+                    | Some projectPath ->
+                        let fullProject = normalizePath projectPath
+
+                        if not (File.Exists fullProject) then
+                            Error(
+                                jobj
+                                    [ "status", jstr "invalid_args"
+                                      "message", jstr $"fcs_review_scan: project file does not exist: %s{fullProject}" ]
+                                :> JsonNode
+                            )
+                        else
+                            match tryReadProject fullProject with
+                            | Error reason ->
+                                Error(
+                                    jobj
+                                        [ "status", jstr "error"
+                                          "message", jstr $"fcs_review_scan: project file cannot be read: %s{reason}" ]
+                                    :> JsonNode
+                                )
+                            | Ok doc ->
+                                let workspaceRoot = Path.GetDirectoryName fullProject
+
+                                let included =
+                                    filterProjectFiles workspaceRoot (defaultFilterOptions Review) (compileFiles fullProject doc)
+                                    |> fun result ->
+                                        result.Included
+                                        |> List.map (fun f -> f.Path)
+                                        |> List.filter File.Exists
+                                        |> List.distinct
+                                        |> List.sort
+
+                                Ok("project", included)
+
+            match filesResult with
+            | Error err -> return err
+            | Ok(mode, files) ->
+
+            // ── Parse each file (parse-only) and collect candidates ──────────────
+            let scanned = ResizeArray<string>()
+            let parseErrors = ResizeArray<JsonNode>()
+            // (category, file, sortLine, sortColumn, node) — node pre-built, the rest for ordering + counting.
+            let collected = ResizeArray<string * string * int * int * JsonNode>()
+
+            for file in files do
+                try
+                    let source = File.ReadAllText file
+                    let sourceText = SourceText.ofString source
+
+                    let parsingOptions =
+                        { FSharpParsingOptions.Default with
+                            SourceFiles = [| file |] }
+
+                    let! parseResults = checker.ParseFile(file, sourceText, parsingOptions) |> asTask
+                    scanned.Add file
+
+                    let lines = source.Replace("\r\n", "\n").Split('\n')
+
+                    let lineTextAt (oneBasedLine: int) =
+                        if oneBasedLine >= 1 && oneBasedLine <= lines.Length then
+                            let raw = lines[oneBasedLine - 1].Trim()
+                            if raw.Length > 200 then raw.Substring(0, 200) + "..." else raw
+                        else
+                            ""
+
+                    for candidate in ReviewScanner.scan wanted parseResults.ParseTree do
+                        let r = candidate.Range
+
+                        let node =
+                            jobj
+                                [ "category", jstr candidate.Category
+                                  "file", jstr file
+                                  "range", rangeToJsonNoFile r
+                                  "lineText", jstr (lineTextAt r.StartLine)
+                                  "note", jstr candidate.Note ]
+                            :> JsonNode
+
+                        collected.Add(candidate.Category, file, r.StartLine, r.StartColumn, node)
+                with ex ->
+                    parseErrors.Add(jobj [ "file", jstr file; "message", jstr ex.Message ] :> JsonNode)
+
+            // ── Order, count over the FULL set, then cap to maxResults ───────────
+            let ordered =
+                collected |> Seq.sortBy (fun (_, file, line, col, _) -> file, line, col) |> Seq.toList
+
+            let byCategory =
+                ordered
+                |> List.countBy (fun (category, _, _, _, _) -> category)
+                |> List.sortBy fst
+                |> List.map (fun (category, n) -> category, jint n)
+                |> jobj
+
+            let total = ordered.Length
+
+            let pageNodes =
+                ordered |> List.truncate maxResults |> List.map (fun (_, _, _, _, node) -> node)
+
+            let countsNode =
+                jobj [ "total", jint total; "returned", jint pageNodes.Length; "byCategory", byCategory ]
+                :> JsonNode
+
+            return
+                jobj
+                    [ "status", jstr "succeeded"
+                      "mode", jstr mode
+                      "scanned", JsonArray(scanned.ToArray() |> Array.map jstr) :> JsonNode
+                      "candidates", JsonArray(pageNodes |> List.toArray) :> JsonNode
+                      "counts", countsNode
+                      "truncated", jbool (total > pageNodes.Length)
+                      "parseErrors", JsonArray(parseErrors.ToArray()) :> JsonNode ]
+                :> JsonNode
+        }
+
+    // ── fcs_dead_code (#70): conservative dead-code candidate analysis ────────────────
+    // A CLEANUP/REVIEW pass — candidates, NOT deletions, NOT navigation. Reuses the same
+    // project-sweep machinery as `find` (ResolveFsprojOptions → ProjectSweepUses →
+    // GetAllUsesOfAllSymbols). For every DEFINED module/type-level value or function
+    // binding it counts NON-definition uses of that symbol across the swept projects; zero
+    // non-def uses → a candidate. CONSERVATIVE by construction (prefers false negatives):
+    //   • only private/internal bindings by default — public is presumed reachable by
+    //     external callers (includePublic widens to public too);
+    //   • a definition is matched to its uses by BOTH declaration-location AND FullName, so
+    //     any plausible reference (incl. a self-recursive call) keeps a symbol live;
+    //   • skips compiler-generated, [<EntryPoint>], constructors, property/event accessors,
+    //     overrides / interface implementations, active patterns, and every non-mfv symbol
+    //     (union cases, record fields, type definitions) — categories whose real usage FCS
+    //     may under-attribute.
+    // Writes nothing; always emits caveats. Use `find` to verify each candidate.
+    member this.DeadCode(args: FcsDeadCodeArgs) : Task<JsonNode> =
+        task {
+            let includePublic = args.includePublic |> Option.defaultValue false
+            let maxResults = args.maxResults |> Option.defaultValue 100 |> max 0 |> min 500
+
+            // Resolve the sweep target like Find/TestsForSymbol: explicit projectPath
+            // (Program.fs already falls back to the active set_project), else nothing.
+            let sweepTargetOpt =
+                args.projectPath
+                |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.map normalizePath
+
+            match sweepTargetOpt with
+            | None ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr
+                              "fcs_dead_code needs a project context: pass projectPath (.fsproj/.sln/.slnx) or call set_project first." ]
+                    :> JsonNode
+            | Some sweepTarget ->
+
+            let projects = SolutionParsing.listProjects sweepTarget
+
+            if projects.Length = 0 then
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr $"fcs_dead_code could not resolve any .fsproj to sweep from: {sweepTarget}" ]
+                    :> JsonNode
+            else
+
+            // ── Skip predicates over an mfv (every read guarded — FCS throws on synthetics) ──
+            // `flag onError f` evaluates a boolean property; on an FCS throw it yields the
+            // caller-chosen default so an unreadable symbol is treated CONSERVATIVELY
+            // (positive requirement defaults false; each skip-flag defaults true).
+            let flag (onError: bool) (f: unit -> bool) =
+                try
+                    f ()
+                with _ ->
+                    onError
+
+            let isEntryPoint (m: FSharpMemberOrFunctionOrValue) =
+                try
+                    m.Attributes
+                    |> Seq.exists (fun a ->
+                        try
+                            let tn = a.AttributeType.FullName
+
+                            not (isNull tn)
+                            && (tn = "Microsoft.FSharp.Core.EntryPointAttribute"
+                                || tn.EndsWith(".EntryPointAttribute", StringComparison.Ordinal))
+                        with _ ->
+                            false)
+                with _ ->
+                    false
+
+            let declaringIsInterface (m: FSharpMemberOrFunctionOrValue) =
+                try
+                    match m.DeclaringEntity with
+                    | Some e -> e.IsInterface
+                    | None -> false
+                with _ ->
+                    false
+
+            // A symbol is a dead-code CANDIDATE shape iff it is a module/type-level value or
+            // function binding that is none of the skip categories. Non-mfv symbols (union
+            // cases, record fields, type/module entities) are excluded outright.
+            let isCandidateShape (sym: FSharpSymbol) =
+                match sym with
+                | :? FSharpMemberOrFunctionOrValue as m ->
+                    flag false (fun () -> m.IsModuleValueOrMember)
+                    && not (flag true (fun () -> m.IsCompilerGenerated))
+                    && not (flag true (fun () -> m.IsConstructor))
+                    && not (flag true (fun () -> m.IsImplicitConstructor))
+                    && not (flag true (fun () -> m.IsPropertyGetterMethod))
+                    && not (flag true (fun () -> m.IsPropertySetterMethod))
+                    && not (flag true (fun () -> m.IsEventAddMethod))
+                    && not (flag true (fun () -> m.IsEventRemoveMethod))
+                    && not (flag true (fun () -> m.IsOverrideOrExplicitInterfaceImplementation))
+                    && not (flag true (fun () -> m.IsExplicitInterfaceImplementation))
+                    && not (flag true (fun () -> m.IsActivePattern))
+                    && not (flag true (fun () -> m.IsExtensionMember))
+                    && not (declaringIsInterface m)
+                    && not (isEntryPoint m)
+                | _ -> false
+
+            // Keep only the accessibilities in scope: private/internal always, public only
+            // under includePublic. "unknown" (synthetic / unreadable) is never a candidate.
+            let accKeep (sym: FSharpSymbol) =
+                match accessibilityString sym with
+                | "private"
+                | "internal" -> true
+                | "public" -> includePublic
+                | _ -> false
+
+            let declRangeOf (sym: FSharpSymbol) : range option =
+                try
+                    sym.DeclarationLocation
+                with _ ->
+                    None
+
+            let fullNameOf (sym: FSharpSymbol) : string option =
+                try
+                    match sym.FullName with
+                    | null -> None
+                    | fn when String.IsNullOrWhiteSpace fn -> None
+                    | fn -> Some fn
+                with _ ->
+                    None
+
+            let keyOfRange (dr: range) =
+                $"{normalizePath dr.FileName}:{dr.StartLine}:{dr.StartColumn}:{dr.EndLine}:{dr.EndColumn}"
+
+            // Accumulate across ALL swept projects FIRST, then filter — so a use in a
+            // later-swept project still rescues a definition swept earlier.
+            let nonDefDeclKeys = System.Collections.Generic.HashSet<string>()
+            let nonDefFullNames = System.Collections.Generic.HashSet<string>()
+
+            let defByKey =
+                System.Collections.Generic.Dictionary<
+                    string,
+                    {| Name: string
+                       FullName: string
+                       Kind: string
+                       Accessibility: string
+                       File: string
+                       StartLine: int
+                       StartCol: int
+                       EndLine: int
+                       EndCol: int
+                       Project: string |}
+                 >()
+
+            for fsproj in projects do
+                try
+                    let projDisplay = Path.GetFileNameWithoutExtension fsproj
+                    let! options, _ = this.ResolveFsprojOptions(fsproj)
+
+                    let usesKey =
+                        $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}|{referencedProjectSourcesStamp options}"
+
+                    let! allUses, _ = this.ProjectSweepUses(usesKey, options)
+
+                    for u in allUses do
+                        let sym = u.Symbol
+
+                        if u.IsFromDefinition then
+                            // Record a candidate-shape definition, keyed by its own
+                            // declaration location (the stable cross-compilation anchor).
+                            if accKeep sym && isCandidateShape sym then
+                                match declRangeOf sym with
+                                | Some dr ->
+                                    let key = keyOfRange dr
+
+                                    if not (defByKey.ContainsKey key) then
+                                        defByKey[key] <-
+                                            {| Name = sym.DisplayName
+                                               FullName = (fullNameOf sym |> Option.defaultValue "")
+                                               Kind = symbolKind sym
+                                               Accessibility = accessibilityString sym
+                                               File = normalizePath dr.FileName
+                                               StartLine = dr.StartLine
+                                               StartCol = dr.StartColumn
+                                               EndLine = dr.EndLine
+                                               EndCol = dr.EndColumn
+                                               Project = projDisplay |}
+                                | None -> ()
+                        else
+                            // A NON-definition use marks its target symbol LIVE — by both the
+                            // target's declaration location and its FullName (either match
+                            // keeps the symbol off the candidate list).
+                            match declRangeOf sym with
+                            | Some dr -> nonDefDeclKeys.Add(keyOfRange dr) |> ignore
+                            | None -> ()
+
+                            match fullNameOf sym with
+                            | Some fn -> nonDefFullNames.Add fn |> ignore
+                            | None -> ()
+                with _ ->
+                    // A project that fails to resolve/check is skipped — the candidate scan
+                    // is best-effort, never a hard failure for one bad project.
+                    ()
+
+            let candidatesAll =
+                defByKey
+                |> Seq.filter (fun kv ->
+                    let v = kv.Value
+
+                    not (nonDefDeclKeys.Contains kv.Key)
+                    && (v.FullName = "" || not (nonDefFullNames.Contains v.FullName)))
+                |> Seq.map (fun kv -> kv.Value)
+                |> Seq.sortBy (fun v -> v.File, v.StartLine, v.StartCol, v.Name)
+                |> Seq.toArray
+
+            let total = candidatesAll.Length
+            let page = candidatesAll |> Array.truncate maxResults
+            let truncated = total > page.Length
+
+            let candidateToJson
+                (v:
+                    {| Name: string
+                       FullName: string
+                       Kind: string
+                       Accessibility: string
+                       File: string
+                       StartLine: int
+                       StartCol: int
+                       EndLine: int
+                       EndCol: int
+                       Project: string |})
+                =
+                let rangeNode =
+                    jobj
+                        [ "startLine", jint v.StartLine
+                          "startColumn", jint v.StartCol
+                          "endLine", jint v.EndLine
+                          "endColumn", jint v.EndCol ]
+                    :> JsonNode
+
+                let declaredIn =
+                    jobj [ "file", jstr v.File; "range", rangeNode ] :> JsonNode
+
+                let note =
+                    $"{v.Accessibility} {v.Kind} '{v.Name}' has no non-definition use across the swept project(s) — verify with `find` before removing"
+
+                jobj
+                    [ "name", jstr v.Name
+                      "fullName", jstrOrNull v.FullName
+                      "kind", jstr v.Kind
+                      "accessibility", jstr v.Accessibility
+                      "declaredIn", declaredIn
+                      "note", jstr note ]
+                :> JsonNode
+
+            let caveats =
+                [ "candidates only — a conservative cleanup pass, NOT a deletion list; run `find` on each before removing"
+                  "reflection, dynamic invocation, serialization, and DI wiring can use a symbol that has no static reference"
+                  "interface implementations, overrides, and [<EntryPoint>] are excluded, but indirect reachability is not modeled"
+                  "a symbol used ONLY by tests still appears as a candidate — check the test projects too"
+                  (if includePublic then
+                       "includePublic=true: public symbols are included; any external or published consumer makes them live"
+                   else
+                       "public symbols are excluded by default (presumed reachable by external callers); pass includePublic=true to include them")
+                  "union cases, record fields, and type definitions are NOT analyzed (FCS may under-attribute their pattern/usage sites)" ]
+                @ (if truncated then
+                       [ $"results capped at {maxResults}; {total - page.Length} more candidate(s) not shown — raise maxResults" ]
+                   else
+                       [])
+
+            return
+                jobj
+                    [ "status", jstr "succeeded"
+                      "projectsScanned", jint projects.Length
+                      "candidates", JsonArray(page |> Array.map candidateToJson) :> JsonNode
+                      "candidateCount", jint total
+                      "truncated", jbool truncated
+                      "caveats", JsonArray(caveats |> List.map jstr |> List.toArray) :> JsonNode ]
+                :> JsonNode
+        }
+
+    // ── fcs_analyzer_diagnostics (#72): report F# ANALYZER diagnostics, grouped ───────────
+    // F# analyzers are NOT run by FCS — they run via the fsharp-analyzers CLI / Analyzers.SDK.
+    // This member detects the analyzer configuration exactly as project_health does
+    // (ProjectHealth.detectAnalyzerConfig), then — when a runner is available — invokes the
+    // CLI and parses its SARIF into a grouped, agent-friendly shape. When no runner is
+    // available it does NOT fake diagnostics: it reports the configured analyzer packages
+    // truthfully plus a clear note. Read-only; writes nothing. The SARIF parser + grouping
+    // (AnalyzerDiagnostics module) carry the tested logic; the live run is environment-gated.
+    // Fully synchronous (no FCS await): project-XML detection plus an optional, env-gated
+    // CLI run. Returned via Task.FromResult like the other synchronous tools
+    // (fsharp_project_inspect / fsharp_runtime_status) — a `task {}` with no `let!`/`do!`
+    // would not statically compile to a resumable state machine (FS3511 under Release).
+    member _.AnalyzerDiagnostics(args: FcsAnalyzerDiagnosticsArgs) : Task<JsonNode> =
+        let invalidArgs (message: string) : JsonNode =
+            jobj [ "status", jstr "invalid_args"; "message", jstr message ] :> JsonNode
+
+        let result: JsonNode =
+            match
+                args.projectPath
+                |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.map normalizePath
+            with
+            | None ->
+                invalidArgs
+                    "fcs_analyzer_diagnostics needs a project context: pass projectPath (.fsproj/.sln/.slnx) or call set_project first."
+            | Some target ->
+                let projects = SolutionParsing.listProjects target
+
+                if projects.Length = 0 then
+                    invalidArgs $"fcs_analyzer_diagnostics could not resolve any .fsproj from: {target}"
+                else
+                    // Detect analyzer config across every resolved project; union the packages.
+                    let configs =
+                        projects
+                        |> Array.choose (fun p ->
+                            match ProjectHealth.detectAnalyzerConfig p with
+                            | Ok cfg -> Some(p, cfg)
+                            | Error _ -> None)
+
+                    let configured = configs |> Array.exists (fun (_, c) -> c.Configured)
+
+                    let packagesJson =
+                        configs
+                        |> Array.collect (fun (_, c) -> c.Packages |> List.toArray)
+                        |> Array.distinctBy (fun p -> p.PackageId)
+                        |> Array.map ProjectHealth.analyzerPackageInfoToJson
+
+                    if not configured then
+                        AnalyzerDiagnostics.noAnalyzersResponse ()
+                    else
+                        match AnalyzerDiagnostics.detectRunner () with
+                        | None -> AnalyzerDiagnostics.configuredNotRunResponse packagesJson
+                        | Some command ->
+                            // Run the CLI per configured project and merge the SARIF diagnostics.
+                            let collected = ResizeArray<AnalyzerDiagnostics.AnalyzerDiagnostic>()
+                            let runErrors = ResizeArray<string>()
+
+                            for projectPath, _ in configs do
+                                match AnalyzerDiagnostics.runAnalyzers command projectPath with
+                                | Ok sarif -> collected.AddRange(AnalyzerDiagnostics.parseSarif sarif)
+                                | Error e -> runErrors.Add e
+
+                            if collected.Count = 0 && runErrors.Count > 0 then
+                                AnalyzerDiagnostics.runFailedResponse packagesJson (String.concat "; " runErrors)
+                            else
+                                let maxResults =
+                                    args.maxResults |> Option.defaultValue 200 |> max 1 |> min 1000
+
+                                AnalyzerDiagnostics.okResponse
+                                    packagesJson
+                                    (List.ofSeq collected)
+                                    args.severity
+                                    maxResults
+
+        Task.FromResult result

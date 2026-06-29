@@ -299,14 +299,26 @@ let main argv =
                                             | Some path ->
                                                 let! probe = fcsBridge.ProbeProjectOptions path
 
-                                                let ok =
-                                                    match probe with
-                                                    | Ok _ -> true
-                                                    | Error _ -> false
-
                                                 match resultObj["readiness"] with
                                                 | :? JsonObject as readinessObj ->
-                                                    readinessObj["projectOptions"] <- jbool ok
+                                                    match probe with
+                                                    | Ok info ->
+                                                        readinessObj["projectOptions"] <- jbool true
+
+                                                        // Restore-awareness (#138): options can load while the
+                                                        // project's external references are absent on disk, which
+                                                        // leaves symbolIndex empty and makes FCS tools fail with
+                                                        // 'FSharp.Core.dll not found'. Surface "restore first"
+                                                        // rather than letting `ready` imply it's usable.
+                                                        if FsLangMcp.Types.ReferenceResolution.looksUnrestored
+                                                               info.ReferencesExisting
+                                                               info.ReferencesTotal then
+                                                            readinessObj["restoreStatus"] <- jstr "unrestored"
+
+                                                            readinessObj["restoreHint"] <-
+                                                                jstr
+                                                                    "external references unresolved — run dotnet restore && dotnet build before using FCS tools"
+                                                    | Error _ -> readinessObj["projectOptions"] <- jbool false
                                                 | _ -> ()
                                             | None -> ()
                                         | _ -> ()
@@ -403,7 +415,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsFileOutlineArgs>
                         "fcs_file_outline"
-                        "Agent-friendly compact F# outline for one file. Filters local/noisy symbols by default and returns name, kind, range, signature/type, accessibility, and declaration range. Prefer this over fcs_file_symbols for navigation."
+                        "Agent-friendly compact F# outline for one file. Defaults to summaryOnly=true: module/type headers + per-kind memberCounts only (no per-member signatures), so large files never overflow the token ceiling. Set summaryOnly=false for full name/kind/range/signature/accessibility entries. Filters local/noisy symbols by default. Prefer fcs_project_outline for a whole-project overview; fcs_file_symbols for raw unfiltered symbols."
                         (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.FileOutline args)))
                     |> unwrapResult
                 )
@@ -517,10 +529,30 @@ let main argv =
                 )
 
                 tool (
+                    TypedTool.define<FcsCheckCompileOrderArgs>
+                        "fcs_check_compile_order"
+                        "Detect F#'s file-ordering gotcha: a symbol used before the file that DEFINES it in <Compile> order reads as FS0039 'not defined' though it exists. Returns { symbol, definedIn, usedIn{file,compileIndex,range,lineText}, fix } so an agent reorders the .fsproj. Use when `check` reports FS0039 'X is not defined' to tell a compile-ORDER problem from a missing `open` (fcs_suggest_open handles that). projectPath optional after set_project; `symbol` narrows to one name."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.CheckCompileOrder args)))
+                    |> unwrapResult
+                )
+
+                tool (
                     TypedTool.define<FslangmcpVersionArgs>
                         "fslangmcp_version"
                         "Returns the installed FsLangMCP product version and name. Zero-arg (pass {}). Same value is also surfaced in the set_project response (fslangmcpVersion field) and the fsharp_runtime_status response. Use this tool when filing UX feedback so reports can be matched to a specific release of the MCP server. Pure: no project context required, no side effects, no caches read."
                         (fun _ -> toolResult versionResponse)
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<DiagnosticFixesArgs>
+                        "fcs_diagnostic_fixes"
+                        "Fetch a file's diagnostics, then request code-action fixes for each and group them per diagnostic: range, severity, code, message, fixes [{title, kind, editSummary}], plus diagnosticCount/fixCount. Agent-friendly wrapper over raw textDocument_codeAction: supplies the diagnostic context the raw proxy leaves empty and groups the fixes. Requires set_project first. Pass line(+character) to narrow to one position, else all; pass text for unsaved content."
+                        (fun args -> toolResult (runLimited lspGate (fun () -> bridge.DiagnosticFixes args)))
                     |> unwrapResult
                 )
 
@@ -537,6 +569,136 @@ let main argv =
                                         bridge.FsacProcess
                                 )
                             ))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsExplainDiagnosticArgs>
+                        "fcs_explain_diagnostic"
+                        "Explain an F# compiler diagnostic in plain language with repair context: title, explanation, likelyCauses, repairHints, relatedTools. Pass `code` (\"FS0039\"), `errorNumber` (39), or path+line+character to auto-fetch it via FCS. Use this when `check` reports an FS error you need to turn into a fix — feed it check's errorNumberText. Curated map of ~25 common diagnostics; pass the raw `message` to enrich hints (FS0039 → fcs_suggest_open). Unknown codes return status=unknown_code."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.ExplainDiagnostic args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsTestsForSymbolArgs>
+                        "fcs_tests_for_symbol"
+                        "List the tests that likely cover a symbol. Sweeps the active solution's test projects (detected as project_health does — <IsTestProject> or an xunit/nunit/expecto ref), filters FCS symbol uses to test files, and tags each site with its enclosing test ([<Fact>]/[<Theory>]/[<Test>]/testCase). Use it for the test-coverage slice `find` lacks — find returns every use; this returns only test-file sites plus the enclosing test name. projectPath falls back to set_project."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.TestsForSymbol args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<RenamePreviewArgs>
+                        "fcs_rename_preview"
+                        "Preview a semantic rename's full impact WITHOUT applying it — non-destructive, writes nothing. Runs the same FSAC machinery as `textDocument_rename` but returns edits grouped by file, each with originalLineText and previewLineText, plus totalEdits, fileCount, and a crossProject flag. Use it to inspect blast radius before `textDocument_rename` applies the change. Requires `set_project`. Returns `no_symbol` when the position has no renamable symbol. Pass `text` for unsaved buffers."
+                        (fun args -> toolResult (runLimited lspGate (fun () -> bridge.RenamePreview args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsPublicApiArgs>
+                        "fcs_public_api"
+                        "Emit an F# project's public API surface: every public type and its public members with signatures, sorted stably by fullName then member name so two version snapshots diff cleanly. Prefer over `fcs_project_outline` for API-stability/breaking-change diffs — public-only (includeInternal=true adds internals), signature-complete, deterministic order. projectPath optional after set_project. Narrow with namespaceFilter (substring on FullName); paginated via maxResults + cursor."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.PublicApi args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsRefactorImpactArgs>
+                        "fcs_refactor_impact"
+                        "Preview a change's blast radius + a verify checklist WITHOUT editing. Orchestrates find (cross-project use sites), fcs_tests_for_symbol, fcs_check_compile_order (kind=move) and fcs_public_api (kind=signature|delete, when public) into { target, impact, tests, compileOrder?, apiSurface?, verify[] }. Pass `symbol` or path+line+character; kind=rename|signature|move|delete|auto. Use before a rename/move/delete; prefer `fcs_rename_preview` for the exact edits, this for project-wide impact."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (
+                                runLimited fcsGate (fun () ->
+                                    fcsBridge.RefactorImpact(args, (fun rp -> bridge.RenamePreview rp)))))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsSignatureStatusArgs>
+                        "fcs_signature_status"
+                        "Report the .fsi-vs-impl public-surface gap for one .fs WITHOUT editing: type-checks the impl with its sibling .fsi stripped, then diffs — members public in the impl but missing from the .fsi (silently hidden) → missingFromSig; .fsi entries with no impl match → staleInSig, each with a val/type signaturePreview. No .fsi? lists the would-be signature. Use for .fsi drift (members hidden/stale); prefer `fcs_public_api` for the whole public surface. projectPath falls back to set_project."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.SignatureStatus args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsReviewScanArgs>
+                        "fcs_review_scan"
+                        "Scan F# source for review CANDIDATES from the untyped AST — interesting spots to eyeball, not a linter and never bugs. Categories: match_wildcard, try_with, raise_or_failwith, mutable_binding, blocking_call, cast_or_box, reflection, large_function. Pass `path` (one file) or `projectPath` (whole project; falls back to set_project), narrow with `categories`, cap with `maxResults`. Parse-only, writes nothing; candidates carry range, lineText and a neutral note, plus counts.byCategory."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.ReviewScan args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsDeadCodeArgs>
+                        "fcs_dead_code"
+                        "List likely-unused F# symbols as cleanup candidates — a conservative cleanup pass (candidates, not deletions); use `find` to verify each candidate's real usage before removing. Sweeps the project (GetAllUsesOfAllSymbols) and flags private/internal value & function bindings whose only use is their own definition. Public is excluded (includePublic=true adds it); skips compiler-generated, [<EntryPoint>], overrides/interface impls, ctors. Always emits caveats. projectPath falls back to set_project."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.DeadCode args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsCreateFilePlanArgs>
+                        "fcs_create_file_plan"
+                        "Plan WHERE a new .fs file belongs WITHOUT creating it — read-only, writes nothing. Loads the resolved <Compile> order, recommends an insertion index (right after `afterFile`, else namespace-neighbour/end), infers the namespace/module convention from neighbours, and emits the exact <Compile Include=...> edit plus a dependency note (a file may only reference EARLIER files). Use before adding an .fs file to pick the right <Compile> position; pair with `fcs_check_compile_order` after."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.CreateFilePlan args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsAnalyzerDiagnosticsArgs>
+                        "fcs_analyzer_diagnostics"
+                        "Report F# ANALYZER diagnostics (not compiler diagnostics), grouped: analyzersConfigured, analyzerPackages, diagnostics [{analyzer, code, severity, message, file, range}], counts {byAnalyzer, bySeverity}. Detects analyzer config like project_health, runs the fsharp-analyzers CLI when available, parses its SARIF; none configured → no_analyzers. Use to read analyzer DIAGNOSTICS; project_health reports whether analyzers are CONFIGURED. severity filters; projectPath falls back to set_project."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.AnalyzerDiagnostics args)))
+                    |> unwrapResult
+                )
+
+                tool (
+                    TypedTool.define<FcsAnalyzerSetupPreviewArgs>
+                        "fcs_analyzer_setup_preview"
+                        "Plan what to add to enable F# analyzers WITHOUT applying it — read-only, writes nothing. Reads the .fsproj + Directory.Build.props/.targets + dotnet-tools.json, diffs current wiring against the required set: analyzer package refs + GeneratePathProperty, FSharp.Analyzers.Build, the FSharpAnalyzersOtherFlags property, a local fsharp-analyzers manifest. Emits each gap as an exact XML/JSON snippet + reason. Use this to set analyzers up; pair with fcs_analyzer_diagnostics to read diagnostics after."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.AnalyzerSetupPreview args)))
                     |> unwrapResult
                 )
 
