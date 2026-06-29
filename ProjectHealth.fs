@@ -81,7 +81,24 @@ let private compileFiles (projectPath: string) (doc: XDocument) =
     |> Seq.filter (fun (path, _, _) -> isFsFile path)
     |> Seq.toList
 
-let private analyzerPackages (doc: XDocument) =
+/// Structured analyzer PackageReference info. Shared by project_health's analyzer-health
+/// block and fcs_analyzer_diagnostics so both agree on what "an analyzer package" is:
+/// the package id contains "Analyzer", OR its IncludeAssets contains "analyzers".
+type AnalyzerPackageInfo =
+    { PackageId: string
+      Version: string option
+      IncludeAssets: string
+      PrivateAssets: string option }
+
+/// Analyzer configuration detected from one .fsproj: the analyzer PackageReferences plus
+/// any analyzer config files alongside it. `Configured` is the SAME signal project_health
+/// uses to report `analyzers_configured`.
+type AnalyzerConfig =
+    { Configured: bool
+      Packages: AnalyzerPackageInfo list
+      ConfigFiles: string list }
+
+let private analyzerPackageInfos (doc: XDocument) : AnalyzerPackageInfo list =
     doc.Descendants(xname "PackageReference")
     |> Seq.choose (fun element ->
         let includeValue =
@@ -94,13 +111,24 @@ let private analyzerPackages (doc: XDocument) =
             packageId.Contains("Analyzer", StringComparison.OrdinalIgnoreCase)
             || includeAssets.Contains("analyzers", StringComparison.OrdinalIgnoreCase))
         |> Option.map (fun packageId ->
-            jobj
-                [ "packageId", jstr packageId
-                  "version", attr "Version" element |> Option.map jstr |> Option.defaultValue null
-                  "includeAssets", jstr includeAssets
-                  "privateAssets", attr "PrivateAssets" element |> Option.map jstr |> Option.defaultValue null ]
-            :> JsonNode))
-    |> Seq.toArray
+            { PackageId = packageId
+              Version = attr "Version" element
+              IncludeAssets = includeAssets
+              PrivateAssets = attr "PrivateAssets" element }))
+    |> Seq.toList
+
+/// Render one analyzer package as the JSON object project_health and
+/// fcs_analyzer_diagnostics both emit: { packageId, version, includeAssets, privateAssets }.
+let analyzerPackageInfoToJson (p: AnalyzerPackageInfo) : JsonNode =
+    jobj
+        [ "packageId", jstr p.PackageId
+          "version", p.Version |> Option.map jstr |> Option.defaultValue null
+          "includeAssets", jstr p.IncludeAssets
+          "privateAssets", p.PrivateAssets |> Option.map jstr |> Option.defaultValue null ]
+    :> JsonNode
+
+let private analyzerPackages (doc: XDocument) =
+    analyzerPackageInfos doc |> List.map analyzerPackageInfoToJson |> List.toArray
 
 let private sourceSummary (files: (string * string * string option) list) =
     let missing, unreadable =
@@ -333,6 +361,23 @@ let private findAnalyzerConfigFiles (projectDir: string) =
     |> List.choose (fun fileName ->
         let path = Path.Combine(projectDir, fileName)
         if File.Exists path then Some path else None)
+
+let private analyzerConfigOfDoc (projectDir: string) (doc: XDocument) : AnalyzerConfig =
+    let packages = analyzerPackageInfos doc
+    let configFiles = findAnalyzerConfigFiles projectDir
+
+    { Configured = not packages.IsEmpty || not configFiles.IsEmpty
+      Packages = packages
+      ConfigFiles = configFiles }
+
+/// Detect the analyzer configuration of one .fsproj the SAME way project_health does:
+/// analyzer PackageReferences plus analyzer config files (Directory.Build.*,
+/// Directory.Packages.props, .editorconfig). Reused by fcs_analyzer_diagnostics so the two
+/// tools never disagree on whether analyzers are configured. Missing/unreadable .fsproj → Error.
+let detectAnalyzerConfig (projectPath: string) : Result<AnalyzerConfig, string> =
+    match tryReadProject projectPath with
+    | Error reason -> Error reason
+    | Ok doc -> Ok(analyzerConfigOfDoc (Path.GetDirectoryName projectPath) doc)
 
 let private pickSingleFsproj (projects: string array) (sourcePath: string) =
     match projects with
