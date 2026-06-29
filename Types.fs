@@ -439,6 +439,21 @@ type FcsCreateFilePlanArgs =
       /// .fsproj / .sln / .slnx to plan against. Falls back to the active set_project.
       projectPath: string option }
 
+/// Arguments for fcs_analyzer_setup_preview (#75) — a read-only "what do I need to add to
+/// turn on F# analyzers?" planner. Reads the target .fsproj + the nearest
+/// Directory.Build.props/.targets + dotnet-tools.json (textual, no FCS), diffs the present
+/// wiring against the required set (analyzer package refs + GeneratePathProperty,
+/// FSharp.Analyzers.Build, the FSharpAnalyzersOtherFlags property, and a local
+/// fsharp-analyzers tool manifest), and emits the exact XML/JSON snippets to add. Applies
+/// nothing. Pairs with fcs_analyzer_diagnostics (run AFTER applying the changes).
+type FcsAnalyzerSetupPreviewArgs =
+    { /// .fsproj / .sln / .slnx / directory to plan analyzer setup for. Falls back to the
+      /// active set_project when omitted.
+      projectPath: string option
+      /// Analyzer NuGet packages to wire up. Defaults to
+      /// ["G-Research.FSharp.Analyzers"; "Ionide.Analyzers"] when omitted or empty.
+      analyzerPackages: string list option }
+
 /// Arguments for fcs_refactor_impact — a read-only "what will this change affect, and
 /// what should I verify?" planning preview. Orchestrates the existing find sweep,
 /// tests-for-symbol, compile-order, public-api, and (optionally) rename-preview backends

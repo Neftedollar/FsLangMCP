@@ -7834,6 +7834,14 @@ type internal FcsBridge() =
               "notes", JsonArray(notes.ToArray() |> Array.map jstr) :> JsonNode ]
         :> JsonNode
 
+    /// fcs_analyzer_setup_preview (#75) — read-only planner that reports what to ADD to
+    /// enable F# analyzers (analyzer package refs + GeneratePathProperty, FSharp.Analyzers.Build,
+    /// the FSharpAnalyzersOtherFlags property, a local fsharp-analyzers tool manifest) WITHOUT
+    /// applying anything. Pure .fsproj/.props/.json reads — no FCS — so it delegates to the
+    /// ProjectHealth helper, which reuses project_health's analyzer detection for the current view.
+    member _.AnalyzerSetupPreview(args: FcsAnalyzerSetupPreviewArgs) : Task<JsonNode> =
+        Task.FromResult(FsLangMcp.ProjectHealth.analyzerSetupPreview args)
+
     /// fcs_review_scan — read-only, AST-based review-candidate inventory. Parses each
     /// target file (parse-only, no type-check) and emits structurally interesting sites
     /// for a human/agent to eyeball: review CANDIDATES, never asserted bugs. Writes nothing.

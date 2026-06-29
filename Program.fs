@@ -678,6 +678,18 @@ let main argv =
                     |> unwrapResult
                 )
 
+                tool (
+                    TypedTool.define<FcsAnalyzerSetupPreviewArgs>
+                        "fcs_analyzer_setup_preview"
+                        "Plan what to add to enable F# analyzers WITHOUT applying it — read-only, writes nothing. Reads the .fsproj + Directory.Build.props/.targets + dotnet-tools.json, diffs current wiring against the required set: analyzer package refs + GeneratePathProperty, FSharp.Analyzers.Build, the FSharpAnalyzersOtherFlags property, a local fsharp-analyzers manifest. Emits each gap as an exact XML/JSON snippet + reason. Use this to set analyzers up; pair with fcs_analyzer_diagnostics to read diagnostics after."
+                        (fun args ->
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+
+                            toolResult (runLimited fcsGate (fun () -> fcsBridge.AnalyzerSetupPreview args)))
+                    |> unwrapResult
+                )
+
                 useStdio
             }
 
