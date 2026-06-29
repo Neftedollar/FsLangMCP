@@ -770,6 +770,27 @@ module internal RenamePreviewShape =
                   "crossProject", jbool crossProject ]
             :> JsonNode
 
+// ─── CodeAction request building (#43) ─────────────────────────────────────────
+
+/// Builds the `textDocument/codeAction` request params. Extracted to a pure,
+/// testable seam so the #43 regression cannot recur silently: each JsonNode has a
+/// single Parent reference, so assigning ONE position instance as both
+/// `range.start` and `range.end` throws InvalidOperationException on the second
+/// attach — failing every codeAction call before the RPC is even sent. `start` and
+/// `end` MUST therefore be distinct node instances. `context.diagnostics` is always
+/// present (empty here; the DiagnosticFixes wrapper populates it) to satisfy FSAC's
+/// codeActionLiteralSupport handshake (#53).
+module internal CodeActionRequest =
+
+    let buildParams (uri: string) (line: int) (character: int) : JsonObject =
+        let posNode () =
+            jobj [ "line", jint line; "character", jint character ] :> JsonNode
+
+        jobj
+            [ "textDocument", jobj [ "uri", jstr uri ]
+              "range", jobj [ "start", posNode (); "end", posNode () ]
+              "context", jobj [ "diagnostics", JsonArray() :> JsonNode ] ]
+
 // ─── FsAutoCompleteBridge ──────────────────────────────────────────────────────
 
 type internal FsAutoCompleteBridge() =
@@ -1564,17 +1585,7 @@ type internal FsAutoCompleteBridge() =
             args.path,
             args.text,
             "textDocument/codeAction",
-            fun uri ->
-                // Each JsonNode has a single Parent reference; assigning the same instance
-                // as both `start` and `end` raises InvalidOperationException at the second
-                // attach. Build two distinct position nodes.
-                let posNode () =
-                    jobj [ "line", jint args.line; "character", jint args.character ] :> JsonNode
-
-                jobj
-                    [ "textDocument", jobj [ "uri", jstr uri ]
-                      "range", jobj [ "start", posNode (); "end", posNode () ]
-                      "context", jobj [ "diagnostics", JsonArray() :> JsonNode ] ]
+            fun uri -> CodeActionRequest.buildParams uri args.line args.character
         )
 
     /// Agent-friendly wrapper over the raw codeAction proxy: fetches the file's
