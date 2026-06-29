@@ -635,3 +635,320 @@ let createReport
                           "files", fileSummary :> JsonNode ]
                     :> JsonNode
     }
+
+// ─── #75: fcs_analyzer_setup_preview ──────────────────────────────────────────────
+// Read-only planner: diff a project's CURRENT analyzer wiring against the required set
+// (analyzer package refs + GeneratePathProperty, FSharp.Analyzers.Build, the
+// FSharpAnalyzersOtherFlags property, and a local fsharp-analyzers tool manifest) and emit
+// the exact XML/JSON snippets to add. Writes nothing. Reuses the same analyzerPackages
+// detection project_health's `analyzers` axis uses for the "current" view. This is .fsproj
+// /.props/.json text — not F# semantics — so it reads XML/JSON directly, no FCS.
+
+/// Default analyzer packages wired when the caller doesn't name any.
+let private defaultAnalyzerPackages = [ "G-Research.FSharp.Analyzers"; "Ionide.Analyzers" ]
+
+/// NuGet's GeneratePathProperty emits an MSBuild property named `Pkg<id>` with every `.`
+/// replaced by `_` (other characters, including `-`, preserved verbatim). This is the exact
+/// mapping the repo's own Directory.Build.targets relies on, e.g.
+/// G-Research.FSharp.Analyzers → PkgG-Research_FSharp_Analyzers and Ionide.Analyzers →
+/// PkgIonide_Analyzers.
+let private pkgPathProperty (packageId: string) = "Pkg" + packageId.Replace(".", "_")
+
+/// Known-good pinned versions for the canonical packages so emitted snippets are
+/// paste-ready; unknown packages get a `*` wildcard the caller should pin.
+let private suggestedAnalyzerVersion (packageId: string) =
+    match packageId.ToLowerInvariant() with
+    | "g-research.fsharp.analyzers" -> "0.22.*"
+    | "ionide.analyzers" -> "0.15.*"
+    | _ -> "*"
+
+let private analyzersBuildPackage = "FSharp.Analyzers.Build"
+let private analyzersBuildVersion = "0.5.*"
+let private fsharpAnalyzersToolVersion = "0.36.0"
+let private analyzerDllSubPath = "analyzers/dotnet/fs"
+
+/// Walk up from `startDir` to the filesystem root, returning the first existing path among
+/// the relative candidates. Mirrors MSBuild's nearest-Directory.Build.* lookup and the
+/// conventional `.config/dotnet-tools.json` discovery.
+let private findNearestUpwards (startDir: string) (relativeCandidates: string list) : string option =
+    let rec loop (dir: string) =
+        if String.IsNullOrEmpty dir then
+            None
+        else
+            match
+                relativeCandidates
+                |> List.tryPick (fun rel ->
+                    let p = Path.Combine(dir, rel)
+                    if File.Exists p then Some(Path.GetFullPath p) else None)
+            with
+            | Some hit -> Some hit
+            | None ->
+                let parent = Path.GetDirectoryName dir
+
+                if String.IsNullOrEmpty parent || String.Equals(parent, dir, StringComparison.Ordinal) then
+                    None
+                else
+                    loop parent
+
+    loop startDir
+
+/// Read an XML doc, returning None when it is missing or unreadable.
+let private tryReadProjectOpt (path: string) =
+    match tryReadProject path with
+    | Ok doc -> Some doc
+    | Error _ -> None
+
+/// (packageId, hasGeneratePathProperty) for every PackageReference in a doc.
+let private packageRefsOf (doc: XDocument) : (string * bool) list =
+    doc.Descendants(xname "PackageReference")
+    |> Seq.choose (fun el ->
+        attr "Include" el
+        |> Option.orElseWith (fun () -> attr "Update" el)
+        |> Option.map (fun packageId ->
+            let genPath =
+                attr "GeneratePathProperty" el
+                |> Option.map (fun v -> v.Equals("true", StringComparison.OrdinalIgnoreCase))
+                |> Option.defaultValue false
+
+            packageId, genPath))
+    |> Seq.toList
+
+let private analyzerPackageRefSnippet (packageId: string) =
+    let version = suggestedAnalyzerVersion packageId
+
+    String.concat
+        "\n"
+        [ $"<PackageReference Include=\"{packageId}\" Version=\"{version}\" GeneratePathProperty=\"true\">"
+          "  <IncludeAssets>analyzers</IncludeAssets>"
+          "  <PrivateAssets>all</PrivateAssets>"
+          "</PackageReference>" ]
+
+let private analyzersBuildRefSnippet =
+    String.concat
+        "\n"
+        [ $"<PackageReference Include=\"{analyzersBuildPackage}\" Version=\"{analyzersBuildVersion}\">"
+          "  <IncludeAssets>build</IncludeAssets>"
+          "  <PrivateAssets>all</PrivateAssets>"
+          "</PackageReference>" ]
+
+/// The `--analyzers-path "$(Pkg…)/analyzers/dotnet/fs"` value for the requested packages.
+let private analyzersFlagsValue (packages: string list) =
+    packages
+    |> List.map (fun packageId -> $"--analyzers-path \"$({pkgPathProperty packageId})/{analyzerDllSubPath}\"")
+    |> String.concat " "
+
+let private toolManifestSnippet =
+    String.concat
+        "\n"
+        [ "{"
+          "  \"version\": 1,"
+          "  \"isRoot\": true,"
+          "  \"tools\": {"
+          "    \"fsharp-analyzers\": {"
+          $"      \"version\": \"{fsharpAnalyzersToolVersion}\","
+          "      \"commands\": [ \"fsharp-analyzers\" ]"
+          "    }"
+          "  }"
+          "}" ]
+
+let private toolEntrySnippet =
+    String.concat
+        "\n"
+        [ "\"fsharp-analyzers\": {"
+          $"  \"version\": \"{fsharpAnalyzersToolVersion}\","
+          "  \"commands\": [ \"fsharp-analyzers\" ]"
+          "}" ]
+
+/// True when a dotnet-tools.json manifest already declares the fsharp-analyzers tool.
+let private toolManifestHasFsharpAnalyzers (manifestPath: string) : bool =
+    try
+        match JsonNode.Parse(File.ReadAllText manifestPath) with
+        | null -> false
+        | node ->
+            match node["tools"] with
+            | :? JsonObject as tools -> not (isNull tools["fsharp-analyzers"])
+            | _ -> false
+    with _ ->
+        false
+
+/// Read-only analyzer-setup plan for one F# project. Reports what is already wired, what is
+/// missing, and the exact snippet to add for each gap. Writes nothing.
+let analyzerSetupPreview (args: FcsAnalyzerSetupPreviewArgs) : JsonNode =
+    let invalidArgs message =
+        jobj [ "status", jstr "invalid_args"; "message", jstr message ] :> JsonNode
+
+    match resolveHealthProjectPath args.projectPath with
+    | Error reason -> invalidArgs reason
+    | Ok projectPath ->
+        match tryReadProject projectPath with
+        | Error reason -> invalidArgs $"Project file cannot be read: %s{reason}"
+        | Ok doc ->
+            let projectDir = Path.GetDirectoryName projectPath
+            let projectFileName = Path.GetFileName projectPath
+
+            let requestedPackages =
+                args.analyzerPackages
+                |> Option.map (List.choose (fun p -> if String.IsNullOrWhiteSpace p then None else Some(p.Trim())))
+                |> Option.filter (List.isEmpty >> not)
+                |> Option.defaultValue defaultAnalyzerPackages
+
+            // Nearest config files, walking up from the project directory (MSBuild order).
+            let dirBuildProps = findNearestUpwards projectDir [ "Directory.Build.props" ]
+            let dirBuildTargets = findNearestUpwards projectDir [ "Directory.Build.targets" ]
+
+            let toolManifest =
+                findNearestUpwards projectDir [ Path.Combine(".config", "dotnet-tools.json"); "dotnet-tools.json" ]
+
+            // PackageReference scan across the .fsproj + nearest Directory.Build.props (some
+            // repos centralise analyzer refs there).
+            let allPackageRefs =
+                [ Some doc; dirBuildProps |> Option.bind tryReadProjectOpt ]
+                |> List.choose id
+                |> List.collect packageRefsOf
+
+            let findRef (packageId: string) =
+                allPackageRefs
+                |> List.tryFind (fun (id, _) -> String.Equals(id, packageId, StringComparison.OrdinalIgnoreCase))
+
+            // FSharpAnalyzersOtherFlags can live in the .fsproj or either Directory.Build.* file.
+            let flagsValue =
+                [ Some doc
+                  dirBuildProps |> Option.bind tryReadProjectOpt
+                  dirBuildTargets |> Option.bind tryReadProjectOpt ]
+                |> List.choose id
+                |> List.tryPick (childValue "FSharpAnalyzersOtherFlags")
+
+            let changes = ResizeArray<JsonNode>()
+            let notes = ResizeArray<string>()
+
+            let addChange (file: string) (kind: string) (preview: string) (reason: string) =
+                changes.Add(
+                    jobj
+                        [ "file", jstr file
+                          "kind", jstr kind
+                          "preview", jstr preview
+                          "reason", jstr reason ]
+                    :> JsonNode
+                )
+
+            // 1. Analyzer package refs + GeneratePathProperty per requested package.
+            for packageId in requestedPackages do
+                match findRef packageId with
+                | None ->
+                    addChange
+                        projectFileName
+                        "add_package_ref"
+                        (analyzerPackageRefSnippet packageId)
+                        $"%s{packageId} is not referenced — add it as an analyzer package (IncludeAssets=analyzers, PrivateAssets=all). GeneratePathProperty=true exposes $(%s{pkgPathProperty packageId}) for the analyzer flags."
+                | Some(_, genPath) ->
+                    if not genPath then
+                        addChange
+                            projectFileName
+                            "enable_generate_path_property"
+                            (analyzerPackageRefSnippet packageId)
+                            $"%s{packageId} is referenced but lacks GeneratePathProperty=\"true\"; without it $(%s{pkgPathProperty packageId}) is empty and FSharpAnalyzersOtherFlags cannot locate the analyzer DLLs."
+
+            // 2. FSharp.Analyzers.Build — the MSBuild glue that runs analyzers during build.
+            match findRef analyzersBuildPackage with
+            | Some _ -> ()
+            | None ->
+                addChange
+                    projectFileName
+                    "add_package_ref"
+                    analyzersBuildRefSnippet
+                    $"%s{analyzersBuildPackage} provides the MSBuild target that runs the analyzers during `dotnet build`; without it the analyzers never execute."
+
+            // 3. FSharpAnalyzersOtherFlags property — points the host at the analyzer DLLs.
+            let recommendedFlags = analyzersFlagsValue requestedPackages
+
+            let flagsTargetFile =
+                dirBuildTargets |> Option.map Path.GetFileName |> Option.defaultValue "Directory.Build.targets"
+
+            match flagsValue with
+            | None ->
+                let preview =
+                    match dirBuildTargets with
+                    | Some _ -> $"<FSharpAnalyzersOtherFlags>{recommendedFlags}</FSharpAnalyzersOtherFlags>"
+                    | None ->
+                        String.concat
+                            "\n"
+                            [ "<Project>"
+                              "  <PropertyGroup>"
+                              $"    <FSharpAnalyzersOtherFlags>{recommendedFlags}</FSharpAnalyzersOtherFlags>"
+                              "  </PropertyGroup>"
+                              "</Project>" ]
+
+                addChange
+                    flagsTargetFile
+                    "add_property"
+                    preview
+                    "FSharpAnalyzersOtherFlags tells the F# analyzer host where each package's analyzer DLLs live (via the GeneratePathProperty $(Pkg…) paths). It is missing — add it so the analyzers are discovered."
+            | Some existing ->
+                let missing =
+                    requestedPackages
+                    |> List.filter (fun id -> not (existing.Contains(pkgPathProperty id, StringComparison.OrdinalIgnoreCase)))
+
+                if not missing.IsEmpty then
+                    addChange
+                        flagsTargetFile
+                        "update_property"
+                        $"<FSharpAnalyzersOtherFlags>{recommendedFlags}</FSharpAnalyzersOtherFlags>"
+                        $"""FSharpAnalyzersOtherFlags is present but does not reference: %s{missing |> List.map pkgPathProperty |> String.concat ", "}. Update it so every requested analyzer package is on the --analyzers-path list."""
+
+            // 4. Local fsharp-analyzers tool manifest — how analyzers run in CI.
+            match toolManifest with
+            | None ->
+                addChange
+                    (Path.Combine(".config", "dotnet-tools.json"))
+                    "add_tool_manifest"
+                    toolManifestSnippet
+                    "No local tool manifest declares `fsharp-analyzers`; the CLI (`dotnet fsharp-analyzers --project …`) is how analyzers run in CI. Create one with `dotnet new tool-manifest`, then add the tool."
+            | Some manifestPath ->
+                if not (toolManifestHasFsharpAnalyzers manifestPath) then
+                    let rel =
+                        try
+                            Path.GetRelativePath(projectDir, manifestPath)
+                        with _ ->
+                            Path.GetFileName manifestPath
+
+                    addChange
+                        rel
+                        "add_tool"
+                        toolEntrySnippet
+                        $"A tool manifest exists (%s{Path.GetFileName manifestPath}) but has no `fsharp-analyzers` entry; add it under \"tools\" so `dotnet tool restore` makes the analyzer CLI available."
+
+            // "Current" view: reuse the exact detection project_health's analyzers axis uses.
+            let currentAnalyzers = analyzerPackages doc
+            let alreadyConfigured = currentAnalyzers.Length > 0
+
+            if alreadyConfigured then
+                notes.Add "Project already references analyzer package(s); reporting only the gaps below."
+            else
+                notes.Add "No analyzer packages detected; the plan below wires analyzers from scratch."
+
+            if changes.Count = 0 then
+                notes.Add "All required analyzer wiring is already present for the requested packages — nothing to add."
+
+            notes.Add $"""Requested analyzer packages: %s{String.concat ", " requestedPackages}."""
+
+            notes.Add
+                "Pkg path-property names map the package id with every '.' replaced by '_' (e.g. Ionide.Analyzers → PkgIonide_Analyzers); the snippets above already use the correct names."
+
+            notes.Add
+                "Preview only — this tool writes nothing. After applying the changes, run fcs_analyzer_diagnostics to read what the analyzers report."
+
+            jobj
+                [ "status", jstr "succeeded"
+                  "project", jstr projectPath
+                  "alreadyConfigured", jbool alreadyConfigured
+                  "requestedAnalyzerPackages",
+                  JsonArray(requestedPackages |> List.map jstr |> List.toArray) :> JsonNode
+                  "currentAnalyzers", JsonArray(currentAnalyzers) :> JsonNode
+                  "configFiles",
+                  jobj
+                      [ "directoryBuildProps", dirBuildProps |> Option.map jstr |> Option.defaultValue null
+                        "directoryBuildTargets", dirBuildTargets |> Option.map jstr |> Option.defaultValue null
+                        "toolManifest", toolManifest |> Option.map jstr |> Option.defaultValue null ]
+                  "plannedChanges", JsonArray(changes.ToArray()) :> JsonNode
+                  "notes", JsonArray(notes.ToArray() |> Array.map jstr) :> JsonNode ]
+            :> JsonNode

@@ -40,6 +40,7 @@
     <Compile Include="DeadCodeTests.fs" />
     <Compile Include="CreateFilePlanTests.fs" />
     <Compile Include="AnalyzerDiagnosticsTests.fs" />
+    <Compile Include="AnalyzerSetupPreviewTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
