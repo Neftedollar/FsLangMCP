@@ -9,7 +9,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 <p align="center">
-  <img src="docs/assets/demo.svg" width="820"
+  <img src="docs/assets/find-vs-grep.svg" width="820"
        alt="Terminal demo — rg scoped to Domain/ finds only the Order definition; FsLangMCP find resolves 17 cross-project sites including 9 in App that grep missed." />
 </p>
 <p align="center"><sub>Real output from <a href="examples/quickstart"><code>examples/quickstart</code></a>: <code>grep Domain/</code> finds the definition; <code>find</code> resolves all 17 cross-project uses the agent actually needs.</sub></p>
