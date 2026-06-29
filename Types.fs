@@ -420,6 +420,25 @@ type FcsCheckCompileOrderArgs =
       /// leftmost identifier in an FS0039 "X is not defined" error). Omit to check all.
       symbol: string option }
 
+/// Arguments for fcs_create_file_plan (#66) — a read-only "where should this new .fs file
+/// go, and how?" planner. PLANNING ONLY: it never creates files, writes source, or edits
+/// the .fsproj. It loads the project's resolved <Compile> order, recommends an insertion
+/// index, infers the namespace/module convention from neighbouring files, and spells out
+/// the exact <Compile Include=...> edit. Pairs with fcs_check_compile_order (run AFTER).
+type FcsCreateFilePlanArgs =
+    { /// Proposed new file name (e.g. "Validation.fs"). The leaf name drives matching and the
+      /// suggested module name; a directory prefix, if any, is preserved verbatim in fsprojOp.
+      fileName: string
+      /// Existing sibling the new file should compile AFTER (by name or path). When matched in
+      /// the compile order, the recommended index sits right after it. Omit to let the
+      /// namespace heuristic (or end-of-project insertion) decide.
+      afterFile: string option
+      /// Intended namespace or module for the new file. Compared against the neighbour
+      /// convention to seed the namespace-grouping heuristic; advisory, never enforced.
+      namespaceOrModule: string option
+      /// .fsproj / .sln / .slnx to plan against. Falls back to the active set_project.
+      projectPath: string option }
+
 /// Arguments for fcs_refactor_impact — a read-only "what will this change affect, and
 /// what should I verify?" planning preview. Orchestrates the existing find sweep,
 /// tests-for-symbol, compile-order, public-api, and (optionally) rename-preview backends

@@ -37,6 +37,7 @@
     <Compile Include="SignatureStatusTests.fs" />
     <Compile Include="ReviewScanTests.fs" />
     <Compile Include="DeadCodeTests.fs" />
+    <Compile Include="CreateFilePlanTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
