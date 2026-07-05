@@ -3119,11 +3119,20 @@ type internal FcsBridge() =
                 use cts = new CancellationTokenSource(timeoutMs)
 
                 try
-                    let! results =
-                        Async.StartAsTask(checker.ParseAndCheckProject(options), cancellationToken = cts.Token)
+                    // The timed boundary must cover BOTH the type-check AND the synchronous
+                    // GetAllUsesOfAllSymbols() re-walk (~3 s+, uncancellable once started) —
+                    // otherwise a check finishing near the deadline lets the use-walk overrun
+                    // the advertised budget with no timeout entry (Codex review). Running both
+                    // inside one token-scoped async means F#'s cancellation check at the `let!`
+                    // bind refuses to START the walk once the deadline has passed.
+                    let compute =
+                        async {
+                            let! results = checker.ParseAndCheckProject(options)
+                            let uses = results.GetAllUsesOfAllSymbols()
+                            return uses, results.Diagnostics
+                        }
 
-                    let uses = results.GetAllUsesOfAllSymbols()
-                    let diags = results.Diagnostics
+                    let! uses, diags = Async.StartAsTask(compute, cancellationToken = cts.Token)
                     projectUsesCache.Set(usesKey, (uses, diags))
                     return uses, diags
                 with :? OperationCanceledException | :? TaskCanceledException ->

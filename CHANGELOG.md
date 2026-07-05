@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.3] - 2026-07-05
+
+Follow-up patch addressing two P2 findings from Codex's review of the 0.12.2 correctness patch — both on the 0.12.2 fixes themselves.
+
+### Fixed
+
+- **`find` timeout now covers the whole sweep, including the symbol-use walk.** In 0.12.2 the per-project cancellation token bounded only `ParseAndCheckProject`; the synchronous `GetAllUsesOfAllSymbols()` re-walk ran afterwards outside the token, so a type-check that finished near the deadline could let the use-walk overrun the advertised `timeoutMs` with no per-project timeout entry. Both steps now run inside one token-scoped async, so the walk won't start once the deadline has passed.
+- **Analyzer detection now honors analyzer refs centralized in `Directory.Build.props`.** The 0.12.2 fix based `Configured` on analyzer `PackageReference`s scanned from the `.fsproj` only. Projects that centralize analyzer packages in an MSBuild import (`Directory.Build.props`/`.targets`, or `Directory.Packages.props` via `GlobalPackageReference`) were wrongly reported as un-configured, so `fcs_analyzer_diagnostics` skipped the CLI and `project_health` reported no analyzers. Detection now also scans those XML imports for analyzer package refs. A bare `.editorconfig` (non-XML, no analyzer package) still correctly does NOT count.
+
 ## [0.12.2] - 2026-07-05
 
 Correctness patch from a whole-codebase multi-agent review (20 verified findings) plus the #100 hang report. All fixes are backward-compatible (one new optional `find` arg, one additive response field).

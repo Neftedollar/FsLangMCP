@@ -362,17 +362,56 @@ let private findAnalyzerConfigFiles (projectDir: string) =
         let path = Path.Combine(projectDir, fileName)
         if File.Exists path then Some path else None)
 
+/// Analyzer PackageReferences can be centralized in an MSBuild import
+/// (Directory.Build.props/.targets, or Directory.Packages.props via GlobalPackageReference)
+/// rather than the .fsproj — analyzerPackageInfos only sees the .fsproj, so scan those XML
+/// imports too (Codex review). .editorconfig is not XML → skipped (and is not an analyzer signal).
+let private analyzerPackagesFromConfigFile (path: string) : AnalyzerPackageInfo list =
+    let isMsbuildXml =
+        path.EndsWith(".props", StringComparison.OrdinalIgnoreCase)
+        || path.EndsWith(".targets", StringComparison.OrdinalIgnoreCase)
+
+    if not isMsbuildXml then
+        []
+    else
+        try
+            let doc = XDocument.Load(path)
+
+            [ "PackageReference"; "GlobalPackageReference" ]
+            |> List.collect (fun elemName ->
+                doc.Descendants(xname elemName)
+                |> Seq.choose (fun element ->
+                    let includeValue =
+                        attr "Include" element |> Option.orElseWith (fun () -> attr "Update" element)
+
+                    let includeAssets = attr "IncludeAssets" element |> Option.defaultValue ""
+
+                    includeValue
+                    |> Option.filter (fun packageId ->
+                        packageId.Contains("Analyzer", StringComparison.OrdinalIgnoreCase)
+                        || includeAssets.Contains("analyzers", StringComparison.OrdinalIgnoreCase))
+                    |> Option.map (fun packageId ->
+                        { PackageId = packageId
+                          Version = attr "Version" element
+                          IncludeAssets = includeAssets
+                          PrivateAssets = attr "PrivateAssets" element }))
+                |> Seq.toList)
+        with _ ->
+            []
+
 let private analyzerConfigOfDoc (projectDir: string) (doc: XDocument) : AnalyzerConfig =
-    let packages = analyzerPackageInfos doc
     let configFiles = findAnalyzerConfigFiles projectDir
 
-    // `Configured` must be a REAL analyzer signal. An analyzer PackageReference (IncludeAssets
-    // contains "analyzers" or the package id contains "Analyzer") is the only reliable one.
-    // Merely finding Directory.Build.props/.targets, Directory.Packages.props, or .editorconfig
-    // on disk is NOT evidence of analyzer configuration — nearly every real project has an
-    // .editorconfig, which previously flipped `Configured` to true unconditionally and caused
-    // fcs_analyzer_diagnostics to shell out to the analyzer CLI on plain, analyzer-free
-    // projects. `configFiles` is still surfaced (informational) but no longer drives the flag.
+    // `Configured` must be a REAL analyzer signal — an analyzer PackageReference (id contains
+    // "Analyzer" or IncludeAssets contains "analyzers"), whether declared in the .fsproj OR
+    // centralized in an MSBuild import (Directory.Build.props/.targets, Directory.Packages.props).
+    // The mere EXISTENCE of a config file on disk is NOT evidence: nearly every project has an
+    // .editorconfig, which previously flipped `Configured` true unconditionally and made
+    // fcs_analyzer_diagnostics shell out to the analyzer CLI on plain, analyzer-free projects.
+    let packages =
+        analyzerPackageInfos doc @ (configFiles |> List.collect analyzerPackagesFromConfigFile)
+        |> List.distinctBy (fun p -> p.PackageId)
+
     { Configured = not packages.IsEmpty
       Packages = packages
       ConfigFiles = configFiles }
@@ -648,15 +687,19 @@ let createReport
                           "lsp", lspReadiness :> JsonNode
                           "overall", jstr overallStatus ]
 
-                let analyzers = analyzerPackages doc
-                let analyzerConfigFiles = findAnalyzerConfigFiles projectDir
+                // Reuse the shared detection so this block and detectAnalyzerConfig agree:
+                // analyzer PackageReferences from the .fsproj AND from centralized MSBuild
+                // imports (Directory.Build.props/.targets) both count; a bare .editorconfig
+                // does not (#100 review + Codex review).
+                let analyzerCfg = analyzerConfigOfDoc projectDir doc
+
+                let analyzers =
+                    analyzerCfg.Packages |> List.map analyzerPackageInfoToJson |> List.toArray
+
+                let analyzerConfigFiles = analyzerCfg.ConfigFiles
 
                 let analyzerHealth =
-                    // #100 review: gate on real analyzer PackageReferences only. A bare
-                    // Directory.Build.props / .editorconfig (present in almost every project)
-                    // must NOT read as "analyzers configured" — consistent with
-                    // analyzerConfigOfDoc.Configured.
-                    if analyzers.Length = 0 then
+                    if not analyzerCfg.Configured then
                         jobj
                             [ "status", jstr "no_analyzers_configured"
                               "analyzers", JsonArray() :> JsonNode ]

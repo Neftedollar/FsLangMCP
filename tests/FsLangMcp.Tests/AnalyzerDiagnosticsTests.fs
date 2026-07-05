@@ -267,3 +267,45 @@ let ``detectAnalyzerConfig reports an un-configured project as not configured`` 
         | Ok cfg ->
             Assert.False(cfg.Configured)
             Assert.Empty(cfg.Packages))
+
+// Codex review: analyzer PackageReferences centralized in Directory.Build.props (not the
+// .fsproj) must still count as Configured — otherwise fcs_analyzer_diagnostics silently
+// skips the CLI and project_health reports "no analyzers" for a genuinely-configured project.
+[<Fact>]
+let ``detectAnalyzerConfig honors analyzer refs centralized in Directory.Build.props`` () =
+    withTempDir (fun root ->
+        // .fsproj has NO analyzer ref; the analyzer is centralized in the import.
+        let projectPath = writeProjectWithoutAnalyzer root
+
+        File.WriteAllText(
+            Path.Combine(root, "Directory.Build.props"),
+            String.concat
+                "\n"
+                [ "<Project>"
+                  "  <ItemGroup>"
+                  "    <PackageReference Include=\"G-Research.FSharp.Analyzers\" Version=\"0.15.0\">"
+                  "      <IncludeAssets>analyzers</IncludeAssets>"
+                  "    </PackageReference>"
+                  "  </ItemGroup>"
+                  "</Project>" ]
+        )
+
+        match FsLangMcp.ProjectHealth.detectAnalyzerConfig projectPath with
+        | Error e -> Assert.Fail($"expected Ok, got Error: {e}")
+        | Ok cfg ->
+            Assert.True(cfg.Configured, "analyzer in Directory.Build.props must count as configured")
+            Assert.Contains("G-Research.FSharp.Analyzers", cfg.Packages |> List.map (fun p -> p.PackageId)))
+
+// The false-positive guard: a bare .editorconfig (no analyzer package anywhere) must NOT
+// read as configured — nearly every project has one, and it is not an analyzer signal.
+[<Fact>]
+let ``detectAnalyzerConfig does not flag a bare .editorconfig as configured`` () =
+    withTempDir (fun root ->
+        let projectPath = writeProjectWithoutAnalyzer root
+        File.WriteAllText(Path.Combine(root, ".editorconfig"), "root = true\n[*.fs]\nindent_size = 4\n")
+
+        match FsLangMcp.ProjectHealth.detectAnalyzerConfig projectPath with
+        | Error e -> Assert.Fail($"expected Ok, got Error: {e}")
+        | Ok cfg ->
+            Assert.False(cfg.Configured, "a bare .editorconfig is not an analyzer signal")
+            Assert.Empty(cfg.Packages))
