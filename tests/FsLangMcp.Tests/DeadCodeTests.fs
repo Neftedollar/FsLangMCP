@@ -150,7 +150,11 @@ type DeadCodeTests(fx: DeadCodeFixture, output: ITestOutputHelper) =
             let! result = bridge.DeadCode(dcArgs fx.Fsproj None)
 
             Assert.Equal("succeeded", gs result "status")
+            // #100 review: projectsScanned counts projects ACTUALLY analyzed (not just
+            // requested). On a healthy single project the two agree; a gap would mean a
+            // load failure was swallowed and its symbols weren't considered.
             Assert.Equal(1, gi result "projectsScanned")
+            Assert.Equal(1, gi result "projectsRequested")
 
             let names = candidateNames result
             let nameStr = String.concat ", " names

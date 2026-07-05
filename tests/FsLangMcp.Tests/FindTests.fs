@@ -199,6 +199,7 @@ let private findArgs (projectPath: string) (query: string) : FindArgs =
       includePerProject = None
       projectPath = Some projectPath
       maxResults = Some 500
+      timeoutMs = None
       cursor = None }
 
 let private findSymbolArgs (domainFs: string) (domainFsproj: string) (query: string) (exact: bool) : FcsFindSymbolArgs =
