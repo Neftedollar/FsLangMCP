@@ -3105,18 +3105,34 @@ type internal FcsBridge() =
     // diagnostics, keyed by (resolved-options + source-stamp). Kept in its own method
     // so Find's per-project loop awaits a plain Task instead of nesting a task CE
     // (which is not statically compilable under Release optimization → FS3511).
+    // A cold ParseAndCheckProject on a large solution can run unboundedly (#100:
+    // a 12-project sweep blocked an agent for 30+ min), so the compute path is
+    // cancelled after timeoutMs and surfaces as TimeoutException — every caller's
+    // per-project try/with turns that into a partial result instead of a hang.
     member private _.ProjectSweepUses
-        (usesKey: string, options: FSharpProjectOptions)
+        (usesKey: string, options: FSharpProjectOptions, timeoutMs: int)
         : Task<FSharpSymbolUse array * FSharpDiagnostic array> =
         task {
             match projectUsesCache.TryGet(usesKey) with
             | Some cached -> return cached
             | None ->
-                let! results = checker.ParseAndCheckProject(options) |> asTask
-                let uses = results.GetAllUsesOfAllSymbols()
-                let diags = results.Diagnostics
-                projectUsesCache.Set(usesKey, (uses, diags))
-                return uses, diags
+                use cts = new CancellationTokenSource(timeoutMs)
+
+                try
+                    let! results =
+                        Async.StartAsTask(checker.ParseAndCheckProject(options), cancellationToken = cts.Token)
+
+                    let uses = results.GetAllUsesOfAllSymbols()
+                    let diags = results.Diagnostics
+                    projectUsesCache.Set(usesKey, (uses, diags))
+                    return uses, diags
+                with :? OperationCanceledException | :? TaskCanceledException ->
+                    return
+                        raise (
+                            TimeoutException(
+                                $"FCS sweep of '{Path.GetFileNameWithoutExtension options.ProjectFileName}' timed out after %d{timeoutMs}ms (cold cache or very large project). Run `dotnet build` to warm it, retry, or raise timeoutMs."
+                            )
+                        )
         }
 
     member this.Find(args: FindArgs, ?fsacProbe: string -> Task<int>) : Task<JsonNode> =
@@ -3136,6 +3152,11 @@ type internal FcsBridge() =
             let includeDeclaration = args.includeDeclaration |> Option.defaultValue true
             let includeInfo = args.includeInfo |> Option.defaultValue false
             let includePerProject = args.includePerProject |> Option.defaultValue true
+            // #100 hang fix: `find` must ALWAYS return. timeoutMs is the overall
+            // wall-clock budget for the whole multi-project sweep (default 120s);
+            // each project's FCS sweep is cancelled at the remaining budget, and
+            // projects past the deadline are skipped with a perProject error entry.
+            let sweepBudgetMs = args.timeoutMs |> Option.defaultValue 120000
             // Default page size keeps the compact payload well under the MCP token
             // ceiling on a cap-case hit. Each site is now serialized ONCE — the flat
             // `sites` list — after the grouped definitions/references/fieldSites/
@@ -3344,7 +3365,13 @@ type internal FcsBridge() =
                     // inside the loop trips FS3511).
                     let usesKey =
                         $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}|{referencedProjectSourcesStamp options}"
-                    let! allUses, projDiagnostics = this.ProjectSweepUses(usesKey, options)
+                    // #100: overall wall-clock budget across the whole sweep. Each project
+                    // gets whatever remains; once exhausted, `max 1` makes the next project's
+                    // type-check cancel almost immediately and land in the catch branch as a
+                    // timeout error entry — so a huge/cold solution returns partial instead of
+                    // blocking the caller forever.
+                    let remainingMs = max 1 (sweepBudgetMs - int sweepSw.ElapsedMilliseconds)
+                    let! allUses, projDiagnostics = this.ProjectSweepUses(usesKey, options, remainingMs)
                     aggregatedDiagnostics.AddRange(projDiagnostics)
 
                     // Per-file record-field form classifier (literal vs with-update).
@@ -3614,8 +3641,12 @@ type internal FcsBridge() =
 
             // F5 (#100): drop per-project entries that matched nothing and didn't error —
             // on a large solution they are one-noise-line-per-project that dwarfs a small
-            // result. includePerProject=false omits the array entirely. `projectsSwept`
-            // still conveys the full sweep breadth either way.
+            // result. `projectsSwept` still conveys the full sweep breadth either way.
+            let isErrorEntry (node: JsonNode) =
+                match node with
+                | :? JsonObject as o -> o.ContainsKey("error")
+                | _ -> false
+
             let perProjectField =
                 if includePerProject then
                     let kept =
@@ -3625,7 +3656,16 @@ type internal FcsBridge() =
 
                     [ "perProject", JsonArray(kept) :> JsonNode ]
                 else
-                    []
+                    // includePerProject=false still SURFACES failed-sweep entries — the only
+                    // place a per-project load/timeout error is visible. Omitting them would
+                    // let a caller read a failed project as "zero uses" and delete a live
+                    // symbol (#100). Pure zero-match noise entries stay omitted.
+                    let errored = perProject |> Seq.filter isErrorEntry |> Seq.toArray
+
+                    if errored.Length > 0 then
+                        [ "perProject", JsonArray(errored) :> JsonNode ]
+                    else
+                        []
 
             // F1 (#100): a dotted query that resolved to nothing reads like "symbol absent".
             // symbolMatches now accepts a dotted suffix, so this only fires for a genuine miss
@@ -3787,6 +3827,10 @@ type internal FcsBridge() =
                        LineText: string |}
                  >()
 
+            // #100 review: count only test projects whose sweep succeeded (the catch below
+            // swallows load failures), so projectsScanned never over-reports coverage.
+            let mutable scannedOk = 0
+
             for fsproj in testProjects do
                 try
                     let projDisplay = Path.GetFileNameWithoutExtension fsproj
@@ -3795,7 +3839,8 @@ type internal FcsBridge() =
                     let usesKey =
                         $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}|{referencedProjectSourcesStamp options}"
 
-                    let! allUses, _ = this.ProjectSweepUses(usesKey, options)
+                    let! allUses, _ = this.ProjectSweepUses(usesKey, options, 120000)
+                    scannedOk <- scannedOk + 1
 
                     for u in allUses do
                         if symbolMatches query exact u.Symbol then
@@ -3878,7 +3923,10 @@ type internal FcsBridge() =
                       "symbol", jstr query
                       "tests", JsonArray(testNodes) :> JsonNode
                       "testCount", jint totalTests
-                      "projectsScanned", jint testProjects.Length ]
+                      // scanned = test projects actually swept; requested = total found.
+                      // A gap means some failed to load and their tests were NOT considered.
+                      "projectsScanned", jint scannedOk
+                      "projectsRequested", jint testProjects.Length ]
                 :> JsonNode
         }
 
@@ -5356,7 +5404,31 @@ type internal FcsBridge() =
                             "projectPath is required (or call set_project first to set the active project)"
                         )
                     )
-            | Some fsproj ->
+            | Some inputPath ->
+                // These are single-project tools, but projectPath defaults to the active
+                // set_project — which is the .sln/.slnx itself in solution mode. Feeding a
+                // solution file straight to ResolveFsprojOptions makes WorkspaceLoader reject
+                // it with a cryptic "Unable to load project options" (#100 review). Resolve a
+                // solution/dir to its single .fsproj (as the sweep tools do via listProjects),
+                // and give a clear, actionable error when it's genuinely ambiguous.
+                let fsproj =
+                    let ext = Path.GetExtension(inputPath)
+
+                    if String.Equals(ext, ".fsproj", StringComparison.OrdinalIgnoreCase) then
+                        inputPath
+                    else
+                        match SolutionParsing.listProjects inputPath with
+                        | [| one |] -> one
+                        | [||] -> inputPath // not a solution we can expand — let ResolveFsprojOptions surface the real error
+                        | many ->
+                            let names = many |> Array.map Path.GetFileName |> String.concat ", "
+
+                            raise (
+                                InvalidOperationException(
+                                    $"'{Path.GetFileName inputPath}' contains multiple projects ({names}); this tool operates on ONE project — pass an explicit .fsproj as projectPath."
+                                )
+                            )
+
                 let! options, optionsSource = this.ResolveFsprojOptions(fsproj)
                 let cacheKey = makeResolvedProjectCacheKey options
 
@@ -6901,7 +6973,7 @@ type internal FcsBridge() =
                     let usesKey =
                         $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}|{referencedProjectSourcesStamp options}"
 
-                    let! allUses, diagnostics = this.ProjectSweepUses(usesKey, options)
+                    let! allUses, diagnostics = this.ProjectSweepUses(usesKey, options, 120000)
 
                     // Index every IN-PROJECT definition by DisplayName → (file, declStartLine,
                     // compileIndex). An out-of-order use resolves to its definition by name;
@@ -7108,6 +7180,7 @@ type internal FcsBridge() =
                   includePerProject = None
                   projectPath = args.projectPath
                   maxResults = Some 1000
+                  timeoutMs = None
                   cursor = None }
 
             let findArgs =
@@ -8207,6 +8280,11 @@ type internal FcsBridge() =
                        Project: string |}
                  >()
 
+            // #100 review: count only projects whose sweep actually succeeded. Reporting
+            // projects.Length while the catch below swallows load failures would tell an
+            // agent "N scanned, 0 dead" when 0 projects were analyzed (unrestored solution).
+            let mutable scannedOk = 0
+
             for fsproj in projects do
                 try
                     let projDisplay = Path.GetFileNameWithoutExtension fsproj
@@ -8215,7 +8293,8 @@ type internal FcsBridge() =
                     let usesKey =
                         $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}|{referencedProjectSourcesStamp options}"
 
-                    let! allUses, _ = this.ProjectSweepUses(usesKey, options)
+                    let! allUses, _ = this.ProjectSweepUses(usesKey, options, 120000)
+                    scannedOk <- scannedOk + 1
 
                     for u in allUses do
                         let sym = u.Symbol
@@ -8326,7 +8405,12 @@ type internal FcsBridge() =
             return
                 jobj
                     [ "status", jstr "succeeded"
-                      "projectsScanned", jint projects.Length
+                      // projectsScanned = projects actually analyzed; projectsRequested =
+                      // total in scope. A gap means some projects failed to load (e.g.
+                      // unrestored) and their symbols were NOT considered — do not read
+                      // an empty candidate list as "nothing is dead" when scanned < requested.
+                      "projectsScanned", jint scannedOk
+                      "projectsRequested", jint projects.Length
                       "candidates", JsonArray(page |> Array.map candidateToJson) :> JsonNode
                       "candidateCount", jint total
                       "truncated", jbool truncated
@@ -8387,14 +8471,18 @@ type internal FcsBridge() =
                         match AnalyzerDiagnostics.detectRunner () with
                         | None -> AnalyzerDiagnostics.configuredNotRunResponse packagesJson
                         | Some command ->
-                            // Run the CLI per configured project and merge the SARIF diagnostics.
+                            // Run the CLI only on projects that ACTUALLY have analyzers
+                            // configured (#100 review): including Configured=false projects
+                            // burned one CLI invocation each and let an analyzer-less project's
+                            // run error flip a genuinely-clean configured project to run_failed.
                             let collected = ResizeArray<AnalyzerDiagnostics.AnalyzerDiagnostic>()
                             let runErrors = ResizeArray<string>()
 
-                            for projectPath, _ in configs do
-                                match AnalyzerDiagnostics.runAnalyzers command projectPath with
-                                | Ok sarif -> collected.AddRange(AnalyzerDiagnostics.parseSarif sarif)
-                                | Error e -> runErrors.Add e
+                            for projectPath, cfg in configs do
+                                if cfg.Configured then
+                                    match AnalyzerDiagnostics.runAnalyzers command projectPath with
+                                    | Ok sarif -> collected.AddRange(AnalyzerDiagnostics.parseSarif sarif)
+                                    | Error e -> runErrors.Add e
 
                             if collected.Count = 0 && runErrors.Count > 0 then
                                 AnalyzerDiagnostics.runFailedResponse packagesJson (String.concat "; " runErrors)

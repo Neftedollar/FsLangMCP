@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-07-05
+
+Correctness patch from a whole-codebase multi-agent review (20 verified findings) plus the #100 hang report. All fixes are backward-compatible (one new optional `find` arg, one additive response field).
+
+### Fixed
+
+- **`find` no longer hangs indefinitely on a large/cold multi-project solution** (#100). A cold `ParseAndCheckProject` on a 12-project solution could block an agent for 30+ minutes with no error and no way to regain control. The per-project sweep now runs under an overall wall-clock budget (`find` arg `timeoutMs`, default 120 s): each project is cancelled at the remaining budget and surfaces as a `perProject` timeout entry, so the call always returns a partial result with an actionable reason instead of blocking. Verified on the reporter's 12-project `Sailer.slnx` (was 300 s+ no-return → now returns in ~66 s with the un-warmed projects reported as timed out). The other sweep tools (`fcs_tests_for_symbol`, `fcs_check_compile_order`, `fcs_dead_code`) get the same bound.
+- **`fcs_analyzer_diagnostics` no longer deadlocks on a chatty analyzer run.** `runAnalyzers` redirected the `fsharp-analyzers` child's stdout but never drained it while reading stderr to end under an untimed wait — once the CLI's stdout exceeded the ~64 KB OS pipe buffer the child blocked, wedging the tool (and permanently holding an FCS concurrency slot). Both pipes are now drained concurrently under a 120 s timeout with kill-on-timeout.
+- **FSAC (`fsautocomplete`) child process no longer leaks on a failed `set_project` handshake.** If the `initialize` / `fsharp/workspaceLoad` RPC threw, the already-started process was abandoned un-killed (its handle was only committed after the handshake). The handshake is now wrapped so a failure kills/disposes the child before re-raising.
+- **`fcs_public_api`, `fcs_suggest_open`, `fcs_referenced_symbols`, `fcs_nuget_types`, `fcs_nuget_members` now work in solution mode.** After `set_project` on a `.sln`/`.slnx`, a bare call defaulted `projectPath` to the solution file, which `WorkspaceLoader` cannot load — the tools threw. They now resolve a solution to its single `.fsproj` (or return a clear "pass one explicitly" error when ambiguous), matching the sweep tools.
+- **`fcs_dead_code` / `fcs_tests_for_symbol` no longer over-report `projectsScanned`.** A project that failed to load was silently swallowed, yet the response claimed all projects were scanned — an agent could read "N scanned, 0 dead" when 0 were actually analyzed. `projectsScanned` now counts only successful sweeps; a new `projectsRequested` field shows the total, so a gap is visible.
+- **`find` with `includePerProject=false` still surfaces per-project sweep failures.** The 0.12.1 opt-out omitted the whole `perProject` array — including the error entries that are the only signal a project failed to sweep — so a failed project could be misread as "zero uses". Error entries are now always surfaced; only zero-match noise is trimmed.
+- **`fcs_analyzer_diagnostics` no longer runs the analyzer CLI on projects without analyzers, and no longer reports `run_failed` spuriously.** It ran the CLI on every project whose `.fsproj` merely parsed; an analyzer-less project's run error could flip a genuinely-clean configured project to `run_failed`. The CLI now runs only on projects with a real analyzer package reference.
+- **`set_project` on a non-existent path returns the `{status:"invalid_args"}` envelope** instead of throwing a raw `ArgumentException` (matching every other validation in the handler).
+- **`project_health` in solution mode no longer silently ignores a requested `compileCheck`.** It returned `status:"ok"` while never running the check; it now reports `compileStatus` as not-supported-in-solution-mode with a hint to re-target a single `.fsproj`.
+- **`project_health` / analyzer detection no longer reports "analyzers configured" for a bare `.editorconfig`.** `Configured` now requires a real analyzer `PackageReference` rather than the mere existence of a `Directory.Build.*` / `.editorconfig` file (which nearly every project has).
+
 ## [0.12.1] - 2026-06-29
 
 Patch release — three fixes from a 0.12.0-binary reproducibility pass over the #100 UX backlog (most prior findings turned out to be stale-version artifacts; these three reproduced).

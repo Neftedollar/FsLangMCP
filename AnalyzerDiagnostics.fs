@@ -332,6 +332,10 @@ let runAnalyzers (command: string) (projectPath: string) : Result<string, string
     let reportPath =
         Path.Combine(Path.GetTempPath(), $"fslangmcp_analyzers_{Guid.NewGuid():N}.sarif")
 
+    // Bound the wait: a wedged/misbehaving CLI must surface as an error, not hang the
+    // caller's fcsGate slot forever. 120s is generous for a mid-sized project's analyzer pass.
+    let runTimeoutMs = 120_000
+
     try
         let psi = ProcessStartInfo(command)
         psi.ArgumentList.Add("--project")
@@ -343,24 +347,43 @@ let runAnalyzers (command: string) (projectPath: string) : Result<string, string
         psi.UseShellExecute <- false
         psi.CreateNoWindow <- true
         use p = Process.Start(psi)
-        let stderr = p.StandardError.ReadToEnd()
-        p.WaitForExit() |> ignore
 
-        if File.Exists reportPath then
-            let sarif = File.ReadAllText reportPath
+        // Drain BOTH pipes concurrently, started BEFORE waiting. The CLI's actual payload is
+        // the SARIF file at reportPath, not stdout/stderr — those are just console chatter.
+        // But if either pipe is left unread and the child writes more than the OS pipe buffer
+        // (~64KB, easily hit by per-file progress logging on a mid-sized project), the child
+        // blocks on the write, never exits, and WaitForExit blocks forever.
+        let stdoutTask = p.StandardOutput.ReadToEndAsync()
+        let stderrTask = p.StandardError.ReadToEndAsync()
 
+        if not (p.WaitForExit runTimeoutMs) then
             try
-                File.Delete reportPath
+                p.Kill true
             with _ ->
                 ()
 
-            Ok sarif
+            Error $"fsharp-analyzers timed out after {runTimeoutMs}ms"
         else
-            Error(
-                if String.IsNullOrWhiteSpace stderr then
-                    $"fsharp-analyzers produced no report (exit {p.ExitCode})"
-                else
-                    stderr.Trim()
-            )
+            // Exited in time — await both reads so the pipes are fully drained before touching
+            // the report file.
+            let stderr = stderrTask.GetAwaiter().GetResult()
+            stdoutTask.GetAwaiter().GetResult() |> ignore
+
+            if File.Exists reportPath then
+                let sarif = File.ReadAllText reportPath
+
+                try
+                    File.Delete reportPath
+                with _ ->
+                    ()
+
+                Ok sarif
+            else
+                Error(
+                    if String.IsNullOrWhiteSpace stderr then
+                        $"fsharp-analyzers produced no report (exit {p.ExitCode})"
+                    else
+                        stderr.Trim()
+                )
     with ex ->
         Error ex.Message

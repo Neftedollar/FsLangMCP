@@ -366,14 +366,24 @@ let private analyzerConfigOfDoc (projectDir: string) (doc: XDocument) : Analyzer
     let packages = analyzerPackageInfos doc
     let configFiles = findAnalyzerConfigFiles projectDir
 
-    { Configured = not packages.IsEmpty || not configFiles.IsEmpty
+    // `Configured` must be a REAL analyzer signal. An analyzer PackageReference (IncludeAssets
+    // contains "analyzers" or the package id contains "Analyzer") is the only reliable one.
+    // Merely finding Directory.Build.props/.targets, Directory.Packages.props, or .editorconfig
+    // on disk is NOT evidence of analyzer configuration — nearly every real project has an
+    // .editorconfig, which previously flipped `Configured` to true unconditionally and caused
+    // fcs_analyzer_diagnostics to shell out to the analyzer CLI on plain, analyzer-free
+    // projects. `configFiles` is still surfaced (informational) but no longer drives the flag.
+    { Configured = not packages.IsEmpty
       Packages = packages
       ConfigFiles = configFiles }
 
 /// Detect the analyzer configuration of one .fsproj the SAME way project_health does:
-/// analyzer PackageReferences plus analyzer config files (Directory.Build.*,
-/// Directory.Packages.props, .editorconfig). Reused by fcs_analyzer_diagnostics so the two
-/// tools never disagree on whether analyzers are configured. Missing/unreadable .fsproj → Error.
+/// `Configured` is driven ONLY by real analyzer PackageReferences — config files
+/// (Directory.Build.*, Directory.Packages.props, .editorconfig) are collected as
+/// informational evidence but never flip `Configured` on their own (nearly every project
+/// has an .editorconfig, which is not an analyzer signal). Reused by fcs_analyzer_diagnostics
+/// so the two tools never disagree on whether analyzers are configured. Missing/unreadable
+/// .fsproj → Error.
 let detectAnalyzerConfig (projectPath: string) : Result<AnalyzerConfig, string> =
     match tryReadProject projectPath with
     | Error reason -> Error reason
@@ -457,12 +467,31 @@ let createReport
                           "exists", jbool (File.Exists p) ]
                     :> JsonNode)
 
+            // Solution mode cannot run a compile check — there's no single project to compile.
+            // Be HONEST about a requested (non-"Skip") compileCheck rather than silently
+            // reporting "not_checked" as if the request were a no-op: an agent that keys off
+            // compileStatus.status should be able to tell the check never ran, and be pointed
+            // at the per-project path that can actually run it.
+            let compileStatus =
+                if String.Equals(compileCheck, "Skip", StringComparison.OrdinalIgnoreCase) then
+                    jobj [ "status", jstr "not_checked" ] :> JsonNode
+                else
+                    jobj
+                        [ "status", jstr "not_supported_in_solution_mode"
+                          "reason",
+                          jstr
+                              $"compileCheck=\"%s{compileCheck}\" was requested, but project_health cannot run a compile check across a whole solution — compilation is verified per .fsproj."
+                          "hint",
+                          jstr
+                              "Re-run project_health with an explicit .fsproj path (see solution.projects below) to get a compile verdict." ]
+                    :> JsonNode
+
             return
                 jobj
                     [ "status", jstr "ok"
                       "reportKind", jstr "solution"
                       "toolingReadiness", jobj [ "overall", jstr "solution" ]
-                      "compileStatus", jobj [ "status", jstr "not_checked" ]
+                      "compileStatus", compileStatus
                       "solution",
                       jobj
                           [ "source", jstr source
@@ -623,7 +652,11 @@ let createReport
                 let analyzerConfigFiles = findAnalyzerConfigFiles projectDir
 
                 let analyzerHealth =
-                    if analyzers.Length = 0 && analyzerConfigFiles.IsEmpty then
+                    // #100 review: gate on real analyzer PackageReferences only. A bare
+                    // Directory.Build.props / .editorconfig (present in almost every project)
+                    // must NOT read as "analyzers configured" — consistent with
+                    // analyzerConfigOfDoc.Configured.
+                    if analyzers.Length = 0 then
                         jobj
                             [ "status", jstr "no_analyzers_configured"
                               "analyzers", JsonArray() :> JsonNode ]

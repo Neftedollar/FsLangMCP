@@ -969,7 +969,12 @@ type internal FsAutoCompleteBridge() =
             let inputPath = Path.GetFullPath(projectPathArg)
 
             if not (File.Exists(inputPath) || Directory.Exists(inputPath)) then
-                invalidArg (nameof args.projectPath) $"Path does not exist: %s{inputPath}"
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message", jstr $"projectPath does not exist: {inputPath}" ]
+                    :> JsonNode
+            else
 
             match WorkspaceSelection.select inputPath with
             | WorkspaceSelection.Ambiguous candidates ->
@@ -1109,122 +1114,143 @@ type internal FsAutoCompleteBridge() =
             if not (fsacProc.Start()) then
                 invalidOp $"Unable to start %s{command}"
 
-            let pumpStderr: Task =
-                task {
-                    let mutable keepReading = true
+            // The handshake below (RPC construction, `initialize`, `fsharp/workspaceLoad`)
+            // can throw. Until `rpc`/`lspProcess` are assigned at the very end, this method
+            // is the only owner of `fsacProc` (and `jsonRpc` once constructed) — if we let
+            // the exception propagate without cleaning them up first, the already-started
+            // fsautocomplete process leaks (nothing else can ever reap it).
+            let mutable startedJsonRpc: JsonRpc option = None
 
-                    while keepReading do
-                        let! line = fsacProc.StandardError.ReadLineAsync()
+            try
+                let pumpStderr: Task =
+                    task {
+                        let mutable keepReading = true
 
-                        if isNull line then
-                            keepReading <- false
-                        elif not (String.IsNullOrWhiteSpace line) then
-                            Console.Error.WriteLine($"[fsautocomplete] {line}")
-                }
+                        while keepReading do
+                            let! line = fsacProc.StandardError.ReadLineAsync()
 
-            pumpStderr.ContinueWith(
-                (fun (t: Task) ->
-                    if t.IsFaulted then
-                        let ex = t.Exception.GetBaseException()
+                            if isNull line then
+                                keepReading <- false
+                            elif not (String.IsNullOrWhiteSpace line) then
+                                Console.Error.WriteLine($"[fsautocomplete] {line}")
+                    }
 
-                        if not (ex :? ObjectDisposedException) then
-                            Console.Error.WriteLine($"[stderr pump] %s{ex.Message}")),
-                TaskContinuationOptions.OnlyOnFaulted
-            )
-            |> ignore
+                pumpStderr.ContinueWith(
+                    (fun (t: Task) ->
+                        if t.IsFaulted then
+                            let ex = t.Exception.GetBaseException()
 
-            stderrPump <- Some pumpStderr
-
-            let formatter = new SystemTextJsonFormatter()
-            let formatterOpts = JsonSerializerOptions()
-            formatterOpts.DefaultIgnoreCondition <- JsonIgnoreCondition.WhenWritingNull
-            formatter.JsonSerializerOptions <- formatterOpts
-
-            let handler =
-                new HeaderDelimitedMessageHandler(
-                    fsacProc.StandardInput.BaseStream,
-                    fsacProc.StandardOutput.BaseStream,
-                    formatter
+                            if not (ex :? ObjectDisposedException) then
+                                Console.Error.WriteLine($"[stderr pump] %s{ex.Message}")),
+                    TaskContinuationOptions.OnlyOnFaulted
                 )
+                |> ignore
 
-            let jsonRpc = new JsonRpc(handler)
-            let targetOptions = JsonRpcTargetOptions(AllowNonPublicInvocation = true)
+                stderrPump <- Some pumpStderr
 
-            jsonRpc.AddLocalRpcTarget(new DiagnosticsTarget(diagnostics, diagnosticsAnalyzedAt), targetOptions)
-            |> ignore
+                let formatter = new SystemTextJsonFormatter()
+                let formatterOpts = JsonSerializerOptions()
+                formatterOpts.DefaultIgnoreCondition <- JsonIgnoreCondition.WhenWritingNull
+                formatter.JsonSerializerOptions <- formatterOpts
 
-            jsonRpc.AddLocalRpcTarget(new WorkspaceLoadTarget(markWorkspaceReady), targetOptions)
-            |> ignore
+                let handler =
+                    new HeaderDelimitedMessageHandler(
+                        fsacProc.StandardInput.BaseStream,
+                        fsacProc.StandardOutput.BaseStream,
+                        formatter
+                    )
 
-            jsonRpc.StartListening()
+                let jsonRpc = new JsonRpc(handler)
+                startedJsonRpc <- Some jsonRpc
+                let targetOptions = JsonRpcTargetOptions(AllowNonPublicInvocation = true)
 
-            let rootUri = Uri(workspaceRoot).AbsoluteUri
-            let workspaceName = Path.GetFileName(workspaceRoot)
+                jsonRpc.AddLocalRpcTarget(new DiagnosticsTarget(diagnostics, diagnosticsAnalyzedAt), targetOptions)
+                |> ignore
 
-            let initializeParams =
-                jobj
-                    [ "processId", jint Environment.ProcessId
-                      "rootUri", jstr rootUri
-                      "trace", jstr "off"
-                      "clientInfo", jobj [ "name", jstr "fsmcp-fsharp"; "version", jstr "0.1.0" ]
-                      "initializationOptions", jobj [ "AutomaticWorkspaceInit", jbool (useAutomaticWorkspaceInit ()) ]
-                      "workspaceFolders",
-                      JsonArray(jobj [ "uri", jstr rootUri; "name", jstr workspaceName ] :> JsonNode) :> JsonNode
-                      "capabilities",
-                      jobj
-                          [ "workspace", jobj [ "workspaceFolders", jbool true ]
-                            "textDocument",
-                            jobj
-                                [ "completion", jobj [ "completionItem", jobj [ "snippetSupport", jbool true ] ]
-                                  // FSAC gates codeAction *kinds* (its quick-fixes) on the client
-                                  // advertising codeActionLiteralSupport; without it codeAction returns
-                                  // null/Commands only. Required for fcs_diagnostic_fixes (#53).
-                                  "codeAction",
-                                  jobj
-                                      [ "codeActionLiteralSupport",
-                                        jobj
-                                            [ "codeActionKind",
-                                              jobj
-                                                  [ "valueSet",
-                                                    JsonArray(
-                                                        [| "quickfix"
-                                                           "refactor"
-                                                           "refactor.extract"
-                                                           "refactor.inline"
-                                                           "refactor.rewrite"
-                                                           "source"
-                                                           "source.organizeImports" |]
-                                                        |> Array.map jstr
-                                                    )
-                                                    :> JsonNode ] ]
-                                        "isPreferredSupport", jbool true
-                                        "dataSupport", jbool true
-                                        "resolveSupport", jobj [ "properties", JsonArray(jstr "edit") :> JsonNode ] ]
-                                  // Advertise push-diagnostics + save sync so FSAC publishes
-                                  // diagnostics for opened/changed documents.
-                                  "publishDiagnostics", jobj [ "relatedInformation", jbool true ]
-                                  "synchronization", jobj [ "didSave", jbool true ] ] ] ]
+                jsonRpc.AddLocalRpcTarget(new WorkspaceLoadTarget(markWorkspaceReady), targetOptions)
+                |> ignore
 
-            let! _ = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("initialize", initializeParams)
-            do! jsonRpc.NotifyWithParameterObjectAsync("initialized", JsonObject())
+                jsonRpc.StartListening()
 
-            match explicitWorkspacePath () with
-            | Some workspacePath ->
-                let document = jobj [ "uri", jstr (toFileUri workspacePath) ] :> JsonNode
-                let documents = JsonArray(document)
+                let rootUri = Uri(workspaceRoot).AbsoluteUri
+                let workspaceName = Path.GetFileName(workspaceRoot)
 
-                let workspaceLoadParams =
+                let initializeParams =
                     jobj
-                        [ "TextDocuments", documents.DeepClone()
-                          "textDocuments", documents.DeepClone() ]
+                        [ "processId", jint Environment.ProcessId
+                          "rootUri", jstr rootUri
+                          "trace", jstr "off"
+                          "clientInfo", jobj [ "name", jstr "fsmcp-fsharp"; "version", jstr "0.1.0" ]
+                          "initializationOptions", jobj [ "AutomaticWorkspaceInit", jbool (useAutomaticWorkspaceInit ()) ]
+                          "workspaceFolders",
+                          JsonArray(jobj [ "uri", jstr rootUri; "name", jstr workspaceName ] :> JsonNode) :> JsonNode
+                          "capabilities",
+                          jobj
+                              [ "workspace", jobj [ "workspaceFolders", jbool true ]
+                                "textDocument",
+                                jobj
+                                    [ "completion", jobj [ "completionItem", jobj [ "snippetSupport", jbool true ] ]
+                                      // FSAC gates codeAction *kinds* (its quick-fixes) on the client
+                                      // advertising codeActionLiteralSupport; without it codeAction returns
+                                      // null/Commands only. Required for fcs_diagnostic_fixes (#53).
+                                      "codeAction",
+                                      jobj
+                                          [ "codeActionLiteralSupport",
+                                            jobj
+                                                [ "codeActionKind",
+                                                  jobj
+                                                      [ "valueSet",
+                                                        JsonArray(
+                                                            [| "quickfix"
+                                                               "refactor"
+                                                               "refactor.extract"
+                                                               "refactor.inline"
+                                                               "refactor.rewrite"
+                                                               "source"
+                                                               "source.organizeImports" |]
+                                                            |> Array.map jstr
+                                                        )
+                                                        :> JsonNode ] ]
+                                            "isPreferredSupport", jbool true
+                                            "dataSupport", jbool true
+                                            "resolveSupport", jobj [ "properties", JsonArray(jstr "edit") :> JsonNode ] ]
+                                      // Advertise push-diagnostics + save sync so FSAC publishes
+                                      // diagnostics for opened/changed documents.
+                                      "publishDiagnostics", jobj [ "relatedInformation", jbool true ]
+                                      "synchronization", jobj [ "didSave", jbool true ] ] ] ]
 
-                let! _ = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("fsharp/workspaceLoad", workspaceLoadParams)
-                markWorkspaceReady ()
-            | None -> ()
+                let! _ = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("initialize", initializeParams)
+                do! jsonRpc.NotifyWithParameterObjectAsync("initialized", JsonObject())
 
-            rpc <- Some jsonRpc
-            lspProcess <- Some fsacProc
-            return jsonRpc
+                match explicitWorkspacePath () with
+                | Some workspacePath ->
+                    let document = jobj [ "uri", jstr (toFileUri workspacePath) ] :> JsonNode
+                    let documents = JsonArray(document)
+
+                    let workspaceLoadParams =
+                        jobj
+                            [ "TextDocuments", documents.DeepClone()
+                              "textDocuments", documents.DeepClone() ]
+
+                    let! _ =
+                        jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("fsharp/workspaceLoad", workspaceLoadParams)
+
+                    markWorkspaceReady ()
+                | None -> ()
+
+                rpc <- Some jsonRpc
+                lspProcess <- Some fsacProc
+                return jsonRpc
+            with ex ->
+                // Handshake failed before the fields above were committed: this method is
+                // still the sole owner of fsacProc/jsonRpc, so reap them here or they leak.
+                startedJsonRpc |> Option.iter (fun r -> r.Dispose())
+
+                if not fsacProc.HasExited then
+                    fsacProc.Kill(true)
+
+                fsacProc.Dispose()
+                return raise ex
         }
 
     member private this.EnsureStarted() : Task<JsonRpc> =

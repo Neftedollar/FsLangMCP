@@ -238,6 +238,10 @@ type FindArgs =
       /// Maximum sites returned per page. Default 40 (keeps the compact payload well
       /// under the MCP token ceiling on a hot symbol); cursor pages the rest.
       maxResults: int option
+      /// Overall wall-clock budget in ms for the whole multi-project sweep. Default
+      /// 120000 (120 s). Each project's FCS type-check is cancelled at the remaining
+      /// budget so a huge/cold solution surfaces a partial result instead of hanging.
+      timeoutMs: int option
       /// Opaque cursor from a prior call's nextCursor. Omit for the first page.
       cursor: string option }
 
