@@ -12,6 +12,78 @@ open System.Text.Json.Nodes
 open System.Text.Json.Serialization
 open StreamJsonRpc
 
+let private timeoutFromEnv (name: string) (defaultMilliseconds: int) =
+    match Environment.GetEnvironmentVariable(name) with
+    | value when not (String.IsNullOrWhiteSpace(value)) ->
+        match Int32.TryParse(value) with
+        | true, milliseconds when milliseconds > 0 -> TimeSpan.FromMilliseconds(float milliseconds)
+        | _ -> TimeSpan.FromMilliseconds(float defaultMilliseconds)
+    | _ -> TimeSpan.FromMilliseconds(float defaultMilliseconds)
+
+let private invokeWithTimeout
+    (jsonRpc: JsonRpc)
+    (methodName: string)
+    (parameters: JsonObject)
+    (timeout: TimeSpan)
+    : Task<JsonNode> =
+    task {
+        use cts = new CancellationTokenSource()
+        let invocation = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>(methodName, parameters, cts.Token)
+
+        invocation.ContinueWith(
+            (fun (faulted: Task) -> faulted.Exception |> ignore),
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted ||| TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default
+        )
+        |> ignore
+
+        let timeoutError () =
+            TimeoutException(
+                $"FSAC LSP request '%s{methodName}' timed out after %d{int64 timeout.TotalMilliseconds}ms."
+            )
+
+        try
+            return! invocation.WaitAsync(timeout)
+        with
+        | :? TimeoutException ->
+            cts.Cancel()
+            return raise (timeoutError ())
+        | :? OperationCanceledException when cts.IsCancellationRequested -> return raise (timeoutError ())
+    }
+
+let private notifyWithTimeout
+    (jsonRpc: JsonRpc)
+    (methodName: string)
+    (parameters: JsonObject)
+    (timeout: TimeSpan)
+    : Task =
+    task {
+        let notification = jsonRpc.NotifyWithParameterObjectAsync(methodName, parameters)
+
+        notification.ContinueWith(
+            (fun (faulted: Task) -> faulted.Exception |> ignore),
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted ||| TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default
+        )
+        |> ignore
+
+        try
+            do! notification.WaitAsync(timeout)
+        with :? TimeoutException ->
+            return
+                raise (
+                    TimeoutException(
+                        $"FSAC LSP notification '%s{methodName}' timed out after %d{int64 timeout.TotalMilliseconds}ms."
+                    )
+                )
+    }
+
+let private releaseOnDispose (semaphore: SemaphoreSlim) =
+    { new IDisposable with
+        member _.Dispose() = semaphore.Release() |> ignore }
+
 // ─── LSP types ─────────────────────────────────────────────────────────────────
 
 type private LspDocumentState =
@@ -793,8 +865,15 @@ module internal CodeActionRequest =
 
 // ─── FsAutoCompleteBridge ──────────────────────────────────────────────────────
 
-type internal FsAutoCompleteBridge() =
+type internal FsAutoCompleteBridge
+    (
+        ?startupTimeoutOverride: TimeSpan,
+        ?requestTimeoutOverride: TimeSpan,
+        ?fsacCommandOverride: string,
+        ?fsacArgsOverride: string list
+    ) =
     let gate = new SemaphoreSlim(1, 1)
+    let projectSwitchGate = new SemaphoreSlim(1, 1)
     let documents = ConcurrentDictionary<string, LspDocumentState>()
     let diagnostics = ConcurrentDictionary<string, JsonNode>()
     // Tracks when FSAC last pushed diagnostics for each URI. Surfaced via
@@ -814,7 +893,13 @@ type internal FsAutoCompleteBridge() =
     [<VolatileField>]
     let mutable runtimeWorkspaceRoot: string option = None
 
-    let workspaceReadyEvent = new ManualResetEventSlim(false)
+    let startupTimeout =
+        startupTimeoutOverride
+        |> Option.defaultWith (fun () -> timeoutFromEnv "FSLANGMCP_LSP_STARTUP_TIMEOUT_MS" 60_000)
+
+    let requestTimeout =
+        requestTimeoutOverride
+        |> Option.defaultWith (fun () -> timeoutFromEnv "FSLANGMCP_LSP_REQUEST_TIMEOUT_MS" 30_000)
 
     [<VolatileField>]
     let mutable workspaceReady = false
@@ -873,13 +958,16 @@ type internal FsAutoCompleteBridge() =
         |> Path.GetFullPath
 
     let fsacCommand () =
-        Environment.GetEnvironmentVariable("FSAC_COMMAND")
-        |> Option.ofObj
-        |> Option.filter (String.IsNullOrWhiteSpace >> not)
+        fsacCommandOverride
+        |> Option.orElseWith (fun () ->
+            Environment.GetEnvironmentVariable("FSAC_COMMAND")
+            |> Option.ofObj
+            |> Option.filter (String.IsNullOrWhiteSpace >> not))
         |> Option.defaultValue "fsautocomplete"
 
     let fsacArgs () =
-        Environment.GetEnvironmentVariable("FSAC_ARGS") |> Option.ofObj |> parseArgs
+        fsacArgsOverride
+        |> Option.defaultWith (fun () -> Environment.GetEnvironmentVariable("FSAC_ARGS") |> Option.ofObj |> parseArgs)
 
     let explicitWorkspacePath () =
         runtimeProjectPath
@@ -895,7 +983,6 @@ type internal FsAutoCompleteBridge() =
     let markWorkspaceReady () =
         workspaceReady <- true
         workspaceReadyAt <- ValueSome DateTimeOffset.UtcNow
-        workspaceReadyEvent.Set()
 
     member private _.StopLspUnsafe() =
         match rpc with
@@ -907,6 +994,12 @@ type internal FsAutoCompleteBridge() =
         match lspProcess with
         | Some fsacProc when not fsacProc.HasExited ->
             fsacProc.Kill(true)
+
+            try
+                fsacProc.WaitForExit(5000) |> ignore
+            with _ ->
+                ()
+
             // Give pump 500ms to notice process died
             match stderrPump with
             | Some pump ->
@@ -926,12 +1019,38 @@ type internal FsAutoCompleteBridge() =
         stderrPump <- None
         documents.Clear()
         diagnostics.Clear()
+        diagnosticsAnalyzedAt.Clear()
         workspaceReady <- false
         workspaceReadyAt <- ValueNone
         symbolIndexEverWarmed <- false
-        workspaceReadyEvent.Reset()
+
+    member private this.InvokeLiveUnsafe(jsonRpc: JsonRpc, methodName: string, parameters: JsonObject) : Task<JsonNode> =
+        task {
+            try
+                return! invokeWithTimeout jsonRpc methodName parameters requestTimeout
+            with :? TimeoutException as ex ->
+                match rpc with
+                | Some current when Object.ReferenceEquals(current, jsonRpc) -> this.StopLspUnsafe()
+                | _ -> ()
+
+                return raise ex
+        }
+
+    member private this.NotifyLiveUnsafe(jsonRpc: JsonRpc, methodName: string, parameters: JsonObject) : Task =
+        task {
+            try
+                do! notifyWithTimeout jsonRpc methodName parameters requestTimeout
+            with :? TimeoutException as ex ->
+                match rpc with
+                | Some current when Object.ReferenceEquals(current, jsonRpc) -> this.StopLspUnsafe()
+                | _ -> ()
+
+                return raise ex
+        }
 
     member _.DiagnosticsStore = diagnostics
+
+    member _.DiagnosticsAnalyzedAtStore = diagnosticsAnalyzedAt
 
     member _.CurrentProjectPath = runtimeProjectPath
 
@@ -948,7 +1067,16 @@ type internal FsAutoCompleteBridge() =
 
     // Wait until workspaceReady is true or timeout elapses
     member _.WaitForReady(timeout: TimeSpan) : Task<bool> =
-        task { return workspaceReadyEvent.Wait(timeout) }
+        task {
+            let sw = Stopwatch.StartNew()
+
+            while not workspaceReady && sw.Elapsed < timeout do
+                let remaining = timeout - sw.Elapsed
+                let delay = min 50 (max 1 (int remaining.TotalMilliseconds))
+                do! Task.Delay(delay)
+
+            return workspaceReady
+        }
 
     // Return not-ready JSON if workspace not loaded yet
     member _.NotReadyResponse() : JsonNode =
@@ -957,7 +1085,7 @@ type internal FsAutoCompleteBridge() =
               "message", jstr "fsautocomplete is still loading the project. Try again in a moment." ]
         :> JsonNode
 
-    member this.SetProject(args: SetProjectArgs) : Task<JsonNode> =
+    member private this.SetProjectCore(args: SetProjectArgs) : Task<JsonNode> =
         task {
             // Guard before Path.GetFullPath: a wrong/missing key deserializes projectPath to
             // null, and Path.GetFullPath(null) throws ArgumentNullException naming the internal
@@ -1086,6 +1214,16 @@ type internal FsAutoCompleteBridge() =
                                     JsonArray(selectionCandidates |> List.map WorkspaceSelection.candidateToJson |> List.toArray) :> JsonNode ]
                               :> JsonNode ]
                         :> JsonNode
+        }
+
+    member this.SetProject(args: SetProjectArgs) : Task<JsonNode> =
+        task {
+            do! projectSwitchGate.WaitAsync()
+
+            try
+                return! this.SetProjectCore(args)
+            finally
+                projectSwitchGate.Release() |> ignore
         }
 
     // StartLspUnsafe: assumes gate is already held by caller
@@ -1219,8 +1357,8 @@ type internal FsAutoCompleteBridge() =
                                       "publishDiagnostics", jobj [ "relatedInformation", jbool true ]
                                       "synchronization", jobj [ "didSave", jbool true ] ] ] ]
 
-                let! _ = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("initialize", initializeParams)
-                do! jsonRpc.NotifyWithParameterObjectAsync("initialized", JsonObject())
+                let! _ = invokeWithTimeout jsonRpc "initialize" initializeParams startupTimeout
+                do! notifyWithTimeout jsonRpc "initialized" (JsonObject()) startupTimeout
 
                 match explicitWorkspacePath () with
                 | Some workspacePath ->
@@ -1232,8 +1370,7 @@ type internal FsAutoCompleteBridge() =
                             [ "TextDocuments", documents.DeepClone()
                               "textDocuments", documents.DeepClone() ]
 
-                    let! _ =
-                        jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("fsharp/workspaceLoad", workspaceLoadParams)
+                    let! _ = invokeWithTimeout jsonRpc "fsharp/workspaceLoad" workspaceLoadParams startupTimeout
 
                     markWorkspaceReady ()
                 | None -> ()
@@ -1249,22 +1386,21 @@ type internal FsAutoCompleteBridge() =
                 if not fsacProc.HasExited then
                     fsacProc.Kill(true)
 
+                    try
+                        do! fsacProc.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5.0))
+                    with _ ->
+                        ()
+
                 fsacProc.Dispose()
                 return raise ex
         }
 
-    member private this.EnsureStarted() : Task<JsonRpc> =
+    // Caller holds gate for the whole operation, including the eventual RPC invoke.
+    member private this.EnsureStartedUnsafe() : Task<JsonRpc> =
         task {
-            do! gate.WaitAsync()
-
-            try
-                match rpc with
-                | Some existing -> return existing
-                | None ->
-                    let! result = this.StartLspUnsafe()
-                    return result
-            finally
-                gate.Release() |> ignore
+            match rpc with
+            | Some existing -> return existing
+            | None -> return! this.StartLspUnsafe()
         }
 
     member private this.SyncDocument(jsonRpc: JsonRpc, path: string, providedText: string option) : Task<string> =
@@ -1283,7 +1419,7 @@ type internal FsAutoCompleteBridge() =
                         [ "textDocument", jobj [ "uri", jstr uri; "version", jint state.Version ]
                           "contentChanges", JsonArray(jobj [ "text", jstr text ] :> JsonNode) :> JsonNode ]
 
-                do! jsonRpc.NotifyWithParameterObjectAsync("textDocument/didChange", didChangeParams)
+                do! this.NotifyLiveUnsafe(jsonRpc, "textDocument/didChange", didChangeParams)
                 return uri
             | false, _ ->
                 documents[uri] <- { Version = 1; Text = text }
@@ -1297,36 +1433,30 @@ type internal FsAutoCompleteBridge() =
                                 "version", jint 1
                                 "text", jstr text ] ]
 
-                do! jsonRpc.NotifyWithParameterObjectAsync("textDocument/didOpen", didOpenParams)
+                do! this.NotifyLiveUnsafe(jsonRpc, "textDocument/didOpen", didOpenParams)
                 return uri
         }
 
-    // WithDocument: gate wraps only SyncDocument; released before LSP invoke
+    // Keep sync + invoke in one critical section so set_project cannot dispose the
+    // captured JsonRpc while a request is in flight.
     member private this.WithDocument
         (path: string, providedText: string option, methodName: string, mkParams: string -> JsonObject)
         : Task<JsonNode> =
         task {
-            let! jsonRpc = this.EnsureStarted()
+            do! gate.WaitAsync()
 
-            if not workspaceReady then
-                return this.NotReadyResponse()
-            else
+            try
+                let! jsonRpc = this.EnsureStartedUnsafe()
 
-                // Lock only for document sync
-                let! uri =
-                    task {
-                        do! gate.WaitAsync()
-
-                        try
-                            return! this.SyncDocument(jsonRpc, path, providedText)
-                        finally
-                            gate.Release() |> ignore
-                    }
-
-                // Gate released — StreamJsonRpc handles concurrent requests natively
-                let parameters = mkParams uri
-                let! response = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>(methodName, parameters)
-                return jobj [ "status", jstr "ok"; "result", response ] :> JsonNode
+                if not workspaceReady then
+                    return this.NotReadyResponse()
+                else
+                    let! uri = this.SyncDocument(jsonRpc, path, providedText)
+                    let parameters = mkParams uri
+                    let! response = this.InvokeLiveUnsafe(jsonRpc, methodName, parameters)
+                    return jobj [ "status", jstr "ok"; "result", response ] :> JsonNode
+            finally
+                gate.Release() |> ignore
         }
 
     member private this.PositionParams(uri: string, line: int, character: int) : JsonObject =
@@ -1390,27 +1520,30 @@ type internal FsAutoCompleteBridge() =
 
     member this.WorkspaceSymbol(args: WorkspaceSymbolArgs) : Task<JsonNode> =
         task {
-            let! jsonRpc = this.EnsureStarted()
+            do! gate.WaitAsync()
 
-            if not workspaceReady then
-                return this.NotReadyResponse()
-            else
+            try
+                let! jsonRpc = this.EnsureStartedUnsafe()
 
-                // No document sync needed — just invoke directly, no gate
-                let parameters = jobj [ "query", jstr args.query ]
-                let! response = jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("workspace/symbol", parameters)
+                if not workspaceReady then
+                    return this.NotReadyResponse()
+                else
+                    let parameters = jobj [ "query", jstr args.query ]
+                    let! response = this.InvokeLiveUnsafe(jsonRpc, "workspace/symbol", parameters)
 
-                // First non-empty response is the signal that the symbol index has warmed.
-                match response with
-                | :? JsonArray as arr when arr.Count > 0 -> symbolIndexEverWarmed <- true
-                | _ -> ()
+                    // First non-empty response is the signal that the symbol index has warmed.
+                    match response with
+                    | :? JsonArray as arr when arr.Count > 0 -> symbolIndexEverWarmed <- true
+                    | _ -> ()
 
-                return
-                    LspResponseShape.workspaceSymbolResponse
-                        response
-                        workspaceReadyAt
-                        DateTimeOffset.UtcNow
-                        (TimeSpan.FromSeconds 3.0)
+                    return
+                        LspResponseShape.workspaceSymbolResponse
+                            response
+                            workspaceReadyAt
+                            DateTimeOffset.UtcNow
+                            (TimeSpan.FromSeconds 3.0)
+            finally
+                gate.Release() |> ignore
         }
 
     member _.Diagnostics(args: DiagnosticsArgs) : Task<JsonNode> =
@@ -1489,7 +1622,9 @@ type internal FsAutoCompleteBridge() =
 
     member this.Formatting(args: FormattingArgs) : Task<JsonNode> =
         task {
-            let! jsonRpc = this.EnsureStarted()
+            do! gate.WaitAsync()
+            use _gateLease = releaseOnDispose gate
+            let! jsonRpc = this.EnsureStartedUnsafe()
 
             if not workspaceReady then
                 return this.NotReadyResponse()
@@ -1500,16 +1635,7 @@ type internal FsAutoCompleteBridge() =
                 let originalText =
                     args.text |> Option.defaultWith (fun () -> File.ReadAllText(fullPath))
 
-                // Lock only for document sync
-                let! uri =
-                    task {
-                        do! gate.WaitAsync()
-
-                        try
-                            return! this.SyncDocument(jsonRpc, args.path, args.text)
-                        finally
-                            gate.Release() |> ignore
-                    }
+                let! uri = this.SyncDocument(jsonRpc, args.path, args.text)
 
                 let formatParams =
                     jobj
@@ -1517,7 +1643,7 @@ type internal FsAutoCompleteBridge() =
                           "options", jobj [ "tabSize", jint 4; "insertSpaces", jbool true ] ]
 
                 let! editsToken =
-                    jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("textDocument/formatting", formatParams)
+                    this.InvokeLiveUnsafe(jsonRpc, "textDocument/formatting", formatParams)
 
                 // Apply text edits to produce formatted result
                 let applyEdits (text: string) (edits: JsonArray) =
@@ -1621,7 +1747,9 @@ type internal FsAutoCompleteBridge() =
     /// diagnostic. line/character narrow to one position; omit for the whole file.
     member this.DiagnosticFixes(args: DiagnosticFixesArgs) : Task<JsonNode> =
         task {
-            let! jsonRpc = this.EnsureStarted()
+            do! gate.WaitAsync()
+            use _gateLease = releaseOnDispose gate
+            let! jsonRpc = this.EnsureStartedUnsafe()
 
             if not workspaceReady then
                 return this.NotReadyResponse()
@@ -1636,16 +1764,8 @@ type internal FsAutoCompleteBridge() =
                     | true, ts -> ValueSome ts
                     | false, _ -> ValueNone
 
-                // Sync the document under the gate so FSAC re-analyzes and republishes.
-                let! _ =
-                    task {
-                        do! gate.WaitAsync()
-
-                        try
-                            return! this.SyncDocument(jsonRpc, args.path, args.text)
-                        finally
-                            gate.Release() |> ignore
-                    }
+                // Sync while the lifecycle gate is held so FSAC cannot restart mid-request.
+                let! _ = this.SyncDocument(jsonRpc, args.path, args.text)
 
                 // Bounded wait for FSAC to push a fresh diagnostics set for this URI.
                 // On timeout we proceed with whatever the store holds (possibly empty)
@@ -1698,7 +1818,7 @@ type internal FsAutoCompleteBridge() =
                               "context", jobj [ "diagnostics", JsonArray(diag.DeepClone()) :> JsonNode ] ]
 
                     let! response =
-                        jsonRpc.InvokeWithParameterObjectAsync<JsonNode>("textDocument/codeAction", parameters)
+                        this.InvokeLiveUnsafe(jsonRpc, "textDocument/codeAction", parameters)
 
                     let fixes =
                         match response with
@@ -1833,4 +1953,5 @@ type internal FsAutoCompleteBridge() =
     interface IDisposable with
         member this.Dispose() =
             this.StopLspUnsafe()
+            projectSwitchGate.Dispose()
             gate.Dispose()

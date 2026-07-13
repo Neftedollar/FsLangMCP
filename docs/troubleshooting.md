@@ -21,6 +21,11 @@ medium projects this can take 5–30 seconds.
    stays `false`, the fsautocomplete child process is failing to start — check
    `fsharp_runtime_status` to see if it appears in `children`.
 
+If the handshake itself exceeds 60 seconds, FsLangMCP terminates and resets the
+FSAC child instead of leaving the LSP slot blocked. Raise
+`FSLANGMCP_LSP_STARTUP_TIMEOUT_MS` only when a known-large workspace genuinely
+needs longer; ordinary live requests use `FSLANGMCP_LSP_REQUEST_TIMEOUT_MS`.
+
 ---
 
 ## FCS tools fail with a confusing `FSharp.Core` path error or return empty results
@@ -138,6 +143,16 @@ Two likely causes:
 
 2. **Project has compile errors** that prevented the symbol table from being built.
    Call `check` first and fix any errors, then retry `find`.
+
+---
+
+## A tool reports that an external process timed out
+
+`proj-info`, bootstrap commands, and analyzer probes run with bounded waits. On
+timeout FsLangMCP kills the whole child-process tree and releases its concurrency
+slot. Relevant overrides are `FSLANGMCP_PROJ_INFO_TIMEOUT_MS` and
+`FSLANGMCP_BOOTSTRAP_TIMEOUT_MS`; increase them only after confirming the child is
+making progress rather than waiting indefinitely.
 
 ---
 

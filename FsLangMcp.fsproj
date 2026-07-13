@@ -21,6 +21,7 @@
 
   <ItemGroup>
     <Compile Include="BoundedCache.fs" />
+    <Compile Include="ProcessRunner.fs" />
     <Compile Include="Types.fs" />
     <Compile Include="Version.fs" />
     <Compile Include="ProjectFiles.fs" />

@@ -209,10 +209,17 @@ Pass `projectPath` explicitly on every FCS tool call — FCS tools cache project
 { "path": "/absolute/path/to/File.fs", "projectPath": "/absolute/path/to/App.fsproj" }
 ```
 
-Concurrency limits (env-overridable):
+Concurrency limits:
 
 - `FSLANGMCP_MAX_CONCURRENT_FCS=2`
-- `FSLANGMCP_MAX_CONCURRENT_LSP=1` (LSP tools serialize to protect FSAC workspace state)
+- LSP tools are always serialized. FSAC owns one mutable workspace, so LSP concurrency is intentionally not configurable.
+
+Process and RPC timeouts (milliseconds):
+
+- `FSLANGMCP_LSP_STARTUP_TIMEOUT_MS=60000`
+- `FSLANGMCP_LSP_REQUEST_TIMEOUT_MS=30000`
+- `FSLANGMCP_PROJ_INFO_TIMEOUT_MS=120000`
+- `FSLANGMCP_BOOTSTRAP_TIMEOUT_MS=300000`
 
 ## Response Shape
 
@@ -241,7 +248,8 @@ dotnet tool restore
 
 ## Known Issues
 
-- LSP proxy tools return `{"status": "not_ready"}` if called before `fsautocomplete` finishes loading. `set_project` waits up to 30 seconds — if still `not_ready`, the project may be too large or FSAC may have failed to start.
+- LSP proxy tools return `{"status": "not_ready"}` if called before `fsautocomplete` finishes loading. `set_project` waits up to 30 seconds for workspace readiness; the preceding RPC handshake has its own configurable 60-second timeout and kills/reset FSAC on expiry.
+- FCS does not expose cancellation once synchronous project-option evaluation or `GetAllUsesOfAllSymbols()` has started. `find` still returns at its requested timeout and reuses one in-flight task per project/cache key on retries, but that computation may continue in the background until FCS returns. Restart FsLangMCP to terminate a genuinely stuck FCS operation.
 - FCS tools fall back to script-style inference (`GetProjectOptionsFromScript`) only when no `.fsproj` is found. Diagnostics and symbol data can be incomplete for multi-project solutions in this mode.
 - `project_health` is project-focused — it does not inspect whole solutions or resolve ambiguous directories.
 

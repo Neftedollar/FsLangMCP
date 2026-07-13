@@ -143,10 +143,10 @@ When multiple agents target the same FsLangMCP instance but different projects, 
 { "path": "/abs/path/File.fs", "projectPath": "/abs/path/App.fsproj" }
 ```
 
-Concurrency limits (env-overridable):
+Concurrency limits:
 
 - `FSLANGMCP_MAX_CONCURRENT_FCS=2`
-- `FSLANGMCP_MAX_CONCURRENT_LSP=1` (LSP tools serialize to protect FSAC workspace state)
+- LSP tools are always serialized because FSAC owns one mutable workspace.
 
 ## Local dev (without global install)
 
@@ -177,4 +177,17 @@ All clients can pass these args in the `args` array:
 | `--fsac-args "<args>"` | Pass extra args to FSAC |
 | `--bootstrap-tools` | Install/update `fsautocomplete` + `ionide.projinfo.tool` |
 
-Environment variable fallbacks: `FSAC_COMMAND`, `FSAC_ARGS`, `FSA_PROJECT_PATH`.
+Environment variable fallbacks and limits:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `FSAC_COMMAND` | `fsautocomplete` | FSAC executable |
+| `FSAC_ARGS` | empty | Extra FSAC arguments |
+| `FSA_PROJECT_PATH` | current directory | Initial project/workspace hint |
+| `FSLANGMCP_MAX_CONCURRENT_FCS` | `2` | Maximum concurrent FCS tool calls |
+| `FSLANGMCP_LSP_STARTUP_TIMEOUT_MS` | `60000` | `initialize` / `workspaceLoad` RPC timeout |
+| `FSLANGMCP_LSP_REQUEST_TIMEOUT_MS` | `30000` | Live LSP request/notification timeout |
+| `FSLANGMCP_PROJ_INFO_TIMEOUT_MS` | `120000` | `proj-info` child-process timeout |
+| `FSLANGMCP_BOOTSTRAP_TIMEOUT_MS` | `300000` | Per-command `--bootstrap-tools` timeout |
+
+LSP concurrency is deliberately fixed at one. Increasing parallelism around a single mutable FSAC workspace can mix document versions or dispose an RPC during `set_project`; the bridge therefore serializes lifecycle, document sync, and invocation internally.

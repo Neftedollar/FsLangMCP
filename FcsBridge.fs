@@ -2,6 +2,7 @@ module FsLangMcp.FcsBridge
 
 open System
 open System.IO
+open System.Collections.Concurrent
 open System.Threading
 open System.Threading.Tasks
 open FsLangMcp.Types
@@ -865,6 +866,11 @@ type internal FcsBridge() =
     let optionsCache = BoundedCache<string, FSharpProjectOptions * string>(50)
     let projectResultsCache = BoundedCache<string, FSharpCheckProjectResults>(3)
 
+    let optionsInFlight =
+        ConcurrentDictionary<string, Lazy<Task<FSharpProjectOptions * string>>>()
+
+    let mutable optionsCacheGeneration = 0L
+
     // find sweep (issue #131): memoize each project's whole-symbol-use enumeration +
     // diagnostics. FCS's project cache keeps ParseAndCheckProject warm, but
     // GetAllUsesOfAllSymbols() is NOT memoized — it re-walks every recorded symbol use
@@ -882,8 +888,25 @@ type internal FcsBridge() =
     let projectUsesCache =
         BoundedCache<string, FSharpSymbolUse array * FSharpDiagnostic array>(50)
 
+    // A timed-out GetAllUsesOfAllSymbols call cannot be preempted by FCS once its
+    // synchronous walk starts. Keep one shared computation per cache key so retries
+    // observe the same task instead of accumulating abandoned worker threads.
+    let projectUsesInFlight =
+        ConcurrentDictionary<string, Lazy<Task<FSharpSymbolUse array * FSharpDiagnostic array>>>()
+
+    let mutable projectUsesCacheGeneration = 0L
+
     let asTask (workflow: Async<'T>) : Task<'T> =
         Async.StartAsTask(workflow, cancellationToken = CancellationToken.None)
+
+    let observeFault (operation: Task) =
+        operation.ContinueWith(
+            (fun (faulted: Task) -> faulted.Exception |> ignore),
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted ||| TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default
+        )
+        |> ignore
 
     let jstrOrNull (value: string) : JsonNode =
         if String.IsNullOrWhiteSpace(value) then
@@ -1664,19 +1687,47 @@ type internal FcsBridge() =
             match optionsCache.TryGet(fsprojKey) with
             | Some(cached, source) -> return cached, source
             | None ->
-                let! projInfoResult = this.LoadProjectOptionsFromFsproj(fullPath)
+                let fileStamp =
+                    if File.Exists(fullPath) then File.GetLastWriteTimeUtc(fullPath).Ticks else -1L
 
-                match projInfoResult with
-                | Some projOpts ->
-                    optionsCache.Set(fsprojKey, (projOpts, "ionide-proj-info"))
-                    return projOpts, "ionide-proj-info"
-                | None ->
-                    return
-                        raise (
-                            InvalidOperationException(
-                                $"Unable to load F# project options from explicit projectPath: %s{fullPath}"
+                let inFlightKey = $"%s{fsprojKey}|%d{fileStamp}"
+                let generation = Volatile.Read(&optionsCacheGeneration)
+
+                let pending =
+                    optionsInFlight.GetOrAdd(
+                        inFlightKey,
+                        fun _ ->
+                            Lazy<Task<FSharpProjectOptions * string>>(
+                                (fun () ->
+                                    task {
+                                        try
+                                            let! projInfoResult = this.LoadProjectOptionsFromFsproj(fullPath)
+
+                                            match projInfoResult with
+                                            | Some projOpts ->
+                                                let value = projOpts, "ionide-proj-info"
+
+                                                if Volatile.Read(&optionsCacheGeneration) = generation then
+                                                    optionsCache.Set(fsprojKey, value)
+
+                                                return value
+                                            | None ->
+                                                return
+                                                    raise (
+                                                        InvalidOperationException(
+                                                            $"Unable to load F# project options from explicit projectPath: %s{fullPath}"
+                                                        )
+                                                    )
+                                        finally
+                                            optionsInFlight.TryRemove(inFlightKey) |> ignore
+                                    }),
+                                LazyThreadSafetyMode.ExecutionAndPublication
                             )
                         )
+
+                let work = pending.Value
+                observeFault work
+                return! work
         }
 
     member private this.ResolveProjectOptions
@@ -2931,20 +2982,6 @@ type internal FcsBridge() =
             return jobj (baseFields @ paginationFields) :> JsonNode
         }
 
-    // ── find: ParseAndCheckProject warm-up for one project (issue #128) ──────────
-    // Used by the set_project fire-and-forget pre-warm so the FIRST `find` sweep
-    // hits FCS's (now solution-scale) project cache instead of paying cold cost.
-    // Swallows all failures — pre-warming is a latency optimization, never a gate.
-    member this.PrewarmProject(fsproj: string) : Task<unit> =
-        task {
-            try
-                let! options, _ = this.ResolveFsprojOptions(normalizePath fsproj)
-                let! _ = checker.ParseAndCheckProject(options) |> asTask
-                return ()
-            with _ ->
-                return ()
-        }
-
     // ── find: resolve the symbol name under a cursor (kind=position) ─────────────
     // Returns Ok displayName (fed to the union sweep as an exact query) or Error
     // envelope. Mirrors fcs_symbol_at_word's tolerant resolution: line + optional
@@ -3105,10 +3142,9 @@ type internal FcsBridge() =
     // diagnostics, keyed by (resolved-options + source-stamp). Kept in its own method
     // so Find's per-project loop awaits a plain Task instead of nesting a task CE
     // (which is not statically compilable under Release optimization → FS3511).
-    // A cold ParseAndCheckProject on a large solution can run unboundedly (#100:
-    // a 12-project sweep blocked an agent for 30+ min), so the compute path is
-    // cancelled after timeoutMs and surfaces as TimeoutException — every caller's
-    // per-project try/with turns that into a partial result instead of a hang.
+    // The caller waits through a hard Task.WaitAsync boundary. FCS does not expose
+    // cancellation for GetAllUsesOfAllSymbols once the synchronous walk starts, so
+    // the underlying task may finish later; projectUsesInFlight deduplicates retries.
     member private _.ProjectSweepUses
         (usesKey: string, options: FSharpProjectOptions, timeoutMs: int)
         : Task<FSharpSymbolUse array * FSharpDiagnostic array> =
@@ -3116,26 +3152,40 @@ type internal FcsBridge() =
             match projectUsesCache.TryGet(usesKey) with
             | Some cached -> return cached
             | None ->
-                use cts = new CancellationTokenSource(timeoutMs)
+                let generation = Volatile.Read(&projectUsesCacheGeneration)
+
+                let pending =
+                    projectUsesInFlight.GetOrAdd(
+                        usesKey,
+                        fun _ ->
+                            Lazy<Task<FSharpSymbolUse array * FSharpDiagnostic array>>(
+                                (fun () ->
+                                    task {
+                                        try
+                                            let! results = checker.ParseAndCheckProject(options) |> asTask
+                                            let uses = results.GetAllUsesOfAllSymbols()
+                                            let value = uses, results.Diagnostics
+
+                                            // set_project may clear caches while this uncancellable
+                                            // FCS walk is still running. Do not repopulate a new
+                                            // generation with the old workspace's result.
+                                            if Volatile.Read(&projectUsesCacheGeneration) = generation then
+                                                projectUsesCache.Set(usesKey, value)
+
+                                            return value
+                                        finally
+                                            projectUsesInFlight.TryRemove(usesKey) |> ignore
+                                    }),
+                                LazyThreadSafetyMode.ExecutionAndPublication
+                            )
+                    )
+
+                let work = pending.Value
+                observeFault work
 
                 try
-                    // The timed boundary must cover BOTH the type-check AND the synchronous
-                    // GetAllUsesOfAllSymbols() re-walk (~3 s+, uncancellable once started) —
-                    // otherwise a check finishing near the deadline lets the use-walk overrun
-                    // the advertised budget with no timeout entry (Codex review). Running both
-                    // inside one token-scoped async means F#'s cancellation check at the `let!`
-                    // bind refuses to START the walk once the deadline has passed.
-                    let compute =
-                        async {
-                            let! results = checker.ParseAndCheckProject(options)
-                            let uses = results.GetAllUsesOfAllSymbols()
-                            return uses, results.Diagnostics
-                        }
-
-                    let! uses, diags = Async.StartAsTask(compute, cancellationToken = cts.Token)
-                    projectUsesCache.Set(usesKey, (uses, diags))
-                    return uses, diags
-                with :? OperationCanceledException | :? TaskCanceledException ->
+                    return! work.WaitAsync(TimeSpan.FromMilliseconds(float (max 1 timeoutMs)))
+                with :? TimeoutException ->
                     return
                         raise (
                             TimeoutException(
@@ -3351,15 +3401,22 @@ type internal FcsBridge() =
 
             // Per-project sweep. Sequential by design: parallel Ionide.ProjInfo option
             // resolution races on MSBuild's *.nuget.g.props for sibling projects that
-            // share a P2P reference; FCS also serializes ParseAndCheckProject internally,
-            // so the set_project pre-warm + solution-scale cache (not intra-call
-            // parallelism) is what removes the cold cost. See the spike's -m:1 finding.
+            // share a P2P reference; FCS also serializes ParseAndCheckProject internally.
             for fsproj in projectsToSweep do
                 let projSw = System.Diagnostics.Stopwatch.StartNew()
                 let projDisplay = Path.GetFileNameWithoutExtension fsproj
 
                 try
-                    let! options, _ = this.ResolveFsprojOptions(fsproj)
+                    let remainingBeforeLoad = sweepBudgetMs - int sweepSw.ElapsedMilliseconds
+
+                    if remainingBeforeLoad <= 0 then
+                        raise (TimeoutException($"Overall find budget of %d{sweepBudgetMs}ms was exhausted."))
+
+                    let optionsTask = this.ResolveFsprojOptions(fsproj)
+                    observeFault optionsTask
+
+                    let! options, _ =
+                        optionsTask.WaitAsync(TimeSpan.FromMilliseconds(float remainingBeforeLoad))
 
                     // issue #131: memoize the whole-symbol-use enumeration per (project,
                     // source-stamp, referenced-assembly-stamp, referenced-project-sources-
@@ -6443,6 +6500,8 @@ type internal FcsBridge() =
         }
 
     member _.ClearCaches() =
+        Interlocked.Increment(&optionsCacheGeneration) |> ignore
+        Interlocked.Increment(&projectUsesCacheGeneration) |> ignore
         optionsCache.Clear()
         projectResultsCache.Clear()
         // issue #131: a new set_project (or any explicit cache clear) must drop the
