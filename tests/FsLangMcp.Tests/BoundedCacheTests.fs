@@ -1,5 +1,6 @@
 module FsLangMcp.Tests.BoundedCacheTests
 
+open System
 open FsLangMcp.BoundedCache
 open Xunit
 open System.Threading.Tasks
@@ -52,6 +53,36 @@ let ``Clear empties the cache`` () =
     cache.Clear()
     Assert.Equal(None, cache.TryGet("a"))
     Assert.Equal(None, cache.TryGet("b"))
+
+[<Fact>]
+let ``TryRemove does not let stale order entries exceed capacity`` () =
+    let cache = BoundedCache<string, int>(2)
+    cache.Set("a", 1)
+    cache.Set("b", 2)
+    Assert.True(cache.TryRemove("a"))
+    cache.Set("c", 3)
+    cache.Set("d", 4)
+    Assert.Equal(2, cache.Count)
+    Assert.Equal(None, cache.TryGet("b"))
+    Assert.Equal(Some 3, cache.TryGet("c"))
+    Assert.Equal(Some 4, cache.TryGet("d"))
+
+[<Fact>]
+let ``Reinserted key keeps its new FIFO position after TryRemove`` () =
+    let cache = BoundedCache<string, int>(2)
+    cache.Set("a", 1)
+    cache.Set("b", 2)
+    Assert.True(cache.TryRemove("a"))
+    cache.Set("a", 10)
+    cache.Set("c", 3)
+    Assert.Equal(None, cache.TryGet("b"))
+    Assert.Equal(Some 10, cache.TryGet("a"))
+    Assert.Equal(Some 3, cache.TryGet("c"))
+
+[<Fact>]
+let ``Non-positive capacity is rejected`` () =
+    Assert.Throws<ArgumentException>(fun () -> BoundedCache<string, int>(0) |> ignore)
+    |> ignore
 
 [<Fact>]
 let ``Capacity-1 cache evicts on each new key`` () =

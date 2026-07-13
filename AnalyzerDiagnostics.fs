@@ -310,14 +310,13 @@ let detectRunner () : string option =
         None
     else
         try
-            let psi = ProcessStartInfo("fsharp-analyzers", "--version")
-            psi.RedirectStandardOutput <- true
-            psi.RedirectStandardError <- true
-            psi.UseShellExecute <- false
-            psi.CreateNoWindow <- true
-            use p = Process.Start(psi)
+            let result =
+                FsLangMcp.ProcessRunner.run
+                    "fsharp-analyzers"
+                    [ "--version" ]
+                    (TimeSpan.FromSeconds(15.0))
 
-            if p.WaitForExit(15000) && p.ExitCode = 0 then
+            if result.ExitCode = 0 then
                 Some "fsharp-analyzers"
             else
                 None
@@ -332,58 +331,30 @@ let runAnalyzers (command: string) (projectPath: string) : Result<string, string
     let reportPath =
         Path.Combine(Path.GetTempPath(), $"fslangmcp_analyzers_{Guid.NewGuid():N}.sarif")
 
-    // Bound the wait: a wedged/misbehaving CLI must surface as an error, not hang the
-    // caller's fcsGate slot forever. 120s is generous for a mid-sized project's analyzer pass.
-    let runTimeoutMs = 120_000
+    let runTimeout = TimeSpan.FromSeconds(120.0)
 
     try
-        let psi = ProcessStartInfo(command)
-        psi.ArgumentList.Add("--project")
-        psi.ArgumentList.Add(projectPath)
-        psi.ArgumentList.Add("--report")
-        psi.ArgumentList.Add(reportPath)
-        psi.RedirectStandardOutput <- true
-        psi.RedirectStandardError <- true
-        psi.UseShellExecute <- false
-        psi.CreateNoWindow <- true
-        use p = Process.Start(psi)
-
-        // Drain BOTH pipes concurrently, started BEFORE waiting. The CLI's actual payload is
-        // the SARIF file at reportPath, not stdout/stderr — those are just console chatter.
-        // But if either pipe is left unread and the child writes more than the OS pipe buffer
-        // (~64KB, easily hit by per-file progress logging on a mid-sized project), the child
-        // blocks on the write, never exits, and WaitForExit blocks forever.
-        let stdoutTask = p.StandardOutput.ReadToEndAsync()
-        let stderrTask = p.StandardError.ReadToEndAsync()
-
-        if not (p.WaitForExit runTimeoutMs) then
-            try
-                p.Kill true
-            with _ ->
-                ()
-
-            Error $"fsharp-analyzers timed out after {runTimeoutMs}ms"
-        else
-            // Exited in time — await both reads so the pipes are fully drained before touching
-            // the report file.
-            let stderr = stderrTask.GetAwaiter().GetResult()
-            stdoutTask.GetAwaiter().GetResult() |> ignore
+        try
+            let result =
+                FsLangMcp.ProcessRunner.run
+                    command
+                    [ "--project"; projectPath; "--report"; reportPath ]
+                    runTimeout
 
             if File.Exists reportPath then
-                let sarif = File.ReadAllText reportPath
-
-                try
-                    File.Delete reportPath
-                with _ ->
-                    ()
-
-                Ok sarif
+                Ok(File.ReadAllText reportPath)
             else
                 Error(
-                    if String.IsNullOrWhiteSpace stderr then
-                        $"fsharp-analyzers produced no report (exit {p.ExitCode})"
+                    if String.IsNullOrWhiteSpace result.StandardError then
+                        $"fsharp-analyzers produced no report (exit %d{result.ExitCode})"
                     else
-                        stderr.Trim()
+                        result.StandardError.Trim()
                 )
-    with ex ->
-        Error ex.Message
+        with ex ->
+            Error ex.Message
+    finally
+        try
+            if File.Exists reportPath then
+                File.Delete reportPath
+        with _ ->
+            ()

@@ -12,6 +12,7 @@ open FsLangMcp.ProjectHealth
 open FsLangMcp.ProjectInspection
 open FsLangMcp.Tools
 open FsLangMcp.RuntimeStatus
+open FsLangMcp.ProcessRunner
 open FsMcp.Core
 open FsMcp.Core.Validation
 open FsMcp.Server
@@ -20,26 +21,25 @@ open System.Text.Json.Nodes
 
 // ─── CLI helpers ───────────────────────────────────────────────────────────────
 
+let private readPositiveIntEnv (name: string) (defaultValue: int) =
+    match Environment.GetEnvironmentVariable(name) with
+    | null -> defaultValue
+    | value ->
+        match Int32.TryParse(value) with
+        | true, parsed when parsed > 0 -> parsed
+        | _ -> defaultValue
+
+let private timeoutFromEnv (name: string) (defaultMilliseconds: int) =
+    TimeSpan.FromMilliseconds(float (readPositiveIntEnv name defaultMilliseconds))
+
 let private runProcess (fileName: string) (args: string list) =
-    let psi = ProcessStartInfo()
-    psi.FileName <- fileName
-    psi.UseShellExecute <- false
-    psi.RedirectStandardOutput <- true
-    psi.RedirectStandardError <- true
-    psi.CreateNoWindow <- true
+    let result =
+        ProcessRunner.run
+            fileName
+            args
+            (timeoutFromEnv "FSLANGMCP_BOOTSTRAP_TIMEOUT_MS" 300_000)
 
-    for arg in args do
-        psi.ArgumentList.Add(arg)
-
-    use proc = new Process(StartInfo = psi)
-
-    if not (proc.Start()) then
-        invalidOp $"Unable to start process: %s{fileName}"
-
-    let stdout = proc.StandardOutput.ReadToEnd()
-    let stderr = proc.StandardError.ReadToEnd()
-    proc.WaitForExit()
-    proc.ExitCode, stdout, stderr
+    result.ExitCode, result.StandardOutput, result.StandardError
 
 let private parseProjInfoOutput (path: string) (exitCode: int) (stdout: string) (stderr: string) : JsonNode =
     if exitCode <> 0 then
@@ -74,48 +74,24 @@ let private parseProjInfoOutput (path: string) (exitCode: int) (stdout: string) 
 
 let private runProjInfoAsync (path: string) : Task<JsonNode> =
     task {
-        let psi = ProcessStartInfo()
-        psi.FileName <- "proj-info"
-        psi.UseShellExecute <- false
-        psi.RedirectStandardOutput <- true
-        psi.RedirectStandardError <- true
-        psi.CreateNoWindow <- true
-        psi.ArgumentList.Add("--project")
-        psi.ArgumentList.Add(path)
-        psi.ArgumentList.Add("--fcs")
-        psi.ArgumentList.Add("--serialize")
+        try
+            let! result =
+                ProcessRunner.runAsync
+                    "proj-info"
+                    [ "--project"; path; "--fcs"; "--serialize" ]
+                    (timeoutFromEnv "FSLANGMCP_PROJ_INFO_TIMEOUT_MS" 120_000)
+                    CancellationToken.None
 
-        use proc = new Process(StartInfo = psi)
-
-        let started =
-            try
-                proc.Start()
-            with
-            | :? System.ComponentModel.Win32Exception
-            | :? System.IO.IOException ->
+            return parseProjInfoOutput path result.ExitCode result.StandardOutput result.StandardError
+        with
+        | :? System.ComponentModel.Win32Exception
+        | :? IOException ->
+            return
                 raise (
                     FileNotFoundException
                         "proj-info not found on PATH. Install with: dotnet tool install -g ionide.projinfo.tool"
                 )
-
-        if not started then
-            raise (InvalidOperationException "Unable to start proj-info process")
-
-        let stdoutTask = proc.StandardOutput.ReadToEndAsync()
-        let stderrTask = proc.StandardError.ReadToEndAsync()
-        let! stdout = stdoutTask
-        let! stderr = stderrTask
-        do! proc.WaitForExitAsync()
-        return parseProjInfoOutput path proc.ExitCode stdout stderr
     }
-
-let private readPositiveIntEnv (name: string) (defaultValue: int) =
-    match Environment.GetEnvironmentVariable(name) with
-    | null -> defaultValue
-    | value ->
-        match Int32.TryParse(value) with
-        | true, parsed when parsed > 0 -> parsed
-        | _ -> defaultValue
 
 let private runLimited (gate: SemaphoreSlim) (work: unit -> Task<JsonNode>) : Task<JsonNode> =
     task {
@@ -207,7 +183,9 @@ let main argv =
         use bridge = new FsAutoCompleteBridge()
         let fcsBridge = new FcsBridge()
         use fcsGate = new SemaphoreSlim(readPositiveIntEnv "FSLANGMCP_MAX_CONCURRENT_FCS" 2)
-        use lspGate = new SemaphoreSlim(readPositiveIntEnv "FSLANGMCP_MAX_CONCURRENT_LSP" 1)
+        // FSAC owns one mutable workspace. Keep the public gate fixed at one; the bridge
+        // also serializes internally because some FCS orchestrators call LSP directly.
+        use lspGate = new SemaphoreSlim(1, 1)
 
         let versionResponse: Task<JsonNode> =
             task {
@@ -256,30 +234,6 @@ let main argv =
                                     task {
                                         let! result = bridge.SetProject args
                                         fcsBridge.ClearCaches()
-
-                                        // Fire-and-forget pre-warm (issue #128): kick a background
-                                        // ParseAndCheckProject over every member project so the FIRST
-                                        // `find` sweep hits FCS's (solution-scale) project cache warm
-                                        // instead of paying cold type-check cost. Acquire the fcsGate
-                                        // per project so concurrent real tool calls still interleave.
-                                        match bridge.CurrentProjectPath with
-                                        | Some activeProject ->
-                                            let warmTargets =
-                                                FsLangMcp.ProjectFiles.SolutionParsing.listProjects activeProject
-
-                                            if warmTargets.Length > 0 then
-                                                (task {
-                                                    for fsproj in warmTargets do
-                                                        do! fcsGate.WaitAsync()
-
-                                                        try
-                                                            do! fcsBridge.PrewarmProject fsproj
-                                                        finally
-                                                            fcsGate.Release() |> ignore
-                                                 }
-                                                 :> Task)
-                                                |> ignore
-                                        | None -> ()
 
                                         // Enrich readiness.projectOptions by probing the first loaded .fsproj.
                                         // Bridge cannot do this itself (no FCS handle); we own that wiring here.

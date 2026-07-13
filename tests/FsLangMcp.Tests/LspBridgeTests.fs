@@ -1,14 +1,86 @@
 module FsLangMcp.Tests.LspBridgeTests
 
 open System
+open System.Diagnostics
 open System.IO
 open System.Text.Json
+open System.Threading.Tasks
 open Xunit
 open FsLangMcp.LspBridge
 
 let private jsonElement (json: string) =
     use doc = JsonDocument.Parse(json)
     doc.RootElement.Clone()
+
+[<Fact>]
+let ``Disposing bridge clears diagnostics and their freshness timestamps`` () =
+    let bridge = new FsAutoCompleteBridge()
+    let diagnostics = bridge.DiagnosticsStore
+    let analyzedAt = bridge.DiagnosticsAnalyzedAtStore
+    diagnostics["file:///old.fs"] <- System.Text.Json.Nodes.JsonArray()
+    analyzedAt["file:///old.fs"] <- DateTimeOffset.UtcNow
+
+    (bridge :> IDisposable).Dispose()
+
+    Assert.Empty(diagnostics)
+    Assert.Empty(analyzedAt)
+
+[<Fact>]
+let ``Startup timeout kills an unresponsive FSAC child`` () : Task =
+    task {
+        let id = Guid.NewGuid().ToString("N")
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_lsp_timeout_%s{id}")
+        let projectPath = Path.Combine(root, "App.fsproj")
+        let scriptPath = Path.Combine(root, "hang.fsx")
+        let pidPath = Path.Combine(root, "child.pid")
+
+        try
+            Directory.CreateDirectory(root) |> ignore
+            File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+
+            File.WriteAllText(
+                scriptPath,
+                $"System.IO.File.WriteAllText(@\"%s{pidPath}\", System.Environment.ProcessId.ToString())\nSystem.Threading.Thread.Sleep(30000)\n"
+            )
+
+            use bridge =
+                new FsAutoCompleteBridge(
+                    startupTimeoutOverride = TimeSpan.FromSeconds(3.0),
+                    fsacCommandOverride = "dotnet",
+                    fsacArgsOverride = [ "fsi"; "--exec"; scriptPath ]
+                )
+
+            let operation =
+                bridge.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some true }
+                )
+
+            let! error = Assert.ThrowsAsync<TimeoutException>(fun () -> operation :> Task)
+            Assert.Contains("initialize", error.Message)
+            Assert.True(File.Exists(pidPath), "The fake FSAC child did not start before timeout.")
+
+            let pid = File.ReadAllText(pidPath) |> Int32.Parse
+
+            let isRunning () =
+                try
+                    use child = Process.GetProcessById(pid)
+                    not child.HasExited
+                with :? ArgumentException ->
+                    false
+
+            let deadline = DateTimeOffset.UtcNow.AddSeconds(2.0)
+
+            while isRunning () && DateTimeOffset.UtcNow < deadline do
+                do! Task.Delay(25)
+
+            Assert.False(isRunning (), $"Timed-out FSAC child %d{pid} is still running.")
+            Assert.True(bridge.FsacProcess.IsNone)
+        finally
+            if Directory.Exists(root) then
+                Directory.Delete(root, true)
+    }
 
 [<Fact>]
 let ``workspace notification parser recognizes FSAC content wrapped finished event`` () =

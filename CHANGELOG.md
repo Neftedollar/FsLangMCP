@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `BoundedCache.TryRemove` now removes its FIFO node as well as the dictionary entry. Repeated fresh checks can no longer grow the eviction queue without bound, exceed cache capacity, or evict a newly reinserted value through a stale queue entry.
+- All FSAC handshakes and live LSP calls now have bounded, configurable timeouts. A timeout cancels the StreamJsonRpc request, kills/resets the current FSAC child, and releases the serialized LSP slot.
+- LSP lifecycle, document synchronization, and invocation are serialized inside `FsAutoCompleteBridge`; `set_project` can no longer dispose an RPC while `find`, refactor orchestration, or a raw LSP tool is using it. Concurrent project switches are serialized through a separate lifecycle gate.
+- FSAC restart now clears diagnostics freshness timestamps together with diagnostics payloads, preventing an empty new workspace from reporting an old `analyzedAt` / `mostRecentAnalyzedAt`.
+- Bootstrap, `proj-info`, and analyzer subprocesses now share a kill-on-timeout runner that drains stdout and stderr concurrently. Chatty or wedged children no longer deadlock a tool slot or survive timeout cleanup; analyzer report files are removed on every exit path.
+- Removed the untracked fire-and-forget solution prewarm started by `set_project`; repeated project switches no longer accumulate stale FCS jobs competing for the global FCS gate.
+- `find` now enforces its timeout with `Task.WaitAsync` around project-option loading and the complete type-check + synchronous symbol-use walk. Since FCS cannot preempt work already in progress, one in-flight computation is retained per project/cache key and reused by retries instead of spawning additional abandoned workers; cache-generation checks prevent late completion from repopulating caches after `set_project`.
+
+### Changed
+
+- LSP concurrency is fixed at one. `FSLANGMCP_MAX_CONCURRENT_LSP` is no longer honored because FSAC exposes one mutable workspace; FCS concurrency remains configurable with `FSLANGMCP_MAX_CONCURRENT_FCS`.
+- Added timeout settings: `FSLANGMCP_LSP_STARTUP_TIMEOUT_MS`, `FSLANGMCP_LSP_REQUEST_TIMEOUT_MS`, `FSLANGMCP_PROJ_INFO_TIMEOUT_MS`, and `FSLANGMCP_BOOTSTRAP_TIMEOUT_MS`.
+
 ## [0.12.3] - 2026-07-05
 
 Follow-up patch addressing two P2 findings from Codex's review of the 0.12.2 correctness patch — both on the 0.12.2 fixes themselves.
