@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-08-02
+
+### Fixed
+
+- **Windows startup crash inherited from the bundled FsMcp.** 0.13.0 shipped with
+  FsMcp 1.2.1, whose stderr sink opened Unix file descriptor 2 directly. On Windows
+  that throws `The handle is invalid` while the logger provider is constructed, so
+  the server failed at startup. As a `DotnetTool` package the FsMcp assemblies are
+  bundled rather than resolved at install time, so the only remedy is a rebuild.
+  0.13.1 bundles FsMcp 1.2.2, which selects the sink per platform.
+
+  **Windows users on 0.13.0 must upgrade.** macOS and Linux are unaffected.
+
 ## [0.13.0] - 2026-08-02
 
 ### Fixed
