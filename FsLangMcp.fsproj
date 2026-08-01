@@ -4,7 +4,7 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <PackageId>FsLangMcp</PackageId>
-    <Version>0.12.3</Version>
+    <Version>0.13.0</Version>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>fslangmcp</ToolCommandName>
     <PackageOutputPath>./nupkg</PackageOutputPath>
@@ -54,8 +54,8 @@
       <IncludeAssets>build</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="FsMcp.Server" Version="1.1.*" />
-    <PackageReference Include="FsMcp.TaskApi" Version="1.1.*" />
+    <PackageReference Include="FsMcp.Server" Version="1.2.*" />
+    <PackageReference Include="FsMcp.TaskApi" Version="1.2.*" />
     <PackageReference Include="G-Research.FSharp.Analyzers" Version="0.22.*" GeneratePathProperty="true">
       <IncludeAssets>analyzers</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>

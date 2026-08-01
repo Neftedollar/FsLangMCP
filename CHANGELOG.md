@@ -8,9 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-02
+
 ### Fixed
 
 - `BoundedCache.TryRemove` now removes its FIFO node as well as the dictionary entry. Repeated fresh checks can no longer grow the eviction queue without bound, exceed cache capacity, or evict a newly reinserted value through a stale queue entry.
+
+  **Impact.** Before this fix the cache was not bounded at all. `TryRemove` dropped the dictionary entry but left the key in the eviction queue, and eviction only fires on `dict.Count >= maxSize` while removing a single queue entry per insert. Landing on a stale key freed no slot yet still admitted the new entry, so every invalidation permanently raised the effective ceiling by one. Applied to `projectResultsCache` — declared capacity 3, values of type `FSharpCheckProjectResults`, i.e. a whole project's type-check state — a long editing session accumulated tens of gigabytes. Observed in the field: a server reaching **34.7 GB RSS after 14 hours**, which on a 32 GB machine drove the OS into swap thrash (84 swapfiles, VM compressor at 100% of its segment limit) until the kernel watchdog panicked the host. Reproduced against the released 0.12.3 implementation: a cache declared with capacity 10 held 20 entries after 10 invalidations; with this fix it holds 10.
 - All FSAC handshakes and live LSP calls now have bounded, configurable timeouts. A timeout cancels the StreamJsonRpc request, kills/resets the current FSAC child, and releases the serialized LSP slot.
 - LSP lifecycle, document synchronization, and invocation are serialized inside `FsAutoCompleteBridge`; `set_project` can no longer dispose an RPC while `find`, refactor orchestration, or a raw LSP tool is using it. Concurrent project switches are serialized through a separate lifecycle gate.
 - FSAC restart now clears diagnostics freshness timestamps together with diagnostics payloads, preventing an empty new workspace from reporting an old `analyzedAt` / `mostRecentAnalyzedAt`.
@@ -22,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - LSP concurrency is fixed at one. `FSLANGMCP_MAX_CONCURRENT_LSP` is no longer honored because FSAC exposes one mutable workspace; FCS concurrency remains configurable with `FSLANGMCP_MAX_CONCURRENT_FCS`.
 - Added timeout settings: `FSLANGMCP_LSP_STARTUP_TIMEOUT_MS`, `FSLANGMCP_LSP_REQUEST_TIMEOUT_MS`, `FSLANGMCP_PROJ_INFO_TIMEOUT_MS`, and `FSLANGMCP_BOOTSTRAP_TIMEOUT_MS`.
+- Requires FsMcp 1.2.x (was 1.1.x). FsMcp 1.2.0 fixes a stdio deadlock: hosts that never read the server's stderr filled the 64 KB pipe, and because the built-in console logger wrote through `ConsolePal`'s process-wide monitor — shared with stdout — the parked write blocked the next response. The server went silent while still holding live requests. Affects any host that discards stderr.
 
 ## [0.12.3] - 2026-07-05
 
