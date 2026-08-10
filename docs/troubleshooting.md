@@ -46,12 +46,13 @@ you can catch this without reading FCS error messages.
 
 ---
 
-## `set_project` required before `textDocument_*` / `workspace_*` tools
+## `set_project` required before raw LSP-proxy tools
 
 The raw LSP-proxy tools (`textDocument_completion`, `textDocument_formatting`,
-`textDocument_codeAction`, `textDocument_rename`, `fsharp_signature_data`) and
-workspace tools require an initialized FSAC workspace. If called before
-`set_project` completes, they return `{"status": "not_ready"}`.
+`textDocument_codeAction`, `textDocument_rename`, `fsharp_signature_data`)
+require an initialized FSAC workspace. If called before `set_project` completes,
+they return `{"status": "not_ready"}`. `fcs_signature_help` is in-process FCS
+and does not require LSP readiness when explicit project options are supplied.
 
 **Remediation:**
 
@@ -63,9 +64,10 @@ wait for partial readiness automatically.
 
 ## `symbolIndex` is `false` right after `set_project`
 
-`set_project` reports `readiness.symbolIndex=false` immediately after load. The
-symbol index warms in the background while FSAC loads the project — this is
-expected, not an error.
+`set_project` can report `readiness.symbolIndex=false` immediately after load.
+Read `readiness.symbolIndexState` and `readiness.symbolIndexHint`: they distinguish
+a normally `warming` index from an LSP that is `blocked_on_lsp` or `not_started`,
+and state whether to wait/retry or call `set_project` with `restartLsp=true`.
 
 **What to do:** Start using `find`, `check`, and outline tools normally. They
 trigger on-demand type-checking per file and don't depend on a fully warmed
@@ -122,11 +124,12 @@ dotnet tool update -g FsLangMcp
 FCS caches project-wide results in memory. After editing a file, you may see
 a brief window where `check` returns a cached snapshot.
 
-**Remediation:** Call `check` with `speed: "trusted default"` (the default) rather
-than `speed: "fast"`. The trusted default always performs a fresh in-process
+**Remediation:** Call `check` with `speed: "trusted"` (the default) rather
+than `speed: "fast"`. Trusted mode always performs a fresh in-process
 type-check; `fast` returns the cached FSAC snapshot and may reflect
 pre-edit state. If stale results persist, call `set_project` again to clear
-FCS caches.
+semantic-analysis caches. FsLangMCP retains MSBuild project options only while
+their project, imports, restore outputs, and source-directory inputs are unchanged.
 
 ---
 

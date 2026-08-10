@@ -654,12 +654,13 @@ let ``project_health reports binaryOutputPath when matching dll exists under bin
         Assert.True(proj["lastBuildSucceeded"].GetValue<bool>())
         Assert.NotNull(proj["lastBuildAt"])
         Assert.Equal(dllPath, proj["binaryOutputPath"].GetValue<string>())
+        Assert.Equal("Release", proj["configuration"].GetValue<string>())
     finally
         if Directory.Exists root then Directory.Delete(root, true)
 
 [<Fact>]
 let ``project_health new fields present on success path for any project`` () =
-    // Verifies that every successful project_health response includes the six new fields.
+    // Verifies that every successful project_health response includes the test/build fields.
     let runId = System.Guid.NewGuid().ToString("N")
     let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_fields_present_%s{runId}")
     try
@@ -674,6 +675,7 @@ let ``project_health new fields present on success path for any project`` () =
         Assert.True(proj.ContainsKey("lastBuildSucceeded"))
         Assert.True(proj.ContainsKey("lastBuildAt"))
         Assert.True(proj.ContainsKey("binaryOutputPath"))
+        Assert.True(proj.ContainsKey("configuration"))
     finally
         if Directory.Exists root then Directory.Delete(root, true)
 
@@ -806,5 +808,183 @@ let ``project_health summarizes a multi-project solution instead of blocking (#1
         Assert.Equal("solution", ((result["toolingReadiness"])["overall"]).GetValue<string>())
         Assert.Equal(2, ((result["solution"])["projectCount"]).GetValue<int>())
         Assert.Equal(2, ((result["solution"])["projects"]).AsArray().Count)
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+// ─── v0.13.2 regressions from #100 field feedback ──────────────────────────────
+
+[<Fact>]
+let ``project_health uses the active solution workspace root for reverse test discovery`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_workspace_%s{runId}")
+
+    try
+        let sourceDir = Path.Combine(root, "src", "Library")
+        let projectPath = writeNonTestProject sourceDir
+        let testsDir = Path.Combine(root, "tests", "Library.Tests")
+        Directory.CreateDirectory(testsDir) |> ignore
+        File.WriteAllText(Path.Combine(testsDir, "Tests.fs"), "module Tests\n\n[<Xunit.Fact>]\nlet ok () = ()\n")
+
+        let testProjectPath = Path.Combine(testsDir, "Library.Tests.fsproj")
+        let relativeProjectReference = Path.GetRelativePath(testsDir, projectPath)
+
+        File.WriteAllText(
+            testProjectPath,
+            String.concat
+                "\n"
+                [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+                  "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+                  "  <ItemGroup><Compile Include=\"Tests.fs\" /></ItemGroup>"
+                  "  <ItemGroup>"
+                  "    <PackageReference Include=\"xunit\" Version=\"2.9.0\" />"
+                  $"    <ProjectReference Include=\"%s{relativeProjectReference}\" />"
+                  "  </ItemGroup>"
+                  "</Project>" ]
+        )
+
+        let solutionPath = Path.Combine(root, "Workspace.slnx")
+        File.WriteAllText(solutionPath, "<Solution />")
+
+        // Simulate an explicit per-project health request after set_project selected
+        // the solution: no workspacePath argument, but the live LSP snapshot knows its root.
+        let snapshot =
+            { ProjectPath = Some solutionPath
+              WorkspaceRoot = Some root
+              WorkspaceReady = true
+              DiagnosticsFileCount = 0 }
+
+        let result = report (healthArgs projectPath None) snapshot
+        let discovered = (result["tests"]["projects"]).AsArray()
+
+        Assert.Equal(root, (result["workspace"]["workspaceRoot"]).GetValue<string>())
+        Assert.Equal("test_projects_found", (result["tests"]["status"]).GetValue<string>())
+        Assert.Single(discovered) |> ignore
+        Assert.Equal(testProjectPath, (discovered[0]["projectPath"]).GetValue<string>())
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Fact>]
+let ``analyzer config discovery walks ancestors independently and nearest files shadow parents`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_configs_%s{runId}")
+
+    try
+        let projectDir = Path.Combine(root, "src", "Library")
+        let projectPath = writeNonTestProject projectDir
+        let nearerProps = Path.Combine(root, "src", "Directory.Build.props")
+        let rootProps = Path.Combine(root, "Directory.Build.props")
+        let rootTargets = Path.Combine(root, "Directory.Build.targets")
+        let rootPackages = Path.Combine(root, "Directory.Packages.props")
+        let rootEditorConfig = Path.Combine(root, ".editorconfig")
+
+        // The parent props contains a real analyzer, but normal nearest-file MSBuild
+        // lookup must stop at the closer, bare props file under src/.
+        File.WriteAllText(
+            rootProps,
+            "<Project><ItemGroup><PackageReference Include=\"Parent.Analyzer\" Version=\"1.0\" /></ItemGroup></Project>"
+        )
+        File.WriteAllText(nearerProps, "<Project />")
+        File.WriteAllText(rootTargets, "<Project />")
+        File.WriteAllText(rootPackages, "<Project />")
+        File.WriteAllText(rootEditorConfig, "root = true\n")
+
+        let config = detectAnalyzerConfig projectPath |> Result.defaultWith failwith
+
+        Assert.False(config.Configured)
+        Assert.Empty(config.Packages)
+        Assert.Equal<string list>(
+            [ nearerProps; rootTargets; rootPackages; rootEditorConfig ],
+            config.ConfigFiles
+        )
+
+        // A sibling project with no nearer override inherits and scans the root props.
+        let siblingProjectPath = writeNonTestProject (Path.Combine(root, "samples", "Consumer"))
+        let inheritedConfig = detectAnalyzerConfig siblingProjectPath |> Result.defaultWith failwith
+        Assert.True(inheritedConfig.Configured)
+        Assert.Contains(inheritedConfig.Packages, fun package -> package.PackageId = "Parent.Analyzer")
+        Assert.Contains(rootProps, inheritedConfig.ConfigFiles)
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Fact>]
+let ``analyzer PackageReference reads child metadata and attributes take precedence`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_package_metadata_%s{runId}")
+
+    try
+        Directory.CreateDirectory(root) |> ignore
+        File.WriteAllText(Path.Combine(root, "Library.fs"), "module Library\n")
+        let projectPath = Path.Combine(root, "Library.fsproj")
+
+        File.WriteAllText(
+            projectPath,
+            String.concat
+                "\n"
+                [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+                  "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+                  "  <ItemGroup><Compile Include=\"Library.fs\" /></ItemGroup>"
+                  "  <ItemGroup>"
+                  "    <PackageReference Include=\"Contoso.Tooling\">"
+                  "      <Version>1.2.3</Version>"
+                  "      <IncludeAssets>analyzers;build</IncludeAssets>"
+                  "      <PrivateAssets>all</PrivateAssets>"
+                  "    </PackageReference>"
+                  "    <PackageReference Include=\"Override.Analyzer\" Version=\"2.0.0\" IncludeAssets=\"runtime\" PrivateAssets=\"compile\">"
+                  "      <Version>9.9.9</Version>"
+                  "      <IncludeAssets>analyzers</IncludeAssets>"
+                  "      <PrivateAssets>all</PrivateAssets>"
+                  "    </PackageReference>"
+                  "    <PackageReference Include=\"CaseInsensitive.Tooling\">"
+                  "      <version>3.4.5</version>"
+                  "      <includeassets>analyzers</includeassets>"
+                  "      <privateassets>all</privateassets>"
+                  "    </PackageReference>"
+                  "  </ItemGroup>"
+                  "</Project>" ]
+        )
+
+        let result = report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
+        let packages = (result["analyzers"]["analyzers"]).AsArray()
+        let byId = packages |> Seq.map (fun p -> (p["packageId"]).GetValue<string>(), p) |> Map.ofSeq
+        let childOnly = byId["Contoso.Tooling"]
+        let attributeFirst = byId["Override.Analyzer"]
+        let caseInsensitive = byId["CaseInsensitive.Tooling"]
+
+        Assert.Equal("analyzers_configured", (result["analyzers"]["status"]).GetValue<string>())
+        Assert.Equal("1.2.3", childOnly["version"].GetValue<string>())
+        Assert.Equal("analyzers;build", childOnly["includeAssets"].GetValue<string>())
+        Assert.Equal("all", childOnly["privateAssets"].GetValue<string>())
+        Assert.Equal("2.0.0", attributeFirst["version"].GetValue<string>())
+        Assert.Equal("runtime", attributeFirst["includeAssets"].GetValue<string>())
+        Assert.Equal("compile", attributeFirst["privateAssets"].GetValue<string>())
+        Assert.Equal("3.4.5", caseInsensitive["version"].GetValue<string>())
+        Assert.Equal("analyzers", caseInsensitive["includeAssets"].GetValue<string>())
+        Assert.Equal("all", caseInsensitive["privateAssets"].GetValue<string>())
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health reports the configuration of the selected build artifact`` () =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_build_config_%s{runId}")
+
+    try
+        let projectPath = writeNonTestProject root
+        let debugDir = Path.Combine(root, "bin", "Debug", "net10.0")
+        let releaseDir = Path.Combine(root, "bin", "Release", "net10.0")
+        Directory.CreateDirectory(debugDir) |> ignore
+        Directory.CreateDirectory(releaseDir) |> ignore
+        let debugDll = Path.Combine(debugDir, "Library.dll")
+        let releaseDll = Path.Combine(releaseDir, "Library.dll")
+        File.WriteAllBytes(debugDll, [||])
+        File.WriteAllBytes(releaseDll, [||])
+        File.SetLastWriteTimeUtc(debugDll, System.DateTime.UtcNow.AddMinutes(-2.0))
+        File.SetLastWriteTimeUtc(releaseDll, System.DateTime.UtcNow.AddMinutes(-1.0))
+
+        let result = report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
+        let project = result["project"]
+
+        Assert.Equal(releaseDll, project["binaryOutputPath"].GetValue<string>())
+        Assert.Equal("Release", project["configuration"].GetValue<string>())
     finally
         if Directory.Exists root then Directory.Delete(root, true)

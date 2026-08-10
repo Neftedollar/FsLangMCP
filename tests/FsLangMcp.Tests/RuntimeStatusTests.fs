@@ -161,6 +161,17 @@ let ``buildSnapshot gcInfo totalAllocated is non-negative`` () =
     Assert.True(allocated >= 0L)
 
 [<Fact>]
+let ``buildSnapshot exposes non-negative thread diagnostics`` () =
+    let result = buildSnapshot defaultArgs defaultConfig None
+    let proc = node result "process"
+    let threads = node proc "threads"
+
+    Assert.True(getIntAt threads "process" >= 0)
+    Assert.True(getIntAt threads "threadPool" >= 0)
+    Assert.True(threads["pendingWorkItems"].GetValue<int64>() >= 0L)
+    Assert.True(threads["completedWorkItems"].GetValue<int64>() >= 0L)
+
+[<Fact>]
 let ``buildSnapshot assemblies loaded count is positive`` () =
     let result = buildSnapshot defaultArgs defaultConfig None
     let proc = node result "process"

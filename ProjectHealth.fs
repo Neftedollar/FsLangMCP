@@ -21,6 +21,26 @@ let private attr (name: string) (element: XElement) =
     | null -> None
     | value -> Some value.Value
 
+/// Read ordinary MSBuild item metadata. NuGet accepts metadata both as an XML
+/// attribute and as a child element; when both are present, the attribute is
+/// the value MSBuild exposes and therefore wins here too.
+let private itemMetadata (name: string) (element: XElement) =
+    element.Attributes()
+    |> Seq.tryPick (fun attribute ->
+        if attribute.Name.LocalName.Equals(name, StringComparison.OrdinalIgnoreCase) then
+            let value = attribute.Value.Trim()
+            if String.IsNullOrWhiteSpace value then None else Some value
+        else
+            None)
+    |> Option.orElseWith (fun () ->
+        element.Elements()
+        |> Seq.tryPick (fun child ->
+            if child.Name.LocalName.Equals(name, StringComparison.OrdinalIgnoreCase) then
+                let value = child.Value.Trim()
+                if String.IsNullOrWhiteSpace value then None else Some value
+            else
+                None))
+
 let private childValue (name: string) (doc: XDocument) =
     doc.Descendants(xname name)
     |> Seq.tryPick (fun element ->
@@ -98,23 +118,25 @@ type AnalyzerConfig =
       Packages: AnalyzerPackageInfo list
       ConfigFiles: string list }
 
+let private tryAnalyzerPackageInfo (element: XElement) : AnalyzerPackageInfo option =
+    let includeValue =
+        attr "Include" element |> Option.orElseWith (fun () -> attr "Update" element)
+
+    let includeAssets = itemMetadata "IncludeAssets" element |> Option.defaultValue ""
+
+    includeValue
+    |> Option.filter (fun packageId ->
+        packageId.Contains("Analyzer", StringComparison.OrdinalIgnoreCase)
+        || includeAssets.Contains("analyzers", StringComparison.OrdinalIgnoreCase))
+    |> Option.map (fun packageId ->
+        { PackageId = packageId
+          Version = itemMetadata "Version" element
+          IncludeAssets = includeAssets
+          PrivateAssets = itemMetadata "PrivateAssets" element })
+
 let private analyzerPackageInfos (doc: XDocument) : AnalyzerPackageInfo list =
     doc.Descendants(xname "PackageReference")
-    |> Seq.choose (fun element ->
-        let includeValue =
-            attr "Include" element |> Option.orElseWith (fun () -> attr "Update" element)
-
-        let includeAssets = attr "IncludeAssets" element |> Option.defaultValue ""
-
-        includeValue
-        |> Option.filter (fun packageId ->
-            packageId.Contains("Analyzer", StringComparison.OrdinalIgnoreCase)
-            || includeAssets.Contains("analyzers", StringComparison.OrdinalIgnoreCase))
-        |> Option.map (fun packageId ->
-            { PackageId = packageId
-              Version = attr "Version" element
-              IncludeAssets = includeAssets
-              PrivateAssets = attr "PrivateAssets" element }))
+    |> Seq.choose tryAnalyzerPackageInfo
     |> Seq.toList
 
 /// Render one analyzer package as the JSON object project_health and
@@ -238,8 +260,13 @@ let private countTestAttributesInFile (filePath: string) =
     with _ ->
         0
 
+type private BuildArtifactInfo =
+    { Path: string
+      Configuration: string option }
+
 /// Find the most-recently-written .dll under bin/ whose basename matches the
-/// project name (case-insensitive). Returns absolute path or None.
+/// project name (case-insensitive), together with the conventional first path
+/// segment under bin/ (normally Debug or Release) as its configuration.
 /// Searches only inside projectDir/bin/ to avoid OOM walks on monorepos.
 let private findLatestBuildArtifact (projectDir: string) (projectName: string) =
     let binDir = Path.Combine(projectDir, "bin")
@@ -256,6 +283,19 @@ let private findLatestBuildArtifact (projectDir: string) (projectName: string) =
                     StringComparison.OrdinalIgnoreCase))
             |> Seq.sortByDescending File.GetLastWriteTimeUtc
             |> Seq.tryHead
+            |> Option.map (fun path ->
+                let relativePath = Path.GetRelativePath(binDir, path)
+
+                let segments =
+                    relativePath.Split(
+                        [| Path.DirectorySeparatorChar; Path.AltDirectorySeparatorChar |],
+                        StringSplitOptions.RemoveEmptyEntries
+                    )
+
+                { Path = path
+                  // A direct bin/Foo.dll does not encode a configuration. Keep
+                  // that unknown instead of guessing from another project property.
+                  Configuration = if segments.Length > 1 then Some segments[0] else None })
         with _ ->
             None
 
@@ -299,13 +339,19 @@ let private testProjectInfo
 
     let lastBuildAt : JsonNode =
         match latestArtifact with
-        | Some p -> jstr (File.GetLastWriteTimeUtc(p).ToString("o"))
+        | Some artifact -> jstr (File.GetLastWriteTimeUtc(artifact.Path).ToString("o"))
         | None   -> null
 
     let binaryOutputPath : JsonNode =
         match latestArtifact with
-        | Some p -> jstr p
+        | Some artifact -> jstr artifact.Path
         | None   -> null
+
+    let configuration : JsonNode =
+        latestArtifact
+        |> Option.bind _.Configuration
+        |> Option.map jstr
+        |> Option.defaultValue null
 
     jobj
         [ "isTestProject",    JsonValue.Create(isTest) :> JsonNode
@@ -313,7 +359,8 @@ let private testProjectInfo
           "testCount",        testCountNode
           "lastBuildSucceeded", lastBuildSucceeded
           "lastBuildAt",      lastBuildAt
-          "binaryOutputPath", binaryOutputPath ]
+          "binaryOutputPath", binaryOutputPath
+          "configuration", configuration ]
 
 let private discoverTestProjects (workspaceRoot: string) (currentProjectPath: string) =
     if not (Directory.Exists workspaceRoot) then
@@ -353,14 +400,40 @@ let private discoverTestProjects (workspaceRoot: string) (currentProjectPath: st
                     None)
         |> Seq.toArray
 
+/// Walk up from `startDir` to the filesystem root, returning the first existing path among
+/// the relative candidates. Mirrors MSBuild's nearest-Directory.Build.* lookup and the
+/// conventional `.config/dotnet-tools.json` discovery.
+let private findNearestUpwards (startDir: string) (relativeCandidates: string list) : string option =
+    let rec loop (dir: string) =
+        if String.IsNullOrEmpty dir then
+            None
+        else
+            match
+                relativeCandidates
+                |> List.tryPick (fun rel ->
+                    let p = Path.Combine(dir, rel)
+                    if File.Exists p then Some(Path.GetFullPath p) else None)
+            with
+            | Some hit -> Some hit
+            | None ->
+                let parent = Path.GetDirectoryName dir
+
+                if String.IsNullOrEmpty parent || String.Equals(parent, dir, StringComparison.Ordinal) then
+                    None
+                else
+                    loop parent
+
+    loop (Path.GetFullPath startDir)
+
 let private findAnalyzerConfigFiles (projectDir: string) =
     [ "Directory.Build.props"
       "Directory.Build.targets"
       "Directory.Packages.props"
       ".editorconfig" ]
-    |> List.choose (fun fileName ->
-        let path = Path.Combine(projectDir, fileName)
-        if File.Exists path then Some path else None)
+    // Each MSBuild/config filename has its own nearest-file search. A nearer
+    // Directory.Build.props must not accidentally hide an independently located
+    // Directory.Build.targets (or vice versa).
+    |> List.choose (fun fileName -> findNearestUpwards projectDir [ fileName ])
 
 /// Analyzer PackageReferences can be centralized in an MSBuild import
 /// (Directory.Build.props/.targets, or Directory.Packages.props via GlobalPackageReference)
@@ -380,21 +453,7 @@ let private analyzerPackagesFromConfigFile (path: string) : AnalyzerPackageInfo 
             [ "PackageReference"; "GlobalPackageReference" ]
             |> List.collect (fun elemName ->
                 doc.Descendants(xname elemName)
-                |> Seq.choose (fun element ->
-                    let includeValue =
-                        attr "Include" element |> Option.orElseWith (fun () -> attr "Update" element)
-
-                    let includeAssets = attr "IncludeAssets" element |> Option.defaultValue ""
-
-                    includeValue
-                    |> Option.filter (fun packageId ->
-                        packageId.Contains("Analyzer", StringComparison.OrdinalIgnoreCase)
-                        || includeAssets.Contains("analyzers", StringComparison.OrdinalIgnoreCase))
-                    |> Option.map (fun packageId ->
-                        { PackageId = packageId
-                          Version = attr "Version" element
-                          IncludeAssets = includeAssets
-                          PrivateAssets = attr "PrivateAssets" element }))
+                |> Seq.choose tryAnalyzerPackageInfo
                 |> Seq.toList)
         with _ ->
             []
@@ -588,12 +647,31 @@ let createReport
             | Ok doc ->
                 let projectDir = Path.GetDirectoryName(projectPath)
 
+                let normalizeWorkspaceRoot (path: string) =
+                    let fullPath = Path.GetFullPath path
+                    if File.Exists fullPath then Path.GetDirectoryName fullPath else fullPath
+
+                let containsProject (workspaceRoot: string) =
+                    let relative = Path.GetRelativePath(workspaceRoot, projectPath)
+                    let parentPrefix = $"..%c{Path.DirectorySeparatorChar}"
+
+                    not (Path.IsPathRooted relative)
+                    && not (String.Equals(relative, "..", StringComparison.Ordinal))
+                    && not (relative.StartsWith(parentPrefix, StringComparison.Ordinal))
+
                 let workspaceRoot =
-                    args.workspacePath
-                    |> Option.map (fun p ->
-                        let full = Path.GetFullPath p
-                        if File.Exists full then Path.GetDirectoryName full else full)
-                    |> Option.defaultValue projectDir
+                    match args.workspacePath with
+                    | Some path -> normalizeWorkspaceRoot path
+                    | None ->
+                        // After set_project on a solution, the active project may live
+                        // under src/ while reverse-reference tests live under tests/.
+                        // Prefer the live workspace root when it actually contains the
+                        // inspected project; explicit out-of-workspace inspections still
+                        // fall back to their own project directory.
+                        lspSnapshot.WorkspaceRoot
+                        |> Option.map normalizeWorkspaceRoot
+                        |> Option.filter (fun root -> Directory.Exists root && containsProject root)
+                        |> Option.defaultValue projectDir
 
                 let files = compileFiles projectPath doc
                 let fileSummary = sourceSummary files
@@ -702,7 +780,9 @@ let createReport
                     if not analyzerCfg.Configured then
                         jobj
                             [ "status", jstr "no_analyzers_configured"
-                              "analyzers", JsonArray() :> JsonNode ]
+                              "analyzers", JsonArray() :> JsonNode
+                              "configurationFiles",
+                              JsonArray(analyzerConfigFiles |> List.map jstr |> List.toArray) :> JsonNode ]
                     else
                         jobj
                             [ "status", jstr "analyzers_configured"
@@ -750,7 +830,8 @@ let createReport
                                 "testCount",        (let n = testInfo["testCount"] in if isNull n then null else n.DeepClone())
                                 "lastBuildSucceeded", (let n = testInfo["lastBuildSucceeded"] in if isNull n then null else n.DeepClone())
                                 "lastBuildAt",      (let n = testInfo["lastBuildAt"] in if isNull n then null else n.DeepClone())
-                                "binaryOutputPath", (let n = testInfo["binaryOutputPath"] in if isNull n then null else n.DeepClone()) ]
+                                "binaryOutputPath", (let n = testInfo["binaryOutputPath"] in if isNull n then null else n.DeepClone())
+                                "configuration", (let n = testInfo["configuration"] in if isNull n then null else n.DeepClone()) ]
                           "workspace",
                           jobj
                               [ "workspaceRoot", jstr workspaceRoot
@@ -796,31 +877,6 @@ let private analyzersBuildPackage = "FSharp.Analyzers.Build"
 let private analyzersBuildVersion = "0.5.*"
 let private fsharpAnalyzersToolVersion = "0.36.0"
 let private analyzerDllSubPath = "analyzers/dotnet/fs"
-
-/// Walk up from `startDir` to the filesystem root, returning the first existing path among
-/// the relative candidates. Mirrors MSBuild's nearest-Directory.Build.* lookup and the
-/// conventional `.config/dotnet-tools.json` discovery.
-let private findNearestUpwards (startDir: string) (relativeCandidates: string list) : string option =
-    let rec loop (dir: string) =
-        if String.IsNullOrEmpty dir then
-            None
-        else
-            match
-                relativeCandidates
-                |> List.tryPick (fun rel ->
-                    let p = Path.Combine(dir, rel)
-                    if File.Exists p then Some(Path.GetFullPath p) else None)
-            with
-            | Some hit -> Some hit
-            | None ->
-                let parent = Path.GetDirectoryName dir
-
-                if String.IsNullOrEmpty parent || String.Equals(parent, dir, StringComparison.Ordinal) then
-                    None
-                else
-                    loop parent
-
-    loop startDir
 
 /// Read an XML doc, returning None when it is missing or unreadable.
 let private tryReadProjectOpt (path: string) =

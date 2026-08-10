@@ -22,6 +22,12 @@
       "totalAllocated": <number>,
       "lastTrigger": "<gen>"
     },
+    "threads": {
+      "process": <number>,
+      "threadPool": <number>,
+      "pendingWorkItems": <number>,
+      "completedWorkItems": <number>
+    },
     "assemblies": {
       "loaded": <number>,
       "lastLoaded": "<assembly>"

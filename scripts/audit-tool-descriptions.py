@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit MCP tool descriptions in Program.fs against the 5-slot schema.
+"""Audit MCP tool descriptions in Program.fs against the 4-slot schema.
 
 Schema reference: docs/tool-description-schema.md
 

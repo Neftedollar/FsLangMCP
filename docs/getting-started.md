@@ -44,7 +44,7 @@ Call `set_project` with the path to your `.fsproj`, `.sln`, `.slnx`, or project 
 set_project { "projectPath": "/absolute/path/to/MyApp.sln" }
 ```
 
-The response includes `readiness` flags (`lsp`, `projectOptions`, `symbolIndex`) and `loadedProjects`. Wait until `readiness.lsp` is `true` before calling LSP-proxy tools.
+The response includes `readiness` flags (`lsp`, `projectOptions`, `symbolIndex`) and `loadedProjects`. Wait until `readiness.lsp` is `true` before calling LSP-proxy tools. If `symbolIndex` is `false`, follow `symbolIndexState` and the actionable `symbolIndexHint`; `find` and `check` remain available while the FSAC index warms.
 
 ### Step 2 — use `find` and `check` as your primary entry points
 
@@ -71,7 +71,7 @@ Once you have a base signal from `find` and `check`, the other 33 tools let you 
 
 ```
 1. set_project  {"projectPath": "/abs/path/MyApp.sln"}
-   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.12.1"
+   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.13.2"
 
 2. check  {}
    → verdict="clean"

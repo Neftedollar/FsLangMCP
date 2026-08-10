@@ -88,24 +88,29 @@ Response shape:
 
 ```json
 {
-  "status": "ready",
-  "fslangmcpVersion": "0.12.1",
-  "projectCount": 2,
-  "lspRestarted": true,
-  "loadedProjects": [
-    "…/Domain/Domain.fsproj",
-    "…/App/App.fsproj"
-  ],
-  "readiness": {
-    "lsp": true,
-    "projectOptions": true,
-    "symbolIndex": false
+  "status": "ok",
+  "result": {
+    "fslangmcpVersion": "0.13.2",
+    "lspRestartRequested": true,
+    "lspRestarted": true,
+    "lspReplacedExistingProcess": false,
+    "workspaceLoadStatus": "ready",
+    "loadedProjects": [
+      "…/Domain/Domain.fsproj",
+      "…/App/App.fsproj"
+    ],
+    "readiness": {
+      "lsp": true,
+      "projectOptions": true,
+      "symbolIndex": false,
+      "symbolIndexState": "warming"
+    }
   }
 }
 ```
 
-`readiness.symbolIndex` starts false; it warms in the background. The other two
-tools work immediately once `lsp` and `projectOptions` are both true.
+`result.readiness.symbolIndex` can start false while the index warms in the
+background. `check` and `find` remain available when `projectOptions` is true.
 
 ---
 
@@ -289,6 +294,6 @@ dotnet run --project App/App.fsproj
 
 - **Response field names are exact**: `totalSites`, `breakdown`, `sites[].kind`,
   `sites[].symbolFullName`, `sites[].lineText`, `resolution.projectsSwept` all
-  match the v0.12.1 tool implementation.
+  match the v0.13.2 tool implementation.
 
 - **Time to first success: ~3 minutes** (install + bootstrap + four tool calls).

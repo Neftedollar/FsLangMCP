@@ -9,10 +9,10 @@ module FsLangMcp.Tests.CheckTests
 // that into a single field — `verdict` ∈ { clean, errors, unknown } — backed by a FRESH
 // in-process FCS re-check on the default speed="trusted".
 //
-// Fixture: one leaf project Probe with two source files (Helpers.fs consumed by Main.fs)
-// built ONCE, so cross-file edits exercise the stale-`{}` property. Each test sets the
-// on-disk source it needs first (xUnit serialises methods within a class), so the FCS
-// re-check is what makes the verdict reflect the current revision.
+// Fixture: one leaf project Probe where Helpers.fs is consumed by Main.fs, built ONCE,
+// so cross-file edits exercise the stale-`{}` property. Each test sets the on-disk source
+// it needs first (xUnit serialises methods within a class), so the FCS re-check is what
+// makes the verdict reflect the current revision.
 
 open System
 open System.IO
@@ -36,6 +36,12 @@ let private brokenHelpers =
 let private cleanMain =
     String.concat "\n" [ "module Probe.Main"; ""; "open Probe.Helpers"; ""; "let result: int = add 1 2"; "" ]
 
+let private standaloneSignature =
+    String.concat "\n" [ "module Probe.Standalone"; ""; "val answer: int"; "" ]
+
+let private standaloneImplementation =
+    String.concat "\n" [ "module Probe.Standalone"; ""; "let answer = 42"; "" ]
+
 // Self-contained single-file type error (string assigned to int).
 let private errorMain =
     String.concat "\n" [ "module Probe.Main"; ""; "let x: int = \"oops\""; "" ]
@@ -46,6 +52,8 @@ let private probeProject =
         [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
           "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
           "  <ItemGroup>"
+          "    <Compile Include=\"Standalone.fsi\" />"
+          "    <Compile Include=\"Standalone.fs\" />"
           "    <Compile Include=\"Helpers.fs\" />"
           "    <Compile Include=\"Main.fs\" />"
           "  </ItemGroup>"
@@ -64,6 +72,8 @@ type CheckFixture() =
         full
 
     let probeFsproj = write "Probe/Probe.fsproj" probeProject
+    let standaloneFsi = write "Probe/Standalone.fsi" standaloneSignature
+    let _standaloneFs = write "Probe/Standalone.fs" standaloneImplementation
     let helpersFs = write "Probe/Helpers.fs" cleanHelpers
     let mainFs = write "Probe/Main.fs" cleanMain
 
@@ -108,6 +118,7 @@ type CheckFixture() =
 
     member _.Root = root
     member _.ProbeFsproj = probeFsproj
+    member _.StandaloneFsi = standaloneFsi
     member _.HelpersFs = helpersFs
     member _.MainFs = mainFs
     member _.BuildExitCode = buildExit
@@ -201,6 +212,44 @@ type CheckTests(fx: CheckFixture) =
             Assert.Equal("file", gs result "scope")
             Assert.Equal("errors", gs result "verdict")
             Assert.True(gi result "errorCount" > 0)
+        }
+
+    [<Theory>]
+    [<InlineData(".fsproj")>]
+    [<InlineData(".sln")>]
+    [<InlineData(".slnx")>]
+    member _.``check path rejects project and solution files with structured InvalidArgument``(extension: string) : Task =
+        task {
+            let nonSourcePath = Path.Combine(fx.Root, $"NotSource{extension}")
+            File.WriteAllText(nonSourcePath, "")
+            let bridge = FcsBridge()
+
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        path = Some nonSourcePath
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            Assert.Equal("error", gs result "status")
+            Assert.Equal("InvalidArgument", gs result "errorKind")
+            Assert.Contains(".fs/.fsi", gs result "message")
+        }
+
+    [<Fact>]
+    member _.``check path accepts an F# signature file``() : Task =
+        task {
+            let bridge = FcsBridge()
+
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        path = Some fx.StandaloneFsi
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            Assert.Equal("succeeded", gs result "status")
+            Assert.Equal("file", gs result "scope")
         }
 
     [<Fact>]

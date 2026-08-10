@@ -35,6 +35,25 @@ let private surfaceFs =
           ""
           "type private PrivateRecord = { Hidden: string }"
           ""
+          "type Box<'T> = { Value: 'T }"
+          ""
+          "type GenericRecord ="
+          "    { Text: string option"
+          "      Count: int option"
+          "      Names: string list"
+          "      Boxed: Box<string> }"
+          ""
+          "type GenericMethods ="
+          "    static member Convert(value: Box<int>) : Box<string> = { Value = string value.Value }"
+          ""
+          "module Acme ="
+          "    module Microsoft ="
+          "        module FSharp ="
+          "            module Core ="
+          "                type Widget<'T> = { Value: 'T }"
+          ""
+          "type QualifiedRecord = { Custom: Acme.Microsoft.FSharp.Core.Widget<string> }"
+          ""
           "type Widget() ="
           "    member _.Visible () = 1"
           "    member internal _.HiddenMember () = 2"
@@ -69,6 +88,7 @@ type SurfaceFixture() =
     let bridge = FcsBridge()
 
     member _.Project = project
+    member _.Source = Path.Combine(root, "Surface.fs")
     member internal _.Bridge = bridge
 
     interface IDisposable with
@@ -116,6 +136,12 @@ let private memberKind (entity: JsonNode) (name: string) : string option =
             else
                 None)
     | _ -> None
+
+let private memberSignature (entity: JsonNode) (name: string) : string =
+    (entity["members"] :?> JsonArray)
+    |> Seq.cast<JsonNode>
+    |> Seq.find (fun m -> m["name"].GetValue<string>() = name)
+    |> fun m -> m["signature"].GetValue<string>()
 
 // ─────────────────────────────────────────────────────────────────────────────────
 
@@ -190,6 +216,42 @@ type PublicApiTests(fx: SurfaceFixture) =
         }
 
     [<Fact>]
+    member _.``generic signatures preserve concrete arguments in readable FSharp form`` () : Task =
+        task {
+            let! result = fx.Bridge.PublicApi(baseArgs fx.Project)
+
+            let record = tryEntity result "Probe.Surface.GenericRecord"
+            Assert.True(record.IsSome)
+            Assert.Equal("Text: string option", memberSignature record.Value "Text")
+            Assert.Equal("Count: int option", memberSignature record.Value "Count")
+            Assert.Equal("Names: string list", memberSignature record.Value "Names")
+            Assert.Equal("Boxed: Probe.Surface.Box<string>", memberSignature record.Value "Boxed")
+
+            let methods = tryEntity result "Probe.Surface.GenericMethods"
+            Assert.True(methods.IsSome)
+            Assert.Equal(
+                "Convert(value: Probe.Surface.Box<int>) -> Probe.Surface.Box<string>",
+                memberSignature methods.Value "Convert"
+            )
+
+            let qualified = tryEntity result "Probe.Surface.QualifiedRecord"
+            Assert.True(qualified.IsSome)
+            Assert.Equal(
+                "Custom: Probe.Surface.Acme.Microsoft.FSharp.Core.Widget<string>",
+                memberSignature qualified.Value "Custom"
+            )
+
+            for signature in
+                [ memberSignature record.Value "Text"
+                  memberSignature record.Value "Count"
+                  memberSignature record.Value "Names"
+                  memberSignature record.Value "Boxed"
+                  memberSignature methods.Value "Convert"
+                  memberSignature qualified.Value "Custom" ] do
+                Assert.DoesNotContain("`1", signature)
+        }
+
+    [<Fact>]
     member _.``entities and members are stably sorted`` () : Task =
         task {
             let! result = fx.Bridge.PublicApi({ baseArgs fx.Project with includeInternal = Some true })
@@ -234,6 +296,118 @@ type PublicApiTests(fx: SurfaceFixture) =
             Assert.True(entityCount >= 3, $"expected >= 3 entities, got {entityCount}")
             // memberCount is the sum across the whole surface and must be positive.
             Assert.True(memberCount > 0, $"expected memberCount > 0, got {memberCount}")
+        }
+
+    [<Fact>]
+    member _.``public API cache invalidates when a project source file changes`` () : Task =
+        task {
+            let original = File.ReadAllText(fx.Source)
+
+            try
+                let! before = fx.Bridge.PublicApi(baseArgs fx.Project)
+                Assert.DoesNotContain("Probe.Surface.AddedAfterEdit", entityFullNames before)
+
+                File.WriteAllText(fx.Source, original + "\ntype AddedAfterEdit = { Value: int }\n")
+                File.SetLastWriteTimeUtc(fx.Source, DateTime.UtcNow.AddSeconds(2.0))
+
+                let! after = fx.Bridge.PublicApi(baseArgs fx.Project)
+                Assert.Contains("Probe.Surface.AddedAfterEdit", entityFullNames after)
+            finally
+                File.WriteAllText(fx.Source, original)
+        }
+
+    [<Fact>]
+    member _.``public API reloads project options when the compile graph changes`` () : Task =
+        task {
+            let originalProject = File.ReadAllText(fx.Project)
+            let addedFile = Path.Combine(Path.GetDirectoryName(fx.Project), "Added.fs")
+
+            try
+                let! before = fx.Bridge.PublicApi(baseArgs fx.Project)
+                Assert.DoesNotContain("Probe.Added.AddedByCompileGraph", entityFullNames before)
+
+                File.WriteAllText(
+                    addedFile,
+                    "module Probe.Added\n\ntype AddedByCompileGraph = { Value: int }\n"
+                )
+
+                let updatedProject =
+                    originalProject.Replace(
+                        "    <Compile Include=\"Surface.fs\" />",
+                        "    <Compile Include=\"Surface.fs\" />"
+                        + Environment.NewLine
+                        + "    <Compile Include=\"Added.fs\" />"
+                    )
+
+                File.WriteAllText(fx.Project, updatedProject)
+                File.SetLastWriteTimeUtc(fx.Project, DateTime.UtcNow.AddSeconds(2.0))
+
+                let! after = fx.Bridge.PublicApi(baseArgs fx.Project)
+                Assert.Contains("Probe.Added.AddedByCompileGraph", entityFullNames after)
+            finally
+                File.WriteAllText(fx.Project, originalProject)
+
+                if File.Exists addedFile then
+                    File.Delete addedFile
+        }
+
+    [<Fact>]
+    member _.``project options stay warm across analysis clears and coalesce an input refresh`` () : Task =
+        task {
+            let bridge = FcsBridge()
+            let projectDir = Path.GetDirectoryName(fx.Project)
+            let directoryBuildProps = Path.Combine(projectDir, "Directory.Build.props")
+
+            let assertLoaded = function
+                | Ok _ -> ()
+                | Error message -> Assert.Fail($"project-options probe failed: {message}")
+
+            try
+                let before = bridge.ProjectOptionsLoadCount
+                let! first = bridge.ProbeProjectOptions(fx.Project)
+                assertLoaded first
+
+                let afterFirst = bridge.ProjectOptionsLoadCount
+                Assert.Equal(before + 1L, afterFirst)
+
+                // set_project uses this lighter clear: unchanged MSBuild inputs must not
+                // invoke Ionide again (each real invocation owns MSBuild node threads).
+                for _ in 1..8 do
+                    bridge.ClearAnalysisCaches()
+                    let! warm = bridge.ProbeProjectOptions(fx.Project)
+                    assertLoaded warm
+
+                Assert.Equal(afterFirst, bridge.ProjectOptionsLoadCount)
+
+                // A previously-missing ancestor import is part of the fingerprint. All
+                // concurrent stale callers must share one refresh, then remain warm.
+                File.WriteAllText(
+                    directoryBuildProps,
+                    "<Project><PropertyGroup><FsLangMcpCacheProbe>true</FsLangMcpCacheProbe></PropertyGroup></Project>"
+                )
+
+                let probes = Array.init 12 (fun _ -> bridge.ProbeProjectOptions(fx.Project))
+                let! refreshed = Task.WhenAll(probes)
+                refreshed |> Array.iter assertLoaded
+
+                let afterRefresh = bridge.ProjectOptionsLoadCount
+                Assert.Equal(afterFirst + 1L, afterRefresh)
+
+                // Fresh file checks invalidate semantic results, not project options.
+                let checkArgs: FcsParseAndCheckArgs =
+                    { path = fx.Source
+                      text = None
+                      projectPath = Some fx.Project
+                      projectOptions = None }
+
+                let! firstCheck = bridge.CheckFile(checkArgs)
+                let! secondCheck = bridge.CheckFile(checkArgs)
+                Assert.Equal("succeeded", firstCheck["status"].GetValue<string>())
+                Assert.Equal("succeeded", secondCheck["status"].GetValue<string>())
+                Assert.Equal(afterRefresh, bridge.ProjectOptionsLoadCount)
+            finally
+                if File.Exists directoryBuildProps then
+                    File.Delete directoryBuildProps
         }
 
     [<Fact>]
