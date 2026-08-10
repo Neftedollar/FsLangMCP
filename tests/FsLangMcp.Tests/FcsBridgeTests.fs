@@ -735,6 +735,79 @@ let ``fcs_file_outline bypasses File.Exists gate when non-empty text is supplied
     }
 
 [<Fact>]
+let ``fcs_parse_and_check_file accepts fsx and uses script inference`` () : Task =
+    task {
+        let bridge = FcsBridge()
+        let scriptPath = Path.Combine(Path.GetTempPath(), $"fslangmcp_script_%O{Guid.NewGuid()}.fsx")
+
+        try
+            File.WriteAllText(scriptPath, "let answer = 42\n")
+
+            let! result =
+                bridge.ParseAndCheckFile(
+                    { path = scriptPath
+                      text = None
+                      projectPath = None
+                      projectOptions = None }
+                )
+
+            Assert.NotEqual<string>("error", result["status"].GetValue<string>())
+            Assert.Equal("scriptInference", result["optionsSource"].GetValue<string>())
+        finally
+            if File.Exists scriptPath then
+                File.Delete scriptPath
+    }
+
+[<Fact>]
+let ``fcs_parse_and_check_file refreshes cached script options when load directives change`` () : Task =
+    task {
+        let bridge = FcsBridge()
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_script_refresh_%O{Guid.NewGuid()}")
+        let scriptPath = Path.Combine(root, "Main.fsx")
+        let loadedPath = Path.Combine(root, "Loaded.fsx")
+
+        try
+            Directory.CreateDirectory(root) |> ignore
+            File.WriteAllText(scriptPath, "let answer = 42\n")
+            File.WriteAllText(loadedPath, "module Loaded\nlet answer = 42\n")
+
+            let args text =
+                { path = scriptPath
+                  text = text
+                  projectPath = None
+                  projectOptions = None }
+
+            let! before = bridge.ParseAndCheckFile(args None)
+            Assert.Equal("scriptInference", before["optionsSource"].GetValue<string>())
+
+            let beforeSourceFiles =
+                (before["projectSourceFiles"] :?> JsonArray)
+                |> Seq.map (fun item -> item.GetValue<string>())
+                |> Seq.toArray
+
+            Assert.DoesNotContain(Path.GetFullPath(loadedPath), beforeSourceFiles)
+
+            // ClearAnalysisCaches is what set_project uses. Script options may survive
+            // only when their source (including #load/#r/#I directives) is unchanged.
+            bridge.ClearAnalysisCaches()
+
+            let updated = "#load \"Loaded.fsx\"\nopen Loaded\nlet fromLoad = answer\n"
+            let! after = bridge.ParseAndCheckFile(args (Some updated))
+
+            Assert.Equal("scriptInference", after["optionsSource"].GetValue<string>())
+
+            let sourceFiles =
+                (after["projectSourceFiles"] :?> JsonArray)
+                |> Seq.map (fun item -> item.GetValue<string>())
+                |> Seq.toArray
+
+            Assert.Contains(Path.GetFullPath(loadedPath), sourceFiles)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
 let ``fcs_file_outline still rejects a directory path even when text is supplied`` () : Task =
     // Finding 1: the directory guard must remain active even with a non-empty text buffer.
     task {

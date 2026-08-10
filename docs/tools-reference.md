@@ -8,7 +8,7 @@ All positions (`line`, `character`) are **0-based**. `projectPath` is optional o
 
 ## Headline tools
 
-These two tools supersede a cluster of lower-level primitives. Reach for them first.
+These two tools replace the legacy search/check entry points removed in v0.13.1. Reach for them first.
 
 ### `find`
 
@@ -16,7 +16,7 @@ These two tools supersede a cluster of lower-level primitives. Reach for them fi
 
 **Key args:**
 - `query` (required) — symbol name, dotted suffix, or qualified name
-- `kind` — `symbol` | `members` | `field` | `definition` | `position` (default: `symbol`)
+- `kind` — `auto` | `symbol` | `members` | `field` | `definition` | `position` (default: `auto`; unions symbol/member/field sites)
 - `member` — narrow to a specific member name when `kind=members`
 - `scope` — narrow to a file or project
 - `contextLines` — include surrounding source lines in the response
@@ -33,7 +33,7 @@ These two tools supersede a cluster of lower-level primitives. Reach for them fi
 - `scope` — `auto` | `file` | `project` | `workspace` | `snippet` (default: `auto`)
 - `path` — file path when `scope=file`
 - `snippet` — inline source when `scope=snippet`
-- `speed` — `trusted default` (fresh check) | `fast` (cached FSAC snapshot)
+- `speed` — `trusted` (default; fresh check) | `fast` (cached FSAC snapshot)
 - `severity` — filter results by severity level
 
 **Use when:** "Did my edit compile?", "Are there errors in this file?", "Is the workspace clean?"
@@ -44,12 +44,13 @@ These two tools supersede a cluster of lower-level primitives. Reach for them fi
 
 ### `set_project`
 
-**Purpose:** Initialize or switch the FSAC/LSP project context. Must be called before `textDocument_*` and `workspace_*` tools.
+**Purpose:** Initialize or switch the FSAC/LSP project context. Must be called before raw LSP-proxy tools.
 
 **Key args:**
 - `projectPath` (required) — `.fsproj`, `.sln`, `.slnx`, or directory path
+- `restartLsp` — request an FSAC restart (default `true`)
 
-**Response includes:** `loadedProjects`, `readiness` (`lsp` / `projectOptions` / `symbolIndex` flags), `fslangmcpVersion`.
+**Response includes:** `loadedProjects`, `readiness` (`lsp` / `projectOptions` / `symbolIndex` flags plus `symbolIndexState` / `symbolIndexHint`), `lspRestartRequested`, legacy `lspRestarted`, `lspReplacedExistingProcess`, and `fslangmcpVersion`. `lspRestarted` keeps mirroring the request for compatibility; `lspReplacedExistingProcess=true` means a pre-existing FSAC process was actually replaced, so first launch reports `false` there.
 
 **Use when:** Starting a session or switching to a different project. Call once; context persists.
 
@@ -361,9 +362,13 @@ These two tools supersede a cluster of lower-level primitives. Reach for them fi
 
 ---
 
-## Raw LSP proxies
+## Exact-position helpers
 
-These tools are direct proxies to fsautocomplete LSP messages. They require `set_project` first and an exact 0-based position. Prefer the semantic tools above for agent flows; use these for exact-position editor operations and FSAC debugging.
+The `textDocument_*` tools and `fsharp_signature_data` are direct proxies to
+fsautocomplete and require `set_project` plus LSP readiness. `fcs_signature_help`
+runs in-process and instead needs FCS project context via `projectPath`,
+`projectOptions`, or a source path inside a project. Prefer the semantic tools
+above for free-form agent flows.
 
 ### `textDocument_completion`
 
@@ -437,6 +442,6 @@ These tools are direct proxies to fsautocomplete LSP messages. They require `set
 
 ### `fsharp_runtime_status`
 
-**Purpose:** Read-only snapshot of the FsLangMCP process runtime state: managed-heap sizes by generation/LOH/POH, GC collection counts, `isServerGC` flag, assembly load count, FCS checker configuration flags and project-results cache size, and the FSAC child-process working set.
+**Purpose:** Read-only snapshot of the FsLangMCP process runtime state: managed-heap sizes by generation/LOH/POH, GC collection counts, `isServerGC` flag, assembly load count, FCS checker configuration flags and project-results cache size, FSAC child-process working set, and `process.threads` (OS process/ThreadPool counts plus pending/completed work items).
 
 **Use when:** Memory growth monitoring during long multi-agent sessions. Never triggers a GC collection or walks the heap.

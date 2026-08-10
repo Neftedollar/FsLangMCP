@@ -7,6 +7,7 @@ module FsLangMcp.RuntimeStatus
 open System
 open System.Diagnostics
 open System.Runtime
+open System.Threading
 open FsLangMcp.Types
 open System.Text.Json.Nodes
 
@@ -136,6 +137,24 @@ let private assemblyCountJson () : JsonNode =
 
     jobj [ "loaded", jint count; "lastLoaded", jstr lastName ] :> JsonNode
 
+/// Thread counts are intentionally observational: this does not enumerate stacks,
+/// suspend threads, or attach diagnostics. The process count is the OS-visible total;
+/// ThreadPool counters help distinguish worker growth from dedicated/native threads.
+/// The OS count is null only when the platform refuses process-thread inspection.
+let private threadInfoJson (proc: Process) : JsonNode =
+    let processThreads: JsonNode =
+        try
+            jint proc.Threads.Count
+        with _ ->
+            null
+
+    jobj
+        [ "process", processThreads
+          "threadPool", jint ThreadPool.ThreadCount
+          "pendingWorkItems", jint64 ThreadPool.PendingWorkItemCount
+          "completedWorkItems", jint64 ThreadPool.CompletedWorkItemCount ]
+    :> JsonNode
+
 let private fcsStatusJson (config: FcsCheckerConfig) : JsonNode =
     // IncrementalBuilder count is not exposed by the public FCS API on net10.0.
     // Count is null because FSharpChecker does not expose live builder count on net10.0.
@@ -199,6 +218,7 @@ let buildSnapshot
         [ yield "uptimeSeconds", jint uptimeSeconds
           yield "managedHeap", managedHeapJson ()
           yield "gcInfo", gcInfoJson ()
+          yield "threads", threadInfoJson proc
 
           if includeAssemblies then
               yield "assemblies", assemblyCountJson ()

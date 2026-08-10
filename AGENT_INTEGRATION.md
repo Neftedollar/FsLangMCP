@@ -1,6 +1,6 @@
 # Agent Integration Guide
 
-This document describes a recommended workflow for AI coding agents (Claude Code, Cursor, GitHub Copilot CLI, Codex, etc.) that delegate F# work to subagents and use FsLangMCP as the semantic-query layer. It is opinionated — the patterns here came from real production multi-agent runs and have been refined through ~12 subagent sessions and ~700 tool calls against this server.
+This document describes a recommended workflow for AI coding agents (Claude Code, Cursor, GitHub Copilot CLI, Codex, etc.) that delegate F# work to subagents and use FsLangMCP as the semantic-query layer. It targets the 35-tool v0.13.2 surface and is opinionated — the patterns here came from real production multi-agent runs and have been refined through ~12 subagent sessions and ~700 tool calls against this server.
 
 ## Why this guide exists
 
@@ -29,19 +29,20 @@ Drop this into your project's `CLAUDE.md` (Claude Code), your `.cursorrules` (Cu
   - **"Where is X used / defined?"** → `mcp__fslangmcp__find` (one
     multi-project symbol sweep that unions definitions, references,
     record-field set sites, and member-usage sites across every member
-    project). It supersedes the lower-level `workspace_symbol`,
+    project). The former aliases `workspace_symbol`,
     `fcs_find_symbol`, `fcs_project_symbol_uses`, `fcs_find_member_usages`,
     `fcs_record_field_audit`, `textDocument_references`, and
-    `textDocument_definition`.
+    `textDocument_definition` were removed in v0.13.1; use `find` instead.
   - **"Did my edit compile?"** → `mcp__fslangmcp__check` (one
     `clean` / `errors` / `unknown` verdict from a FRESH in-process
-    type-check — no stale-`{}` false-clean, no `dotnet build` fallback). It
-    supersedes the lower-level `workspace_diagnostics`, `fsharp_compile`,
-    `fcs_check_file`, `fcs_parse_and_check_file`, and `fcs_validate_snippet`.
-  - Those twelve cluster tools stay available as lower-level primitives —
-    use them only when you need a specific knob `find` / `check` don't expose.
+    type-check — no stale-`{}` false-clean, no `dotnet build` fallback).
+    The former aliases `workspace_diagnostics`, `fsharp_compile`,
+    `fcs_check_file`, `fcs_parse_and_check_file`, and `fcs_validate_snippet`
+    were removed in v0.13.1; use `check` instead.
+  - Removed aliases are not registered. Update old prompts rather than falling
+    back to a legacy tool name.
   - Other entry points as needed: `project_health`, `fcs_project_outline`,
-    `fcs_type_at_position`.
+    `fcs_symbol_at_word`.
 - `rg` remains correct for non-F# files (`.fsproj`, `paket.dependencies`,
   `Directory.Packages.props`, CI YAML) and textual idiom counts.
 
@@ -56,7 +57,7 @@ Apply the tool that matches the data shape, not the calendar:
 | Semantic question on compiled F# source | fslangmcp                     |
 | Textual scan of .fsproj XML / YAML / md | rg                            |
 | NuGet third-party type enumeration      | `fcs_nuget_types` / `fcs_referenced_symbols` (shipped v0.7.0) |
-| Unfiled draft `.fsi` sketches in specs/ | `fcs_validate_snippet` with `mode="fsi"` (shipped v0.7.0) |
+| Unfiled F# snippet                      | `check` with `scope="snippet"` and `snippet` |
 | Markdown design docs                    | Direct Read                   |
 
 Three independent agent runs in this project confirmed: design-phase tasks
@@ -72,10 +73,10 @@ section telling the subagent to:
 1. **Use `fslangmcp`** for all semantic F# queries. Spell out canonical
    entry points: `mcp__fslangmcp__set_project` once, then `check` for a
    compile verdict after edits, `find` for "where is X used / defined?"
-   navigation, `fcs_project_outline` for structure, and `fcs_type_at_position`
-   for types. The single-project `workspace_symbol` / `textDocument_references`
-   / `workspace_diagnostics` primitives are lower-level fallbacks behind
-   `find` / `check`.
+   navigation, `fcs_project_outline` for structure, and `fcs_symbol_at_word`
+   for types. Do not use the removed `workspace_symbol`,
+   `textDocument_references`, or `workspace_diagnostics` aliases; route those
+   requests through `find` / `check`.
 2. **Use `rg` only for non-F# files** (`.fsproj`, `.md`, JSON, YAML, idiom
    counts).
 3. **Deliver a 5–10 bullet end-of-run UX report on `fslangmcp`** — what
@@ -108,9 +109,9 @@ A minimal F# subagent brief skeleton. Embed your task-specific content where ind
 - For F# semantic queries (`.fs` / `.fsi`): use `fslangmcp` MCP. Call
   `mcp__fslangmcp__set_project` ONCE with the repo root, then use `find`
   for "where is X used / defined?", `check` for "did my edit compile?",
-  and `fcs_project_outline` / `fcs_type_at_position` / `textDocument_codeAction`
-  as needed. The single-project `workspace_diagnostics`, `workspace_symbol`,
-  and `textDocument_references` are lower-level fallbacks behind `find` / `check`.
+  and `fcs_project_outline` / `fcs_symbol_at_word` / `textDocument_codeAction`
+  as needed. The removed `workspace_diagnostics`, `workspace_symbol`, and
+  `textDocument_references` aliases are not available; use `find` / `check`.
 - `rg` is OK for non-F# files (.fsproj, .md, .json, .yml).
 - For NuGet third-party type enumeration: `fcs_nuget_types` (exact
   assembly) and `fcs_referenced_symbols` (cross-assembly search), both
@@ -118,7 +119,7 @@ A minimal F# subagent brief skeleton. Embed your task-specific content where ind
 - For unresolved-symbol "what `open` do I add?" lookups:
   `fcs_suggest_open` (shipped v0.9.0).
 - For record-construction-site audits (`{ Field = ... }` /
-  `{ x with Field = ... }`): `fcs_record_field_audit` (shipped v0.8.0).
+  `{ x with Field = ... }`): `find` with `kind="field"`.
 
 ## End-of-run deliverables
 
@@ -181,11 +182,10 @@ The patterns in this guide were not invented in a vacuum. The orchestration log 
 
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — symptom-keyed
   guide for the common failure modes subagents hit (`not_ready` after
-  `set_project`, VS.Threading bind race in subagent contexts, stale
-  `workspace_diagnostics` after edits, `fcs_find_symbol` zero-match
-  cases).
+  `set_project`, VS.Threading bind race in subagent contexts, stale-check
+  concerns after edits, and `find` zero-match cases).
 - [`docs/tool-description-schema.md`](docs/tool-description-schema.md) —
-  the 5-slot description schema used by every registered tool. Useful
+  the 4-slot description schema used by every registered tool. Useful
   when authoring agent rules that route by tool description.
 
 ## License

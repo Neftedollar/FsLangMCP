@@ -205,7 +205,7 @@ let main argv =
                 tool (
                     TypedTool.define<CompletionArgs>
                         "textDocument_completion"
-                        "Raw LSP proxy to fsautocomplete textDocument/completion. Exact-position IDE primitive; requires set_project first. line/character are 0-based. Pass 'text' for unsaved content. Avoid for free-form agent flows — completion is exact-position editor IO; for symbol semantics use fcs_symbol_at_word or fcs_type_at_position instead."
+                        "Raw LSP proxy to fsautocomplete textDocument/completion. Exact-position IDE primitive; requires set_project first. line/character are 0-based. Pass 'text' for unsaved content. Avoid for free-form agent flows — completion is exact-position editor IO; for symbol semantics use fcs_symbol_at_word or find(kind=position) instead."
                         (fun args -> toolResult (runLimited lspGate (fun () -> bridge.Completion args)))
                     |> unwrapResult
                 )
@@ -213,7 +213,7 @@ let main argv =
                 tool (
                     TypedTool.define<CheckArgs>
                         "check"
-                        "One trustworthy verdict for the active F# context. Bare check() suffices: returns `verdict` (clean|errors|unknown) after a FRESH in-process type-check, so it never reports a stale-`{}` false-clean and you don't fall back to dotnet build. Optional: scope (auto|file|project|workspace|snippet), path, snippet (inline source), speed (trusted default | fast = cached FSAC snapshot), severity. Prefer over workspace_diagnostics / fcs_check_file when you just need a yes/no answer."
+                        "One trustworthy verdict for the active F# context. Bare check() suffices: returns `verdict` (clean|errors|unknown) after a FRESH in-process type-check, so it never reports a stale-`{}` false-clean and you don't fall back to dotnet build. Optional: scope (auto|file|project|workspace|snippet), path, snippet (inline source), speed (trusted default | fast = cached FSAC snapshot), severity. Prefer over raw diagnostics plumbing when you just need a yes/no answer."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -227,13 +227,17 @@ let main argv =
                 tool (
                     TypedTool.define<SetProjectArgs>
                         "set_project"
-                        "Initialize or switch the FSAC/LSP project context. Must be called before textDocument_* and workspace_* tools. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load and clears FCS caches. Response includes loadedProjects (.fsproj paths discovered) and readiness (lsp / projectOptions / symbolIndex flags)."
+                        "Initialize or switch the FSAC/LSP project context. Required before raw LSP proxies. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load and clears stale FCS analysis while retaining validated MSBuild project options. Response includes loadedProjects, readiness, restart intent, and whether a running FSAC process was actually replaced."
                         (fun args ->
                             toolResult (
                                 runLimited lspGate (fun () ->
                                     task {
                                         let! result = bridge.SetProject args
-                                        fcsBridge.ClearCaches()
+                                        // Repeated set_project calls still need fresh semantic results, but
+                                        // re-running Ionide/MSBuild for an unchanged project creates orphaned
+                                        // in-process MSBuild node threads (issue #150). Project options carry
+                                        // their own input stamps; retain them and clear only FCS analysis data.
+                                        fcsBridge.ClearAnalysisCaches()
 
                                         // Enrich readiness.projectOptions by probing the first loaded .fsproj.
                                         // Bridge cannot do this itself (no FCS handle); we own that wiring here.
@@ -321,7 +325,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsReferencedSymbolsArgs>
                         "fcs_referenced_symbols"
-                        "Substring search across the project's referenced assemblies (NuGet + framework) by DisplayName or FullName (case-insensitive). Prefer `fcs_nuget_types` when you already know the exact assembly name. Complements `workspace_symbol` (project-local). Reports assembly, kind, accessibility, isObsolete. `includeNonPublic=true` for internals. Paginated; default 200, max 1000. First call triggers ParseAndCheckProject. Details: docs/tools-detailed.md#fcs_referenced_symbols."
+                        "Substring search across the project's referenced assemblies (NuGet + framework) by DisplayName or FullName (case-insensitive). Prefer `fcs_nuget_types` when you already know the exact assembly name; use `find` for project-local symbols. Reports assembly, kind, accessibility, isObsolete. `includeNonPublic=true` for internals. Paginated; default 200, max 1000. First call triggers ParseAndCheckProject. Details: docs/tools-detailed.md#fcs_referenced_symbols."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -411,7 +415,7 @@ let main argv =
                 tool (
                     TypedTool.define<FcsProjectOutlineArgs>
                         "fcs_project_outline"
-                        "Agent-friendly project outline over filtered compile files. Prefer over `workspace_symbol` for whole-project structural overview — skips generated/build artifacts and returns compact per-file outlines. `projectPath` is optional after `set_project` (falls back to the active project); pass it explicitly for a different .fsproj. Use `maxFiles`/`maxResultsPerFile` on large projects."
+                        "Agent-friendly whole-project structural overview over filtered compile files. Skips generated/build artifacts and returns compact per-file outlines; use `find` for symbol sites instead. `projectPath` is optional after `set_project` (falls back to the active project); pass it explicitly for a different .fsproj. Use `maxFiles`/`maxResultsPerFile` on large projects."
                         (fun args ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -513,7 +517,7 @@ let main argv =
                 tool (
                     TypedTool.define<RuntimeStatusArgs>
                         "fsharp_runtime_status"
-                        "Read-only observational snapshot of the FsLangMCP process runtime state: managed-heap sizes by generation/LOH/POH, GC collection counts, isServerGC flag, assembly load count, FCS checker configuration flags and project-results cache size, and the FSAC child-process working set. Returns numbers only — no interpretation. Never triggers a GC collection, never walks the heap, never attaches diagnostic listeners."
+                        "Read-only observational snapshot of FsLangMCP: managed-heap and GC counters, OS-visible and thread-pool thread counts, assembly count, FCS checker/cache state, and FSAC child working set. Use during long sessions to distinguish thread growth from managed-memory growth. Never triggers GC, walks the heap, suspends threads, or attaches diagnostics."
                         (fun args ->
                             toolResult (
                                 Task.FromResult(
@@ -660,7 +664,23 @@ let main argv =
             }
 
         try
-            Server.run server |> fun t -> t.GetAwaiter().GetResult()
+            // Generic Host watches appsettings.json by default. In restricted hosts the
+            // file-watcher token can already be cancelled, making ChangeToken.OnChange
+            // re-register synchronously forever before MCP can read `initialize`.
+            let reloadConfigKey = "DOTNET_HOSTBUILDER__RELOADCONFIGONCHANGE"
+            let previousReloadConfig = Environment.GetEnvironmentVariable(reloadConfigKey)
+
+            let serverTask =
+                try
+                    Environment.SetEnvironmentVariable(reloadConfigKey, "false")
+                    Server.run server
+                finally
+                    // Server.run creates the Generic Host synchronously before returning
+                    // its pending task. Restore immediately so FSAC children inherit the
+                    // caller's environment rather than this server-startup workaround.
+                    Environment.SetEnvironmentVariable(reloadConfigKey, previousReloadConfig)
+
+            serverTask.GetAwaiter().GetResult()
             0
         with ex ->
             Console.Error.WriteLine($"Fatal error: %s{ex.Message}")

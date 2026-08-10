@@ -14,7 +14,7 @@ dotnet test tests/FsLangMcp.Tests/FsLangMcp.Tests.fsproj -c Release --nologo
 
 - **Target framework**: `net10.0` (set in `FsLangMcp.fsproj`).
 - **Warnings-as-errors**: enforced via `<TreatWarningsAsErrors>true</TreatWarningsAsErrors>` in `Directory.Build.props`. A clean build is mandatory before opening a PR.
-- **Test baseline**: 289 passing at `v0.9.0`. Every PR must keep the suite green and add tests for any new behaviour.
+- **Test baseline**: run the full suite above and keep every test green; the count is intentionally not pinned because regression coverage grows with each release.
 
 Optional helpers via the `Justfile`:
 
@@ -26,9 +26,9 @@ just analyze   # run F# analyzers (Ionide.Analyzers, G-Research.FSharp.Analyzers
 
 ## Adding a new MCP tool
 
-The codebase ships ~32 tools that all follow the same registration shape. To add another:
+The v0.13.2 surface ships 35 tools that all follow the same registration shape. To add another:
 
-1. **Define the args record in `Types.fs`** with `///` doc-comments on every field. Use existing records as the style template (e.g. `FcsValidateSnippetArgs`, `FcsRecordFieldAuditArgs`). Defaults stated in `///` text must match the actual `defaultArg` call site in the handler.
+1. **Define the args record in `Types.fs`** with `///` doc-comments on every field. Use current records such as `FindArgs` and `CheckArgs` as style templates. Defaults stated in `///` text must match the actual `defaultArg` call site in the handler.
 
 2. **Implement the handler** as a `member` on `FcsBridge` (in-process FCS work) or `FsAutoCompleteBridge` (LSP-shaped proxies). Return `Task<JsonNode>`. Reuse `jobj` / `jstr` / `jint` / `jbool` helpers from `Types.fs` for response construction.
 
@@ -48,7 +48,7 @@ The codebase ships ~32 tools that all follow the same registration shape. To add
    tool (
        TypedTool.define<MyToolArgs>
            "tool_name"
-           "[FCS in-process] Short routing description …"
+           "Short routing description …"
            (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.MyTool args)))
        |> unwrapResult
    )
@@ -56,7 +56,7 @@ The codebase ships ~32 tools that all follow the same registration shape. To add
 
    Use `fcsGate` for FCS-backed work, `lspGate` for fsautocomplete proxies. The semaphores cap concurrent FCS work at `FSLANGMCP_MAX_CONCURRENT_FCS` (default 2) and concurrent LSP work at `FSLANGMCP_MAX_CONCURRENT_LSP` (default 1).
 
-5. **Write the description** following `docs/tool-description-schema.md`. Target 250–400 chars across the 5 slots (Tag + What + Prefer-X-over-Y + Key-params + Caveat + Cross-ref). The schema doc explains why and shows anti-patterns.
+5. **Write the description** following `docs/tool-description-schema.md`. Target 250–400 chars across its 4 slots (What + Prefer/Avoid + Key params + Caveat/Cross-ref). The schema doc explains why and shows anti-patterns.
 
 6. **Add regression tests** in `tests/FsLangMcp.Tests/FcsBridgeTests.fs` (or the bridge-appropriate file). Cover both the success path AND failure modes (invalid args, missing project, etc.). For refactors of existing tools, prefer **proof-by-breaking** — write the test against a behaviour the old implementation cannot satisfy, so the test fails deterministically if the production code is reverted. See the v0.9.0 CHANGELOG entry for #124 for a worked example.
 

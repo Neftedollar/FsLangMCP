@@ -8,6 +8,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-08-10
+
+### Added
+
+- `fsharp_runtime_status` now reports OS-visible process threads plus .NET
+  thread-pool, pending-work, and completed-work counters under `process.threads`,
+  making long-session growth measurable without attaching a profiler.
+- `set_project.readiness` now explains an unwarmed symbol index through additive
+  `symbolIndexState` and `symbolIndexHint` fields. `lspRestartRequested` records
+  intent, while `lspReplacedExistingProcess` reports whether an existing FSAC
+  process was actually replaced. The legacy `lspRestarted` field keeps its
+  request-mirroring behavior for patch-release compatibility.
+- `project_health` reports the configuration associated with its selected build
+  artifact.
+
+### Fixed
+
+- MCP stdio startup disables Generic Host configuration reload only while
+  constructing the server, preventing pre-stdin `ChangeToken.OnChange` recursion
+  when a restricted file provider returns an already-changed watch token. The
+  caller's environment is restored before FSAC child processes can inherit it.
+- Repeated `set_project(restartLsp=true)` now retains and drains the retired FSAC
+  JSON-RPC generation before starting another one. Unchanged projects also reuse
+  bounded, input-stamped Ionide/MSBuild options instead of evaluating the project
+  again on every call; this removes the observed linear thread growth from #150.
+  Project, import, restore, generated-props/targets, and source-directory changes
+  invalidate the entry. The underlying MSBuild in-process-node lifecycle remains
+  an upstream Ionide/MSBuild limitation on genuine cache misses.
+- `EnsureProjectResults` cache entries now include source stamps. Public API and
+  referenced-assembly tools therefore see both edits to known files and
+  additions/removals in the `<Compile>` graph (#148).
+- `check(scope="file")` performs one fresh parse/type-check after invalidation
+  instead of computing and discarding an initial result. Per-response source-line
+  reads are memoized, and test-discovery regexes are compiled once (#148).
+- Source-tool validation rejects project/solution files with a structured
+  `InvalidArgument` while preserving `.fs`, `.fsi`, unsaved-buffer, and `.fsx`
+  script-inference flows.
+- `project_health` uses the active solution root for sibling test discovery,
+  searches MSBuild/analyzer config files through ancestors, reads package metadata
+  from attributes or child elements, and no longer treats a bare config file as an
+  analyzer signal (#100).
+- `fcs_public_api` preserves generic arguments in readable signatures (for example
+  `string option`, `string list`, and user-defined `Box<string>`), so incompatible
+  generic surfaces no longer compare as identical (#100).
+
+### Changed
+
+- `fcs_dead_code` moves the repeated removal warning to one response-level
+  `verificationHint`; the existing candidate `note` string remains for compatibility
+  as a compact pointer to that hint.
+- Agent integration and tool-reference docs now match the shipped 35-tool surface
+  and explicitly route removed aliases through `find` and `check` (#100).
+
 ## [0.13.1] - 2026-08-02
 
 ### Fixed
@@ -498,7 +551,18 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
   Earlier releases (0.2.0, 0.3.0, 0.3.1, 0.4.0) shipped without tags;
   backfilling them would point at synthetic refs.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.13.2...HEAD
+[0.13.2]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.13.2
+[0.13.1]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.13.1
+[0.13.0]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.13.0
+[0.12.3]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.12.3
+[0.12.2]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.12.2
+[0.12.1]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.12.1
+[0.12.0]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.12.0
+[0.11.0]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.11.0
+[0.10.1]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.10.1
+[0.10.0]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.10.0
+[0.9.2]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.9.2
 [0.9.1]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.9.1
 [0.9.0]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.9.0
 [0.8.6]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.8.6

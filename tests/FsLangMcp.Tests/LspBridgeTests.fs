@@ -12,6 +12,55 @@ let private jsonElement (json: string) =
     use doc = JsonDocument.Parse(json)
     doc.RootElement.Clone()
 
+let private fakeFsacScript =
+    """open System
+open System.Text
+open System.Text.Json
+
+let readMessage () =
+    let mutable contentLength = 0
+    let mutable readingHeaders = true
+
+    while readingHeaders do
+        let line = Console.In.ReadLine()
+
+        if isNull line then
+            Environment.Exit(0)
+        elif line.Length = 0 then
+            readingHeaders <- false
+        elif line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase) then
+            contentLength <- Int32.Parse(line.Substring("Content-Length:".Length).Trim())
+
+    let chars = Array.zeroCreate<char> contentLength
+    let mutable offset = 0
+
+    while offset < contentLength do
+        let count = Console.In.Read(chars, offset, contentLength - offset)
+
+        if count = 0 then
+            Environment.Exit(0)
+
+        offset <- offset + count
+
+    String(chars)
+
+let writeResponse (id: string) (result: string) =
+    let response = $"{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}"
+    let byteCount = Encoding.UTF8.GetByteCount(response)
+    Console.Out.Write($"Content-Length: {byteCount}\r\n\r\n{response}")
+    Console.Out.Flush()
+
+while true do
+    use message = JsonDocument.Parse(readMessage ())
+    let root = message.RootElement
+    let mutable id = Unchecked.defaultof<JsonElement>
+
+    if root.TryGetProperty("id", &id) then
+        let methodName = root.GetProperty("method").GetString()
+        let result = if methodName = "initialize" then "{\"capabilities\":{}}" else "null"
+        writeResponse (id.GetRawText()) result
+"""
+
 [<Fact>]
 let ``Disposing bridge clears diagnostics and their freshness timestamps`` () =
     let bridge = new FsAutoCompleteBridge()
@@ -78,6 +127,137 @@ let ``Startup timeout kills an unresponsive FSAC child`` () : Task =
             Assert.False(isRunning (), $"Timed-out FSAC child %d{pid} is still running.")
             Assert.True(bridge.FsacProcess.IsNone)
         finally
+            if Directory.Exists(root) then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``Repeated SetProject restarts fully drain prior LSP lifecycle`` () : Task =
+    task {
+        let id = Guid.NewGuid().ToString("N")
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_lsp_restart_%s{id}")
+        let projectPath = Path.Combine(root, "App.fsproj")
+        let scriptPath = Path.Combine(root, "fake-fsac.fsx")
+
+        Directory.CreateDirectory(root) |> ignore
+        File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+
+        File.WriteAllText(scriptPath, fakeFsacScript)
+
+        let bridge =
+            new FsAutoCompleteBridge(
+                startupTimeoutOverride = TimeSpan.FromSeconds(10.0),
+                fsacCommandOverride = "dotnet",
+                fsacArgsOverride = [ "fsi"; "--exec"; scriptPath ]
+            )
+
+        try
+            let! first =
+                bridge.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some true }
+                )
+
+            let firstResult = first["result"]
+            let readiness = firstResult["readiness"]
+            Assert.True((firstResult["lspRestartRequested"]).GetValue<bool>())
+            Assert.True((firstResult["lspRestarted"]).GetValue<bool>())
+            Assert.False((firstResult["lspReplacedExistingProcess"]).GetValue<bool>())
+            Assert.False((readiness["symbolIndex"]).GetValue<bool>())
+            Assert.Equal("warming", (readiness["symbolIndexState"]).GetValue<string>())
+            Assert.False(String.IsNullOrWhiteSpace((readiness["symbolIndexHint"]).GetValue<string>()))
+            Assert.Equal(0, bridge.PendingLspCleanupCount)
+
+            for _ in 1..6 do
+                let! restarted =
+                    bridge.SetProject(
+                        { projectPath = projectPath
+                          workspacePath = None
+                          restartLsp = Some true }
+                    )
+
+                let restartedResult = restarted["result"]
+                Assert.True((restartedResult["lspRestarted"]).GetValue<bool>())
+                Assert.True((restartedResult["lspReplacedExistingProcess"]).GetValue<bool>())
+                Assert.Equal(0, bridge.PendingLspCleanupCount)
+        finally
+            (bridge :> IDisposable).Dispose()
+
+            if Directory.Exists(root) then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``Timed out cleanup remains retained and blocks a new LSP generation`` () : Task =
+    task {
+        let id = Guid.NewGuid().ToString("N")
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_lsp_cleanup_%s{id}")
+        let projectPath = Path.Combine(root, "App.fsproj")
+        let scriptPath = Path.Combine(root, "fake-fsac.fsx")
+        let cleanupBarrier = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        Directory.CreateDirectory(root) |> ignore
+        File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+        File.WriteAllText(scriptPath, fakeFsacScript)
+
+        let bridge =
+            new FsAutoCompleteBridge(
+                startupTimeoutOverride = TimeSpan.FromSeconds(10.0),
+                cleanupTimeoutOverride = TimeSpan.FromMilliseconds(50.0),
+                cleanupDrainBarrierOverride = (fun () -> Some(cleanupBarrier.Task :> Task)),
+                fsacCommandOverride = "dotnet",
+                fsacArgsOverride = [ "fsi"; "--exec"; scriptPath ]
+            )
+
+        let restart () =
+            bridge.SetProject(
+                { projectPath = projectPath
+                  workspacePath = None
+                  restartLsp = Some true }
+            )
+
+        try
+            let! _ = restart ()
+
+            let firstPid =
+                match bridge.FsacProcess with
+                | Some fsacProc -> fsacProc.Id
+                | None -> failwith "The first fake FSAC generation did not start."
+
+            let! firstTimeout =
+                Assert.ThrowsAsync<InvalidOperationException>(fun () -> restart () :> Task)
+
+            Assert.Contains("draining the previous FSAC LSP generation", firstTimeout.Message)
+            Assert.True(bridge.FsacProcess.IsNone)
+            Assert.Equal(1, bridge.PendingLspCleanupCount)
+
+            // A second request must wait on the same retained drain instead of starting
+            // a replacement while the prior generation still owns pipe-reader tasks.
+            let! secondTimeout =
+                Assert.ThrowsAsync<InvalidOperationException>(fun () -> restart () :> Task)
+
+            Assert.Contains("draining the previous FSAC LSP generation", secondTimeout.Message)
+            Assert.True(bridge.FsacProcess.IsNone)
+            Assert.Equal(1, bridge.PendingLspCleanupCount)
+
+            cleanupBarrier.SetResult(())
+            let drainDeadline = DateTimeOffset.UtcNow.AddSeconds(2.0)
+
+            while bridge.PendingLspCleanupCount <> 0 && DateTimeOffset.UtcNow < drainDeadline do
+                do! Task.Delay(10)
+
+            Assert.Equal(0, bridge.PendingLspCleanupCount)
+
+            let! _ = restart ()
+
+            match bridge.FsacProcess with
+            | Some fsacProc -> Assert.NotEqual(firstPid, fsacProc.Id)
+            | None -> Assert.Fail("A new FSAC generation did not start after cleanup completed.")
+        finally
+            cleanupBarrier.TrySetResult(()) |> ignore
+            (bridge :> IDisposable).Dispose()
+
             if Directory.Exists(root) then
                 Directory.Delete(root, true)
     }
@@ -636,6 +816,32 @@ let ``mostRecentAnalyzedAt with fileGlob matching zero files is null`` () =
     Assert.Null(result["mostRecentAnalyzedAt"])
 
 // ─── set_project arg validation (#100) ───────────────────────────────────────
+
+[<Fact>]
+let ``setProjectReadiness explains how to recover while symbol index is warming`` () =
+    let readiness = setProjectReadiness true false true
+
+    Assert.False(readiness["symbolIndex"].GetValue<bool>())
+    Assert.Equal("warming", readiness["symbolIndexState"].GetValue<string>())
+    Assert.Contains("incomplete", readiness["symbolIndexHint"].GetValue<string>())
+    Assert.Contains("retry", readiness["symbolIndexHint"].GetValue<string>())
+
+[<Fact>]
+let ``setProjectReadiness explains how to start LSP when it was not requested`` () =
+    let readiness = setProjectReadiness false false false
+    let timedOutReadiness = setProjectReadiness false false true
+
+    Assert.Equal("not_started", readiness["symbolIndexState"].GetValue<string>())
+    Assert.Contains("unavailable", readiness["symbolIndexHint"].GetValue<string>())
+    Assert.Contains("restartLsp=true", readiness["symbolIndexHint"].GetValue<string>())
+    Assert.Equal("blocked_on_lsp", timedOutReadiness["symbolIndexState"].GetValue<string>())
+    Assert.Contains("Retry set_project", timedOutReadiness["symbolIndexHint"].GetValue<string>())
+
+[<Fact>]
+let ``lspRestartOccurred requires both a restart request and a running LSP`` () =
+    Assert.False(lspRestartOccurred true false)
+    Assert.False(lspRestartOccurred false true)
+    Assert.True(lspRestartOccurred true true)
 
 [<Fact>]
 let ``SetProject with null projectPath returns invalid_args naming projectPath`` () : System.Threading.Tasks.Task =

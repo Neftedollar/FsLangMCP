@@ -174,7 +174,7 @@ type DeadCodeTests(fx: DeadCodeFixture, output: ITestOutputHelper) =
         }
 
     [<Fact>]
-    member _.``dead_code candidate carries name, accessibility, declaredIn and a find note``() : Task =
+    member _.``dead_code keeps candidate facts and emits one response-level verification hint``() : Task =
         task {
             Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
             let bridge = FcsBridge()
@@ -191,8 +191,8 @@ type DeadCodeTests(fx: DeadCodeFixture, output: ITestOutputHelper) =
             let startLine = declaredIn["range"]["startLine"]
             Assert.Contains("DeadLib.fs", gs declaredIn "file")
             Assert.NotNull(startLine)
-            // The note steers the agent to verify with `find` before deleting.
-            Assert.Contains("find", gs orphan "note")
+            Assert.Equal("See verificationHint.", gs orphan "note")
+            Assert.Contains("find", gs result "verificationHint")
         }
 
     [<Fact>]

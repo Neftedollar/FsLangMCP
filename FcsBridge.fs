@@ -834,7 +834,57 @@ module private ReviewScanner =
         List.ofSeq acc
 
 
+// Compiled once for all fcs_tests_for_symbol requests.
+let private testAttrRegex =
+    System.Text.RegularExpressions.Regex(
+        """\[<\s*(?:[\w.]+\.)?(?:Fact|Theory|Test|TestCase|TestMethod|Property)(?:Attribute)?\b""",
+        System.Text.RegularExpressions.RegexOptions.Compiled
+    )
+
+let private expectoLabelRegex =
+    System.Text.RegularExpressions.Regex(
+        "\\b(?:ftestCaseAsync|ptestCaseAsync|testCaseAsync|ftestCase|ptestCase|testCase|ftestAsync|ptestAsync|testAsync|ftestProperty|ptestProperty|testProperty|test)\\s+\"([^\"]*)\"",
+        System.Text.RegularExpressions.RegexOptions.Compiled
+    )
+
+let private bindingNameRegex =
+    System.Text.RegularExpressions.Regex(
+        """\b(?:let|member)\s+(?:rec\s+|inline\s+|mutable\s+|private\s+|internal\s+|this\.|_\.)*(``[^`]+``|[A-Za-z_][\w']*)""",
+        System.Text.RegularExpressions.RegexOptions.Compiled
+    )
+
+let private fsharpTypeNameRegex =
+    System.Text.RegularExpressions.Regex(
+        @"(?<![\w.])Microsoft\.FSharp\.(?:Core|Collections)\.(?<name>[\w']+)(?![\w])",
+        System.Text.RegularExpressions.RegexOptions.Compiled
+    )
+
+
 // ─── FcsBridge ─────────────────────────────────────────────────────────────────
+
+[<Struct>]
+type private ProjectOptionsInputKind =
+    | FileInput
+    | DirectoryInput
+
+[<Struct>]
+type private ProjectOptionsInputStamp =
+    { Kind: ProjectOptionsInputKind
+      Path: string
+      Exists: bool
+      LastWriteTimeUtcTicks: int64
+      Length: int64 }
+
+[<NoComparison; NoEquality>]
+type private ProjectOptionsFingerprint =
+    { Inputs: ProjectOptionsInputStamp array }
+
+[<NoComparison; NoEquality>]
+type private ProjectOptionsCacheEntry =
+    { Options: FSharpProjectOptions
+      Source: string
+      Fingerprint: ProjectOptionsFingerprint option
+      ScriptSourceHash: string option }
 
 type internal FcsBridge() =
     // FCS default projectCacheSize is 3. The `find` multi-project union sweep
@@ -863,13 +913,13 @@ type internal FcsBridge() =
     // Sized to keep a whole solution's resolved options warm during a `find` sweep
     // (issue #128) — a 10-entry cache would evict early projects mid-sweep on a
     // >10-project solution, forcing redundant Ionide.ProjInfo re-resolution.
-    let optionsCache = BoundedCache<string, FSharpProjectOptions * string>(50)
+    let optionsCache = BoundedCache<string, ProjectOptionsCacheEntry>(50)
     let projectResultsCache = BoundedCache<string, FSharpCheckProjectResults>(3)
 
     let optionsInFlight =
-        ConcurrentDictionary<string, Lazy<Task<FSharpProjectOptions * string>>>()
+        ConcurrentDictionary<string, Lazy<Task<ProjectOptionsCacheEntry>>>()
 
-    let mutable optionsCacheGeneration = 0L
+    let mutable projectOptionsLoadCount = 0L
 
     // find sweep (issue #131): memoize each project's whole-symbol-use enumeration +
     // diagnostics. FCS's project cache keeps ParseAndCheckProject warm, but
@@ -883,7 +933,7 @@ type internal FcsBridge() =
     // referencedProjectSourcesStamp (0.10.1 Codex P2). Every MISS runs the original
     // ParseAndCheckProject + GetAllUsesOfAllSymbols path — a cached `find` is never staler
     // than an uncached one (correctness first, speed is the unchanged-project fast path).
-    // Cleared by ClearCaches() (so set_project invalidates it). Sized to the same
+    // Cleared by ClearAnalysisCaches() (so set_project invalidates it). Sized to the same
     // solution scale as optionsCache so a whole solution stays warm between sweeps.
     let projectUsesCache =
         BoundedCache<string, FSharpSymbolUse array * FSharpDiagnostic array>(50)
@@ -941,6 +991,35 @@ type internal FcsBridge() =
     let typeName (typ: FSharpType) =
         typ.BasicQualifiedName
         |> Option.defaultWith (fun () -> typ.Format(FSharpDisplayContext.Empty))
+
+    let shortenFSharpTypeNames (formatted: string) =
+        fsharpTypeNameRegex.Replace(
+            formatted,
+            System.Text.RegularExpressions.MatchEvaluator(fun m -> m.Groups["name"].Value)
+        )
+
+    let rec publicApiTypeName (typ: FSharpType) =
+        try
+            let basicName = typ.BasicQualifiedName |> Option.defaultValue ""
+            let arityMarker = basicName.LastIndexOf('`')
+            let genericArguments = typ.GenericArguments |> Seq.toArray
+
+            if arityMarker >= 0 && genericArguments.Length > 0 then
+                let genericName = basicName.Substring(0, arityMarker).Replace('+', '.')
+
+                match genericName, genericArguments with
+                | ("Microsoft.FSharp.Core.FSharpOption" | "Microsoft.FSharp.Core.option"), [| argument |] ->
+                    $"{publicApiTypeName argument} option"
+                | ("Microsoft.FSharp.Collections.FSharpList" | "Microsoft.FSharp.Collections.list"), [| argument |] ->
+                    $"{publicApiTypeName argument} list"
+                | _ ->
+                    let name = shortenFSharpTypeNames genericName
+                    let arguments = genericArguments |> Array.map publicApiTypeName |> String.concat ", "
+                    $"{name}<{arguments}>"
+            else
+                typ.Format(FSharpDisplayContext.Empty) |> shortenFSharpTypeNames
+        with _ ->
+            typeName typ
 
     let diagnosticToJson (d: FSharpDiagnostic) : JsonNode =
         jobj
@@ -1200,7 +1279,7 @@ type internal FcsBridge() =
         with _ ->
             false
 
-    let memberSignature (m: FSharpMemberOrFunctionOrValue) : string =
+    let memberSignatureWith (formatType: FSharpType -> string) (m: FSharpMemberOrFunctionOrValue) : string =
         try
             let paramGroups = m.CurriedParameterGroups
 
@@ -1209,13 +1288,13 @@ type internal FcsBridge() =
                 |> Seq.collect id
                 |> Seq.map (fun p ->
                     let pName = p.Name |> Option.defaultValue "_"
-                    let pType = try typeName p.Type with _ -> "?"
+                    let pType = try formatType p.Type with _ -> "?"
                     $"{pName}: {pType}")
                 |> String.concat ", "
 
             let returnType =
                 try
-                    typeName m.ReturnParameter.Type
+                    formatType m.ReturnParameter.Type
                 with _ ->
                     "?"
 
@@ -1225,6 +1304,9 @@ type internal FcsBridge() =
                 m.DisplayName
             with _ ->
                 "<unknown>"
+
+    let memberSignature (m: FSharpMemberOrFunctionOrValue) : string =
+        memberSignatureWith typeName m
 
     let tryExtractXmlSummary (xmlDoc: FSharpXmlDoc) : JsonNode =
         try
@@ -1375,13 +1457,26 @@ type internal FcsBridge() =
     let sourceLines (source: string) =
         source.Split('\n') |> Array.map (fun line -> line.TrimEnd('\r'))
 
-    let lineContextToJson contextLines filePath startLine =
+    let lineContextToJson
+        (linesByFile: System.Collections.Generic.Dictionary<string, string array>)
+        contextLines
+        filePath
+        startLine
+        =
         let contextLines = max 0 contextLines
+        let cacheKey = normalizePath filePath
 
-        if not (File.Exists filePath) then
+        let lines =
+            match linesByFile.TryGetValue(cacheKey) with
+            | true, cached -> cached
+            | _ ->
+                let loaded = if File.Exists cacheKey then File.ReadAllLines(cacheKey) else [||]
+                linesByFile[cacheKey] <- loaded
+                loaded
+
+        if lines.Length = 0 then
             jobj [ "lineText", jstr ""; "before", JsonArray() :> JsonNode; "after", JsonArray() :> JsonNode ]
         else
-            let lines = File.ReadAllLines(filePath)
             let lineIndex = max 0 (startLine - 1)
 
             let lineText =
@@ -1509,7 +1604,21 @@ type internal FcsBridge() =
                       "errorKind", jstr "InvalidArgument"
                       "message",
                       jstr
-                          $"%s{toolName} expects 'path' to be a source file (.fs/.fsi), not a directory. To search project-wide, pass any source file in the project as 'path' and the .fsproj as 'projectPath'." ]
+                          $"%s{toolName} expects 'path' to be a source file (.fs/.fsi/.fsx), not a directory. To search project-wide, pass any source file in the project as 'path' and the .fsproj as 'projectPath'." ]
+                :> JsonNode
+            )
+        elif
+            not (
+                String.Equals(Path.GetExtension(fullPath), ".fs", StringComparison.OrdinalIgnoreCase)
+                || String.Equals(Path.GetExtension(fullPath), ".fsi", StringComparison.OrdinalIgnoreCase)
+                || String.Equals(Path.GetExtension(fullPath), ".fsx", StringComparison.OrdinalIgnoreCase)
+            )
+        then
+            Some(
+                jobj
+                    [ "status", jstr "error"
+                      "errorKind", jstr "InvalidArgument"
+                      "message", jstr $"%s{toolName} expects 'path' to be an F# source file (.fs/.fsi/.fsx): %s{fullPath}" ]
                 :> JsonNode
             )
         elif not hasText && not (File.Exists(fullPath)) then
@@ -1537,6 +1646,182 @@ type internal FcsBridge() =
     let makeResolvedProjectCacheKey (projectOptions: FSharpProjectOptions) =
         let optionsHash = String.concat "|" projectOptions.OtherOptions
         $"%s{projectOptions.ProjectFileName}::%s{optionsHash}"
+
+    let makeFsprojOptionsCacheKey (fsprojPath: string) =
+        $"fsproj::%s{normalizePath fsprojPath}"
+
+    let makeOptionsCacheEntry options source fingerprint scriptSourceHash =
+        { Options = options
+          Source = source
+          Fingerprint = fingerprint
+          ScriptSourceHash = scriptSourceHash }
+
+    let scriptSourceHash (source: string) =
+        source
+        |> System.Text.Encoding.UTF8.GetBytes
+        |> System.Security.Cryptography.SHA256.HashData
+        |> Convert.ToHexString
+
+    let captureProjectOptionsInputStamp kind path =
+        try
+            match kind with
+            | FileInput ->
+                let info = FileInfo(path)
+                info.Refresh()
+
+                if info.Exists then
+                    { Kind = kind
+                      Path = path
+                      Exists = true
+                      LastWriteTimeUtcTicks = info.LastWriteTimeUtc.Ticks
+                      Length = info.Length }
+                else
+                    { Kind = kind
+                      Path = path
+                      Exists = false
+                      LastWriteTimeUtcTicks = -1L
+                      Length = -1L }
+            | DirectoryInput ->
+                let info = DirectoryInfo(path)
+                info.Refresh()
+
+                if info.Exists then
+                    { Kind = kind
+                      Path = path
+                      Exists = true
+                      LastWriteTimeUtcTicks = info.LastWriteTimeUtc.Ticks
+                      Length = -1L }
+                else
+                    { Kind = kind
+                      Path = path
+                      Exists = false
+                      LastWriteTimeUtcTicks = -1L
+                      Length = -1L }
+        with _ ->
+            { Kind = kind
+              Path = path
+              Exists = false
+              LastWriteTimeUtcTicks = -1L
+              Length = -1L }
+
+    let projectOptionsInputStampIsCurrent expected =
+        let current = captureProjectOptionsInputStamp expected.Kind expected.Path
+
+        current.Exists = expected.Exists
+        && current.LastWriteTimeUtcTicks = expected.LastWriteTimeUtcTicks
+        && current.Length = expected.Length
+
+    let projectOptionsCacheEntryIsCurrent entry =
+        match entry.Fingerprint with
+        | None -> true
+        | Some fingerprint -> fingerprint.Inputs |> Array.forall projectOptionsInputStampIsCurrent
+
+    let captureProjectOptionsFingerprint (projects: Ionide.ProjInfo.Types.ProjectOptions list) =
+        let pathComparer =
+            if OperatingSystem.IsWindows() then
+                StringComparer.OrdinalIgnoreCase
+            else
+                StringComparer.Ordinal
+
+        let fileInputs = System.Collections.Generic.HashSet<string>(pathComparer)
+        let directoryInputs = System.Collections.Generic.HashSet<string>(pathComparer)
+
+        let tryResolvePath baseDirectory (path: string) =
+            try
+                if String.IsNullOrWhiteSpace(path) then
+                    None
+                else
+                    let candidate = path.Trim().Trim('"')
+
+                    if Path.IsPathFullyQualified(candidate) then
+                        Some(Path.GetFullPath(candidate))
+                    else
+                        Some(Path.GetFullPath(Path.Combine(baseDirectory, candidate)))
+            with _ ->
+                None
+
+        let addFile baseDirectory path =
+            match tryResolvePath baseDirectory path with
+            | Some fullPath -> fileInputs.Add(fullPath) |> ignore
+            | None -> ()
+
+        let addDirectory path =
+            try
+                if not (String.IsNullOrWhiteSpace(path)) then
+                    directoryInputs.Add(Path.GetFullPath(path)) |> ignore
+            with _ ->
+                ()
+
+        let ancestorSentinelNames =
+            [| "Directory.Build.props"
+               "Directory.Build.targets"
+               "Directory.Packages.props"
+               "global.json"
+               "NuGet.config"
+               "NuGet.Config"
+               "nuget.config" |]
+
+        let addAncestorSentinels projectDirectory =
+            try
+                let mutable directory = DirectoryInfo(projectDirectory)
+
+                while not (isNull directory) do
+                    for fileName in ancestorSentinelNames do
+                        fileInputs.Add(Path.Combine(directory.FullName, fileName)) |> ignore
+
+                    directory <- directory.Parent
+            with _ ->
+                ()
+
+        for project in projects do
+            let projectPath =
+                tryResolvePath (Directory.GetCurrentDirectory()) project.ProjectFileName
+                |> Option.defaultValue project.ProjectFileName
+
+            let projectDirectory = Path.GetDirectoryName(projectPath)
+            addFile projectDirectory projectPath
+            addDirectory projectDirectory
+            addAncestorSentinels projectDirectory
+
+            // NuGet creates these after the first restore. Keep explicit missing
+            // sentinels so a cache entry captured before restore is invalidated when
+            // generated imports appear (existing imports are also in MSBuildAllProjects).
+            let projectFileName = Path.GetFileName(projectPath)
+            addFile projectDirectory (Path.Combine("obj", $"%s{projectFileName}.nuget.g.props"))
+            addFile projectDirectory (Path.Combine("obj", $"%s{projectFileName}.nuget.g.targets"))
+
+            for importedProject in project.ProjectSdkInfo.MSBuildAllProjects do
+                addFile projectDirectory importedProject
+
+            addFile projectDirectory project.ProjectSdkInfo.ProjectAssetsFile
+
+            for projectReference in project.ReferencedProjects do
+                addFile projectDirectory projectReference.ProjectFileName
+
+            for sourceFile in project.SourceFiles do
+                match tryResolvePath projectDirectory sourceFile with
+                | Some fullPath -> addDirectory (Path.GetDirectoryName(fullPath))
+                | None -> ()
+
+        let inputs =
+            seq {
+                for path in fileInputs do
+                    yield FileInput, path
+
+                for path in directoryInputs do
+                    yield DirectoryInput, path
+            }
+            |> Seq.sortBy (fun (kind, path) ->
+                let kindOrder =
+                    match kind with
+                    | FileInput -> 0
+                    | DirectoryInput -> 1
+
+                kindOrder, path)
+            |> Seq.map (fun (kind, path) -> captureProjectOptionsInputStamp kind path)
+            |> Seq.toArray
+
+        { Inputs = inputs }
 
     // Per-file write-time vector for the find use-cache (issue #131). The stamp changes
     // when ANY source file's on-disk mtime changes (not just the newest), so an edit to
@@ -1659,7 +1944,9 @@ type internal FcsBridge() =
 
         errors.Length, warnings.Length
 
-    member private _.LoadProjectOptionsFromFsproj(fsprojPath: string) : Task<FSharpProjectOptions option> =
+    member private _.LoadProjectOptionsFromFsproj
+        (fsprojPath: string)
+        : Task<(FSharpProjectOptions * ProjectOptionsFingerprint) option> =
         // Offload to thread pool — MSBuild/SDK probing is CPU+IO bound.
         // Assumption: Init.init and WorkspaceLoader do not rely on thread-local or
         // SynchronizationContext state (safe for file-system-based SDK resolution).
@@ -1668,12 +1955,14 @@ type internal FcsBridge() =
                 let projectDir = Path.GetDirectoryName(fsprojPath)
                 let toolsPath = Init.init (DirectoryInfo(projectDir)) None
                 let loader = WorkspaceLoader.Create(toolsPath, [])
+                Interlocked.Increment(&projectOptionsLoadCount) |> ignore
                 let projects = loader.LoadProjects([ fsprojPath ]) |> Seq.toList
 
                 match projects with
                 | proj :: _ ->
                     let fcsOpts = FCS.mapToFSharpProjectOptions proj (projects |> Seq.map id)
-                    Some fcsOpts
+                    let fingerprint = captureProjectOptionsFingerprint projects
+                    Some(fcsOpts, fingerprint)
                 | [] -> None
             with ex ->
                 Console.Error.WriteLine($"[proj-info] Failed to load %s{fsprojPath}: %s{ex.Message}")
@@ -1682,35 +1971,34 @@ type internal FcsBridge() =
     member private this.ResolveFsprojOptions(fsprojPath: string) : Task<FSharpProjectOptions * string> =
         task {
             let fullPath = normalizePath fsprojPath
-            let fsprojKey = $"fsproj::%s{fullPath}"
+            let fsprojKey = makeFsprojOptionsCacheKey fullPath
 
             match optionsCache.TryGet(fsprojKey) with
-            | Some(cached, source) -> return cached, source
-            | None ->
-                let fileStamp =
-                    if File.Exists(fullPath) then File.GetLastWriteTimeUtc(fullPath).Ticks else -1L
-
-                let inFlightKey = $"%s{fsprojKey}|%d{fileStamp}"
-                let generation = Volatile.Read(&optionsCacheGeneration)
+            | Some cached when projectOptionsCacheEntryIsCurrent cached ->
+                return cached.Options, cached.Source
+            | _ ->
 
                 let pending =
                     optionsInFlight.GetOrAdd(
-                        inFlightKey,
+                        fsprojKey,
                         fun _ ->
-                            Lazy<Task<FSharpProjectOptions * string>>(
+                            Lazy<Task<ProjectOptionsCacheEntry>>(
                                 (fun () ->
                                     task {
                                         try
                                             let! projInfoResult = this.LoadProjectOptionsFromFsproj(fullPath)
 
                                             match projInfoResult with
-                                            | Some projOpts ->
-                                                let value = projOpts, "ionide-proj-info"
+                                            | Some(projOpts, fingerprint) ->
+                                                let entry =
+                                                    makeOptionsCacheEntry
+                                                        projOpts
+                                                        "ionide-proj-info"
+                                                        (Some fingerprint)
+                                                        None
 
-                                                if Volatile.Read(&optionsCacheGeneration) = generation then
-                                                    optionsCache.Set(fsprojKey, value)
-
-                                                return value
+                                                optionsCache.Set(fsprojKey, entry)
+                                                return entry
                                             | None ->
                                                 return
                                                     raise (
@@ -1719,7 +2007,7 @@ type internal FcsBridge() =
                                                         )
                                                     )
                                         finally
-                                            optionsInFlight.TryRemove(inFlightKey) |> ignore
+                                            optionsInFlight.TryRemove(fsprojKey) |> ignore
                                     }),
                                 LazyThreadSafetyMode.ExecutionAndPublication
                             )
@@ -1727,7 +2015,8 @@ type internal FcsBridge() =
 
                 let work = pending.Value
                 observeFault work
-                return! work
+                let! entry = work
+                return entry.Options, entry.Source
         }
 
     member private this.ResolveProjectOptions
@@ -1745,12 +2034,12 @@ type internal FcsBridge() =
                     |> normalizePath
 
                 match optionsCache.TryGet(cacheKey) with
-                | Some(cached, source) -> return cached, source
+                | Some cached -> return cached.Options, cached.Source
                 | None ->
                     let resolvedOptions =
                         checker.GetProjectOptionsFromCommandLineArgs(projectFileName, options |> List.toArray)
 
-                    optionsCache.Set(cacheKey, (resolvedOptions, "commandLineArgs"))
+                    optionsCache.Set(cacheKey, makeOptionsCacheEntry resolvedOptions "commandLineArgs" None None)
                     return resolvedOptions, "commandLineArgs"
             | _ ->
                 let requestedFsproj = explicitFsproj projectPath
@@ -1775,18 +2064,21 @@ type internal FcsBridge() =
                                 { scriptOptions with
                                     ProjectFileName = fsprojPath }
 
-                            let fsprojKey = $"fsproj::%s{fsprojPath}"
-                            optionsCache.Set(fsprojKey, (discovered, "auto-discovered-script-fallback"))
                             return discovered, "auto-discovered-script-fallback"
                 | None ->
                     let scriptKey = $"script::%s{fullPath}"
+                    let contentHash = scriptSourceHash text
 
                     match optionsCache.TryGet(scriptKey) with
-                    | Some(cached, source) -> return cached, source
-                    | None ->
+                    | Some cached when cached.ScriptSourceHash = Some contentHash ->
+                        return cached.Options, cached.Source
+                    | _ ->
                         let sourceText = SourceText.ofString text
                         let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
-                        optionsCache.Set(scriptKey, (scriptOptions, "scriptInference"))
+                        optionsCache.Set(
+                            scriptKey,
+                            makeOptionsCacheEntry scriptOptions "scriptInference" None (Some contentHash)
+                        )
                         return scriptOptions, "scriptInference"
         }
 
@@ -1821,16 +2113,20 @@ type internal FcsBridge() =
             | Some err -> return err
             | None ->
 
-            // Resolve options FIRST so we can do surgical (per-project) cache
-            // invalidation instead of nuking caches for every loaded project.
-            let! path, _, optionsSource, projectOptions, parseResults, checkedResults =
-                this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
+            // Resolve source/options without checking first: the only parse+check below
+            // must run after invalidation, otherwise every fcs_check_file pays for a
+            // throwaway baseline check before doing the fresh one.
+            let path = normalizePath args.path
+            let source = args.text |> Option.defaultWith (fun () -> File.ReadAllText(path))
+            let sourceText = SourceText.ofString source
 
-            // Drop the cached project-options + project-results entries for THIS
-            // project only — leaves other projects' warm caches alone.
-            let fsprojKey = projectOptions.ProjectFileName
+            let! projectOptions, optionsSource =
+                this.ResolveProjectOptions(path, source, args.projectPath, args.projectOptions)
+
+            // Drop the cached semantic results for THIS project only. Resolved project
+            // options remain reusable: their own input fingerprint invalidates them when
+            // the project graph changes, while source edits are handled by FCS below.
             let projectResultsKey = makeResolvedProjectCacheKey projectOptions
-            optionsCache.TryRemove(fsprojKey) |> ignore
             projectResultsCache.TryRemove(projectResultsKey) |> ignore
 
             // Ask FCS to drop its incremental-build cache for this project so
@@ -1838,11 +2134,14 @@ type internal FcsBridge() =
             // global — keeps other projects' caches warm.
             checker.InvalidateConfiguration(projectOptions)
 
-            // Re-run parse+check now that caches are invalidated. The PrepareCheckContext
-            // call above gave us a baseline; if the user just invalidated mid-edit, we
-            // want the post-invalidation result for diagnostics.
-            let! _, _, _, _, parseResults, checkedResults =
-                this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
+            // One fresh operation returns both parse and type-check results.
+            let! parseResults, checkAnswer =
+                checker.ParseAndCheckFileInProject(path, 0, sourceText, projectOptions) |> asTask
+
+            let checkedResults =
+                match checkAnswer with
+                | FSharpCheckFileAnswer.Succeeded results -> Some results
+                | FSharpCheckFileAnswer.Aborted -> None
 
             let parseDiagnostics = parseResults.Diagnostics |> Array.map diagnosticToJson
 
@@ -2783,9 +3082,11 @@ type internal FcsBridge() =
                     // parse failures (e.g. files in error, or temp-file projects).
                     fallbackHeuristic symbolUse
 
+            let lineContextCache = System.Collections.Generic.Dictionary<string, string array>()
+
             let siteToJson (symbolUse: FSharpSymbolUse) =
                 let r = symbolUse.Range
-                let context = lineContextToJson 2 symbolUse.FileName r.StartLine
+                let context = lineContextToJson lineContextCache 2 symbolUse.FileName r.StartLine
                 let form = formOf symbolUse
 
                 jobj
@@ -2863,9 +3164,11 @@ type internal FcsBridge() =
                     symbolUse.Symbol.FullName, symbolUse.FileName, r.StartLine, r.StartColumn)
                 |> Seq.toArray
 
+            let lineContextCache = System.Collections.Generic.Dictionary<string, string array>()
+
             let useToJson (symbolUse: FSharpSymbolUse) =
                 let r = symbolUse.Range
-                let context = lineContextToJson contextLines symbolUse.FileName r.StartLine
+                let context = lineContextToJson lineContextCache contextLines symbolUse.FileName r.StartLine
 
                 jobj
                     [ "file", jstr (normalizePath symbolUse.FileName)
@@ -3197,7 +3500,14 @@ type internal FcsBridge() =
     member this.Find(args: FindArgs, ?fsacProbe: string -> Task<int>) : Task<JsonNode> =
         task {
             match ArgsValidation.requireNonBlank "query" args.query with
-            | Error envelope -> return envelope
+            | Error _ ->
+                return
+                    jobj
+                        [ "status", jstr "invalid_args"
+                          "message",
+                          jstr
+                              "find requires a non-empty query (symbol, type, or member name). Expected parameters: query (required); kind, scope, exact, member, field, path, line, word, occurrence, character, contextLines, includeDeclaration, includeInfo, includePerProject, projectPath, maxResults, timeoutMs, cursor (optional)." ]
+                    :> JsonNode
             | Ok query0 ->
 
             let kind = (args.kind |> Option.defaultValue "auto").Trim().ToLowerInvariant()
@@ -3613,6 +3923,8 @@ type internal FcsBridge() =
             let pageSites =
                 sortedSites |> Array.skip (min pageOffset totalSites) |> Array.truncate pageSize
 
+            let lineContextCache = System.Collections.Generic.Dictionary<string, string array>()
+
             let siteToJson (s: {| File: string
                                   StartLine: int
                                   StartCol: int
@@ -3621,7 +3933,7 @@ type internal FcsBridge() =
                                   Kind: string
                                   Project: string
                                   FullName: string |}) =
-                let ctx = lineContextToJson contextLines s.File s.StartLine
+                let ctx = lineContextToJson lineContextCache contextLines s.File s.StartLine
 
                 let rangeNode =
                     jobj
@@ -3813,24 +4125,6 @@ type internal FcsBridge() =
             // Scan source lines upward from a use to the nearest test marker:
             //   • an Expecto label   → the quoted label string is the test name;
             //   • a test attribute   → the name of the let/member it decorates.
-            let testAttrRegex =
-                System.Text.RegularExpressions.Regex(
-                    """\[<\s*(?:[\w.]+\.)?(?:Fact|Theory|Test|TestCase|TestMethod|Property)(?:Attribute)?\b""",
-                    System.Text.RegularExpressions.RegexOptions.Compiled
-                )
-
-            let expectoLabelRegex =
-                System.Text.RegularExpressions.Regex(
-                    "\\b(?:ftestCaseAsync|ptestCaseAsync|testCaseAsync|ftestCase|ptestCase|testCase|ftestAsync|ptestAsync|testAsync|ftestProperty|ptestProperty|testProperty|test)\\s+\"([^\"]*)\"",
-                    System.Text.RegularExpressions.RegexOptions.Compiled
-                )
-
-            let bindingNameRegex =
-                System.Text.RegularExpressions.Regex(
-                    """\b(?:let|member)\s+(?:rec\s+|inline\s+|mutable\s+|private\s+|internal\s+|this\.|_\.)*(``[^`]+``|[A-Za-z_][\w']*)""",
-                    System.Text.RegularExpressions.RegexOptions.Compiled
-                )
-
             let findEnclosingTest (lines: string array) (useLine1: int) : string option =
                 if lines.Length = 0 then
                     None
@@ -4366,15 +4660,23 @@ type internal FcsBridge() =
                     | None ->
                         // Resolve options, invalidate THIS project, then re-check fresh so
                         // on-disk edits (incl. cross-file) are reflected — mirrors fcs_check_file.
-                        let! _, _, _, projectOptions, _, _ =
-                            this.PrepareCheckContext(path, None, args.projectPath, None)
+                        let fullPath = normalizePath path
+                        let source = File.ReadAllText(fullPath)
+                        let sourceText = SourceText.ofString source
+                        let! projectOptions, optionsSource =
+                            this.ResolveProjectOptions(fullPath, source, args.projectPath, None)
 
                         let projectResultsKey = makeResolvedProjectCacheKey projectOptions
                         projectResultsCache.TryRemove(projectResultsKey) |> ignore
                         checker.InvalidateConfiguration(projectOptions)
 
-                        let! _, _, optionsSource, _, parseResults, checkedResults =
-                            this.PrepareCheckContext(path, None, args.projectPath, None)
+                        let! parseResults, checkAnswer =
+                            checker.ParseAndCheckFileInProject(fullPath, 0, sourceText, projectOptions) |> asTask
+
+                        let checkedResults =
+                            match checkAnswer with
+                            | FSharpCheckFileAnswer.Succeeded results -> Some results
+                            | FSharpCheckFileAnswer.Aborted -> None
 
                         let checkDiagnostics =
                             checkedResults
@@ -5496,7 +5798,7 @@ type internal FcsBridge() =
                             )
 
                 let! options, optionsSource = this.ResolveFsprojOptions(fsproj)
-                let cacheKey = makeResolvedProjectCacheKey options
+                let cacheKey = $"{makeResolvedProjectCacheKey options}::sources::{sourceFilesStamp options}"
 
                 let! results =
                     task {
@@ -5985,7 +6287,7 @@ type internal FcsBridge() =
             //    helpers; only the bare signature strings are built locally) ──────────
             let fieldSignature (f: FSharpField) =
                 try
-                    $"{f.Name}: {typeName f.FieldType}"
+                    $"{f.Name}: {publicApiTypeName f.FieldType}"
                 with _ ->
                     try f.Name with _ -> "<unknown>"
 
@@ -6005,7 +6307,7 @@ type internal FcsBridge() =
                     else
                         let fieldTypes =
                             uc.Fields
-                            |> Seq.map (fun f -> try typeName f.FieldType with _ -> "?")
+                            |> Seq.map (fun f -> try publicApiTypeName f.FieldType with _ -> "?")
                             |> String.concat " * "
 
                         $"{uc.Name} of {fieldTypes}"
@@ -6057,7 +6359,7 @@ type internal FcsBridge() =
                                 Some
                                     {| name = (try m.DisplayName with _ -> "<unknown>")
                                        kind = memberKindString m
-                                       signature = memberSignature m
+                                       signature = memberSignatureWith publicApiTypeName m
                                        accessibility = acc |}
                             else
                                 None)
@@ -6499,14 +6801,13 @@ type internal FcsBridge() =
                 :> JsonNode
         }
 
-    member _.ClearCaches() =
-        Interlocked.Increment(&optionsCacheGeneration) |> ignore
+    member _.ClearAnalysisCaches() =
         Interlocked.Increment(&projectUsesCacheGeneration) |> ignore
-        optionsCache.Clear()
         projectResultsCache.Clear()
         // issue #131: a new set_project (or any explicit cache clear) must drop the
-        // memoized find sweeps too, so a project switch never serves a prior project's
-        // symbol uses.
+        // memoized find sweeps too, so a project switch never serves stale symbol uses.
+        // Project options intentionally survive: every fsproj entry is validated against
+        // its complete ProjInfo input fingerprint before reuse (issue #150).
         projectUsesCache.Clear()
 
     /// Returns configuration flags captured at checker creation time, for use by RuntimeStatus.
@@ -6519,6 +6820,10 @@ type internal FcsBridge() =
     /// Returns the number of entries currently held in the project-results cache.
     member _.ProjectResultsCacheCount = projectResultsCache.Count
 
+    /// Number of actual Ionide/MSBuild project loads attempted by this bridge. Cache hits
+    /// do not increment it; exposed for deterministic project-options cache tests.
+    member _.ProjectOptionsLoadCount = Volatile.Read(&projectOptionsLoadCount)
+
     /// Number of entries in the find sweep use-cache (issue #131). One per (project,
     /// source-stamp); unchanged between sweeps of the same projects, grows by one per
     /// project when a swept source file is edited. Exposed for cache-behaviour tests.
@@ -6527,18 +6832,14 @@ type internal FcsBridge() =
     member this.ProbeProjectOptions(fsprojPath: string) : Task<Result<ProjectOptionsInfo, string>> =
         task {
             try
-                let! result = this.LoadProjectOptionsFromFsproj(fsprojPath)
+                let! options, source = this.ResolveFsprojOptions(fsprojPath)
+                let existing, total = ReferenceResolution.probe options.OtherOptions
 
                 return
-                    match result with
-                    | Some options ->
-                        let existing, total = ReferenceResolution.probe options.OtherOptions
-
-                        Ok
-                            { Source = "ionide-proj-info"
-                              ReferencesExisting = existing
-                              ReferencesTotal = total }
-                    | None -> Error "Ionide.ProjInfo could not load project options."
+                    Ok
+                        { Source = source
+                          ReferencesExisting = existing
+                          ReferencesTotal = total }
             with ex ->
                 return Error ex.Message
         }
@@ -8443,16 +8744,13 @@ type internal FcsBridge() =
                 let declaredIn =
                     jobj [ "file", jstr v.File; "range", rangeNode ] :> JsonNode
 
-                let note =
-                    $"{v.Accessibility} {v.Kind} '{v.Name}' has no non-definition use across the swept project(s) — verify with `find` before removing"
-
                 jobj
                     [ "name", jstr v.Name
                       "fullName", jstrOrNull v.FullName
                       "kind", jstr v.Kind
                       "accessibility", jstr v.Accessibility
                       "declaredIn", declaredIn
-                      "note", jstr note ]
+                      "note", jstr "See verificationHint." ]
                 :> JsonNode
 
             let caveats =
@@ -8482,6 +8780,9 @@ type internal FcsBridge() =
                       "candidates", JsonArray(page |> Array.map candidateToJson) :> JsonNode
                       "candidateCount", jint total
                       "truncated", jbool truncated
+                      "verificationHint",
+                      jstr
+                          "Each candidate has no non-definition use across the swept project(s); verify it with `find` before removing."
                       "caveats", JsonArray(caveats |> List.map jstr |> List.toArray) :> JsonNode ]
                 :> JsonNode
         }

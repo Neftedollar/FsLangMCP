@@ -113,9 +113,11 @@ Full setup: [`docs/getting-started.md`](docs/getting-started.md) · Per-client c
 | `fcs_nuget_members` | Enumerate members of one type from a referenced assembly. |
 | `fcs_referenced_symbols` | Substring search across all referenced assemblies (NuGet + framework). |
 
-### Raw LSP proxies
+### Exact-position helpers
 
-Require `set_project`. Prefer the semantic tools above for agent flows; these are useful for exact-position editor operations and FSAC debugging.
+The raw `textDocument_*` tools and `fsharp_signature_data` require `set_project`
+and LSP readiness. `fcs_signature_help` runs in-process with FCS project context.
+Prefer the semantic tools above for free-form agent flows.
 
 | Tool | What it does |
 |------|--------------|
@@ -131,13 +133,13 @@ Require `set_project`. Prefer the semantic tools above for agent flows; these ar
 | Tool | What it does |
 |------|--------------|
 | `fslangmcp_version` | Returns installed version. Zero-arg. Use when filing UX feedback. |
-| `fsharp_runtime_status` | Read-only runtime snapshot: heap sizes, GC counts, FCS cache size, FSAC working set. |
+| `fsharp_runtime_status` | Read-only runtime snapshot: heap/GC, FCS cache, FSAC working set, and `process.threads` (OS/ThreadPool counts plus pending/completed work items). |
 
 ## Example Agent Session
 
 ```
 1. set_project  {"projectPath": "/abs/path/MyApp.sln"}
-   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.12.1"
+   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.13.2"
 
 2. check  {}
    → verdict="clean"
@@ -227,6 +229,12 @@ Process and RPC timeouts (milliseconds):
 - **Not ready**: `{"status": "not_ready", "message": "..."}` — FSAC workspace still loading
 - **Invalid args**: `{"status": "invalid_args", "message": "..."}` — required arg blank/missing
 - **Error**: MCP protocol error with `{"errorKind": "...", "message": "..."}` payload
+
+`set_project` keeps the boolean readiness flags for compatibility and adds
+`readiness.symbolIndexState` / `readiness.symbolIndexHint` when the symbol index
+is not ready. `lspRestartRequested` reports intent; legacy `lspRestarted` keeps
+mirroring that request, while `lspReplacedExistingProcess` reports whether a
+running FSAC process was actually replaced.
 
 LSP positions (`line`, `character`) are **0-based**.
 

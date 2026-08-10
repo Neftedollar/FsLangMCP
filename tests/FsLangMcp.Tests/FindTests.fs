@@ -399,7 +399,11 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
             let! result = bridge.Find(findArgs fx.Slnx "   ")
 
             Assert.Equal("invalid_args", gs result "status")
+            Assert.Contains("Expected parameters", gs result "message")
             Assert.Contains("query", gs result "message")
+            Assert.Contains("kind", gs result "message")
+            Assert.Contains("scope", gs result "message")
+            Assert.Contains("projectPath", gs result "message")
         }
 
     [<Fact>]

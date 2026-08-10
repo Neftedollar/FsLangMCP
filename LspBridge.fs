@@ -267,6 +267,44 @@ type private WorkspaceLoadTarget(setReady: unit -> unit) =
 // ─── LspResponseShape (pure response builders, testable) ──────────────────────
 
 module internal LspResponseShape =
+    /// True only when a requested restart replaces an already-running LSP.
+    /// A first launch is a start, not a restart.
+    let lspRestartOccurred (restartRequested: bool) (lspWasRunning: bool) =
+        restartRequested && lspWasRunning
+
+    /// Builds the additive readiness detail returned by set_project. Keep the
+    /// original boolean fields stable while giving callers a recovery path when
+    /// the symbol index is not ready yet.
+    let setProjectReadiness
+        (lspReady: bool)
+        (symbolIndexReady: bool)
+        (restartRequested: bool)
+        : JsonNode =
+        let symbolIndexState, symbolIndexHint =
+            if symbolIndexReady then
+                "ready", null
+            elif lspReady then
+                "warming",
+                jstr
+                    "The FSAC symbol index is still warming, so symbol-index fallback results may be incomplete. Wait briefly, then retry the symbol-dependent request; find and check remain available."
+            elif restartRequested then
+                "blocked_on_lsp",
+                jstr
+                    "FSAC did not become ready, so position-based LSP tools and symbol-index fallback are unavailable. Retry set_project with restartLsp=true."
+            else
+                "not_started",
+                jstr
+                    "The LSP was not started, so position-based LSP tools and symbol-index fallback are unavailable. Call set_project with restartLsp=true."
+
+        jobj
+            [ "lsp", jbool lspReady
+              // projectOptions is enriched by the caller in Program.fs (Bridge has no FCS handle).
+              "projectOptions", jbool false
+              "symbolIndex", jbool symbolIndexReady
+              "symbolIndexState", jstr symbolIndexState
+              "symbolIndexHint", symbolIndexHint ]
+        :> JsonNode
+
     /// Maps a severity name (case-insensitive) to the LSP numeric code:
     /// 1=error, 2=warning, 3=information, 4=hint. Returns None for unrecognised names.
     let severityCodeOf (raw: string) : int option =
@@ -869,6 +907,8 @@ type internal FsAutoCompleteBridge
     (
         ?startupTimeoutOverride: TimeSpan,
         ?requestTimeoutOverride: TimeSpan,
+        ?cleanupTimeoutOverride: TimeSpan,
+        ?cleanupDrainBarrierOverride: (unit -> Task option),
         ?fsacCommandOverride: string,
         ?fsacArgsOverride: string list
     ) =
@@ -901,6 +941,9 @@ type internal FsAutoCompleteBridge
         requestTimeoutOverride
         |> Option.defaultWith (fun () -> timeoutFromEnv "FSLANGMCP_LSP_REQUEST_TIMEOUT_MS" 30_000)
 
+    let cleanupTimeout =
+        cleanupTimeoutOverride |> Option.defaultValue (TimeSpan.FromSeconds(5.0))
+
     [<VolatileField>]
     let mutable workspaceReady = false
 
@@ -912,6 +955,92 @@ type internal FsAutoCompleteBridge
 
     [<VolatileField>]
     let mutable stderrPump: Task option = None
+
+    let mutable pendingLspCleanups = 0
+    let mutable pendingLspCleanup: Task option = None
+
+    let tryDispose (resource: unit -> IDisposable) =
+        try
+            resource().Dispose()
+        with _ ->
+            ()
+
+    let cleanupLspResources
+        (jsonRpc: JsonRpc option)
+        (fsacProcess: Process option)
+        (pump: Task option)
+        : Task =
+        task {
+            if jsonRpc.IsNone && fsacProcess.IsNone && pump.IsNone then
+                return ()
+            else
+                Interlocked.Increment(&pendingLspCleanups) |> ignore
+
+                try
+                    // JsonRpc.Dispose only starts its asynchronous shutdown. Closing the
+                    // redirected streams unblocks the pipe readers; Completion below proves
+                    // that the old RPC generation is fully reaped before another is started.
+                    match jsonRpc with
+                    | Some instance ->
+                        try
+                            instance.Dispose()
+                        with _ ->
+                            ()
+                    | None -> ()
+
+                    match fsacProcess with
+                    | Some fsacProc ->
+                        try
+                            if not fsacProc.HasExited then
+                                fsacProc.Kill(true)
+                        with _ ->
+                            ()
+
+                        tryDispose (fun () -> fsacProc.StandardInput :> IDisposable)
+                        tryDispose (fun () -> fsacProc.StandardOutput :> IDisposable)
+                        tryDispose (fun () -> fsacProc.StandardError :> IDisposable)
+                    | None -> ()
+
+                    let completions =
+                        [ match jsonRpc with
+                          | Some instance -> yield instance.Completion
+                          | None -> ()
+
+                          match fsacProcess with
+                          | Some fsacProc ->
+                              try
+                                  if not fsacProc.HasExited then
+                                      yield fsacProc.WaitForExitAsync()
+                              with _ ->
+                                  ()
+                          | _ -> ()
+
+                          match pump with
+                          | Some pumpTask -> yield pumpTask
+                          | None -> ()
+
+                          match cleanupDrainBarrierOverride |> Option.bind (fun barrier -> barrier ()) with
+                          | Some barrier -> yield barrier
+                          | None -> () ]
+
+                    if not completions.IsEmpty then
+                        try
+                            do! Task.WhenAll(completions)
+                        with _ ->
+                            // Every completion has settled; cleanup faults are intentionally
+                            // secondary to the request/startup error that initiated shutdown.
+                            ()
+                finally
+                    match fsacProcess with
+                    | Some fsacProc ->
+                        try
+                            fsacProc.Dispose()
+                        with _ ->
+                            ()
+                    | None -> ()
+
+                    Interlocked.Decrement(&pendingLspCleanups) |> ignore
+        }
 
     let parseArgs (raw: string option) =
         raw
@@ -984,45 +1113,51 @@ type internal FsAutoCompleteBridge
         workspaceReady <- true
         workspaceReadyAt <- ValueSome DateTimeOffset.UtcNow
 
-    member private _.StopLspUnsafe() =
-        match rpc with
-        | Some instance ->
-            instance.Dispose()
-            rpc <- None
-        | None -> ()
+    member private _.BeginLspCleanupUnsafe
+        (stoppedRpc: JsonRpc option, stoppedProcess: Process option, stoppedPump: Task option)
+        =
+        if stoppedRpc.IsSome || stoppedProcess.IsSome || stoppedPump.IsSome then
+            let cleanup = cleanupLspResources stoppedRpc stoppedProcess stoppedPump
 
-        match lspProcess with
-        | Some fsacProc when not fsacProc.HasExited ->
-            fsacProc.Kill(true)
+            pendingLspCleanup <-
+                match pendingLspCleanup with
+                | Some previous -> Some(Task.WhenAll([| previous; cleanup |]))
+                | None -> Some cleanup
 
-            try
-                fsacProc.WaitForExit(5000) |> ignore
-            with _ ->
-                ()
-
-            // Give pump 500ms to notice process died
-            match stderrPump with
-            | Some pump ->
+    member private _.AwaitPendingLspCleanupUnsafe() : Task<bool> =
+        task {
+            match pendingLspCleanup with
+            | None -> return true
+            | Some cleanup ->
                 try
-                    pump.Wait(500) |> ignore
-                with _ ->
-                    ()
-            | None -> ()
+                    // Bound only this caller's wait. The actual drain task remains retained
+                    // after a timeout, so no later generation can start over live pipe readers.
+                    do! cleanup.WaitAsync(cleanupTimeout)
+                    pendingLspCleanup <- None
+                    return true
+                with :? TimeoutException ->
+                    return false
+        }
 
-            fsacProc.Dispose()
-            lspProcess <- None
-        | Some fsacProc ->
-            fsacProc.Dispose()
-            lspProcess <- None
-        | None -> ()
+    member private this.StopLspUnsafe() : Task<bool> =
+        task {
+            let stoppedRpc = rpc
+            let stoppedProcess = lspProcess
+            let stoppedPump = stderrPump
 
-        stderrPump <- None
-        documents.Clear()
-        diagnostics.Clear()
-        diagnosticsAnalyzedAt.Clear()
-        workspaceReady <- false
-        workspaceReadyAt <- ValueNone
-        symbolIndexEverWarmed <- false
+            rpc <- None
+            lspProcess <- None
+            stderrPump <- None
+            documents.Clear()
+            diagnostics.Clear()
+            diagnosticsAnalyzedAt.Clear()
+            workspaceReady <- false
+            workspaceReadyAt <- ValueNone
+            symbolIndexEverWarmed <- false
+
+            this.BeginLspCleanupUnsafe(stoppedRpc, stoppedProcess, stoppedPump)
+            return! this.AwaitPendingLspCleanupUnsafe()
+        }
 
     member private this.InvokeLiveUnsafe(jsonRpc: JsonRpc, methodName: string, parameters: JsonObject) : Task<JsonNode> =
         task {
@@ -1030,7 +1165,9 @@ type internal FsAutoCompleteBridge
                 return! invokeWithTimeout jsonRpc methodName parameters requestTimeout
             with :? TimeoutException as ex ->
                 match rpc with
-                | Some current when Object.ReferenceEquals(current, jsonRpc) -> this.StopLspUnsafe()
+                | Some current when Object.ReferenceEquals(current, jsonRpc) ->
+                    let! _ = this.StopLspUnsafe()
+                    ()
                 | _ -> ()
 
                 return raise ex
@@ -1042,7 +1179,9 @@ type internal FsAutoCompleteBridge
                 do! notifyWithTimeout jsonRpc methodName parameters requestTimeout
             with :? TimeoutException as ex ->
                 match rpc with
-                | Some current when Object.ReferenceEquals(current, jsonRpc) -> this.StopLspUnsafe()
+                | Some current when Object.ReferenceEquals(current, jsonRpc) ->
+                    let! _ = this.StopLspUnsafe()
+                    ()
                 | _ -> ()
 
                 return raise ex
@@ -1064,6 +1203,9 @@ type internal FsAutoCompleteBridge
 
     /// Returns the live FSAC child process handle, or None if FSAC is not running.
     member _.FsacProcess: Process option = lspProcess
+
+    /// Number of retired LSP generations still draining redirected IO.
+    member _.PendingLspCleanupCount = Volatile.Read(&pendingLspCleanups)
 
     // Wait until workspaceReady is true or timeout elapses
     member _.WaitForReady(timeout: TimeSpan) : Task<bool> =
@@ -1129,22 +1271,30 @@ type internal FsAutoCompleteBridge
                 let restartLsp = args.restartLsp |> Option.defaultValue true
                 do! gate.WaitAsync()
 
-                let capturedProjectPath, capturedWorkspaceRoot =
+                let lspWasRunning, capturedProjectPath, capturedWorkspaceRoot =
                     try
+                        let lspWasRunning =
+                            lspProcess
+                            |> Option.exists (fun lspProc -> not lspProc.HasExited)
+
                         runtimeProjectPath <- Some projectPath
                         runtimeWorkspaceRoot <- Some resolvedWorkspace
 
                         Environment.SetEnvironmentVariable("FSA_PROJECT_PATH", runtimeProjectPath |> Option.defaultValue "")
                         Environment.SetEnvironmentVariable("FSA_WORKSPACE_ROOT", resolvedWorkspace)
 
-                        runtimeProjectPath, resolvedWorkspace
+                        lspWasRunning, runtimeProjectPath, resolvedWorkspace
                     with ex ->
                         gate.Release() |> ignore
                         reraise ()
 
                 if restartLsp then
                     try
-                        this.StopLspUnsafe()
+                        let! cleanupCompleted = this.StopLspUnsafe()
+
+                        if not cleanupCompleted then
+                            invalidOp "Timed out while draining the previous FSAC LSP generation."
+
                         let! _ = this.StartLspUnsafe()
                         ()
                     finally
@@ -1158,17 +1308,15 @@ type internal FsAutoCompleteBridge
                 let loadedProjectsNode =
                     JsonArray(loadedProjects |> Array.map jstr) :> JsonNode
 
+                let lspReplacedExistingProcess =
+                    LspResponseShape.lspRestartOccurred restartLsp lspWasRunning
+
                 if restartLsp then
                     let! ready = this.WaitForReady(TimeSpan.FromSeconds(30.0))
                     let loadStatus = if ready then "ready" else "timeout"
 
                     let readinessNode =
-                        jobj
-                            [ "lsp", jbool ready
-                              // projectOptions is enriched by the caller in Program.fs (Bridge has no FCS handle).
-                              "projectOptions", jbool false
-                              "symbolIndex", jbool symbolIndexEverWarmed ]
-                        :> JsonNode
+                        LspResponseShape.setProjectReadiness ready symbolIndexEverWarmed restartLsp
 
                     return
                         jobj
@@ -1179,7 +1327,11 @@ type internal FsAutoCompleteBridge
                                     "projectPath", capturedProjectPath |> Option.map jstr |> Option.defaultValue null
                                     "requestedPath", jstr inputPath
                                     "workspaceRoot", jstr capturedWorkspaceRoot
+                                    "lspRestartRequested", jbool restartLsp
+                                    // Preserve the pre-0.13.2 contract: this field historically
+                                    // mirrored the request, including on a first launch.
                                     "lspRestarted", jbool restartLsp
+                                    "lspReplacedExistingProcess", jbool lspReplacedExistingProcess
                                     "solutionMode", jbool isSolution
                                     "workspaceLoadStatus", jstr loadStatus
                                     "loadedProjects", loadedProjectsNode
@@ -1190,11 +1342,7 @@ type internal FsAutoCompleteBridge
                         :> JsonNode
                 else
                     let readinessNode =
-                        jobj
-                            [ "lsp", jbool workspaceReady
-                              "projectOptions", jbool false
-                              "symbolIndex", jbool symbolIndexEverWarmed ]
-                        :> JsonNode
+                        LspResponseShape.setProjectReadiness workspaceReady symbolIndexEverWarmed restartLsp
 
                     return
                         jobj
@@ -1205,7 +1353,9 @@ type internal FsAutoCompleteBridge
                                     "projectPath", capturedProjectPath |> Option.map jstr |> Option.defaultValue null
                                     "requestedPath", jstr inputPath
                                     "workspaceRoot", jstr capturedWorkspaceRoot
+                                    "lspRestartRequested", jbool restartLsp
                                     "lspRestarted", jbool restartLsp
+                                    "lspReplacedExistingProcess", jbool lspReplacedExistingProcess
                                     "solutionMode", jbool isSolution
                                     "workspaceLoadStatus", jstr "not_started"
                                     "loadedProjects", loadedProjectsNode
@@ -1229,6 +1379,11 @@ type internal FsAutoCompleteBridge
     // StartLspUnsafe: assumes gate is already held by caller
     member private this.StartLspUnsafe() : Task<JsonRpc> =
         task {
+            let! cleanupCompleted = this.AwaitPendingLspCleanupUnsafe()
+
+            if not cleanupCompleted then
+                invalidOp "Timed out while draining the previous FSAC LSP generation."
+
             let command = fsacCommand ()
             let args = fsacArgs ()
             let workspaceRoot = getWorkspaceRoot ()
@@ -1258,6 +1413,7 @@ type internal FsAutoCompleteBridge
             // the exception propagate without cleaning them up first, the already-started
             // fsautocomplete process leaks (nothing else can ever reap it).
             let mutable startedJsonRpc: JsonRpc option = None
+            let mutable startedStderrPump: Task option = None
 
             try
                 let pumpStderr: Task =
@@ -1285,6 +1441,7 @@ type internal FsAutoCompleteBridge
                 |> ignore
 
                 stderrPump <- Some pumpStderr
+                startedStderrPump <- Some pumpStderr
 
                 let formatter = new SystemTextJsonFormatter()
                 let formatterOpts = JsonSerializerOptions()
@@ -1381,17 +1538,9 @@ type internal FsAutoCompleteBridge
             with ex ->
                 // Handshake failed before the fields above were committed: this method is
                 // still the sole owner of fsacProc/jsonRpc, so reap them here or they leak.
-                startedJsonRpc |> Option.iter (fun r -> r.Dispose())
-
-                if not fsacProc.HasExited then
-                    fsacProc.Kill(true)
-
-                    try
-                        do! fsacProc.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5.0))
-                    with _ ->
-                        ()
-
-                fsacProc.Dispose()
+                stderrPump <- None
+                this.BeginLspCleanupUnsafe(startedJsonRpc, Some fsacProc, startedStderrPump)
+                let! _ = this.AwaitPendingLspCleanupUnsafe()
                 return raise ex
         }
 
@@ -1952,6 +2101,6 @@ type internal FsAutoCompleteBridge
 
     interface IDisposable with
         member this.Dispose() =
-            this.StopLspUnsafe()
+            this.StopLspUnsafe().GetAwaiter().GetResult() |> ignore
             projectSwitchGate.Dispose()
             gate.Dispose()

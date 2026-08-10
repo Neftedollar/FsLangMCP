@@ -55,6 +55,11 @@ let init () : unit =
                   "totalAllocated"
                   // process uptime
                   "uptimeSeconds"
+                  // process/thread-pool diagnostics
+                  "process"
+                  "threadPool"
+                  "pendingWorkItems"
+                  "completedWorkItems"
                   // assemblies loaded count (varies by JIT progress)
                   "loaded"
                   // child process working set
