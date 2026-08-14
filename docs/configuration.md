@@ -72,16 +72,15 @@ use `find` and `check` instead of grep — the snippet is in
 
 ## Codex (OpenAI)
 
-Codex CLI reads MCP server configuration from `~/.codex/config.toml`. The `mcp_servers` stanza format in Codex's current release is:
+Codex CLI reads MCP server configuration from `~/.codex/config.toml`. Each server is a `[mcp_servers.<name>]` table:
 
 ```toml
-[[mcp_servers]]
-name    = "fslangmcp"
+[mcp_servers.fslangmcp]
 command = "fslangmcp"
 args    = []
 ```
 
-> Codex's config schema is evolving — see [Codex's MCP documentation](https://github.com/openai/codex) for the current exact key names if the above doesn't match your installed version.
+> Codex's config schema is evolving — see [Codex's MCP documentation](https://developers.openai.com/codex/mcp) for the current exact key names if the above doesn't match your installed version.
 
 Put the tool-discipline rules in `AGENTS.md` at the repo root (Codex's equivalent of `CLAUDE.md`). The snippet from [`AGENT_INTEGRATION.md`](../AGENT_INTEGRATION.md) applies unchanged.
 

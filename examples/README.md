@@ -168,23 +168,23 @@ readability; your run will show all sites):
     "scopeResolved": "workspace",
     "projectsSwept": 2,
     "via": "fcs-multiproject-sweep",
-    "fcsSiteCount": 6,
+    "fcsSiteCount": 17,
     "fsacFallbackHits": 0
   },
   "projectsSwept": 2,
-  "totalSites": 6,
+  "totalSites": 17,
   "breakdown": {
-    "definitions": 1,
-    "references": 3,
-    "fieldSetLiteral": 2,
+    "definitions": 2,
+    "references": 5,
+    "fieldSetLiteral": 6,
     "fieldSetUpdate": 0,
-    "fieldRead": 0,
+    "fieldRead": 4,
     "memberUsages": 0
   },
   "sites": [
     {
       "file": "…/Domain/Order.fs",
-      "range": { "startLine": 3, "startColumn": 5, "endLine": 3, "endColumn": 10 },
+      "range": { "startLine": 4, "startColumn": 5, "endLine": 4, "endColumn": 10 },
       "kind": "definition",
       "project": "Domain",
       "symbolFullName": "Domain.Order",
@@ -192,24 +192,25 @@ readability; your run will show all sites):
     },
     {
       "file": "…/App/Program.fs",
-      "range": { "startLine": 4, "startColumn": 6, "endLine": 4, "endColumn": 11 },
+      "range": { "startLine": 4, "startColumn": 8, "endLine": 4, "endColumn": 10 },
       "kind": "field-set-literal",
       "project": "App",
-      "symbolFullName": "Domain.Order",
-      "lineText": "    { Id = 1; Customer = \"Alice\"; Amount = 250.00m }"
+      "symbolFullName": "Domain.Order.Id",
+      "lineText": "    [ { Id = 1; Customer = \"Alice\"; Amount = 250.00m }"
     }
   ]
 }
 ```
 
-Key observation: `resolution.projectsSwept = 2` and sites appear from **both**
-`Domain/Order.fs` (definition) and `App/Program.fs` (field-set-literal,
-field-set-literal, reference). `rg "Order" examples/quickstart/Domain/` would
-return only the Domain sites.
+Key observation: `resolution.projectsSwept = 2` and 17 sites appear from **both**
+projects — 8 in `Domain/Order.fs` (definitions, references, field reads) and 9 in
+`App/Program.fs` (references and field-set literals).
+`rg "Order" examples/quickstart/Domain/` would return only the Domain sites.
 
-Each site carries `file`, `range` (0-based startLine/startColumn/endLine/endColumn),
-`kind` (definition | reference | field-set-literal | field-set-update | field-read |
-member-usage), `project`, `symbolFullName`, and `lineText`.
+Each site carries `file`, `range` (1-based startLine/endLine, 0-based
+startColumn/endColumn), `kind` (definition | reference | field-set-literal |
+field-set-update | field-read | member-usage), `project`, `symbolFullName`, and
+`lineText`.
 
 ---
 

@@ -190,7 +190,7 @@ The response includes `evaluation.status`, `evaluation.source`, `evaluation.impo
 **Purpose:** Given an unresolved symbol name (FS0039), return ranked `open` directive candidates — project-local first, then referenced assemblies.
 
 **Key args:**
-- `symbol` (required) — the unresolved name
+- `symbolName` (required) — the unresolved name
 - `includeReferences` — include referenced assemblies (default `true`)
 
 **Use when:** `check` reports "X is not defined" and you need the right namespace or module to open.
@@ -242,7 +242,7 @@ The response includes `evaluation.status`, `evaluation.source`, `evaluation.impo
 **Purpose:** List tests that likely cover a symbol. Sweeps test projects (detected via `<IsTestProject>` or xunit/nunit/expecto refs), filters FCS symbol uses to test files, and tags each with its enclosing test name.
 
 **Key args:**
-- `symbol` (required) — symbol name to look for in test files
+- `symbolQuery` (required) — symbol name to look for in test files
 - `projectPath` — optional after `set_project`
 
 **Use when:** "What tests cover this function?" — gives the test-coverage slice that `find` (which returns all uses) doesn't directly filter.
@@ -346,7 +346,7 @@ The response includes `evaluation.status`, `evaluation.source`, `evaluation.impo
 **Purpose:** Enumerate all types in one referenced assembly matched by exact `SimpleName` (case-insensitive). Returns display name, full name, kind, accessibility, and obsolete status.
 
 **Key args:**
-- `assemblyName` (required) — exact simple name (e.g. `"Spectre.Console"`)
+- `packageId` (required) — matched against the referenced assembly's exact simple name, case-insensitive (e.g. `"Spectre.Console"`)
 - `maxResults` / `cursor` — pagination (default 500, max 2000)
 
 **Use when:** Discovering what types a specific NuGet package exposes. Note: `Spectre.Console` resolves only to that assembly, not `Spectre.Console.Cli` — call once per assembly.
