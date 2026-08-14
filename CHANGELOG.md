@@ -137,10 +137,13 @@ contracts that callers may have treated as unconditional success.
   `fsharp_project_inspect` through MSBuild evaluation and are normalized by the
   engine itself; a regression test pins that behaviour.
 - `fcs_review_scan` project mode no longer claims `succeeded` over a partial
-  file set: compiled files that cannot be found on disk are listed in a new
-  `unresolvedFiles` response field and downgrade `status` to `partial` (#160).
+  file set: in-scope compiled files that cannot be found on disk are listed in
+  a new `unresolvedFiles` response field and downgrade `status` to `partial`.
+  Filter-excluded entries (generated, obj/bin, tests) are deliberately not
+  counted — their absence is expected pre-build in parse-only mode; the
+  unfiltered view remains `project_health.missingFiles` (#160).
 - `fcs_project_outline` reports the same aggregate `unresolvedFiles` list over
-  the full compile list, so missing files stay visible even when the per-file
+  all in-scope files, so missing files stay visible even when the per-file
   `outlineStatus` errors are on another page (#160).
 
 ## [0.13.2] - 2026-08-10

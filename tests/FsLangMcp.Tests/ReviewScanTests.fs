@@ -411,6 +411,47 @@ let ``project mode reports partial status when a compiled file cannot be resolve
     }
 
 [<Fact>]
+let ``project mode ignores missing files that are outside the scan scope`` () : Task =
+    task {
+        // `unresolvedFiles` covers the SCAN SCOPE, not the raw compile list: entries the
+        // Review filter excludes (generated, obj/bin, tests) are expected to be absent
+        // before a build in this parse-only mode, and their absence is not a coverage
+        // gap. Full-list hygiene lives in project_health.missingFiles (#160, PR review).
+        let dir = Path.Combine(Path.GetTempPath(), $"fslangmcp_review_{Guid.NewGuid():N}")
+        Directory.CreateDirectory dir |> ignore
+        File.WriteAllText(Path.Combine(dir, "ReviewFixture.fs"), fixtureSource)
+
+        let fsprojPath = Path.Combine(dir, "Fixture.fsproj")
+
+        File.WriteAllText(
+            fsprojPath,
+            String.concat
+                "\n"
+                [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+                  "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+                  "  <ItemGroup>"
+                  "    <Compile Include=\"ReviewFixture.fs\" />"
+                  "    <Compile Include=\"obj\\Debug\\Generated.fs\" />"
+                  "    <Compile Include=\"Schema.g.fs\" />"
+                  "  </ItemGroup>"
+                  "</Project>" ]
+        )
+
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.ReviewScan
+                { path = None
+                  projectPath = Some fsprojPath
+                  categories = None
+                  maxResults = None }
+
+        Assert.Equal("succeeded", gs result "status")
+        Assert.Empty(arr result "unresolvedFiles")
+        Assert.Equal(5, total result)
+    }
+
+[<Fact>]
 let ``no path and no projectPath yields invalid_args`` () : Task =
     task {
         let bridge = FcsBridge()

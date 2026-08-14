@@ -274,7 +274,7 @@ The response includes `evaluation.status`, `evaluation.source`, `evaluation.impo
 
 **Use when:** Code review or audit passes. Parse-only, writes nothing.
 
-**Coverage honesty:** in project mode, compiled files that cannot be found on disk are listed in `unresolvedFiles` and downgrade `status` from `succeeded` to `partial` — never trust a scan's coverage without checking `status` and `scanned`.
+**Coverage honesty:** in project mode, in-scope compiled files that cannot be found on disk are listed in `unresolvedFiles` and downgrade `status` from `succeeded` to `partial` — never trust a scan's coverage without checking `status` and `scanned`. Filter-excluded entries (generated, obj/bin, tests) are not counted: their absence is expected pre-build; use `project_health` (`files.missingFiles`) for unfiltered fsproj hygiene.
 
 ---
 

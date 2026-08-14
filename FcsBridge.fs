@@ -7985,8 +7985,11 @@ type internal FcsBridge
             let paginationFields =
                 Cursor.paginationFields "files" totalFileCount pageOffset pageSize pageFiles.Length
 
-            // Aggregate over the FULL compile list, not the current page: per-file
+            // Aggregate over ALL in-scope files, not just the current page: per-file
             // outlineStatus errors can scroll past pagination, this cannot (#160).
+            // Filter-excluded entries (generated, obj/bin, tests) are deliberately not
+            // counted — absent-before-build is normal for them; the unfiltered view is
+            // project_health.missingFiles.
             let unresolvedFiles =
                 allFiles.Included
                 |> List.map (fun f -> f.Path)
@@ -10803,8 +10806,11 @@ type internal FcsBridge
                 jobj [ "total", jint total; "returned", jint pageNodes.Length; "byCategory", byCategory ]
                 :> JsonNode
 
-            // A review scan must never claim coverage it did not achieve: any compiled
-            // file missing on disk downgrades the verdict to `partial` (#160).
+            // A review scan must never claim coverage it did not achieve: any IN-SCOPE
+            // compiled file missing on disk downgrades the verdict to `partial` (#160).
+            // Filter-excluded entries (generated, obj/bin, tests) are deliberately NOT
+            // counted — their absence is expected pre-build in this parse-only mode;
+            // full-list hygiene is project_health.missingFiles' job.
             return
                 jobj
                     [ "status", jstr (if List.isEmpty unresolvedFiles then "succeeded" else "partial")
