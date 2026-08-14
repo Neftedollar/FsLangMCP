@@ -226,11 +226,19 @@ let internal defaultFilterOptions scanKind =
       IncludeObjBin = false
       MaxFiles = None }
 
-let private resolveCompilePath (projectDir: string) (includePath: string) =
-    if Path.IsPathRooted(includePath) then
-        Path.GetFullPath(includePath)
+// MSBuild treats both `\` and `/` as separators in Include paths on every OS; on
+// Unix a raw `\` is a literal filename character, so normalize before touching the
+// filesystem (#160). Mirrors SolutionParsing's fsprojsFromSlnx.
+let internal resolveIncludePath (projectDir: string) (includePath: string) =
+    let normalized =
+        includePath
+            .Replace('/', Path.DirectorySeparatorChar)
+            .Replace('\\', Path.DirectorySeparatorChar)
+
+    if Path.IsPathRooted(normalized) then
+        Path.GetFullPath(normalized)
     else
-        Path.GetFullPath(Path.Combine(projectDir, includePath))
+        Path.GetFullPath(Path.Combine(projectDir, normalized))
 
 let private pairSignatureFiles (rawFiles: ProjectFile list) =
     let implementationByBase =
@@ -291,7 +299,7 @@ let internal compileFiles (projectPath: string) (doc: XDocument) =
     |> Seq.choose (fun element ->
         attr "Include" element
         |> Option.map (fun includePath ->
-            resolveCompilePath projectDir includePath,
+            resolveIncludePath projectDir includePath,
             includePath,
             attr "Link" element))
     |> projectFilesFromEvaluatedItems

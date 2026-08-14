@@ -7985,12 +7985,20 @@ type internal FcsBridge
             let paginationFields =
                 Cursor.paginationFields "files" totalFileCount pageOffset pageSize pageFiles.Length
 
+            // Aggregate over the FULL compile list, not the current page: per-file
+            // outlineStatus errors can scroll past pagination, this cannot (#160).
+            let unresolvedFiles =
+                allFiles.Included
+                |> List.map (fun f -> f.Path)
+                |> List.filter (File.Exists >> not)
+
             let baseFields =
                 [ "status", jstr "ok"
                   "projectPath", jstr projectPath
                   "workspaceRoot", jstr workspaceRoot
                   "summaryOnly", jbool summaryOnly
                   "filterSummary", filterSummaryToJson allFiles :> JsonNode
+                  "unresolvedFiles", JsonArray(unresolvedFiles |> List.map jstr |> List.toArray) :> JsonNode
                   "files", JsonArray(fileEntries.ToArray()) :> JsonNode ]
 
             return jobj (baseFields @ paginationFields) :> JsonNode
@@ -10677,12 +10685,13 @@ type internal FcsBridge
             let pathArg = args.path |> Option.filter (String.IsNullOrWhiteSpace >> not)
             let projectArg = args.projectPath |> Option.filter (String.IsNullOrWhiteSpace >> not)
 
-            let filesResult: Result<string * string list, JsonNode> =
+            // (mode, scannable files, compiled files that do not exist on disk)
+            let filesResult: Result<string * string list * string list, JsonNode> =
                 match pathArg with
                 | Some path ->
                     match validateSourcePath "fcs_review_scan" None path with
                     | Some err -> Error err
-                    | None -> Ok("file", [ normalizePath path ])
+                    | None -> Ok("file", [ normalizePath path ], [])
                 | None ->
                     match projectArg with
                     | None ->
@@ -10716,20 +10725,20 @@ type internal FcsBridge
                             | Ok doc ->
                                 let workspaceRoot = Path.GetDirectoryName fullProject
 
-                                let included =
+                                let resolved, unresolved =
                                     filterProjectFiles workspaceRoot (defaultFilterOptions Review) (compileFiles fullProject doc)
                                     |> fun result ->
                                         result.Included
                                         |> List.map (fun f -> f.Path)
-                                        |> List.filter File.Exists
                                         |> List.distinct
                                         |> List.sort
+                                        |> List.partition File.Exists
 
-                                Ok("project", included)
+                                Ok("project", resolved, unresolved)
 
             match filesResult with
             | Error err -> return err
-            | Ok(mode, files) ->
+            | Ok(mode, files, unresolvedFiles) ->
 
             // ── Parse each file (parse-only) and collect candidates ──────────────
             let scanned = ResizeArray<string>()
@@ -10794,11 +10803,14 @@ type internal FcsBridge
                 jobj [ "total", jint total; "returned", jint pageNodes.Length; "byCategory", byCategory ]
                 :> JsonNode
 
+            // A review scan must never claim coverage it did not achieve: any compiled
+            // file missing on disk downgrades the verdict to `partial` (#160).
             return
                 jobj
-                    [ "status", jstr "succeeded"
+                    [ "status", jstr (if List.isEmpty unresolvedFiles then "succeeded" else "partial")
                       "mode", jstr mode
                       "scanned", JsonArray(scanned.ToArray() |> Array.map jstr) :> JsonNode
+                      "unresolvedFiles", JsonArray(unresolvedFiles |> List.map jstr |> List.toArray) :> JsonNode
                       "candidates", JsonArray(pageNodes |> List.toArray) :> JsonNode
                       "counts", countsNode
                       "truncated", jbool (total > pageNodes.Length)

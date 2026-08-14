@@ -274,6 +274,8 @@ The response includes `evaluation.status`, `evaluation.source`, `evaluation.impo
 
 **Use when:** Code review or audit passes. Parse-only, writes nothing.
 
+**Coverage honesty:** in project mode, compiled files that cannot be found on disk are listed in `unresolvedFiles` and downgrade `status` from `succeeded` to `partial` — never trust a scan's coverage without checking `status` and `scanned`.
+
 ---
 
 ### `fcs_public_api`

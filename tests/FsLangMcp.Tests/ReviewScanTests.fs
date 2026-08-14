@@ -328,6 +328,89 @@ let ``project mode scans the project's compiled files without a build`` () : Tas
     }
 
 [<Fact>]
+let ``project mode resolves MSBuild backslash Compile includes on the host OS`` () : Task =
+    task {
+        // Windows-authored fsprojs write `Domain\Money.fs`; MSBuild normalizes this on
+        // every OS, so the scan must too — otherwise subdirectory files silently vanish
+        // from project mode on macOS/Linux (#160).
+        let dir = Path.Combine(Path.GetTempPath(), $"fslangmcp_review_{Guid.NewGuid():N}")
+        Directory.CreateDirectory(Path.Combine(dir, "Domain")) |> ignore
+        File.WriteAllText(Path.Combine(dir, "Domain", "ReviewFixture.fs"), fixtureSource)
+
+        let fsprojPath = Path.Combine(dir, "Fixture.fsproj")
+
+        File.WriteAllText(
+            fsprojPath,
+            String.concat
+                "\n"
+                [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+                  "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+                  "  <ItemGroup><Compile Include=\"Domain\\ReviewFixture.fs\" /></ItemGroup>"
+                  "</Project>" ]
+        )
+
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.ReviewScan
+                { path = None
+                  projectPath = Some fsprojPath
+                  categories = None
+                  maxResults = None }
+
+        Assert.Equal("succeeded", gs result "status")
+
+        let scanned = arr result "scanned" |> List.map (fun n -> n.GetValue<string>())
+        Assert.Contains(scanned, fun p -> p.EndsWith(Path.Combine("Domain", "ReviewFixture.fs")))
+        Assert.Equal(5, total result)
+    }
+
+[<Fact>]
+let ``project mode reports partial status when a compiled file cannot be resolved`` () : Task =
+    task {
+        // A review tool must never claim full coverage it did not achieve: any Compile
+        // entry that cannot be found on disk downgrades the verdict to `partial` and is
+        // listed in `unresolvedFiles` (#160).
+        let dir = Path.Combine(Path.GetTempPath(), $"fslangmcp_review_{Guid.NewGuid():N}")
+        Directory.CreateDirectory dir |> ignore
+        File.WriteAllText(Path.Combine(dir, "ReviewFixture.fs"), fixtureSource)
+
+        let fsprojPath = Path.Combine(dir, "Fixture.fsproj")
+
+        File.WriteAllText(
+            fsprojPath,
+            String.concat
+                "\n"
+                [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+                  "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+                  "  <ItemGroup>"
+                  "    <Compile Include=\"ReviewFixture.fs\" />"
+                  "    <Compile Include=\"Missing.fs\" />"
+                  "  </ItemGroup>"
+                  "</Project>" ]
+        )
+
+        let bridge = FcsBridge()
+
+        let! result =
+            bridge.ReviewScan
+                { path = None
+                  projectPath = Some fsprojPath
+                  categories = None
+                  maxResults = None }
+
+        Assert.Equal("partial", gs result "status")
+
+        let unresolved = arr result "unresolvedFiles" |> List.map (fun n -> n.GetValue<string>())
+        Assert.Contains(unresolved, fun p -> p.EndsWith "Missing.fs")
+
+        // The resolvable file is still scanned — partial, not aborted.
+        let scanned = arr result "scanned" |> List.map (fun n -> n.GetValue<string>())
+        Assert.Contains(scanned, fun p -> p.EndsWith "ReviewFixture.fs")
+        Assert.Equal(5, total result)
+    }
+
+[<Fact>]
 let ``no path and no projectPath yields invalid_args`` () : Task =
     task {
         let bridge = FcsBridge()
