@@ -8,15 +8,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-14
+
+This is a pre-1.0 SemVer minor because it deliberately tightens several response
+contracts that callers may have treated as unconditional success.
+
+### Added
+
+- FSAC-backed responses carry the active project context and live session
+  generation. Cached diagnostics also report expected, received, missing, and
+  stale files, making incomplete evidence explicit.
+- Fast diagnostics bind each FSAC generation to canonical file identities,
+  content hashes, and the evaluated project/options/reference closure. This
+  supports FSAC's versionless publications without trusting receipt time and
+  makes same-mtime source, reference, and MSBuild-option changes fail closed.
+- `fslangmcp --project <path>` (and `FSA_PROJECT_PATH`) runs the same
+  project-load/readiness pipeline as `set_project` before MCP starts accepting
+  requests. `fslangmcp --version` reports the packaged product version.
+- A pinned runtime manifest and Linux/macOS/Windows live matrix exercise the
+  supported fsautocomplete, ProjInfo, and Fantomas versions through real
+  diagnostics, rename, formatting, process-crash, and restart flows.
+
 ### Changed
 
-- Reproducible restores (#167): all `PackageReference` versions are pinned
-  exactly (floating `*` patch ranges removed), `packages.lock.json` is
-  committed for both projects, and CI/Justfile restore with `--locked-mode`.
-  Dependency updates now arrive as explicit Dependabot PRs that regenerate the
-  lock files; after editing a `PackageReference` locally, run
-  `just restore-update`. The packed tool is unaffected — dependencies were
-  already baked in at pack time; this changes only build reproducibility.
+- **Migration:** `find.resolution.matched` is now nullable. It is `false` only
+  after every requested FCS project completed; an incomplete sweep with no hit is
+  `status="unknown"`, `outcome="indeterminate"`, and `matched=null`. Positive
+  partial results remain actionable and advertise incomplete coverage.
+- **Migration:** `check(speed="fast")` returns `clean` only when the active FSAC
+  generation has a current diagnostics publication for every evaluated in-scope
+  source file. Missing, stale, context-mismatched, or empty-glob coverage returns
+  `unknown`; current errors remain visible even when the rest is incomplete.
+- **Migration:** a cross-project `set_project(restartLsp=false)` leaves the
+  existing context untouched and returns `status="restart_required"`; retry with
+  `restartLsp=true` to switch.
+- `project_health` and project inspection use the evaluated MSBuild/ProjInfo
+  model used by semantic analysis, including imports, resolved compile items,
+  references, output paths, and configuration. LSP readiness is context-bound.
+- Directory targets discover nested workspaces without descending into ignored
+  build/dependency or reparse-point trees. Evaluated linked `<Compile>` files
+  outside the workspace root remain valid members of the selected context.
+
+- Reproducible restores (#167): every direct `PackageReference` now uses a true
+  exact NuGet range (`[x.y.z]`; bare `x.y.z` was only a minimum), both lock files
+  record equal lower/upper bounds, and CI/Justfile restore with `--locked-mode`.
+  Dependency updates arrive as explicit Dependabot PRs; after intentionally
+  editing a pin, `just restore-update` regenerates the locks without selecting a
+  newer version on its own.
+- The build SDK is pinned to `10.0.400` with roll-forward disabled. External
+  runtime tools are pinned to fsautocomplete `0.83.0`,
+  Ionide.ProjInfo.Tool `0.74.2`, and Fantomas `7.0.5`;
+  `--bootstrap-tools` installs or downgrades to those exact embedded-manifest
+  versions.
+- **External-tool security note:** the FsLangMCP package graph itself has no
+  known NuGet advisories, but the latest available fsautocomplete and Fantomas
+  packages still bundle MessagePack versions covered by
+  [GHSA-hv8m-jj95-wg3x](https://github.com/advisories/GHSA-hv8m-jj95-wg3x)
+  and [GHSA-vh6j-jc39-fggf](https://github.com/advisories/GHSA-vh6j-jc39-fggf).
+  FsLangMCP's supervised LSP/formatting paths explicitly use JSON rather than a
+  MessagePack formatter, and no patched upstream tool release exists as of this
+  release. The pins remain exact while upstream remediation is tracked; this is
+  a documented risk acceptance, not a claim that every assembly bundled by an
+  external tool is advisory-free.
+- The autonomous orchestrator workflow is now a manually dispatched, read-only
+  analysis job. It no longer accepts public issue text as an agent prompt, has
+  no repository-write token, does not persist checkout credentials, requires an
+  explicitly reviewed exact Claude Code version, excludes project hooks, skills,
+  and MCP servers, exposes only read tools, and emits only an Actions artifact
+  for human review.
+
+### Fixed
+
+- `find` no longer converts failed/timed-out project sweeps or unavailable FSAC
+  state into authoritative absence, and its workspace-symbol fallback cannot
+  leak a hit from another file, project, or active workspace.
+- `find` rejects unsupported enum values, invalid ranges, unsafe scope/path
+  combinations, and non-advancing pagination sizes with structured
+  `invalid_args` responses instead of silently broadening the search or looping.
+- Dead RPC/process pairs are reaped and transparently restarted; old-generation
+  diagnostics cannot contaminate a replacement session, failed handshakes clear
+  every diagnostic store, and dead generations are never advertised as ready.
+- Rename preview distinguishes genuine `no_symbol` from timeout, disconnect,
+  missing executable, malformed protocol data, and other infrastructure failures.
+  Formatting and diagnostic-fix calls are project-bound, and fixes require the
+  exact open-document diagnostics version instead of wall-clock freshness.
+- Relative `check.fileGlob` patterns are evaluated from the selected workspace;
+  a glob matching no evaluated source file cannot produce a false `clean` result.
+- Closed-file, unsaved-buffer, and Windows-URI diagnostics share one
+  generation-safe freshness model. Disk or evaluated-context changes retire the
+  old generation and return `not_ready` until the rebased FSAC publication is
+  available; they can no longer reuse an old empty payload as `clean`.
+- Analysis caches use ordered, content-addressed source/options/reference/project
+  dependency keys. Same-timestamp edits, compile-order changes, imported MSBuild
+  changes, linked source changes, and referenced-project edits invalidate stale
+  results.
+- Subprocess deadlines cover process exit and both redirected stream drains;
+  output remains bounded while drained, and timeout cleanup terminates the OS
+  process tree rather than leaving descendants holding inherited pipes.
+- Project evaluation and readiness probes now share a bounded ProjInfo deadline,
+  and `check(timeoutMs=...)` applies one overall project/workspace budget to
+  discovery, evaluated-option validation, reference probes, fingerprints, and
+  FCS/FSAC work. Blocking operations use exact-key single-flight plus bounded,
+  no-queue admission held until the real worker settles, so timed-out callers
+  cannot accumulate abandoned MSBuild, filesystem, or compiler work.
+- Unix hosts without an external `setsid` use an internal session wrapper.
+  Timeout cleanup waits, within the existing cleanup budget, until the process
+  group has no live descendants; Linux zombie/exited states are not mistaken for
+  surviving work.
+- The FSAC client handles window message requests/notifications used by real
+  formatting flows instead of failing with `RemoteMethodNotFoundException`.
+- MCP `initialize.serverInfo.version` now preserves the exact product SemVer
+  (`0.14.0`, not the four-component `0.14.0.0` normalized by FsMcp 1.2.2).
+
+- Release builds now derive and validate the version before compilation, pass
+  that same version through build, test, and pack, install-smoke the resulting
+  local tool package, and publish the single verified package (plus its SHA-256)
+  to both GitHub Releases and NuGet without rebuilding or silently skipping a
+  duplicate package. This prevents a tag-only release from packaging an assembly
+  that still reports the previous project-file version.
 
 ## [0.13.2] - 2026-08-10
 
@@ -561,7 +670,8 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
   Earlier releases (0.2.0, 0.3.0, 0.3.1, 0.4.0) shipped without tags;
   backfilling them would point at synthetic refs.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.13.2...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.13.2...v0.14.0
 [0.13.2]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.13.2
 [0.13.1]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.13.1
 [0.13.0]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.13.0

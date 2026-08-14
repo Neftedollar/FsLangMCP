@@ -1,10 +1,17 @@
 module FsLangMcp.Tests.ProjectHealthTests
 
+open System
+open System.Diagnostics
 open System.IO
+open System.Threading
+open System.Threading.Tasks
+open System.Xml.Linq
 open System.Text.Json.Nodes
 open Xunit
 open FsLangMcp.ProjectHealth
 open FsLangMcp.ProjectInspection
+open FsLangMcp.ProjectFiles
+open FsLangMcp.FcsBridge
 open FsLangMcp.Types
 
 let private writeProject root =
@@ -46,19 +53,121 @@ let private healthArgs projectPath workspacePath =
 let private readySnapshot projectPath root =
     { ProjectPath = Some projectPath
       WorkspaceRoot = Some root
+      LoadedProjects = [| projectPath |]
+      SessionLive = true
       WorkspaceReady = true
       DiagnosticsFileCount = 0 }
 
-let private report args snapshot =
-    let probe _ =
-        async { return Ok { Source = "test-probe"; ReferencesExisting = 0; ReferencesTotal = 0 } }
+let private testItemMetadata name (element: XElement) =
+    element.Attributes()
+    |> Seq.tryPick (fun attribute ->
+        if attribute.Name.LocalName.Equals(name, StringComparison.OrdinalIgnoreCase) then
+            Some attribute.Value
+        else
+            None)
+    |> Option.orElseWith (fun () ->
+        element.Elements()
+        |> Seq.tryPick (fun child ->
+            if child.Name.LocalName.Equals(name, StringComparison.OrdinalIgnoreCase) then
+                Some child.Value
+            else
+                None))
 
-    createReport args snapshot probe |> Async.RunSynchronously
+let private testEvaluatedSnapshot referencesExisting referencesTotal projectPath =
+    match tryReadProject projectPath with
+    | Error reason -> Error reason
+    | Ok doc ->
+        let fullPath = Path.GetFullPath projectPath
+        let projectDir = Path.GetDirectoryName fullPath
+        let property name = childValue name doc
+
+        let packages =
+            doc.Descendants(xname "PackageReference")
+            |> Seq.choose (fun element ->
+                attr "Include" element
+                |> Option.map (fun packageId ->
+                    { PackageId = packageId
+                      Version = testItemMetadata "Version" element
+                      FullPath = None
+                      IncludeAssets = testItemMetadata "IncludeAssets" element
+                      PrivateAssets = testItemMetadata "PrivateAssets" element }))
+            |> Seq.toList
+
+        let projectReferences =
+            doc.Descendants(xname "ProjectReference")
+            |> Seq.choose (fun element ->
+                attr "Include" element
+                |> Option.map (fun includePath ->
+                    let path =
+                        if Path.IsPathFullyQualified includePath then includePath
+                        else Path.Combine(projectDir, includePath)
+
+                    { IncludePath = includePath
+                      ProjectPath = Path.GetFullPath path
+                      TargetFramework = None }))
+            |> Seq.toList
+
+        let properties =
+            doc.Descendants()
+            |> Seq.filter (fun element -> element.Parent <> null && element.Parent.Name.LocalName = "PropertyGroup")
+            |> Seq.map (fun element -> element.Name.LocalName, element.Value.Trim())
+            |> Map.ofSeq
+
+        let targetFrameworks =
+            property "TargetFrameworks"
+            |> Option.map (fun value ->
+                value.Split(';', StringSplitOptions.RemoveEmptyEntries) |> Array.toList)
+            |> Option.defaultValue (property "TargetFramework" |> Option.toList)
+
+        let isTestProject =
+            boolProperty "IsTestProject" doc = Some true
+            || packages
+               |> List.exists (fun package ->
+                   package.PackageId.Contains("xunit", StringComparison.OrdinalIgnoreCase)
+                   || package.PackageId.Contains("nunit", StringComparison.OrdinalIgnoreCase)
+                   || package.PackageId.Contains("expecto", StringComparison.OrdinalIgnoreCase))
+
+        Ok
+            { ProjectPath = fullPath
+              ProjectDirectory = projectDir
+              ProjectName = Path.GetFileNameWithoutExtension fullPath
+              EvaluationSource = "test-evaluated"
+              Sdk = attr "Sdk" doc.Root
+              TargetFramework = property "TargetFramework"
+              TargetFrameworks = targetFrameworks
+              OutputType = property "OutputType"
+              AssemblyName = property "AssemblyName" |> Option.defaultValue (Path.GetFileNameWithoutExtension fullPath)
+              Configuration = property "Configuration"
+              IsTestProject = isTestProject
+              RestoreSucceeded = true
+              TargetPath = None
+              Properties = properties
+              Files = compileFiles fullPath doc
+              PackageReferences = packages
+              ProjectReferences = projectReferences
+              ImportedProjects = []
+              OtherOptions = [||]
+              ReferencesExisting = referencesExisting
+              ReferencesTotal = referencesTotal }
+
+let private testEvaluatedProvider path =
+    async { return testEvaluatedSnapshot 0 0 path }
+
+let private report args snapshot =
+    createReport args snapshot testEvaluatedProvider |> Async.RunSynchronously
 
 /// Like `report` but with an injectable probe so tests can simulate an unrestored
 /// project (references declared but absent on disk).
 let private reportWithProbe (probe: ProjectOptionsProbe) args snapshot =
-    createReport args snapshot probe |> Async.RunSynchronously
+    let provider path =
+        async {
+            match! probe path with
+            | Error reason -> return Error reason
+            | Ok info ->
+                return testEvaluatedSnapshot info.ReferencesExisting info.ReferencesTotal path
+        }
+
+    createReport args snapshot provider |> Async.RunSynchronously
 
 [<Fact>]
 let ``project_health reports source files and analyzer setup`` () =
@@ -179,6 +288,8 @@ let ``project_health reports fcs_only overall when lsp workspace is not ready bu
         let snapshot =
             { ProjectPath = Some projectPath
               WorkspaceRoot = Some root
+              LoadedProjects = [| projectPath |]
+              SessionLive = false
               WorkspaceReady = false
               DiagnosticsFileCount = 0 }
 
@@ -226,6 +337,8 @@ let ``fsharp_project_inspect reports compile order and package references`` () =
                   includeGeneratedFiles = None
                   includePackageDetails = Some true
                   includeResolvedOptions = Some false }
+                testEvaluatedProvider
+            |> Async.RunSynchronously
 
         Assert.Equal("ok", result["status"].GetValue<string>())
         Assert.Equal(1, (result["compileOrder"] :?> JsonArray).Count)
@@ -236,6 +349,261 @@ let ``fsharp_project_inspect reports compile order and package references`` () =
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
+
+[<Fact>]
+let ``inspection and health share evaluated SDK defaults conditions imports and references (P1-08)`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_evaluated_project_%s{runId}")
+        let appDir = Path.Combine(root, "App")
+        let dependencyDir = Path.Combine(root, "Dependency")
+        let sharedDir = Path.Combine(root, "Shared")
+
+        let write (path: string) (content: string) =
+            Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
+            File.WriteAllText(path, content)
+
+        try
+            Directory.CreateDirectory(appDir) |> ignore
+            Directory.CreateDirectory(dependencyDir) |> ignore
+            Directory.CreateDirectory(sharedDir) |> ignore
+
+            let dependencyProject = Path.Combine(dependencyDir, "Dependency.fsproj")
+            let appProject = Path.Combine(appDir, "App.fsproj")
+            let importedProps = Path.Combine(root, "Directory.Build.props")
+
+            write (Path.Combine(dependencyDir, "Dependency.fs")) "module Dependency\n\nlet value = 1\n"
+
+            write
+                dependencyProject
+                (String.concat
+                    "\n"
+                    [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+                      "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+                      "  <ItemGroup><Compile Include=\"Dependency.fs\" /></ItemGroup>"
+                      "</Project>" ])
+
+            write (Path.Combine(appDir, "Default.fs")) "module App.Default\n\nlet value = Dependency.value\n"
+            write (Path.Combine(appDir, "Conditional.fs")) "module App.Conditional\n"
+            write (Path.Combine(sharedDir, "Imported.fs")) "module App.Imported\n\nlet imported = 42\n"
+
+            write
+                importedProps
+                (String.concat
+                    "\n"
+                    [ "<Project>"
+                      "  <PropertyGroup Condition=\"'$(MSBuildProjectName)' == 'App'\">"
+                      "    <LangVersion>preview</LangVersion>"
+                      "    <P108Stamp>before</P108Stamp>"
+                      "  </PropertyGroup>"
+                      "  <ItemGroup Condition=\"'$(MSBuildProjectName)' == 'App'\">"
+                      "    <Compile Include=\"$(MSBuildThisFileDirectory)Shared/Imported.fs\" Link=\"Imported.fs\" />"
+                      "    <PackageReference Include=\"Ionide.Analyzers\" Version=\"0.15.0\" IncludeAssets=\"analyzers\" PrivateAssets=\"all\" />"
+                      "    <ProjectReference Include=\"$(MSBuildThisFileDirectory)Dependency/Dependency.fsproj\" />"
+                      "  </ItemGroup>"
+                      "</Project>" ])
+
+            write
+                appProject
+                (String.concat
+                    "\n"
+                    [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+                      "  <PropertyGroup>"
+                      "    <TargetFramework>net10.0</TargetFramework>"
+                      "    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>"
+                      "    <IncludeConditional>false</IncludeConditional>"
+                      "    <P108Project>alpha1</P108Project>"
+                      "  </PropertyGroup>"
+                      "  <ItemGroup>"
+                      "    <Compile Remove=\"Conditional.fs\" Condition=\"'$(IncludeConditional)' != 'true'\" />"
+                      "  </ItemGroup>"
+                      "</Project>" ])
+
+            // Keep the regression hermetic: both packages are already restored for
+            // this repository, so expose their nupkgs through a tiny local feed.
+            let globalPackages =
+                Environment.GetEnvironmentVariable("NUGET_PACKAGES")
+                |> Option.ofObj
+                |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                |> Option.defaultWith (fun () ->
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".nuget", "packages"))
+
+            let localFeed = Path.Combine(root, "local-feed")
+            Directory.CreateDirectory(localFeed) |> ignore
+
+            for packageId in [ "fsharp.core"; "ionide.analyzers" ] do
+                let packageDirectory = Path.Combine(globalPackages, packageId)
+
+                for packageArchive in Directory.EnumerateFiles(packageDirectory, "*.nupkg", SearchOption.AllDirectories) do
+                    File.Copy(packageArchive, Path.Combine(localFeed, Path.GetFileName packageArchive), true)
+
+            let nugetConfig = Path.Combine(root, "NuGet.Config")
+
+            write
+                nugetConfig
+                (String.concat
+                    "\n"
+                    [ "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                      "<configuration>"
+                      "  <packageSources>"
+                      "    <clear />"
+                      "    <add key=\"fixture-local\" value=\"local-feed\" />"
+                      "  </packageSources>"
+                      "  <auditSources><clear /></auditSources>"
+                      "</configuration>" ])
+
+            let psi =
+                ProcessStartInfo(
+                    "dotnet",
+                    $"restore \"%s{appProject}\" --configfile \"%s{nugetConfig}\" --ignore-failed-sources --nologo --disable-build-servers -p:UseSharedCompilation=false -p:NuGetAudit=false"
+                )
+
+            psi.RedirectStandardOutput <- true
+            psi.RedirectStandardError <- true
+            psi.UseShellExecute <- false
+            psi.Environment["MSBUILDDISABLENODEREUSE"] <- "1"
+            psi.Environment["DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER"] <- "1"
+            psi.Environment["DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE"] <- "true"
+
+            use restore = Process.Start psi
+            let restoreOutput = restore.StandardOutput.ReadToEnd() + restore.StandardError.ReadToEnd()
+            restore.WaitForExit()
+            Assert.True(restore.ExitCode = 0, $"fixture restore failed:\n{restoreOutput}")
+
+            let bridge = FcsBridge()
+
+            let provider path =
+                bridge.GetEvaluatedProjectSnapshot(path) |> Async.AwaitTask
+
+            let! inspected =
+                inspectProject
+                    { projectPath = Some appProject
+                      workspacePath = Some root
+                      scope = None
+                      includeGeneratedFiles = Some false
+                      includePackageDetails = Some true
+                      includeResolvedOptions = Some true }
+                    provider
+                |> Async.StartAsTask
+
+            Assert.Equal("ok", inspected["status"].GetValue<string>())
+            Assert.Equal("evaluated", (inspected["evaluation"]["status"]).GetValue<string>())
+            Assert.Equal("ionide-proj-info", (inspected["evaluation"]["source"]).GetValue<string>())
+
+            let evaluatedImports =
+                (inspected["evaluation"]["imports"]).AsArray()
+                |> Seq.map _.GetValue<string>()
+                |> Seq.toArray
+
+            let actualImports = String.concat "\n" evaluatedImports
+
+            Assert.True(
+                Array.contains importedProps evaluatedImports,
+                $"Expected import '%s{importedProps}'. Actual imports:\n%s{actualImports}"
+            )
+
+            let compilePaths =
+                inspected["compileOrder"].AsArray()
+                |> Seq.map (fun item -> item["path"].GetValue<string>())
+                |> Seq.toArray
+
+            Assert.Contains(Path.Combine(appDir, "Default.fs"), compilePaths)
+            Assert.Contains(Path.Combine(sharedDir, "Imported.fs"), compilePaths)
+            Assert.DoesNotContain(Path.Combine(appDir, "Conditional.fs"), compilePaths)
+
+            let packageIds =
+                (inspected["references"]["packageReferences"]).AsArray()
+                |> Seq.map (fun item -> item["packageId"].GetValue<string>())
+                |> Seq.toArray
+
+            Assert.Contains("Ionide.Analyzers", packageIds)
+
+            let projectReferencePaths =
+                (inspected["references"]["projectReferences"]).AsArray()
+                |> Seq.map (fun item -> item["path"].GetValue<string>())
+                |> Seq.toArray
+
+            Assert.Contains(dependencyProject, projectReferencePaths)
+
+            let langVersion =
+                inspected["properties"].AsArray()
+                |> Seq.find (fun property -> property["name"].GetValue<string>() = "LangVersion")
+
+            Assert.Equal("preview", langVersion["value"].GetValue<string>())
+
+            let loadCountAfterInspection = bridge.ProjectOptionsLoadCount
+
+            let healthSnapshot =
+                { ProjectPath = Some appProject
+                  WorkspaceRoot = Some appDir
+                  LoadedProjects = [| appProject |]
+                  SessionLive = true
+                  WorkspaceReady = true
+                  DiagnosticsFileCount = 0 }
+
+            let! health =
+                createReport (healthArgs appProject (Some appDir)) healthSnapshot provider
+                |> Async.StartAsTask
+
+            Assert.Equal("ok", health["status"].GetValue<string>())
+            Assert.Equal("evaluated", (health["evaluation"]["status"]).GetValue<string>())
+            Assert.Equal("analyzers_configured", (health["analyzers"]["status"]).GetValue<string>())
+            Assert.True((health["files"]["sourceFileCount"]).GetValue<int>() >= 2)
+            Assert.Equal(loadCountAfterInspection, bridge.ProjectOptionsLoadCount)
+
+            // A project/import cache key must not trust timestamp + length. Editors
+            // and atomic replace tools can preserve both while changing evaluation.
+            let originalProps = File.ReadAllText importedProps
+            let originalTimestamp = File.GetLastWriteTimeUtc importedProps
+            let updatedProps = originalProps.Replace(">before<", ">after!<", StringComparison.Ordinal)
+            Assert.Equal(originalProps.Length, updatedProps.Length)
+            File.WriteAllText(importedProps, updatedProps)
+            File.SetLastWriteTimeUtc(importedProps, originalTimestamp)
+
+            let loadCountBeforeSameStampEdit = bridge.ProjectOptionsLoadCount
+            let! refreshedResult = bridge.GetEvaluatedProjectSnapshot(appProject)
+
+            match refreshedResult with
+            | Error reason -> Assert.Fail($"evaluation after same-stamp import edit failed: %s{reason}")
+            | Ok refreshed ->
+                Assert.Equal("after!", refreshed.Properties["P108Stamp"])
+                Assert.True(bridge.ProjectOptionsLoadCount > loadCountBeforeSameStampEdit)
+
+            let originalProject = File.ReadAllText appProject
+            let originalProjectTimestamp = File.GetLastWriteTimeUtc appProject
+            let updatedProject = originalProject.Replace(">alpha1<", ">beta22<", StringComparison.Ordinal)
+            Assert.Equal(originalProject.Length, updatedProject.Length)
+            File.WriteAllText(appProject, updatedProject)
+            File.SetLastWriteTimeUtc(appProject, originalProjectTimestamp)
+
+            let loadCountBeforeSameStampProjectEdit = bridge.ProjectOptionsLoadCount
+            let! projectRefreshResult = bridge.GetEvaluatedProjectSnapshot(appProject)
+
+            match projectRefreshResult with
+            | Error reason -> Assert.Fail($"evaluation after same-stamp project edit failed: %s{reason}")
+            | Ok refreshed ->
+                Assert.Equal("beta22", refreshed.Properties["P108Project"])
+                Assert.True(bridge.ProjectOptionsLoadCount > loadCountBeforeSameStampProjectEdit)
+
+            // SDK default Compile globs must also notice a new source when the
+            // directory timestamp is restored to its previous value.
+            let originalDirectoryTimestamp = Directory.GetLastWriteTimeUtc appDir
+            let addedDefaultSource = Path.Combine(appDir, "AddedDefault.fs")
+            write addedDefaultSource "module App.AddedDefault\n"
+            Directory.SetLastWriteTimeUtc(appDir, originalDirectoryTimestamp)
+
+            let loadCountBeforeSourceListingEdit = bridge.ProjectOptionsLoadCount
+            let! listingRefreshResult = bridge.GetEvaluatedProjectSnapshot(appProject)
+
+            match listingRefreshResult with
+            | Error reason -> Assert.Fail($"evaluation after source-list edit failed: %s{reason}")
+            | Ok refreshed ->
+                Assert.Contains(addedDefaultSource, refreshed.Files |> List.map _.Path)
+                Assert.True(bridge.ProjectOptionsLoadCount > loadCountBeforeSourceListingEdit)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
 
 // ─── .sln / .slnx as projectPath ─────────────────────────────────────────────
 
@@ -312,7 +680,12 @@ let ``project_health summarizes a .slnx with multiple fsproj files (#100)`` () =
                   "</Solution>" ])
 
         let snapshot =
-            { ProjectPath = None; WorkspaceRoot = Some root; WorkspaceReady = true; DiagnosticsFileCount = 0 }
+            { ProjectPath = None
+              WorkspaceRoot = Some root
+              LoadedProjects = [||]
+              SessionLive = true
+              WorkspaceReady = true
+              DiagnosticsFileCount = 0 }
 
         let result = report (healthArgs slnxPath None) snapshot
 
@@ -345,7 +718,12 @@ let ``project_health summarizes a .sln with multiple fsproj files (#100)`` () =
                   "EndProject" ])
 
         let snapshot =
-            { ProjectPath = None; WorkspaceRoot = Some root; WorkspaceReady = true; DiagnosticsFileCount = 0 }
+            { ProjectPath = None
+              WorkspaceRoot = Some root
+              LoadedProjects = [||]
+              SessionLive = true
+              WorkspaceReady = true
+              DiagnosticsFileCount = 0 }
 
         let result = report (healthArgs slnPath None) snapshot
 
@@ -439,6 +817,8 @@ let ``overallStatus is fcs_only when fcs is ready and lsp is not_ready`` () =
         let snapshot =
             { ProjectPath = Some projectPath
               WorkspaceRoot = Some root
+              LoadedProjects = [| projectPath |]
+              SessionLive = false
               WorkspaceReady = false
               DiagnosticsFileCount = 0 }
 
@@ -485,6 +865,8 @@ let ``project_health blocks with clear message when projectPath is None and no f
     let snapshot =
         { ProjectPath = None
           WorkspaceRoot = None
+          LoadedProjects = [||]
+          SessionLive = false
           WorkspaceReady = false
           DiagnosticsFileCount = 0 }
 
@@ -850,6 +1232,8 @@ let ``project_health uses the active solution workspace root for reverse test di
         let snapshot =
             { ProjectPath = Some solutionPath
               WorkspaceRoot = Some root
+              LoadedProjects = [| projectPath; testProjectPath |]
+              SessionLive = true
               WorkspaceReady = true
               DiagnosticsFileCount = 0 }
 
@@ -860,6 +1244,71 @@ let ``project_health uses the active solution workspace root for reverse test di
         Assert.Equal("test_projects_found", (result["tests"]["status"]).GetValue<string>())
         Assert.Single(discovered) |> ignore
         Assert.Equal(testProjectPath, (discovered[0]["projectPath"]).GetValue<string>())
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health does not reuse ready LSP state from a different active project`` () =
+    let runId = Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_context_%s{runId}")
+
+    try
+        let activeProject = writeNonTestProject (Path.Combine(root, "Active"))
+        let inspectedProject = writeNonTestProject (Path.Combine(root, "Inspected"))
+        let activeSnapshot = readySnapshot activeProject root
+
+        let result = report (healthArgs inspectedProject (Some root)) activeSnapshot
+        let fcs = result["toolingReadiness"]["fcs"]
+        let lsp = result["toolingReadiness"]["lsp"]
+        let overall = result["toolingReadiness"]["overall"]
+        let workspace = result["workspace"]
+
+        Assert.Equal("ready", fcs["status"].GetValue<string>())
+        Assert.Equal("not_ready", lsp["status"].GetValue<string>())
+        Assert.False(lsp["contextMatched"].GetValue<bool>())
+        Assert.Equal("fcs_only", overall.GetValue<string>())
+        Assert.Equal(activeProject, workspace["lspProjectPath"].GetValue<string>())
+        Assert.False(workspace["lspContextMatched"].GetValue<bool>())
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health serializes evaluated project loads during reverse discovery`` () =
+    let runId = Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_serial_%s{runId}")
+
+    try
+        let currentProject = writeNonTestProject (Path.Combine(root, "Current"))
+        writeNonTestProject (Path.Combine(root, "SiblingA")) |> ignore
+        writeNonTestProject (Path.Combine(root, "SiblingB")) |> ignore
+
+        let mutable activeCalls = 0
+        let mutable maxConcurrentCalls = 0
+        let mutable totalCalls = 0
+        let counterGate = obj ()
+
+        let provider path =
+            async {
+                let active = Interlocked.Increment(&activeCalls)
+                Interlocked.Increment(&totalCalls) |> ignore
+
+                lock counterGate (fun () ->
+                    maxConcurrentCalls <- max maxConcurrentCalls active)
+
+                try
+                    do! Async.Sleep 25
+                    return testEvaluatedSnapshot 0 0 path
+                finally
+                    Interlocked.Decrement(&activeCalls) |> ignore
+            }
+
+        let result =
+            createReport (healthArgs currentProject (Some root)) (readySnapshot currentProject root) provider
+            |> Async.RunSynchronously
+
+        Assert.Equal("ok", result["status"].GetValue<string>())
+        Assert.True(totalCalls >= 4, $"expected current evaluation plus discovery loads, got %d{totalCalls}")
+        Assert.Equal(1, maxConcurrentCalls)
     finally
         if Directory.Exists root then Directory.Delete(root, true)
 

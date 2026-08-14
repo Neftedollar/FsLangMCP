@@ -48,6 +48,51 @@ type internal ProjectFile =
       PairedImplementationPath: string option
       PairedSignaturePath: string option }
 
+/// One direct PackageReference after MSBuild evaluation. Values may originate in
+/// the project file, Directory.Build.props/targets, or another imported props file.
+type internal EvaluatedPackageReference =
+    { PackageId: string
+      Version: string option
+      FullPath: string option
+      IncludeAssets: string option
+      PrivateAssets: string option }
+
+/// One direct ProjectReference after conditions, properties, and imports have
+/// been evaluated by MSBuild through Ionide.ProjInfo.
+type internal EvaluatedProjectReference =
+    { IncludePath: string
+      ProjectPath: string
+      TargetFramework: string option }
+
+/// Shared evaluated project model used by project inspection and project health.
+/// Raw XML remains useful for edit locations, but is not authoritative for items
+/// or properties because it cannot apply SDK defaults, imports, or Conditions.
+type internal EvaluatedProjectSnapshot =
+    { ProjectPath: string
+      ProjectDirectory: string
+      ProjectName: string
+      EvaluationSource: string
+      Sdk: string option
+      TargetFramework: string option
+      TargetFrameworks: string list
+      OutputType: string option
+      AssemblyName: string
+      Configuration: string option
+      IsTestProject: bool
+      RestoreSucceeded: bool
+      TargetPath: string option
+      Properties: Map<string, string>
+      Files: ProjectFile list
+      PackageReferences: EvaluatedPackageReference list
+      ProjectReferences: EvaluatedProjectReference list
+      ImportedProjects: string list
+      OtherOptions: string array
+      ReferencesExisting: int
+      ReferencesTotal: int }
+
+type internal EvaluatedProjectSnapshotProvider =
+    string -> Async<Result<EvaluatedProjectSnapshot, string>>
+
 type internal FilteredProjectFiles =
     { Included: ProjectFile list
       Excluded: (ProjectFile * ExclusionReason) list
@@ -187,25 +232,7 @@ let private resolveCompilePath (projectDir: string) (includePath: string) =
     else
         Path.GetFullPath(Path.Combine(projectDir, includePath))
 
-let internal compileFiles (projectPath: string) (doc: XDocument) =
-    let projectDir = Path.GetDirectoryName(projectPath)
-
-    let rawFiles =
-        doc.Descendants(xname "Compile")
-        |> Seq.choose (fun element ->
-            attr "Include" element
-            |> Option.map (fun includePath ->
-                let path = resolveCompilePath projectDir includePath
-
-                { Path = path
-                  IncludePath = includePath
-                  Link = attr "Link" element
-                  IsSignature = Path.GetExtension(path).Equals(".fsi", StringComparison.OrdinalIgnoreCase)
-                  PairedImplementationPath = None
-                  PairedSignaturePath = None }))
-        |> Seq.filter (fun file -> isFsFile file.Path)
-        |> Seq.toList
-
+let private pairSignatureFiles (rawFiles: ProjectFile list) =
     let implementationByBase =
         rawFiles
         |> List.choose (fun file ->
@@ -239,6 +266,35 @@ let internal compileFiles (projectPath: string) (doc: XDocument) =
                     None
                 else
                     Map.tryFind basePath signatureByBase })
+
+/// Convert already-evaluated Compile items to the common ordered project-file
+/// representation. The input order is compiler order and is never re-sorted.
+let internal projectFilesFromEvaluatedItems (items: (string * string * string option) seq) =
+    items
+    |> Seq.map (fun (path, includePath, link) ->
+        let fullPath = Path.GetFullPath path
+
+        { Path = fullPath
+          IncludePath = includePath
+          Link = link
+          IsSignature = Path.GetExtension(fullPath).Equals(".fsi", StringComparison.OrdinalIgnoreCase)
+          PairedImplementationPath = None
+          PairedSignaturePath = None })
+    |> Seq.filter (fun file -> isFsFile file.Path)
+    |> Seq.toList
+    |> pairSignatureFiles
+
+let internal compileFiles (projectPath: string) (doc: XDocument) =
+    let projectDir = Path.GetDirectoryName(projectPath)
+
+    doc.Descendants(xname "Compile")
+    |> Seq.choose (fun element ->
+        attr "Include" element
+        |> Option.map (fun includePath ->
+            resolveCompilePath projectDir includePath,
+            includePath,
+            attr "Link" element))
+    |> projectFilesFromEvaluatedItems
 
 let private classifyFile (workspaceRoot: string) (options: ScanFilterOptions) (file: ProjectFile) =
     let path = file.Path
@@ -294,6 +350,55 @@ let internal filterSummaryToJson (filtered: FilteredProjectFiles) =
           "exclusionsByReason", jobj reasonCounts
           "truncated", jbool filtered.Truncated ]
 
+// Repository-root inputs need recursive discovery, but the BCL recursive
+// enumeration walks every subtree before callers can filter its results.  Keep
+// this traversal explicit so dependency/build trees and symlinked directories
+// are rejected before descent.
+module internal WorkspaceDirectoryDiscovery =
+    let private ignoredDirectoryNames =
+        System.Collections.Generic.HashSet<string>(
+            [| ".git"; ".hg"; ".svn"; ".vs"; "bin"; "node_modules"; "obj" |],
+            StringComparer.OrdinalIgnoreCase
+        )
+
+    let private pathComparer =
+        if OperatingSystem.IsWindows() then
+            StringComparer.OrdinalIgnoreCase
+        else
+            StringComparer.Ordinal
+
+    let filesBelow (directory: string) (patterns: string array) : string array =
+        let options = EnumerationOptions()
+        options.RecurseSubdirectories <- false
+        options.IgnoreInaccessible <- true
+        options.ReturnSpecialDirectories <- false
+        options.AttributesToSkip <- options.AttributesToSkip ||| FileAttributes.ReparsePoint
+
+        let pending = System.Collections.Generic.Stack<string>()
+        let found = System.Collections.Generic.HashSet<string>(pathComparer)
+        pending.Push(Path.GetFullPath(directory))
+
+        while pending.Count > 0 do
+            let current = pending.Pop()
+
+            for pattern in patterns do
+                try
+                    for path in Directory.EnumerateFiles(current, pattern, options) do
+                        found.Add(Path.GetFullPath(path)) |> ignore
+                with
+                | :? UnauthorizedAccessException
+                | :? IOException -> ()
+
+            try
+                for child in Directory.EnumerateDirectories(current, "*", options) do
+                    if not (ignoredDirectoryNames.Contains(Path.GetFileName(child))) then
+                        pending.Push(child)
+            with
+            | :? UnauthorizedAccessException
+            | :? IOException -> ()
+
+        found |> Seq.toArray
+
 // ─── SolutionParsing ──────────────────────────────────────────────────────────
 // Extracts .fsproj paths from .sln / .slnx files. Pure functions, no IO beyond
 // reading the solution file.
@@ -348,11 +453,18 @@ module internal SolutionParsing =
         with _ ->
             [||]
 
+    let private projectsBelowDirectory (directory: string) =
+        WorkspaceDirectoryDiscovery.filesBelow directory [| "*.fsproj" |]
+        |> Array.sort
+
     /// Lists .fsproj files referenced by the given workspace target. For a direct
-    /// .fsproj path, returns [path]. For .sln / .slnx, returns all .fsproj entries
-    /// that exist on disk. For any other path, returns an empty array.
+    /// .fsproj path, returns [path]. For .sln / .slnx, returns all existing member
+    /// projects. A directory recursively returns its projects (excluding common build,
+    /// VCS, and dependency trees), so repository-root inputs remain useful.
     let listProjects (workspacePath: string) : string array =
-        if not (File.Exists workspacePath) then
+        if Directory.Exists workspacePath then
+            projectsBelowDirectory (Path.GetFullPath workspacePath)
+        elif not (File.Exists workspacePath) then
             [||]
         else
             let ext = Path.GetExtension(workspacePath)

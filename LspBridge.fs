@@ -4,9 +4,12 @@ open System
 open System.IO
 open System.Collections.Concurrent
 open System.Diagnostics
+open System.Security.Cryptography
+open System.Text
 open System.Threading
 open System.Threading.Tasks
 open FsLangMcp.Types
+open FsLangMcp.ProcessRunner
 open System.Text.Json
 open System.Text.Json.Nodes
 open System.Text.Json.Serialization
@@ -84,35 +87,167 @@ let private releaseOnDispose (semaphore: SemaphoreSlim) =
     { new IDisposable with
         member _.Dispose() = semaphore.Release() |> ignore }
 
+let rec private classifyRenameInfrastructureError (error: exn) =
+    match error with
+    | :? TimeoutException -> "timeout", true
+    | :? System.ComponentModel.Win32Exception -> "executable_missing", false
+    | :? IOException
+    | :? ObjectDisposedException
+    | :? EndOfStreamException -> "disconnected", true
+    | :? RemoteInvocationException -> "remote_error", true
+    | :? JsonException
+    | :? InvalidOperationException -> "protocol_error", false
+    | _ when not (isNull error.InnerException) -> classifyRenameInfrastructureError error.InnerException
+    | _ -> "startup_failed", true
+
 // ─── LSP types ─────────────────────────────────────────────────────────────────
 
 type private LspDocumentState =
     { mutable Version: int
-      mutable Text: string }
+      mutable Text: string
+      mutable TextHash: string }
 
-type private DiagnosticsTarget
+exception private DiagnosticsSnapshotGateBusyException
+
+/// One publishDiagnostics notification, committed atomically. Keeping payload,
+/// generation, version evidence, and receipt time together prevents readers from
+/// combining fields from two concurrent FSAC notifications.
+[<NoComparison; NoEquality>]
+type internal DiagnosticEnvelope =
+    { Generation: int64
+      Payload: JsonNode
+      ServerVersion: int option
+      ReceivedAt: DateTimeOffset }
+
+[<RequireQualifiedAccess>]
+module internal DiagnosticIdentity =
+    let pathComparer =
+        if OperatingSystem.IsWindows() then
+            StringComparer.OrdinalIgnoreCase
+        else
+            StringComparer.Ordinal
+
+    let canonicalFileKeyFromPath (path: string) = Path.GetFullPath(path)
+
+    let tryCanonicalFileKeyFromUri (value: string) =
+        try
+            let uri = Uri(value, UriKind.Absolute)
+
+            if uri.IsFile then
+                let decodedPath = Uri.UnescapeDataString(uri.AbsolutePath).Replace('\\', '/')
+
+                let hasLeadingWindowsDrive =
+                    decodedPath.Length >= 4
+                    && decodedPath[0] = '/'
+                    && Char.IsLetter(decodedPath[1])
+                    && decodedPath[2] = ':'
+                    && decodedPath[3] = '/'
+
+                let hasWindowsDrive =
+                    decodedPath.Length >= 3
+                    && Char.IsLetter(decodedPath[0])
+                    && decodedPath[1] = ':'
+                    && decodedPath[2] = '/'
+
+                let localPath =
+                    if not (String.IsNullOrWhiteSpace uri.Host) && uri.Host <> "localhost" then
+                        uri.LocalPath
+                    elif OperatingSystem.IsWindows() && hasLeadingWindowsDrive then
+                        decodedPath.Substring(1).Replace('/', Path.DirectorySeparatorChar)
+                    elif OperatingSystem.IsWindows() then
+                        uri.LocalPath
+                    elif hasWindowsDrive then
+                        "/" + decodedPath
+                    else
+                        decodedPath
+
+                Some(canonicalFileKeyFromPath localPath)
+            else
+                None
+        with _ ->
+            None
+
+    let textHash (text: string) =
+        text
+        |> Encoding.UTF8.GetBytes
+        |> SHA256.HashData
+        |> Convert.ToHexString
+
+    /// Capture a strong hash only when the file metadata is stable across the
+    /// read. A racing/failed read has no baseline and therefore cannot later
+    /// support an authoritative clean verdict.
+    let tryStableFileTextHash (path: string) =
+        try
+            let fullPath = canonicalFileKeyFromPath path
+
+            if not (File.Exists fullPath) then
+                None
+            else
+                let before = FileInfo(fullPath)
+                let beforeLength = before.Length
+                let beforeWrite = before.LastWriteTimeUtc
+                let text = File.ReadAllText(fullPath)
+                let after = FileInfo(fullPath)
+
+                if beforeLength = after.Length && beforeWrite = after.LastWriteTimeUtc then
+                    Some(textHash text)
+                else
+                    None
+        with _ ->
+            None
+
+type private LspLifecycleState =
+    | Stopped
+    | Starting of generation: int64
+    | Ready of generation: int64
+    | Stopping of generation: int64
+    | Faulted of generation: int64 * reason: string
+
+type private DiagnosticFreshness =
+    | Current
+    | DiskContentChanged
+    | Stale
+
+type internal DiagnosticsTarget
     (
-        store: ConcurrentDictionary<string, JsonNode>,
-        analyzedAt: ConcurrentDictionary<string, DateTimeOffset>
+        store: ConcurrentDictionary<string, DiagnosticEnvelope>,
+        generation: int64,
+        isCurrentGeneration: int64 -> bool,
+        synchronizationRoot: obj
     ) =
     [<JsonRpcMethod("textDocument/publishDiagnostics", UseSingleObjectParameterDeserialization = true)>]
     member _.PublishDiagnostics(payload: JsonObject) =
-        let uriToken = payload["uri"]
+        // A retired FSAC process can still have notifications queued while its
+        // redirected streams are draining. Never let such a notification mutate
+        // the diagnostic snapshot owned by the replacement generation.
+        lock synchronizationRoot (fun () ->
+            if isCurrentGeneration generation then
+                let uriToken = payload["uri"]
 
-        if not (isNull uriToken) then
-            let uri = uriToken.GetValue<string>()
-            let diagnostics = payload["diagnostics"]
+                if not (isNull uriToken) then
+                    let uri = uriToken.GetValue<string>()
 
-            store[uri] <-
-                if isNull diagnostics then
-                    JsonArray() :> JsonNode
-                else
-                    diagnostics.DeepClone()
+                    match DiagnosticIdentity.tryCanonicalFileKeyFromUri uri with
+                    | None -> ()
+                    | Some fileKey ->
+                        let diagnostics = payload["diagnostics"]
 
-            // Record when FSAC last reported diagnostics for this URI. Surfaced in
-            // workspace_diagnostics responses so callers can detect stale "all clean"
-            // results after an edit (#115).
-            analyzedAt[uri] <- DateTimeOffset.UtcNow
+                        let serverVersion =
+                            match payload["version"] with
+                            | :? JsonValue as value ->
+                                let mutable version = 0
+                                if value.TryGetValue(&version) then Some version else None
+                            | _ -> None
+
+                        store[fileKey] <-
+                            { Generation = generation
+                              Payload =
+                                if isNull diagnostics then
+                                    JsonArray() :> JsonNode
+                                else
+                                    diagnostics.DeepClone()
+                              ServerVersion = serverVersion
+                              ReceivedAt = DateTimeOffset.UtcNow })
 
 // ─── Workspace load notification parsing ──────────────────────────────────────
 
@@ -209,39 +344,63 @@ module internal WorkspaceSelection =
     type Selection =
         | Selected of projectOrWorkspacePath: string * candidates: Candidate list
         | Ambiguous of candidates: Candidate list
+        | Invalid of reason: string
 
-    let private solutionFiles directory =
-        [| yield! Directory.GetFiles(directory, "*.sln", SearchOption.TopDirectoryOnly)
-           yield! Directory.GetFiles(directory, "*.slnx", SearchOption.TopDirectoryOnly) |]
+    let private recursiveFiles directory pattern =
+        FsLangMcp.ProjectFiles.WorkspaceDirectoryDiscovery.filesBelow directory [| pattern |]
+
+    let private solutionFiles directory searchOption =
+        let find pattern =
+            match searchOption with
+            | SearchOption.TopDirectoryOnly -> Directory.GetFiles(directory, pattern, SearchOption.TopDirectoryOnly)
+            | _ -> recursiveFiles directory pattern
+
+        [| yield! find "*.sln"
+           yield! find "*.slnx" |]
         |> Array.map Path.GetFullPath
         |> Array.sort
 
-    let private projectFiles directory =
-        Directory.GetFiles(directory, "*.fsproj", SearchOption.TopDirectoryOnly)
+    let private projectFiles directory searchOption =
+        (match searchOption with
+         | SearchOption.TopDirectoryOnly -> Directory.GetFiles(directory, "*.fsproj", SearchOption.TopDirectoryOnly)
+         | _ -> recursiveFiles directory "*.fsproj")
         |> Array.map Path.GetFullPath
         |> Array.sort
+
+    let private selectCandidates (kind: CandidateKind) (paths: string array) =
+        if paths.Length > 1 then
+            Some(Ambiguous(paths |> Array.map (fun path -> { Kind = kind; Path = path }) |> Array.toList))
+        elif paths.Length = 1 then
+            Some(Selected(paths[0], [ { Kind = kind; Path = paths[0] } ]))
+        else
+            None
 
     let select (path: string) =
         let fullPath = Path.GetFullPath(path)
 
         if not (Directory.Exists fullPath) then
-            Selected(fullPath, [])
-        else
-            let solutions = solutionFiles fullPath
+            let extension = Path.GetExtension(fullPath)
 
-            if solutions.Length = 1 then
-                Selected(solutions[0], [ { Kind = Solution; Path = solutions[0] } ])
-            elif solutions.Length > 1 then
-                Ambiguous(solutions |> Array.map (fun path -> { Kind = Solution; Path = path }) |> Array.toList)
+            if
+                String.Equals(extension, ".fsproj", StringComparison.OrdinalIgnoreCase)
+                || String.Equals(extension, ".sln", StringComparison.OrdinalIgnoreCase)
+                || String.Equals(extension, ".slnx", StringComparison.OrdinalIgnoreCase)
+            then
+                Selected(fullPath, [])
             else
-                let projects = projectFiles fullPath
-
-                if projects.Length > 1 then
-                    Ambiguous(projects |> Array.map (fun path -> { Kind = Project; Path = path }) |> Array.toList)
-                elif projects.Length = 1 then
-                    Selected(projects[0], [ { Kind = Project; Path = projects[0] } ])
-                else
-                    Selected(fullPath, [])
+                Invalid
+                    $"projectPath must be a directory, .fsproj, .sln, or .slnx file; got '{fullPath}'."
+        else
+            // Preserve the historical top-level precedence first. If the requested
+            // directory is a repository root with no top-level workspace file, recurse
+            // so documented directory inputs can select `src/App/App.fsproj`. Multiple
+            // candidates remain explicit instead of silently choosing by sort order.
+            [ (Solution, solutionFiles fullPath SearchOption.TopDirectoryOnly)
+              (Project, projectFiles fullPath SearchOption.TopDirectoryOnly)
+              (Solution, solutionFiles fullPath SearchOption.AllDirectories)
+              (Project, projectFiles fullPath SearchOption.AllDirectories) ]
+            |> List.tryPick (fun (kind, paths) -> selectCandidates kind paths)
+            |> Option.defaultValue (Selected(fullPath, []))
 
     let candidateKindToString kind =
         match kind with
@@ -263,6 +422,34 @@ type private WorkspaceLoadTarget(setReady: unit -> unit) =
 
     [<JsonRpcMethod("fsharp/workspaceLoad", UseSingleObjectParameterDeserialization = true)>]
     member _.WorkspaceLoad(payload: JsonElement) = notifyIfReady payload
+
+/// Minimal LSP client-side window surface. FSAC/Fantomas can ask the client to
+/// display a message while servicing formatting; leaving this request unhandled
+/// makes StreamJsonRpc answer "method not found" and turns valid formatting into
+/// a RemoteMethodNotFoundException. A headless MCP server has no UI, so requests
+/// are acknowledged with a null (dismissed) action and notifications go to stderr.
+type private WindowMessageTarget() =
+    let log (kind: string) (payload: JsonObject) =
+        let message =
+            match payload["message"] with
+            | :? JsonValue as value ->
+                let mutable text = ""
+                if value.TryGetValue(&text) then text else payload.ToJsonString()
+            | _ -> payload.ToJsonString()
+
+        let bounded = if message.Length <= 2000 then message else message[..1999] + "…"
+        Console.Error.WriteLine($"[fsautocomplete {kind}] {bounded}")
+
+    [<JsonRpcMethod("window/showMessageRequest", UseSingleObjectParameterDeserialization = true)>]
+    member _.ShowMessageRequest(payload: JsonObject) : JsonNode =
+        log "message" payload
+        null
+
+    [<JsonRpcMethod("window/showMessage", UseSingleObjectParameterDeserialization = true)>]
+    member _.ShowMessage(payload: JsonObject) = log "message" payload
+
+    [<JsonRpcMethod("window/logMessage", UseSingleObjectParameterDeserialization = true)>]
+    member _.LogMessage(payload: JsonObject) = log "log" payload
 
 // ─── LspResponseShape (pure response builders, testable) ──────────────────────
 
@@ -385,6 +572,37 @@ module internal LspResponseShape =
                 )
 
             rx.IsMatch(candidate)
+
+    /// Match a user-facing workspace glob against an evaluated source path. Relative
+    /// globs (for example `src/Adapters/*.fs`) are evaluated from the selected
+    /// workspace root; absolute path and file-URI patterns remain supported.
+    let fileMatchesWorkspaceGlob (workspaceRoot: string option) (pattern: string) (filePath: string) : bool =
+        if String.IsNullOrWhiteSpace(pattern) || String.IsNullOrWhiteSpace(filePath) then
+            false
+        else
+            try
+                let slash (value: string) = value.Replace('\\', '/')
+                let fullPath = Path.GetFullPath(filePath)
+                let normalizedPattern = slash pattern
+                let candidates = ResizeArray<string>()
+                candidates.Add(slash fullPath)
+                candidates.Add(Uri(fullPath).AbsoluteUri)
+
+                match workspaceRoot with
+                | Some root when not (String.IsNullOrWhiteSpace root) ->
+                    let relative = Path.GetRelativePath(Path.GetFullPath(root), fullPath)
+
+                    if relative <> ".."
+                       && not (relative.StartsWith(".." + string Path.DirectorySeparatorChar, StringComparison.Ordinal))
+                       && not (Path.IsPathRooted relative) then
+                        candidates.Add(slash relative)
+                | _ -> ()
+
+                candidates
+                |> Seq.distinct
+                |> Seq.exists (fileMatchesGlob normalizedPattern)
+            with _ ->
+                false
 
     /// Filters a JSON diagnostics array (LSP shape) by severity code.
     /// Returns a fresh array containing only diagnostics with matching severity.
@@ -740,6 +958,73 @@ module internal RenamePreviewShape =
                     ""
         | _ -> ""
 
+    let private isStringValue (node: JsonNode) =
+        match node with
+        | :? JsonValue as value ->
+            let mutable text = ""
+            value.TryGetValue(&text)
+        | _ -> false
+
+    let private validateTextEdit (edit: JsonNode) =
+        match edit with
+        | :? JsonObject as obj when (tryRange edit |> Option.isSome) && isStringValue obj["newText"] -> Ok()
+        | _ -> Error "WorkspaceEdit contains a malformed TextEdit (range/newText)."
+
+    let private validateTextEdits (edits: JsonArray) =
+        edits
+        |> Seq.cast<JsonNode>
+        |> Seq.tryPick (fun edit ->
+            match validateTextEdit edit with
+            | Ok() -> None
+            | Error reason -> Some reason)
+        |> function
+            | Some reason -> Error reason
+            | None -> Ok()
+
+    /// A null or genuinely empty WorkspaceEdit means "no symbol". A value that is
+    /// not a valid WorkspaceEdit is a protocol failure and must never be presented
+    /// as a semantic negative.
+    let private validateWorkspaceEdit (workspaceEdit: JsonNode) =
+        if isNull workspaceEdit then
+            Ok()
+        else
+            match workspaceEdit with
+            | :? JsonObject as edit ->
+                match edit["documentChanges"], edit["changes"] with
+                | (:? JsonArray as documentChanges), null ->
+                    documentChanges
+                    |> Seq.cast<JsonNode>
+                    |> Seq.tryPick (fun change ->
+                        match change with
+                        | :? JsonObject as obj ->
+                            match obj["textDocument"], obj["edits"], obj["kind"] with
+                            | (:? JsonObject as document), (:? JsonArray as edits), _
+                                when isStringValue document["uri"] ->
+                                match validateTextEdits edits with
+                                | Ok() -> None
+                                | Error reason -> Some reason
+                            | null, null, kind when isStringValue kind -> None
+                            | _ -> Some "WorkspaceEdit contains a malformed documentChanges entry."
+                        | _ -> Some "WorkspaceEdit documentChanges must contain objects.")
+                    |> function
+                        | Some reason -> Error reason
+                        | None -> Ok()
+                | null, (:? JsonObject as changes) ->
+                    changes
+                    |> Seq.tryPick (fun entry ->
+                        match entry.Value with
+                        | :? JsonArray as edits ->
+                            match validateTextEdits edits with
+                            | Ok() -> None
+                            | Error reason -> Some reason
+                        | _ -> Some "WorkspaceEdit changes entries must be TextEdit arrays.")
+                    |> function
+                        | Some reason -> Error reason
+                        | None -> Ok()
+                | null, null -> Ok()
+                | _, _ -> Error "WorkspaceEdit must contain either documentChanges or changes in the LSP shape."
+            | _ -> Error "FSAC rename result was not a WorkspaceEdit object or null."
+
     /// Applies a single-line TextEdit to one line, producing the preview line:
     /// keep the prefix before `startChar`, splice in `newText`, keep the suffix
     /// from `endChar`. Char offsets are clamped to the line so malformed ranges
@@ -833,52 +1118,60 @@ module internal RenamePreviewShape =
     /// `{ status: "no_symbol"; reason }` envelope when the edit is null/empty —
     /// i.e. FSAC could not resolve a renamable symbol at the position.
     let build (ctx: Context) (workspaceEdit: JsonNode) : JsonNode =
-        let grouped =
-            extractFileEdits workspaceEdit
-            |> List.groupBy fst
-            |> List.map (fun (uri, items) -> uri, (items |> List.collect snd))
-
-        let totalEdits = grouped |> List.sumBy (fun (_, edits) -> edits.Length)
-
-        if List.isEmpty grouped || totalEdits = 0 then
-            let display = ctx.UriToDisplay ctx.OriginatingUri
-
+        match validateWorkspaceEdit workspaceEdit with
+        | Error reason ->
             jobj
-                [ "status", jstr "no_symbol"
-                  "reason",
-                  jstr
-                      $"No renamable symbol at {Path.GetFileName display}:{ctx.Line}:{ctx.Character}. The position may fall on a keyword, literal, operator, whitespace, or a symbol the compiler cannot resolve." ]
+                [ "status", jstr "infrastructure_error"
+                  "errorKind", jstr "protocol_error"
+                  "message", jstr reason ]
             :> JsonNode
-        else
-            let symbol = detectSymbol ctx grouped
+        | Ok() ->
+            let grouped =
+                extractFileEdits workspaceEdit
+                |> List.groupBy fst
+                |> List.map (fun (uri, items) -> uri, (items |> List.collect snd))
 
-            let fileNodes =
-                grouped
-                |> List.map (fun (uri, edits) ->
-                    let linesOpt = ctx.LookupLines uri
-                    let editNodes = edits |> List.map (editPreviewNode linesOpt)
+            let totalEdits = grouped |> List.sumBy (fun (_, edits) -> edits.Length)
 
-                    jobj
-                        [ "file", jstr (ctx.UriToDisplay uri)
-                          "editCount", jint edits.Length
-                          "edits", JsonArray(editNodes |> List.toArray) :> JsonNode ]
-                    :> JsonNode)
+            if List.isEmpty grouped || totalEdits = 0 then
+                let display = ctx.UriToDisplay ctx.OriginatingUri
 
-            let crossProject =
-                grouped
-                |> List.choose (fun (uri, _) -> ctx.ResolveProject uri)
-                |> List.distinct
-                |> List.length > 1
+                jobj
+                    [ "status", jstr "no_symbol"
+                      "reason",
+                      jstr
+                          $"No renamable symbol at {Path.GetFileName display}:{ctx.Line}:{ctx.Character}. The position may fall on a keyword, literal, operator, whitespace, or a symbol the compiler cannot resolve." ]
+                :> JsonNode
+            else
+                let symbol = detectSymbol ctx grouped
 
-            jobj
-                [ "status", jstr "ok"
-                  "symbol", (symbol |> Option.map jstr |> Option.defaultValue null)
-                  "newName", jstr ctx.NewName
-                  "totalEdits", jint totalEdits
-                  "fileCount", jint grouped.Length
-                  "files", JsonArray(fileNodes |> List.toArray) :> JsonNode
-                  "crossProject", jbool crossProject ]
-            :> JsonNode
+                let fileNodes =
+                    grouped
+                    |> List.map (fun (uri, edits) ->
+                        let linesOpt = ctx.LookupLines uri
+                        let editNodes = edits |> List.map (editPreviewNode linesOpt)
+
+                        jobj
+                            [ "file", jstr (ctx.UriToDisplay uri)
+                              "editCount", jint edits.Length
+                              "edits", JsonArray(editNodes |> List.toArray) :> JsonNode ]
+                        :> JsonNode)
+
+                let crossProject =
+                    grouped
+                    |> List.choose (fun (uri, _) -> ctx.ResolveProject uri)
+                    |> List.distinct
+                    |> List.length > 1
+
+                jobj
+                    [ "status", jstr "ok"
+                      "symbol", (symbol |> Option.map jstr |> Option.defaultValue null)
+                      "newName", jstr ctx.NewName
+                      "totalEdits", jint totalEdits
+                      "fileCount", jint grouped.Length
+                      "files", JsonArray(fileNodes |> List.toArray) :> JsonNode
+                      "crossProject", jbool crossProject ]
+                :> JsonNode
 
 // ─── CodeAction request building (#43) ─────────────────────────────────────────
 
@@ -910,16 +1203,44 @@ type internal FsAutoCompleteBridge
         ?cleanupTimeoutOverride: TimeSpan,
         ?cleanupDrainBarrierOverride: (unit -> Task option),
         ?fsacCommandOverride: string,
-        ?fsacArgsOverride: string list
+        ?fsacArgsOverride: string list,
+        ?evaluatedSourceFilesProvider: (string -> Task<Result<string array, string>>)
     ) =
     let gate = new SemaphoreSlim(1, 1)
     let projectSwitchGate = new SemaphoreSlim(1, 1)
-    let documents = ConcurrentDictionary<string, LspDocumentState>()
-    let diagnostics = ConcurrentDictionary<string, JsonNode>()
-    // Tracks when FSAC last pushed diagnostics for each URI. Surfaced via
-    // `analyzedAt` / `analyzedAtByUri` / `mostRecentAnalyzedAt` in workspace_diagnostics
-    // responses (#115) so callers can self-check freshness after an edit.
-    let diagnosticsAnalyzedAt = ConcurrentDictionary<string, DateTimeOffset>()
+    let documents = ConcurrentDictionary<string, LspDocumentState>(DiagnosticIdentity.pathComparer)
+    let diagnostics = ConcurrentDictionary<string, DiagnosticEnvelope>(DiagnosticIdentity.pathComparer)
+    // A versionless publishDiagnostics notification cannot identify which
+    // didOpen/didChange content it analyzed. Stamp every unproven initial open
+    // and every subsequent change with its owning generation so an A -> B -> A
+    // content cycle cannot make a delayed publication for B look current merely
+    // because hashes equal A again. A first open proven identical to both the
+    // generation baseline and stable disk content adds no new content state, so
+    // it remains eligible for versionless diagnostics. An exact current server
+    // version remains causal evidence in either case.
+    let diagnosticContentTransitionTaints =
+        ConcurrentDictionary<string, int64>(DiagnosticIdentity.pathComparer)
+    // PublishDiagnostics runs on StreamJsonRpc's dispatch threads. Generation
+    // transitions and the atomic envelope write share this lock so an old
+    // notification cannot pass a generation check, pause, and repopulate the
+    // replacement generation after Stop/Start has cleared it.
+    let diagnosticsGenerationGate = obj()
+
+    // Strong on-disk content hashes captured before each FSAC process starts.
+    // A versionless FSAC publication can prove freshness only for content equal
+    // to this causal generation baseline.
+    let mutable diagnosticGenerationBaseline =
+        System.Collections.Generic.Dictionary<string, string>(DiagnosticIdentity.pathComparer)
+
+    let mutable runtimeDiagnosticContextFingerprint: string option = None
+    let mutable diagnosticGenerationContextFingerprint: string option = None
+
+    let mutable nextSessionGeneration = 0L
+
+    [<VolatileField>]
+    let mutable activeSessionGeneration = 0L
+
+    let mutable lifecycleState = LspLifecycleState.Stopped
 
     [<VolatileField>]
     let mutable rpc: JsonRpc option = None
@@ -928,10 +1249,28 @@ type internal FsAutoCompleteBridge
     let mutable lspProcess: Process option = None
 
     [<VolatileField>]
+    let mutable lspContainment: ProcessContainment option = None
+
+    [<VolatileField>]
     let mutable runtimeProjectPath: string option = None
 
     [<VolatileField>]
     let mutable runtimeWorkspaceRoot: string option = None
+
+    [<VolatileField>]
+    let mutable runtimeLoadedProjects: string array = [||]
+
+    let sourcePathComparer =
+        if OperatingSystem.IsWindows() then
+            StringComparer.OrdinalIgnoreCase
+        else
+            StringComparer.Ordinal
+
+    // MSBuild Compile membership is authoritative for linked files that live outside
+    // the selected workspace (and may sit below another .fsproj). Reads and replacement
+    // happen under `gate`, together with the rest of the active LSP context.
+    let mutable runtimeEvaluatedSourceFiles =
+        System.Collections.Generic.HashSet<string>(sourcePathComparer)
 
     let startupTimeout =
         startupTimeoutOverride
@@ -968,10 +1307,11 @@ type internal FsAutoCompleteBridge
     let cleanupLspResources
         (jsonRpc: JsonRpc option)
         (fsacProcess: Process option)
+        (containment: ProcessContainment option)
         (pump: Task option)
         : Task =
         task {
-            if jsonRpc.IsNone && fsacProcess.IsNone && pump.IsNone then
+            if jsonRpc.IsNone && fsacProcess.IsNone && containment.IsNone && pump.IsNone then
                 return ()
             else
                 Interlocked.Increment(&pendingLspCleanups) |> ignore
@@ -991,8 +1331,10 @@ type internal FsAutoCompleteBridge
                     match fsacProcess with
                     | Some fsacProc ->
                         try
-                            if not fsacProc.HasExited then
-                                fsacProc.Kill(true)
+                            match containment with
+                            | Some owned -> terminateContainedProcess owned
+                            | None when not fsacProc.HasExited -> fsacProc.Kill(true)
+                            | None -> ()
                         with _ ->
                             ()
 
@@ -1031,13 +1373,18 @@ type internal FsAutoCompleteBridge
                             // secondary to the request/startup error that initiated shutdown.
                             ()
                 finally
-                    match fsacProcess with
-                    | Some fsacProc ->
+                    match containment, fsacProcess with
+                    | Some owned, _ ->
+                        try
+                            (owned :> IDisposable).Dispose()
+                        with _ ->
+                            ()
+                    | None, Some fsacProc ->
                         try
                             fsacProc.Dispose()
                         with _ ->
                             ()
-                    | None -> ()
+                    | None, None -> ()
 
                     Interlocked.Decrement(&pendingLspCleanups) |> ignore
         }
@@ -1060,6 +1407,209 @@ type internal FsAutoCompleteBridge
                 Directory.GetCurrentDirectory()
             else
                 parent
+
+    let pathComparison =
+        if OperatingSystem.IsWindows() then
+            StringComparison.OrdinalIgnoreCase
+        else
+            StringComparison.Ordinal
+
+    let normalizedPath (path: string) =
+        Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+
+    let pathsEqual (left: string) (right: string) =
+        String.Equals(normalizedPath left, normalizedPath right, pathComparison)
+
+    let resolveEvaluatedSourceFiles (loadedProjects: string array) =
+        task {
+            let evaluatedFiles = System.Collections.Generic.HashSet<string>(sourcePathComparer)
+            let elapsed = Stopwatch.StartNew()
+            let mutable deadlineExpired = false
+
+            match evaluatedSourceFilesProvider with
+            | None -> ()
+            | Some getEvaluatedFiles ->
+                for projectPath in loadedProjects do
+                    if not deadlineExpired then
+                        let remaining = startupTimeout - elapsed.Elapsed
+
+                        if remaining <= TimeSpan.Zero then
+                            deadlineExpired <- true
+                        else
+                            try
+                                let! result = (getEvaluatedFiles projectPath).WaitAsync(remaining)
+
+                                match result with
+                                | Ok paths ->
+                                    for path in paths do
+                                        if not (String.IsNullOrWhiteSpace path) then
+                                            try
+                                                evaluatedFiles.Add(normalizedPath path) |> ignore
+                                            with _ ->
+                                                ()
+                                | Error _ -> ()
+                            with
+                            | :? TimeoutException -> deadlineExpired <- true
+                            | _ ->
+                                // Project selection and FSAC startup remain available
+                                // when the optional evaluator cannot load one project.
+                                // Directory/project heuristics below still provide a
+                                // conservative fallback.
+                                ()
+
+            return evaluatedFiles
+        }
+
+    let captureDiagnosticGenerationBaseline () =
+        let baseline =
+            System.Collections.Generic.Dictionary<string, string>(DiagnosticIdentity.pathComparer)
+
+        for file in runtimeEvaluatedSourceFiles do
+            match DiagnosticIdentity.tryStableFileTextHash file with
+            | Some hash -> baseline[DiagnosticIdentity.canonicalFileKeyFromPath file] <- hash
+            | None -> ()
+
+        baseline
+
+    let tryBaselineHash (fileKey: string) =
+        match diagnosticGenerationBaseline.TryGetValue(fileKey) with
+        | true, hash -> Some hash
+        | false, _ -> None
+
+    let isDiagnosticContentTransitionTainted (fileKey: string) =
+        match diagnosticContentTransitionTaints.TryGetValue(fileKey) with
+        | true, generation -> generation = Volatile.Read(&activeSessionGeneration)
+        | false, _ -> false
+
+    let diagnosticFreshness (fileKey: string) (envelope: DiagnosticEnvelope) =
+        if envelope.Generation <> Volatile.Read(&activeSessionGeneration) then
+            Stale
+        else
+            let baseline = tryBaselineHash fileKey
+            let disk = DiagnosticIdentity.tryStableFileTextHash fileKey
+
+            match documents.TryGetValue(fileKey) with
+            | true, document ->
+                match envelope.ServerVersion with
+                | Some version when version = document.Version -> Current
+                | Some _ -> Stale
+                | None when isDiagnosticContentTransitionTainted fileKey -> Stale
+                | None ->
+                    match baseline, disk with
+                    | Some expected, Some actual when expected = actual && document.TextHash = expected -> Current
+                    | Some expected, Some actual when expected <> actual && document.TextHash = actual ->
+                        DiskContentChanged
+                    | _ -> Stale
+            | false, _ ->
+                match baseline, disk with
+                | Some expected, Some actual when expected = actual -> Current
+                | Some expected, Some actual when expected <> actual -> DiskContentChanged
+                | _ -> Stale
+
+    let diagnosticBaselineNeedsRefresh (fileKey: string) =
+        match tryBaselineHash fileKey, DiagnosticIdentity.tryStableFileTextHash fileKey with
+        | Some expected, Some actual when expected <> actual ->
+            match documents.TryGetValue(fileKey) with
+            | false, _ -> true
+            | true, document -> document.TextHash = expected || document.TextHash = actual
+        | None, Some actual ->
+            match documents.TryGetValue(fileKey) with
+            | false, _ -> true
+            | true, document -> document.TextHash = actual
+        | _ -> false
+
+    let diagnosticTaintNeedsRebaseline (fileKey: string) =
+        if not (isDiagnosticContentTransitionTainted fileKey) then
+            false
+        else
+            // Only an envelope explicitly bound to the current client document
+            // version can be consumed without rebasing. A versionless envelope
+            // never clears the generation taint, so if it later overwrites this
+            // exact envelope the next context read still fails closed.
+            match documents.TryGetValue(fileKey), diagnostics.TryGetValue(fileKey) with
+            | (true, document), (true, envelope) when envelope.Generation = Volatile.Read(&activeSessionGeneration) ->
+                match envelope.ServerVersion with
+                | Some version -> version <> document.Version
+                | None -> true
+            | _ -> true
+
+    let contextFingerprintNeedsRefresh (expected: string option) =
+        match expected with
+        | Some fingerprint ->
+            diagnosticGenerationContextFingerprint
+            |> Option.exists (fun actual ->
+                String.Equals(actual, fingerprint, StringComparison.Ordinal))
+            |> not
+        | None -> false
+
+    let isLiveSession () =
+        match rpc, lspProcess with
+        | Some jsonRpc, Some fsacProc ->
+            try
+                not fsacProc.HasExited && not jsonRpc.Completion.IsCompleted
+            with _ ->
+                false
+        | _ -> false
+
+    let contextMatches (requestedPath: string option) =
+        match requestedPath, runtimeProjectPath with
+        | None, Some _ -> true
+        | None, None -> false
+        | Some requested, Some selected ->
+            let requestedFull = normalizedPath requested
+
+            pathsEqual requestedFull selected
+            || (String.Equals(Path.GetExtension(requestedFull), ".fsproj", StringComparison.OrdinalIgnoreCase)
+                && (runtimeLoadedProjects |> Array.exists (pathsEqual requestedFull)))
+        | Some _, None -> false
+
+    let tryFindOwningProject (filePath: string) =
+        let rec walk directory =
+            if String.IsNullOrWhiteSpace directory then
+                None
+            else
+                let projects =
+                    try
+                        Directory.GetFiles(directory, "*.fsproj", SearchOption.TopDirectoryOnly)
+                    with _ ->
+                        [||]
+
+                match projects |> Array.tryFind (fun project -> runtimeLoadedProjects |> Array.exists (pathsEqual project)) with
+                | Some loaded -> Some(normalizedPath loaded)
+                | None when projects.Length = 1 -> Some(normalizedPath projects[0])
+                | _ ->
+                    let parent = Directory.GetParent(directory)
+                    if isNull parent then None else walk parent.FullName
+
+        try
+            let fullPath = normalizedPath filePath
+            let directory = if Directory.Exists fullPath then fullPath else Path.GetDirectoryName fullPath
+            walk directory
+        with _ ->
+            None
+
+    let fileContextMatches (filePath: string) =
+        match runtimeProjectPath with
+        | None -> false
+        | Some _ ->
+            let fullPath = normalizedPath filePath
+
+            if runtimeEvaluatedSourceFiles.Contains fullPath then
+                true
+            else
+                match tryFindOwningProject fullPath with
+                | Some owner -> runtimeLoadedProjects |> Array.exists (pathsEqual owner)
+                | None ->
+                    // Scripts and unsaved files may not have an owning .fsproj. Keep them
+                    // bound to the selected workspace root instead of silently accepting a
+                    // path from another checkout.
+                    match runtimeWorkspaceRoot with
+                    | Some root ->
+                        let relative = Path.GetRelativePath(normalizedPath root, fullPath)
+                        relative <> ".."
+                        && not (relative.StartsWith(".." + string Path.DirectorySeparatorChar, pathComparison))
+                        && not (Path.IsPathRooted relative)
+                    | None -> false
 
     let getWorkspaceRoot () =
         let fromRuntimeWorkspace = runtimeWorkspaceRoot |> Option.map Path.GetFullPath
@@ -1109,15 +1659,28 @@ type internal FsAutoCompleteBridge
 
     let useAutomaticWorkspaceInit () = explicitWorkspacePath().IsNone
 
-    let markWorkspaceReady () =
-        workspaceReady <- true
-        workspaceReadyAt <- ValueSome DateTimeOffset.UtcNow
+    let markWorkspaceReady generation () =
+        if Volatile.Read(&activeSessionGeneration) = generation then
+            workspaceReady <- true
+            workspaceReadyAt <- ValueSome DateTimeOffset.UtcNow
+            lifecycleState <- LspLifecycleState.Ready generation
+
+    let isTransportFailure (jsonRpc: JsonRpc) (ex: exn) =
+        ex :? IOException
+        || ex :? ObjectDisposedException
+        || ex :? EndOfStreamException
+        || jsonRpc.Completion.IsCompleted
 
     member private _.BeginLspCleanupUnsafe
-        (stoppedRpc: JsonRpc option, stoppedProcess: Process option, stoppedPump: Task option)
+        (
+            stoppedRpc: JsonRpc option,
+            stoppedProcess: Process option,
+            stoppedContainment: ProcessContainment option,
+            stoppedPump: Task option
+        )
         =
-        if stoppedRpc.IsSome || stoppedProcess.IsSome || stoppedPump.IsSome then
-            let cleanup = cleanupLspResources stoppedRpc stoppedProcess stoppedPump
+        if stoppedRpc.IsSome || stoppedProcess.IsSome || stoppedContainment.IsSome || stoppedPump.IsSome then
+            let cleanup = cleanupLspResources stoppedRpc stoppedProcess stoppedContainment stoppedPump
 
             pendingLspCleanup <-
                 match pendingLspCleanup with
@@ -1143,27 +1706,54 @@ type internal FsAutoCompleteBridge
         task {
             let stoppedRpc = rpc
             let stoppedProcess = lspProcess
+            let stoppedContainment = lspContainment
             let stoppedPump = stderrPump
+            let stoppedGeneration = Volatile.Read(&activeSessionGeneration)
+
+            lifecycleState <- LspLifecycleState.Stopping stoppedGeneration
 
             rpc <- None
             lspProcess <- None
+            lspContainment <- None
             stderrPump <- None
-            documents.Clear()
-            diagnostics.Clear()
-            diagnosticsAnalyzedAt.Clear()
+            lock diagnosticsGenerationGate (fun () ->
+                Volatile.Write(&activeSessionGeneration, 0L)
+                documents.Clear()
+                diagnostics.Clear()
+                diagnosticContentTransitionTaints.Clear()
+                diagnosticGenerationBaseline <-
+                    System.Collections.Generic.Dictionary<string, string>(DiagnosticIdentity.pathComparer)
+                diagnosticGenerationContextFingerprint <- None)
             workspaceReady <- false
             workspaceReadyAt <- ValueNone
             symbolIndexEverWarmed <- false
 
-            this.BeginLspCleanupUnsafe(stoppedRpc, stoppedProcess, stoppedPump)
-            return! this.AwaitPendingLspCleanupUnsafe()
+            this.BeginLspCleanupUnsafe(stoppedRpc, stoppedProcess, stoppedContainment, stoppedPump)
+            let! completed = this.AwaitPendingLspCleanupUnsafe()
+
+            if completed then
+                lifecycleState <- LspLifecycleState.Stopped
+            else
+                lifecycleState <-
+                    LspLifecycleState.Faulted(stoppedGeneration, "Timed out while draining the retired FSAC session.")
+
+            return completed
         }
 
     member private this.InvokeLiveUnsafe(jsonRpc: JsonRpc, methodName: string, parameters: JsonObject) : Task<JsonNode> =
         task {
             try
                 return! invokeWithTimeout jsonRpc methodName parameters requestTimeout
-            with :? TimeoutException as ex ->
+            with
+            | :? TimeoutException as ex ->
+                match rpc with
+                | Some current when Object.ReferenceEquals(current, jsonRpc) ->
+                    let! _ = this.StopLspUnsafe()
+                    ()
+                | _ -> ()
+
+                return raise ex
+            | ex when isTransportFailure jsonRpc ex ->
                 match rpc with
                 | Some current when Object.ReferenceEquals(current, jsonRpc) ->
                     let! _ = this.StopLspUnsafe()
@@ -1177,7 +1767,16 @@ type internal FsAutoCompleteBridge
         task {
             try
                 do! notifyWithTimeout jsonRpc methodName parameters requestTimeout
-            with :? TimeoutException as ex ->
+            with
+            | :? TimeoutException as ex ->
+                match rpc with
+                | Some current when Object.ReferenceEquals(current, jsonRpc) ->
+                    let! _ = this.StopLspUnsafe()
+                    ()
+                | _ -> ()
+
+                return raise ex
+            | ex when isTransportFailure jsonRpc ex ->
                 match rpc with
                 | Some current when Object.ReferenceEquals(current, jsonRpc) ->
                     let! _ = this.StopLspUnsafe()
@@ -1189,11 +1788,13 @@ type internal FsAutoCompleteBridge
 
     member _.DiagnosticsStore = diagnostics
 
-    member _.DiagnosticsAnalyzedAtStore = diagnosticsAnalyzedAt
-
     member _.CurrentProjectPath = runtimeProjectPath
 
     member _.CurrentWorkspaceRoot = runtimeWorkspaceRoot
+
+    member _.LoadedProjects = Array.copy runtimeLoadedProjects
+
+    member _.IsSessionLive = isLiveSession ()
 
     member _.IsWorkspaceReady = workspaceReady
 
@@ -1206,6 +1807,16 @@ type internal FsAutoCompleteBridge
 
     /// Number of retired LSP generations still draining redirected IO.
     member _.PendingLspCleanupCount = Volatile.Read(&pendingLspCleanups)
+
+    member _.SessionGeneration = Volatile.Read(&activeSessionGeneration)
+
+    member _.LifecycleState =
+        match lifecycleState with
+        | LspLifecycleState.Stopped -> "stopped"
+        | LspLifecycleState.Starting _ -> "starting"
+        | LspLifecycleState.Ready _ -> "ready"
+        | LspLifecycleState.Stopping _ -> "stopping"
+        | LspLifecycleState.Faulted _ -> "faulted"
 
     // Wait until workspaceReady is true or timeout elapses
     member _.WaitForReady(timeout: TimeSpan) : Task<bool> =
@@ -1224,146 +1835,234 @@ type internal FsAutoCompleteBridge
     member _.NotReadyResponse() : JsonNode =
         jobj
             [ "status", jstr "not_ready"
-              "message", jstr "fsautocomplete is still loading the project. Try again in a moment." ]
+              "contextMatched", jbool true
+              "message", jstr "fsautocomplete is still loading the project. Try again in a moment."
+              "activeProjectPath", runtimeProjectPath |> Option.map jstr |> Option.defaultValue null
+              "sessionGeneration", jint64 (Volatile.Read(&activeSessionGeneration)) ]
         :> JsonNode
 
+    member private _.FileContextMismatchResponse(path: string) : JsonNode =
+        jobj
+            [ "status", jstr "context_mismatch"
+              "contextMatched", jbool false
+              "message",
+              jstr
+                  "The requested source file is not part of the active fsautocomplete project context. Call set_project with restartLsp=true for the file's project."
+              "requestedFile", jstr (Path.GetFullPath path)
+              "activeProjectPath", runtimeProjectPath |> Option.map jstr |> Option.defaultValue null
+              "sessionGeneration", jint64 (Volatile.Read(&activeSessionGeneration)) ]
+        :> JsonNode
+
+    member private _.WithContextMetadata(response: JsonNode) =
+        match response with
+        | :? JsonObject as obj ->
+            obj["contextMatched"] <- jbool true
+            obj["activeProjectPath"] <- runtimeProjectPath |> Option.map jstr |> Option.defaultValue null
+            obj["sessionGeneration"] <- jint64 (Volatile.Read(&activeSessionGeneration))
+        | _ -> ()
+
+        response
+
+    member private _.CopyContextMetadata(source: JsonObject, response: JsonNode) =
+        match response with
+        | :? JsonObject as target ->
+            for key in [ "contextMatched"; "activeProjectPath"; "sessionGeneration" ] do
+                target[key] <-
+                    match source[key] with
+                    | null -> null
+                    | value -> value.DeepClone()
+        | _ -> ()
+
+        response
+
     member private this.SetProjectCore(args: SetProjectArgs) : Task<JsonNode> =
-        task {
+        let invalidWorkspace =
+            args.workspacePath
+            |> Option.map Path.GetFullPath
+            |> Option.filter (Directory.Exists >> not)
+
+        match invalidWorkspace with
+        | Some workspace ->
+            Task.FromResult(
+                jobj
+                    [ "status", jstr "invalid_args"
+                      "message", jstr $"workspacePath must be an existing directory: {workspace}" ]
+                :> JsonNode
+            )
+        | None ->
+          task {
             // Guard before Path.GetFullPath: a wrong/missing key deserializes projectPath to
             // null, and Path.GetFullPath(null) throws ArgumentNullException naming the internal
             // 'path' param — misleading callers who passed the wrong key. Surface 'projectPath'.
             match ArgsValidation.requireNonBlank "projectPath" args.projectPath with
             | Error envelope -> return envelope
             | Ok projectPathArg ->
+                let inputPath = Path.GetFullPath(projectPathArg)
 
-            let inputPath = Path.GetFullPath(projectPathArg)
-
-            if not (File.Exists(inputPath) || Directory.Exists(inputPath)) then
-                return
-                    jobj
-                        [ "status", jstr "invalid_args"
-                          "message", jstr $"projectPath does not exist: {inputPath}" ]
-                    :> JsonNode
-            else
-
-            match WorkspaceSelection.select inputPath with
-            | WorkspaceSelection.Ambiguous candidates ->
-                return
-                    jobj
-                        [ "status", jstr "ambiguous_workspace"
-                          "message", jstr "Multiple workspace candidates found. Pass an explicit .sln/.slnx/.fsproj path."
-                          "candidates",
-                          JsonArray(candidates |> List.map WorkspaceSelection.candidateToJson |> List.toArray) :> JsonNode ]
-                    :> JsonNode
-            | WorkspaceSelection.Selected(projectPath, selectionCandidates) ->
-                let isSolution =
-                    projectPath.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
-                    || projectPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
-
-                let resolvedWorkspace =
-                    if isSolution then
-                        Path.GetDirectoryName(projectPath)
-                    else
-                        args.workspacePath
-                        |> Option.map Path.GetFullPath
-                        |> Option.defaultWith (fun () -> resolveWorkspaceFromProjectPath projectPath)
-
-                let restartLsp = args.restartLsp |> Option.defaultValue true
-                do! gate.WaitAsync()
-
-                let lspWasRunning, capturedProjectPath, capturedWorkspaceRoot =
-                    try
-                        let lspWasRunning =
-                            lspProcess
-                            |> Option.exists (fun lspProc -> not lspProc.HasExited)
-
-                        runtimeProjectPath <- Some projectPath
-                        runtimeWorkspaceRoot <- Some resolvedWorkspace
-
-                        Environment.SetEnvironmentVariable("FSA_PROJECT_PATH", runtimeProjectPath |> Option.defaultValue "")
-                        Environment.SetEnvironmentVariable("FSA_WORKSPACE_ROOT", resolvedWorkspace)
-
-                        lspWasRunning, runtimeProjectPath, resolvedWorkspace
-                    with ex ->
-                        gate.Release() |> ignore
-                        reraise ()
-
-                if restartLsp then
-                    try
-                        let! cleanupCompleted = this.StopLspUnsafe()
-
-                        if not cleanupCompleted then
-                            invalidOp "Timed out while draining the previous FSAC LSP generation."
-
-                        let! _ = this.StartLspUnsafe()
-                        ()
-                    finally
-                        gate.Release() |> ignore
-                else
-                    gate.Release() |> ignore
-
-                let loadedProjects =
-                    FsLangMcp.ProjectFiles.SolutionParsing.listProjects projectPath
-
-                let loadedProjectsNode =
-                    JsonArray(loadedProjects |> Array.map jstr) :> JsonNode
-
-                let lspReplacedExistingProcess =
-                    LspResponseShape.lspRestartOccurred restartLsp lspWasRunning
-
-                if restartLsp then
-                    let! ready = this.WaitForReady(TimeSpan.FromSeconds(30.0))
-                    let loadStatus = if ready then "ready" else "timeout"
-
-                    let readinessNode =
-                        LspResponseShape.setProjectReadiness ready symbolIndexEverWarmed restartLsp
-
+                if not (File.Exists(inputPath) || Directory.Exists(inputPath)) then
                     return
                         jobj
-                            [ "status", jstr "ok"
-                              "result",
-                              jobj
-                                  [ "fslangmcpVersion", jstr FsLangMcp.Version.current
-                                    "projectPath", capturedProjectPath |> Option.map jstr |> Option.defaultValue null
-                                    "requestedPath", jstr inputPath
-                                    "workspaceRoot", jstr capturedWorkspaceRoot
-                                    "lspRestartRequested", jbool restartLsp
-                                    // Preserve the pre-0.13.2 contract: this field historically
-                                    // mirrored the request, including on a first launch.
-                                    "lspRestarted", jbool restartLsp
-                                    "lspReplacedExistingProcess", jbool lspReplacedExistingProcess
-                                    "solutionMode", jbool isSolution
-                                    "workspaceLoadStatus", jstr loadStatus
-                                    "loadedProjects", loadedProjectsNode
-                                    "readiness", readinessNode
-                                    "workspaceCandidates",
-                                    JsonArray(selectionCandidates |> List.map WorkspaceSelection.candidateToJson |> List.toArray) :> JsonNode ]
-                              :> JsonNode ]
+                            [ "status", jstr "invalid_args"
+                              "message", jstr $"projectPath does not exist: {inputPath}" ]
                         :> JsonNode
                 else
-                    let readinessNode =
-                        LspResponseShape.setProjectReadiness workspaceReady symbolIndexEverWarmed restartLsp
+                    match WorkspaceSelection.select inputPath with
+                    | WorkspaceSelection.Invalid reason ->
+                        return jobj [ "status", jstr "invalid_args"; "message", jstr reason ] :> JsonNode
+                    | WorkspaceSelection.Ambiguous candidates ->
+                        return
+                            jobj
+                                [ "status", jstr "ambiguous_workspace"
+                                  "message",
+                                  jstr
+                                      "Multiple workspace candidates found. Pass an explicit .sln/.slnx/.fsproj path."
+                                  "candidates",
+                                  JsonArray(candidates |> List.map WorkspaceSelection.candidateToJson |> List.toArray)
+                                  :> JsonNode ]
+                            :> JsonNode
+                    | WorkspaceSelection.Selected(projectPath, selectionCandidates) ->
+                        let isSolution =
+                            projectPath.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
+                            || projectPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
 
-                    return
-                        jobj
-                            [ "status", jstr "ok"
-                              "result",
-                              jobj
-                                  [ "fslangmcpVersion", jstr FsLangMcp.Version.current
-                                    "projectPath", capturedProjectPath |> Option.map jstr |> Option.defaultValue null
-                                    "requestedPath", jstr inputPath
-                                    "workspaceRoot", jstr capturedWorkspaceRoot
-                                    "lspRestartRequested", jbool restartLsp
-                                    "lspRestarted", jbool restartLsp
-                                    "lspReplacedExistingProcess", jbool lspReplacedExistingProcess
-                                    "solutionMode", jbool isSolution
-                                    "workspaceLoadStatus", jstr "not_started"
-                                    "loadedProjects", loadedProjectsNode
-                                    "readiness", readinessNode
-                                    "workspaceCandidates",
-                                    JsonArray(selectionCandidates |> List.map WorkspaceSelection.candidateToJson |> List.toArray) :> JsonNode ]
-                              :> JsonNode ]
-                        :> JsonNode
+                        let requestedWorkspace =
+                            args.workspacePath
+                            |> Option.map Path.GetFullPath
+                            |> Option.orElseWith (fun () ->
+                                if Directory.Exists inputPath then Some inputPath else None)
+
+                        let resolvedWorkspace =
+                            requestedWorkspace
+                            |> Option.defaultWith (fun () ->
+                                if isSolution then
+                                    Path.GetDirectoryName(projectPath)
+                                else
+                                    resolveWorkspaceFromProjectPath projectPath)
+
+                        let loadedProjects = FsLangMcp.ProjectFiles.SolutionParsing.listProjects projectPath
+                        let! evaluatedSourceFiles = resolveEvaluatedSourceFiles loadedProjects
+                        let restartLsp = args.restartLsp |> Option.defaultValue true
+                        let mutable lspWasRunning = false
+                        let mutable restartRequired = false
+
+                        do! gate.WaitAsync()
+
+                        try
+                            lspWasRunning <- isLiveSession ()
+
+                            let sameLiveContext =
+                                runtimeProjectPath |> Option.exists (pathsEqual projectPath)
+                                && runtimeWorkspaceRoot |> Option.exists (pathsEqual resolvedWorkspace)
+
+                            if not restartLsp && lspWasRunning && not sameLiveContext then
+                                // Do not create split-brain state: the advertised target and
+                                // live FSAC must always identify the same workspace.
+                                restartRequired <- true
+                            else
+                                // A completed RPC/process pair is not reusable. Reap it even
+                                // when the caller only asked to select an FCS context.
+                                if not lspWasRunning && (rpc.IsSome || lspProcess.IsSome) then
+                                    let! cleanupCompleted = this.StopLspUnsafe()
+
+                                    if not cleanupCompleted then
+                                        invalidOp "Timed out while draining the previous FSAC LSP generation."
+
+                                if restartLsp then
+                                    let! cleanupCompleted = this.StopLspUnsafe()
+
+                                    if not cleanupCompleted then
+                                        invalidOp "Timed out while draining the previous FSAC LSP generation."
+
+                                runtimeProjectPath <- Some projectPath
+                                runtimeWorkspaceRoot <- Some resolvedWorkspace
+                                runtimeLoadedProjects <- loadedProjects
+                                runtimeEvaluatedSourceFiles <- evaluatedSourceFiles
+                                runtimeDiagnosticContextFingerprint <- None
+
+                                Environment.SetEnvironmentVariable("FSA_PROJECT_PATH", projectPath)
+                                Environment.SetEnvironmentVariable("FSA_WORKSPACE_ROOT", resolvedWorkspace)
+
+                                if restartLsp then
+                                    let! _ = this.StartLspUnsafe()
+                                    ()
+                        finally
+                            gate.Release() |> ignore
+
+                        if restartRequired then
+                            return
+                                jobj
+                                    [ "status", jstr "restart_required"
+                                      "message",
+                                      jstr
+                                          "A live fsautocomplete session is bound to another project context. Retry with restartLsp=true; the active context was not changed."
+                                      "requestedProjectPath", jstr projectPath
+                                      "activeProjectPath",
+                                      runtimeProjectPath |> Option.map jstr |> Option.defaultValue null
+                                      "activeWorkspaceRoot",
+                                      runtimeWorkspaceRoot |> Option.map jstr |> Option.defaultValue null ]
+                                :> JsonNode
+                        else
+                            let loadedProjectsNode = JsonArray(loadedProjects |> Array.map jstr) :> JsonNode
+
+                            let lspReplacedExistingProcess =
+                                LspResponseShape.lspRestartOccurred restartLsp lspWasRunning
+
+                            let! readyObserved =
+                                if restartLsp then
+                                    this.WaitForReady(TimeSpan.FromSeconds(30.0))
+                                else
+                                    Task.FromResult(workspaceReady && isLiveSession ())
+
+                            let live = isLiveSession ()
+                            // A ready notification is historical once the child/RPC has
+                            // completed. Never advertise a dead generation as usable.
+                            let ready = readyObserved && live
+
+                            let loadStatus =
+                                if restartLsp then
+                                    if ready then
+                                        "ready"
+                                    elif not live then
+                                        "faulted"
+                                    else
+                                        "timeout"
+                                elif not live then
+                                    "not_started"
+                                elif ready then
+                                    "ready"
+                                else
+                                    "warming"
+
+                            let readinessNode =
+                                LspResponseShape.setProjectReadiness ready symbolIndexEverWarmed (restartLsp || live)
+
+                            return
+                                jobj
+                                    [ "status", jstr "ok"
+                                      "result",
+                                      jobj
+                                          [ "fslangmcpVersion", jstr FsLangMcp.Version.current
+                                            "projectPath", jstr projectPath
+                                            "requestedPath", jstr inputPath
+                                            "workspaceRoot", jstr resolvedWorkspace
+                                            "lspRestartRequested", jbool restartLsp
+                                            "lspRestarted", jbool restartLsp
+                                            "lspReplacedExistingProcess", jbool lspReplacedExistingProcess
+                                            "solutionMode", jbool isSolution
+                                            "workspaceLoadStatus", jstr loadStatus
+                                            "lspLifecycleState", jstr this.LifecycleState
+                                            "loadedProjects", loadedProjectsNode
+                                            "readiness", readinessNode
+                                            "sessionGeneration", jint64 (Volatile.Read(&activeSessionGeneration))
+                                            "workspaceCandidates",
+                                            JsonArray(
+                                                selectionCandidates
+                                                |> List.map WorkspaceSelection.candidateToJson
+                                                |> List.toArray
+                                            )
+                                            :> JsonNode ]
+                                      :> JsonNode ]
+                                :> JsonNode
         }
 
     member this.SetProject(args: SetProjectArgs) : Task<JsonNode> =
@@ -1387,6 +2086,22 @@ type internal FsAutoCompleteBridge
             let command = fsacCommand ()
             let args = fsacArgs ()
             let workspaceRoot = getWorkspaceRoot ()
+            let generation = Interlocked.Increment(&nextSessionGeneration)
+            // Capture before the FSAC process exists: a versionless publication from
+            // this generation cannot legitimately describe content older than this
+            // baseline. Later disk changes therefore fail closed.
+            let generationBaseline = captureDiagnosticGenerationBaseline ()
+
+            lock diagnosticsGenerationGate (fun () ->
+                // Start can follow a handshake failure for which no committed `rpc`
+                // existed, so establish every generation from an empty snapshot.
+                documents.Clear()
+                diagnostics.Clear()
+                diagnosticContentTransitionTaints.Clear()
+                diagnosticGenerationBaseline <- generationBaseline
+                diagnosticGenerationContextFingerprint <- runtimeDiagnosticContextFingerprint
+                Volatile.Write(&activeSessionGeneration, generation))
+            lifecycleState <- LspLifecycleState.Starting generation
 
             let psi = ProcessStartInfo()
             psi.FileName <- command
@@ -1402,10 +2117,24 @@ type internal FsAutoCompleteBridge
             for arg in args do
                 psi.ArgumentList.Add(arg)
 
-            let fsacProc = new Process(StartInfo = psi)
+            let containment =
+                try
+                    startContainedProcess psi
+                with ex ->
+                    lock diagnosticsGenerationGate (fun () ->
+                        Volatile.Write(&activeSessionGeneration, 0L)
+                        documents.Clear()
+                        diagnostics.Clear()
+                        diagnosticContentTransitionTaints.Clear()
+                        diagnosticGenerationBaseline <-
+                            System.Collections.Generic.Dictionary<string, string>(
+                                DiagnosticIdentity.pathComparer
+                            )
+                        diagnosticGenerationContextFingerprint <- None)
+                    lifecycleState <- LspLifecycleState.Faulted(generation, ex.Message)
+                    raise ex
 
-            if not (fsacProc.Start()) then
-                invalidOp $"Unable to start %s{command}"
+            let fsacProc = containment.Process
 
             // The handshake below (RPC construction, `initialize`, `fsharp/workspaceLoad`)
             // can throw. Until `rpc`/`lspProcess` are assigned at the very end, this method
@@ -1459,11 +2188,21 @@ type internal FsAutoCompleteBridge
                 startedJsonRpc <- Some jsonRpc
                 let targetOptions = JsonRpcTargetOptions(AllowNonPublicInvocation = true)
 
-                jsonRpc.AddLocalRpcTarget(new DiagnosticsTarget(diagnostics, diagnosticsAnalyzedAt), targetOptions)
+                jsonRpc.AddLocalRpcTarget(
+                    new DiagnosticsTarget(
+                        diagnostics,
+                        generation,
+                        (fun candidate -> Volatile.Read(&activeSessionGeneration) = candidate),
+                        diagnosticsGenerationGate
+                    ),
+                    targetOptions
+                )
                 |> ignore
 
-                jsonRpc.AddLocalRpcTarget(new WorkspaceLoadTarget(markWorkspaceReady), targetOptions)
+                jsonRpc.AddLocalRpcTarget(new WorkspaceLoadTarget(markWorkspaceReady generation), targetOptions)
                 |> ignore
+
+                jsonRpc.AddLocalRpcTarget(new WindowMessageTarget(), targetOptions) |> ignore
 
                 jsonRpc.StartListening()
 
@@ -1511,7 +2250,8 @@ type internal FsAutoCompleteBridge
                                             "resolveSupport", jobj [ "properties", JsonArray(jstr "edit") :> JsonNode ] ]
                                       // Advertise push-diagnostics + save sync so FSAC publishes
                                       // diagnostics for opened/changed documents.
-                                      "publishDiagnostics", jobj [ "relatedInformation", jbool true ]
+                                      "publishDiagnostics",
+                                      jobj [ "relatedInformation", jbool true; "versionSupport", jbool true ]
                                       "synchronization", jobj [ "didSave", jbool true ] ] ] ]
 
                 let! _ = invokeWithTimeout jsonRpc "initialize" initializeParams startupTimeout
@@ -1529,17 +2269,48 @@ type internal FsAutoCompleteBridge
 
                     let! _ = invokeWithTimeout jsonRpc "fsharp/workspaceLoad" workspaceLoadParams startupTimeout
 
-                    markWorkspaceReady ()
+                    markWorkspaceReady generation ()
                 | None -> ()
 
                 rpc <- Some jsonRpc
                 lspProcess <- Some fsacProc
+                lspContainment <- Some containment
+
+                jsonRpc.Completion.ContinueWith(
+                    (fun (completed: Task) ->
+                        if Volatile.Read(&activeSessionGeneration) = generation then
+                            workspaceReady <- false
+
+                            let reason =
+                                if completed.IsFaulted then
+                                    completed.Exception.GetBaseException().Message
+                                elif completed.IsCanceled then
+                                    "FSAC RPC session was cancelled."
+                                else
+                                    "FSAC RPC session completed."
+
+                            lifecycleState <- LspLifecycleState.Faulted(generation, reason)),
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default
+                )
+                |> ignore
+
                 return jsonRpc
             with ex ->
                 // Handshake failed before the fields above were committed: this method is
                 // still the sole owner of fsacProc/jsonRpc, so reap them here or they leak.
                 stderrPump <- None
-                this.BeginLspCleanupUnsafe(startedJsonRpc, Some fsacProc, startedStderrPump)
+                lock diagnosticsGenerationGate (fun () ->
+                    Volatile.Write(&activeSessionGeneration, 0L)
+                    documents.Clear()
+                    diagnostics.Clear()
+                    diagnosticContentTransitionTaints.Clear()
+                    diagnosticGenerationBaseline <-
+                        System.Collections.Generic.Dictionary<string, string>(DiagnosticIdentity.pathComparer)
+                    diagnosticGenerationContextFingerprint <- None)
+                lifecycleState <- LspLifecycleState.Faulted(generation, ex.Message)
+                this.BeginLspCleanupUnsafe(startedJsonRpc, Some fsacProc, Some containment, startedStderrPump)
                 let! _ = this.AwaitPendingLspCleanupUnsafe()
                 return raise ex
         }
@@ -1548,7 +2319,14 @@ type internal FsAutoCompleteBridge
     member private this.EnsureStartedUnsafe() : Task<JsonRpc> =
         task {
             match rpc with
-            | Some existing -> return existing
+            | Some existing when isLiveSession () -> return existing
+            | Some _ ->
+                let! cleanupCompleted = this.StopLspUnsafe()
+
+                if not cleanupCompleted then
+                    invalidOp "Timed out while draining the failed FSAC LSP generation."
+
+                return! this.StartLspUnsafe()
             | None -> return! this.StartLspUnsafe()
         }
 
@@ -1556,23 +2334,57 @@ type internal FsAutoCompleteBridge
         task {
             let fullPath = Path.GetFullPath(path)
             let uri = toFileUri fullPath
+            let fileKey = DiagnosticIdentity.canonicalFileKeyFromPath fullPath
             let text = providedText |> Option.defaultWith (fun () -> File.ReadAllText(fullPath))
+            let textHash = DiagnosticIdentity.textHash text
+            let mutable version = 1
+            let mutable opened = false
+            let mutable requiresDiagnosticTaint = true
 
-            match documents.TryGetValue(uri) with
-            | true, state ->
-                state.Version <- state.Version + 1
-                state.Text <- text
+            lock diagnosticsGenerationGate (fun () ->
+                // Once a document changes, no previously cached publication may be
+                // correlated with the new client version. A first didOpen is the one
+                // exception when strong baseline, stable disk, and opened text all
+                // prove the same content; no causal content transition occurred.
+                diagnostics.TryRemove(fileKey) |> ignore
 
+                match documents.TryGetValue(fileKey) with
+                | true, state ->
+                    state.Version <- state.Version + 1
+                    state.Text <- text
+                    state.TextHash <- textHash
+                    version <- state.Version
+                | false, _ ->
+                    opened <- true
+
+                    requiresDiagnosticTaint <-
+                        match tryBaselineHash fileKey, DiagnosticIdentity.tryStableFileTextHash fileKey with
+                        | Some baselineHash, Some diskHash ->
+                            textHash <> baselineHash || diskHash <> baselineHash
+                        | _ -> true
+
+                    documents[fileKey] <-
+                        { Version = 1
+                          Text = text
+                          TextHash = textHash }
+
+                let generation = Volatile.Read(&activeSessionGeneration)
+
+                // Never remove a taint here: once this generation has observed a
+                // causal content transition, a later A -> B -> A cycle cannot restore
+                // versionless causality merely by returning to the baseline hash.
+                if generation > 0L && requiresDiagnosticTaint then
+                    diagnosticContentTransitionTaints[fileKey] <- generation)
+
+            if not opened then
                 let didChangeParams =
                     jobj
-                        [ "textDocument", jobj [ "uri", jstr uri; "version", jint state.Version ]
+                        [ "textDocument", jobj [ "uri", jstr uri; "version", jint version ]
                           "contentChanges", JsonArray(jobj [ "text", jstr text ] :> JsonNode) :> JsonNode ]
 
                 do! this.NotifyLiveUnsafe(jsonRpc, "textDocument/didChange", didChangeParams)
                 return uri
-            | false, _ ->
-                documents[uri] <- { Version = 1; Text = text }
-
+            else
                 let didOpenParams =
                     jobj
                         [ "textDocument",
@@ -1595,15 +2407,20 @@ type internal FsAutoCompleteBridge
             do! gate.WaitAsync()
 
             try
-                let! jsonRpc = this.EnsureStartedUnsafe()
-
-                if not workspaceReady then
-                    return this.NotReadyResponse()
+                if not (fileContextMatches path) then
+                    return this.FileContextMismatchResponse(path)
                 else
-                    let! uri = this.SyncDocument(jsonRpc, path, providedText)
-                    let parameters = mkParams uri
-                    let! response = this.InvokeLiveUnsafe(jsonRpc, methodName, parameters)
-                    return jobj [ "status", jstr "ok"; "result", response ] :> JsonNode
+                    let! jsonRpc = this.EnsureStartedUnsafe()
+
+                    if not workspaceReady then
+                        return this.NotReadyResponse()
+                    else
+                        let! uri = this.SyncDocument(jsonRpc, path, providedText)
+                        let parameters = mkParams uri
+                        let! response = this.InvokeLiveUnsafe(jsonRpc, methodName, parameters)
+
+                        return
+                            this.WithContextMetadata(jobj [ "status", jstr "ok"; "result", response ] :> JsonNode)
             finally
                 gate.Release() |> ignore
         }
@@ -1667,32 +2484,380 @@ type internal FsAutoCompleteBridge
                 baseParams
         )
 
-    member this.WorkspaceSymbol(args: WorkspaceSymbolArgs) : Task<JsonNode> =
+    member this.WorkspaceSymbolForContext
+        (requestedProjectPath: string option, args: WorkspaceSymbolArgs)
+        : Task<JsonNode> =
         task {
             do! gate.WaitAsync()
 
             try
-                let! jsonRpc = this.EnsureStartedUnsafe()
+                let requestedFull = requestedProjectPath |> Option.map Path.GetFullPath
 
-                if not workspaceReady then
-                    return this.NotReadyResponse()
-                else
-                    let parameters = jobj [ "query", jstr args.query ]
-                    let! response = this.InvokeLiveUnsafe(jsonRpc, "workspace/symbol", parameters)
-
-                    // First non-empty response is the signal that the symbol index has warmed.
-                    match response with
-                    | :? JsonArray as arr when arr.Count > 0 -> symbolIndexEverWarmed <- true
-                    | _ -> ()
-
+                if not (contextMatches requestedFull) then
                     return
-                        LspResponseShape.workspaceSymbolResponse
-                            response
-                            workspaceReadyAt
-                            DateTimeOffset.UtcNow
-                            (TimeSpan.FromSeconds 3.0)
+                        jobj
+                            [ "status", jstr "context_mismatch"
+                              "contextMatched", jbool false
+                              "message",
+                              jstr
+                                  "The active fsautocomplete workspace does not contain the requested project. Call set_project with restartLsp=true before using this result as evidence."
+                              "requestedProjectPath", requestedFull |> Option.map jstr |> Option.defaultValue null
+                              "activeProjectPath", runtimeProjectPath |> Option.map jstr |> Option.defaultValue null
+                              "sessionGeneration", jint64 (Volatile.Read(&activeSessionGeneration)) ]
+                        :> JsonNode
+                else
+                    let! jsonRpc = this.EnsureStartedUnsafe()
+
+                    if not workspaceReady then
+                        return
+                            jobj
+                                [ "status", jstr "not_ready"
+                                  "contextMatched", jbool true
+                                  "message", jstr "fsautocomplete is still loading the requested project."
+                                  "activeProjectPath",
+                                  runtimeProjectPath |> Option.map jstr |> Option.defaultValue null
+                                  "sessionGeneration", jint64 (Volatile.Read(&activeSessionGeneration)) ]
+                            :> JsonNode
+                    else
+                        let parameters = jobj [ "query", jstr args.query ]
+                        let! response = this.InvokeLiveUnsafe(jsonRpc, "workspace/symbol", parameters)
+
+                        // First non-empty response is the signal that the symbol index has warmed.
+                        match response with
+                        | :? JsonArray as arr when arr.Count > 0 -> symbolIndexEverWarmed <- true
+                        | _ -> ()
+
+                        let shaped =
+                            LspResponseShape.workspaceSymbolResponse
+                                response
+                                workspaceReadyAt
+                                DateTimeOffset.UtcNow
+                                (TimeSpan.FromSeconds 3.0)
+
+                        match shaped with
+                        | :? JsonObject as obj ->
+                            obj["contextMatched"] <- jbool true
+                            obj["activeProjectPath"] <-
+                                runtimeProjectPath |> Option.map jstr |> Option.defaultValue null
+                            obj["sessionGeneration"] <- jint64 (Volatile.Read(&activeSessionGeneration))
+                        | _ -> ()
+
+                        return shaped
             finally
                 gate.Release() |> ignore
+        }
+
+    member this.WorkspaceSymbol(args: WorkspaceSymbolArgs) : Task<JsonNode> =
+        this.WorkspaceSymbolForContext(runtimeProjectPath, args)
+
+    /// Snapshot publishDiagnostics for an explicitly requested, FCS-evaluated file
+    /// set. Admission to the lifecycle gate is deliberately fail-fast: a caller whose
+    /// own timeout expires must not leave a snapshot continuation queued to mutate or
+    /// restart the session later. Once admitted, the gate binds context, generation,
+    /// and dictionary reads to one session. Empty diagnostic arrays count as received;
+    /// absent publications and stale open-document versions remain explicit coverage
+    /// holes.
+    member this.DiagnosticsForContext
+        (
+            requestedProjectPath: string option,
+            expectedFiles: string array,
+            fileGlob: string option,
+            contextFingerprint: string option
+        )
+        : Task<JsonNode> =
+        task {
+            let pathComparer =
+                if OperatingSystem.IsWindows() then
+                    StringComparer.OrdinalIgnoreCase
+                else
+                    StringComparer.Ordinal
+
+            let filesNode (files: string array) =
+                JsonArray(files |> Array.map jstr) :> JsonNode
+
+            let distinctExpectedFiles () =
+                let seen = System.Collections.Generic.HashSet<string>(pathComparer)
+
+                expectedFiles
+                |> Array.filter (String.IsNullOrWhiteSpace >> not)
+                |> Array.map normalizedPath
+                |> Array.filter (fun file ->
+                    match fileGlob with
+                    | Some pattern -> LspResponseShape.fileMatchesWorkspaceGlob runtimeWorkspaceRoot pattern file
+                    | None -> true)
+                |> Array.filter seen.Add
+                |> Array.sortWith (fun left right -> pathComparer.Compare(left, right))
+
+            let gateBusyResponse () =
+                let expected = distinctExpectedFiles ()
+                let reason = "lsp_lifecycle_gate_busy"
+                let message =
+                    "The diagnostics snapshot was not admitted because another LSP operation is in progress. Retry the check; no snapshot work was queued."
+
+                jobj
+                    [ "status", jstr "not_ready"
+                      "ready", jbool false
+                      "reason", jstr reason
+                      "lspState", jstr "warming"
+                      "contextMatched", jbool false
+                      "complete", jbool false
+                      "message", jstr message
+                      "requestedProjectPath",
+                      requestedProjectPath |> Option.map normalizedPath |> Option.map jstr |> Option.defaultValue null
+                      "activeProjectPath", runtimeProjectPath |> Option.map jstr |> Option.defaultValue null
+                      "sessionGeneration", jint64 (Volatile.Read(&activeSessionGeneration))
+                      "diagnosticsFileCount", jint 0
+                      "expectedFileCount", jint expected.Length
+                      "receivedFileCount", jint 0
+                      "missingFileCount", jint expected.Length
+                      "staleFileCount", jint 0
+                      "expectedFiles", filesNode expected
+                      "receivedFiles", filesNode [||]
+                      "missingFiles", filesNode expected
+                      "staleFiles", filesNode [||]
+                      "result", JsonObject() :> JsonNode ]
+                :> JsonNode
+
+            let gateAcquired = gate.Wait(0)
+            let mutable contextWasMatched = false
+
+            try
+                if not gateAcquired then
+                    raise DiagnosticsSnapshotGateBusyException
+
+                use _gateLease = releaseOnDispose gate
+                let expected = distinctExpectedFiles ()
+                let globMatchedNoFiles =
+                    fileGlob.IsSome
+                    && expected.Length = 0
+                    && (expectedFiles |> Array.exists (String.IsNullOrWhiteSpace >> not))
+
+                let requestedFull = requestedProjectPath |> Option.map normalizedPath
+                let currentGeneration () = Volatile.Read(&activeSessionGeneration)
+
+                if not (contextMatches requestedFull) then
+                    return
+                        jobj
+                            [ "status", jstr "context_mismatch"
+                              "lspState", jstr (LspResponseShape.lspStateString workspaceReady)
+                              "contextMatched", jbool false
+                              "complete", jbool false
+                              "message",
+                              jstr
+                                  "The active fsautocomplete workspace does not contain the requested diagnostics context. Call set_project with restartLsp=true before using cached diagnostics."
+                              "requestedProjectPath", requestedFull |> Option.map jstr |> Option.defaultValue null
+                              "activeProjectPath", runtimeProjectPath |> Option.map jstr |> Option.defaultValue null
+                              "sessionGeneration", jint64 (currentGeneration ())
+                              "diagnosticsFileCount", jint 0
+                              "expectedFileCount", jint expected.Length
+                              "receivedFileCount", jint 0
+                              "missingFileCount", jint expected.Length
+                              "staleFileCount", jint 0
+                              "expectedFiles", filesNode expected
+                              "receivedFiles", filesNode [||]
+                              "missingFiles", filesNode expected
+                              "staleFiles", filesNode [||]
+                              "result", JsonObject() :> JsonNode ]
+                        :> JsonNode
+                else
+                    contextWasMatched <- true
+                    // The context gate above must run first: a mismatched fast check must
+                    // never start (or restart) FSAC in the wrong workspace.
+                    let! _ = this.EnsureStartedUnsafe()
+                    let generation = currentGeneration ()
+                    let baselineCandidates =
+                        System.Collections.Generic.HashSet<string>(DiagnosticIdentity.pathComparer)
+
+                    for file in runtimeEvaluatedSourceFiles do
+                        baselineCandidates.Add(DiagnosticIdentity.canonicalFileKeyFromPath file)
+                        |> ignore
+
+                    for file in expected do
+                        baselineCandidates.Add(DiagnosticIdentity.canonicalFileKeyFromPath file)
+                        |> ignore
+
+                    let changedSinceGeneration =
+                        baselineCandidates
+                        |> Seq.filter diagnosticBaselineNeedsRefresh
+                        |> Seq.toArray
+
+                    let taintedSinceGeneration =
+                        expected
+                        |> Array.map DiagnosticIdentity.canonicalFileKeyFromPath
+                        |> Array.filter diagnosticTaintNeedsRebaseline
+
+                    let inputsNeedingRebaseline =
+                        let seen =
+                            System.Collections.Generic.HashSet<string>(DiagnosticIdentity.pathComparer)
+
+                        Array.append changedSinceGeneration taintedSinceGeneration
+                        |> Array.filter seen.Add
+                        |> Array.sortWith (fun left right -> pathComparer.Compare(left, right))
+
+                    let projectContextChanged = contextFingerprintNeedsRefresh contextFingerprint
+
+                    if projectContextChanged || inputsNeedingRebaseline.Length > 0 then
+                        // The live process predates this disk content, so no
+                        // versionless publication from it can prove freshness. Rebase
+                        // exactly once onto the current disk state and make this call
+                        // fail closed; a retry can consume the new generation.
+                        for file in expected do
+                            runtimeEvaluatedSourceFiles.Add(
+                                DiagnosticIdentity.canonicalFileKeyFromPath file
+                            )
+                            |> ignore
+
+                        match contextFingerprint with
+                        | Some fingerprint -> runtimeDiagnosticContextFingerprint <- Some fingerprint
+                        | None -> ()
+
+                        let! stopped = this.StopLspUnsafe()
+
+                        if not stopped then
+                            invalidOp "Timed out while restarting FSAC for changed diagnostic inputs."
+
+                        let! _ = this.StartLspUnsafe()
+
+                        return
+                            jobj
+                                [ "status", jstr "not_ready"
+                                  "lspState", jstr "warming"
+                                  "contextMatched", jbool true
+                                  "complete", jbool false
+                                  "message",
+                                  jstr
+                                      "The evaluated project/options/source/reference context or live document content changed after this FSAC generation started. The diagnostic session was restarted; retry after workspace diagnostics are published."
+                                  "activeProjectPath",
+                                  runtimeProjectPath |> Option.map jstr |> Option.defaultValue null
+                                  "sessionGeneration", jint64 (currentGeneration ())
+                                  "diagnosticsFileCount", jint 0
+                                  "expectedFileCount", jint expected.Length
+                                  "receivedFileCount", jint 0
+                                  "missingFileCount", jint expected.Length
+                                  "staleFileCount", jint inputsNeedingRebaseline.Length
+                                  "expectedFiles", filesNode expected
+                                  "receivedFiles", filesNode [||]
+                                  "missingFiles", filesNode expected
+                                  "staleFiles", filesNode inputsNeedingRebaseline
+                                  "result", JsonObject() :> JsonNode ]
+                            :> JsonNode
+                    elif not workspaceReady then
+                        return
+                            jobj
+                                [ "status", jstr "not_ready"
+                                  "lspState", jstr "warming"
+                                  "contextMatched", jbool true
+                                  "complete", jbool false
+                                  "message", jstr "fsautocomplete is still loading the requested diagnostics context."
+                                  "activeProjectPath",
+                                  runtimeProjectPath |> Option.map jstr |> Option.defaultValue null
+                                  "sessionGeneration", jint64 generation
+                                  "diagnosticsFileCount", jint 0
+                                  "expectedFileCount", jint expected.Length
+                                  "receivedFileCount", jint 0
+                                  "missingFileCount", jint expected.Length
+                                  "staleFileCount", jint 0
+                                  "expectedFiles", filesNode expected
+                                  "receivedFiles", filesNode [||]
+                                  "missingFiles", filesNode expected
+                                  "staleFiles", filesNode [||]
+                                  "result", JsonObject() :> JsonNode ]
+                            :> JsonNode
+                    else
+                        let result = JsonObject()
+                        let analyzedAtByUri = JsonObject()
+                        let received = ResizeArray<string>()
+                        let missing = ResizeArray<string>()
+                        let stale = ResizeArray<string>()
+                        let currentAnalyzedAt = ResizeArray<DateTimeOffset>()
+
+                        for file in expected do
+                            let uri = toFileUri file
+                            let fileKey = DiagnosticIdentity.canonicalFileKeyFromPath file
+
+                            match diagnostics.TryGetValue(fileKey) with
+                            | false, _ -> missing.Add(file)
+                            | true, envelope ->
+                                received.Add(file)
+
+                                match diagnosticFreshness fileKey envelope with
+                                | Current ->
+                                    result[uri] <- envelope.Payload.DeepClone()
+
+                                    analyzedAtByUri[uri] <-
+                                        jstr (envelope.ReceivedAt.ToUniversalTime().ToString("O"))
+
+                                    currentAnalyzedAt.Add(envelope.ReceivedAt)
+                                | DiskContentChanged
+                                | Stale -> stale.Add(file)
+
+                        let receivedFiles = received.ToArray()
+                        let missingFiles = missing.ToArray()
+                        let staleFiles = stale.ToArray()
+                        let complete =
+                            not globMatchedNoFiles && missingFiles.Length = 0 && staleFiles.Length = 0
+
+                        let mostRecent =
+                            if currentAnalyzedAt.Count = 0 then
+                                None
+                            else
+                                currentAnalyzedAt |> Seq.max |> Some
+
+                        return
+                            jobj
+                                [ "status", jstr "ok"
+                                  "lspState", jstr "ready"
+                                  "contextMatched", jbool true
+                                  "complete", jbool complete
+                                  "message",
+                                  (if globMatchedNoFiles then
+                                       jstr "fileGlob matched no evaluated source files in the requested workspace."
+                                   else
+                                       null)
+                                  "activeProjectPath",
+                                  runtimeProjectPath |> Option.map jstr |> Option.defaultValue null
+                                  "sessionGeneration", jint64 generation
+                                  "diagnosticsFileCount", jint receivedFiles.Length
+                                  "expectedFileCount", jint expected.Length
+                                  "receivedFileCount", jint receivedFiles.Length
+                                  "missingFileCount", jint missingFiles.Length
+                                  "staleFileCount", jint staleFiles.Length
+                                  "expectedFiles", filesNode expected
+                                  "receivedFiles", filesNode receivedFiles
+                                  "missingFiles", filesNode missingFiles
+                                  "staleFiles", filesNode staleFiles
+                                  "mostRecentAnalyzedAt", LspResponseShape.timestampJson mostRecent
+                                  "analyzedAtByUri", analyzedAtByUri :> JsonNode
+                                  "result", result :> JsonNode ]
+                            :> JsonNode
+            with
+            | DiagnosticsSnapshotGateBusyException -> return gateBusyResponse ()
+            | ex ->
+                let expected =
+                    try
+                        distinctExpectedFiles ()
+                    with _ ->
+                        [||]
+
+                return
+                    jobj
+                        [ "status", jstr "infrastructure_error"
+                          "lspState", jstr (LspResponseShape.lspStateString workspaceReady)
+                          "contextMatched", jbool contextWasMatched
+                          "complete", jbool false
+                          "message", jstr ex.Message
+                          "sessionGeneration", jint64 (Volatile.Read(&activeSessionGeneration))
+                          "diagnosticsFileCount", jint 0
+                          "expectedFileCount", jint expected.Length
+                          "receivedFileCount", jint 0
+                          "missingFileCount", jint expected.Length
+                          "staleFileCount", jint 0
+                          "expectedFiles", filesNode expected
+                          "receivedFiles", filesNode [||]
+                          "missingFiles", filesNode expected
+                          "staleFiles", filesNode [||]
+                          "result", JsonObject() :> JsonNode ]
+                    :> JsonNode
         }
 
     member _.Diagnostics(args: DiagnosticsArgs) : Task<JsonNode> =
@@ -1704,21 +2869,21 @@ type internal FsAutoCompleteBridge
                 | Some code -> LspResponseShape.filterDiagnosticsBySeverity code payload
                 | None -> payload
 
-            let resolveByUri (uri: string) =
-                match diagnostics.TryGetValue(uri) with
-                | true, payload -> payload.DeepClone()
+            let resolveByFileKey (fileKey: string) =
+                match diagnostics.TryGetValue(fileKey) with
+                | true, envelope -> envelope.Payload.DeepClone()
                 | false, _ -> JsonArray() :> JsonNode
 
-            let analyzedAtForUri (uri: string) =
-                match diagnosticsAnalyzedAt.TryGetValue(uri) with
-                | true, ts -> Some ts
+            let analyzedAtForFileKey (fileKey: string) =
+                match diagnostics.TryGetValue(fileKey) with
+                | true, envelope -> Some envelope.ReceivedAt
                 | false, _ -> None
 
             match args.path with
             | Some path ->
-                let uri = toFileUri path
-                let payload = resolveByUri uri |> applySeverity
-                let analyzedAt = analyzedAtForUri uri
+                let fileKey = DiagnosticIdentity.canonicalFileKeyFromPath path
+                let payload = resolveByFileKey fileKey |> applySeverity
+                let analyzedAt = analyzedAtForFileKey fileKey
 
                 return
                     LspResponseShape.diagnosticsResponseForFile
@@ -1730,14 +2895,16 @@ type internal FsAutoCompleteBridge
                 let root = JsonObject()
                 let analyzedAtByUri = JsonObject()
 
-                let globMatches (uri: string) =
+                let globMatches (fileKey: string) =
                     match args.fileGlob with
-                    | Some pattern -> LspResponseShape.fileMatchesGlob pattern uri
+                    | Some pattern ->
+                        LspResponseShape.fileMatchesWorkspaceGlob runtimeWorkspaceRoot pattern fileKey
                     | None -> true
 
-                for KeyValue(uri, payload) in diagnostics do
-                    if globMatches uri then
-                        let filtered = payload.DeepClone() |> applySeverity
+                for KeyValue(fileKey, envelope) in diagnostics do
+                    if globMatches fileKey then
+                        let uri = toFileUri fileKey
+                        let filtered = envelope.Payload.DeepClone() |> applySeverity
 
                         // Skip empty-after-filter entries — keeps the response tight when
                         // the user asked for errors-only and a file only has warnings.
@@ -1745,16 +2912,14 @@ type internal FsAutoCompleteBridge
                         | Some _, (:? JsonArray as arr) when arr.Count = 0 -> ()
                         | _ ->
                             root[uri] <- filtered
-
-                            match analyzedAtForUri uri with
-                            | Some ts -> analyzedAtByUri[uri] <- jstr (ts.ToUniversalTime().ToString("O"))
-                            | None -> analyzedAtByUri[uri] <- null
+                            analyzedAtByUri[uri] <-
+                                jstr (envelope.ReceivedAt.ToUniversalTime().ToString("O"))
 
                 let mostRecent =
                     let filtered =
-                        diagnosticsAnalyzedAt
+                        diagnostics
                         |> Seq.filter (fun kv -> globMatches kv.Key)
-                        |> Seq.map (fun kv -> kv.Value)
+                        |> Seq.map (fun kv -> kv.Value.ReceivedAt)
                         |> Seq.toArray
 
                     if filtered.Length = 0 then None
@@ -1769,10 +2934,20 @@ type internal FsAutoCompleteBridge
                         analyzedAtByUri
         }
 
-    member this.Formatting(args: FormattingArgs) : Task<JsonNode> =
+    member private this.WithFileContextGate(path: string, operation: unit -> Task<JsonNode>) : Task<JsonNode> =
         task {
             do! gate.WaitAsync()
             use _gateLease = releaseOnDispose gate
+
+            if not (fileContextMatches path) then
+                return this.FileContextMismatchResponse(path)
+            else
+                return! operation ()
+        }
+
+    member this.Formatting(args: FormattingArgs) : Task<JsonNode> =
+        this.WithFileContextGate(args.path, fun () ->
+          task {
             let! jsonRpc = this.EnsureStartedUnsafe()
 
             if not workspaceReady then
@@ -1868,18 +3043,20 @@ type internal FsAutoCompleteBridge
                     | _ -> originalText
 
                 return
-                    jobj
-                        [ "status", jstr "ok"
-                          "result",
-                          jobj
-                              [ "formatted", jstr formatted
-                                "edits",
-                                (match editsToken with
-                                 | :? JsonArray -> editsToken
-                                 | _ -> JsonArray() :> JsonNode) ]
-                          :> JsonNode ]
-                    :> JsonNode
-        }
+                    this.WithContextMetadata(
+                        jobj
+                            [ "status", jstr "ok"
+                              "result",
+                              jobj
+                                  [ "formatted", jstr formatted
+                                    "edits",
+                                    (match editsToken with
+                                     | :? JsonArray -> editsToken
+                                     | _ -> JsonArray() :> JsonNode) ]
+                              :> JsonNode ]
+                        :> JsonNode
+                    )
+          })
 
     member this.CodeAction(args: CodeActionArgs) : Task<JsonNode> =
         this.WithDocument(
@@ -1895,47 +3072,83 @@ type internal FsAutoCompleteBridge
     /// context the raw `CodeAction` proxy leaves empty — and groups the fixes per
     /// diagnostic. line/character narrow to one position; omit for the whole file.
     member this.DiagnosticFixes(args: DiagnosticFixesArgs) : Task<JsonNode> =
-        task {
-            do! gate.WaitAsync()
-            use _gateLease = releaseOnDispose gate
-            let! jsonRpc = this.EnsureStartedUnsafe()
+        this.WithFileContextGate(args.path, fun () ->
+          task {
+            let! initialRpc = this.EnsureStartedUnsafe()
+            let fullPath = Path.GetFullPath(args.path)
+            let uri = toFileUri fullPath
+            let fileKey = DiagnosticIdentity.canonicalFileKeyFromPath fullPath
+
+            let! jsonRpc =
+                if args.text.IsNone && diagnosticBaselineNeedsRefresh fileKey then
+                    task {
+                        runtimeEvaluatedSourceFiles.Add(fileKey) |> ignore
+                        runtimeDiagnosticContextFingerprint <- None
+                        let! stopped = this.StopLspUnsafe()
+
+                        if not stopped then
+                            invalidOp "Timed out while restarting FSAC for changed diagnostic inputs."
+
+                        return! this.StartLspUnsafe()
+                    }
+                else
+                    Task.FromResult(initialRpc)
 
             if not workspaceReady then
                 return this.NotReadyResponse()
             else
-                let fullPath = Path.GetFullPath(args.path)
-                let uri = toFileUri fullPath
-
-                // Snapshot the prior publish time so we can detect a FRESH republish
-                // (publishDiagnostics arrives asynchronously after didOpen/didChange).
-                let priorAnalyzedAt =
-                    match diagnosticsAnalyzedAt.TryGetValue(uri) with
-                    | true, ts -> ValueSome ts
-                    | false, _ -> ValueNone
-
                 // Sync while the lifecycle gate is held so FSAC cannot restart mid-request.
                 let! _ = this.SyncDocument(jsonRpc, args.path, args.text)
 
-                // Bounded wait for FSAC to push a fresh diagnostics set for this URI.
-                // On timeout we proceed with whatever the store holds (possibly empty)
-                // rather than blocking the single LSP slot indefinitely.
+                let expectedVersion =
+                    match documents.TryGetValue(fileKey) with
+                    | true, state -> state.Version
+                    | false, _ -> 0
+
+                // Bounded wait for diagnostics proven current either by an exact
+                // server document version or by equality with the generation-start
+                // disk baseline. Receipt time alone is never freshness evidence.
                 let deadline = DateTimeOffset.UtcNow.AddSeconds(5.0)
 
                 let isFresh () =
-                    match diagnosticsAnalyzedAt.TryGetValue(uri) with
-                    | true, ts ->
-                        match priorAnalyzedAt with
-                        | ValueSome prev -> ts > prev
-                        | ValueNone -> true
+                    match diagnostics.TryGetValue(fileKey) with
+                    | true, envelope -> diagnosticFreshness fileKey envelope = Current
                     | false, _ -> false
 
                 while not (isFresh ()) && DateTimeOffset.UtcNow < deadline do
                     do! Task.Delay(50)
 
+                let staleResponse =
+                    if isFresh () then
+                        None
+                    else
+                        Some(
+                            jobj
+                                [ "status", jstr "unknown"
+                                  "errorKind", jstr "diagnostics_stale"
+                                  "message",
+                                  jstr
+                                      $"FSAC did not publish diagnostics for document version {expectedVersion} within the freshness deadline. Stale diagnostics were not used."
+                                  "file", jstr fullPath
+                                  "expectedDocumentVersion", jint expectedVersion
+                                  "publishedDocumentVersion",
+                                  (match diagnostics.TryGetValue(fileKey) with
+                                   | true, envelope ->
+                                       envelope.ServerVersion |> Option.map jint |> Option.defaultValue null
+                                   | false, _ -> null) ]
+                            :> JsonNode
+                        )
+
                 let fileDiagnostics =
-                    match diagnostics.TryGetValue(uri) with
-                    | true, (:? JsonArray as arr) -> arr |> Seq.cast<JsonNode> |> Seq.toList
-                    | _ -> []
+                    match staleResponse with
+                    | Some _ -> []
+                    | None ->
+                        match diagnostics.TryGetValue(fileKey) with
+                        | true, envelope ->
+                            match envelope.Payload with
+                            | :? JsonArray as arr -> arr |> Seq.cast<JsonNode> |> Seq.toList
+                            | _ -> []
+                        | _ -> []
 
                 let targeted =
                     fileDiagnostics
@@ -1976,8 +3189,14 @@ type internal FsAutoCompleteBridge
 
                     entries.Add(diag, fixes)
 
-                return LspResponseShape.buildDiagnosticFixesResponse fullPath (List.ofSeq entries)
-        }
+                match staleResponse with
+                | Some response -> return this.WithContextMetadata(response)
+                | None ->
+                    return
+                        this.WithContextMetadata(
+                            LspResponseShape.buildDiagnosticFixesResponse fullPath (List.ofSeq entries)
+                        )
+          })
 
     member this.Rename(args: RenameArgs) : Task<JsonNode> =
         this.WithDocument(
@@ -2087,16 +3306,26 @@ type internal FsAutoCompleteBridge
                          with _ ->
                              false)
                     ->
-                    return RenamePreviewShape.build context obj["result"]
+                    return
+                        this.CopyContextMetadata(
+                            obj,
+                            RenamePreviewShape.build context obj["result"]
+                        )
                 | _ -> return raw
             with ex ->
-                // FSAC raises an LSP error for some unrenamable positions instead of
-                // returning a null edit. Surface that as a clean no_symbol for agents.
+                let errorKind, retryable = classifyRenameInfrastructureError ex
+
+                // Only a valid null/empty WorkspaceEdit means no_symbol. Transport,
+                // startup, remote, and protocol failures remain explicit.
                 return
-                    jobj
-                        [ "status", jstr "no_symbol"
-                          "reason", jstr ex.Message ]
-                    :> JsonNode
+                    this.WithContextMetadata(
+                        jobj
+                            [ "status", jstr "infrastructure_error"
+                              "errorKind", jstr errorKind
+                              "retryable", jbool retryable
+                              "message", jstr ex.Message ]
+                        :> JsonNode
+                    )
         }
 
     interface IDisposable with

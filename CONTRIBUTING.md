@@ -19,14 +19,15 @@ dotnet test tests/FsLangMcp.Tests/FsLangMcp.Tests.fsproj -c Release --nologo
 Optional helpers via the `Justfile`:
 
 ```bash
-just restore   # restore tools + packages
+just restore       # restore the locked NuGet graph
+just tool-restore  # restore exact development tools from dotnet-tools.json
 just check     # build + test
 just analyze   # run F# analyzers (Ionide.Analyzers, G-Research.FSharp.Analyzers)
 ```
 
 ## Adding a new MCP tool
 
-The v0.13.2 surface ships 35 tools that all follow the same registration shape. To add another:
+The v0.14.0 surface ships 35 tools that all follow the same registration shape. To add another:
 
 1. **Define the args record in `Types.fs`** with `///` doc-comments on every field. Use current records such as `FindArgs` and `CheckArgs` as style templates. Defaults stated in `///` text must match the actual `defaultArg` call site in the handler.
 
@@ -69,7 +70,17 @@ The v0.13.2 surface ships 35 tools that all follow the same registration shape. 
 - **`Option.ofObj`** is only appropriate for genuinely nullable returns from .NET APIs. For non-optional `string` args coming from the MCP wire (which can still be blank), use `ArgsValidation.requireNonBlank` in `Types.fs` — that is the standard contract.
 - **Warnings-as-errors** is enforced — `dotnet build -c Release` must complete with `0 Warning(s)`.
 - **Tests must include both positive and failure-mode cases.** Smoke tests that only verify happy paths get caught in review.
-- **Locked restore** (#167): package versions are pinned exactly and `packages.lock.json` is committed; CI restores with `--locked-mode`, which fails (NU1004) if the lock is out of sync. After changing any `PackageReference`, run `just restore-update` (`dotnet restore FsLangMcp.slnx --force-evaluate`) and commit the updated lock files together with the fsproj change. Routine version bumps arrive via Dependabot PRs.
+- **Locked restore** (#167): package versions use exact NuGet ranges (`[x.y.z]`,
+  not the minimum-version meaning of bare `x.y.z`) and `packages.lock.json` is
+  committed. CI restores with `--locked-mode`, which fails (NU1004) if the lock
+  is out of sync. After intentionally changing a `PackageReference`, run
+  `just restore-update` and commit both lock files with the fsproj change;
+  `--force-evaluate` regenerates locks but does not discover an update. Routine
+  version bumps arrive via Dependabot PRs.
+- **Pinned toolchain**: development and CI use SDK `10.0.400` from `global.json`.
+  Runtime FSAC/ProjInfo/Fantomas versions come only from `dotnet-tools.json`. Run
+  `just live-fsac` before changing LSP startup, project loading, or those pins;
+  GitHub Actions repeats the live smoke on Linux, macOS, and Windows.
 
 ## PR process
 

@@ -4,13 +4,13 @@
     "net10.0": {
       "coverlet.msbuild": {
         "type": "Direct",
-        "requested": "[10.0.1, )",
+        "requested": "[10.0.1, 10.0.1]",
         "resolved": "10.0.1",
         "contentHash": "kb5kBe1HioGuH+ZDKysv/oAO9cCUW2yxtrGrRBZp/dIij5f011OfC4XiNMayZ8bGfOv2+n2ocPkaJIGppAZDEg=="
       },
       "FsCheck.Xunit": {
         "type": "Direct",
-        "requested": "[3.3.4, )",
+        "requested": "[3.3.4, 3.3.4]",
         "resolved": "3.3.4",
         "contentHash": "6u6M/YQ+jgQDUmfc5Oe+frc3LCqv8EYmqLV0UaciSHMpT07H1vo2PXYoEz6SjuDGHY48KY8otU2V+OP2eALGbg==",
         "dependencies": {
@@ -21,13 +21,13 @@
       },
       "FSharp.Analyzers.Build": {
         "type": "Direct",
-        "requested": "[0.5.0, )",
+        "requested": "[0.5.0, 0.5.0]",
         "resolved": "0.5.0",
         "contentHash": "KzsZeI3sMK36DloK3nKdHGb8RBeDqitxdqrWQV35DNsLAdx/a9OBFhHngTbnmY6F7Q+urcd/SQvbMcIqFPuD+A=="
       },
       "FSharp.Compiler.Service": {
         "type": "Direct",
-        "requested": "[43.12.203, )",
+        "requested": "[43.12.203, 43.12.203]",
         "resolved": "43.12.203",
         "contentHash": "ZrK+g3JdnkCSSkYFXFcsh5i6hdepyG95wkbZqmjFRC77Byhj2fRYGNcBA8PKpiS3fSRB9g/ISZC2uezl3BOuDQ==",
         "dependencies": {
@@ -36,13 +36,13 @@
       },
       "FSharp.Core": {
         "type": "Direct",
-        "requested": "[10.1.203, )",
+        "requested": "[10.1.203, 10.1.203]",
         "resolved": "10.1.203",
         "contentHash": "I2MFk72yHqfgI594gKFigq8PVIso0Mh1ZUgG9R4n8gyYQ4IwpBxmvecfjnKA7iMLdVHYULB70PsLwYW/K76gew=="
       },
       "FsMcp.Server": {
         "type": "Direct",
-        "requested": "[1.2.2, )",
+        "requested": "[1.2.2, 1.2.2]",
         "resolved": "1.2.2",
         "contentHash": "C195342iDO2A4Rl52KtiR0zrgCXNivDjj15FBzAWlcl9bnpHHTjx91I6yrT8nLWSUFCfqeqo8weN19szV736hQ==",
         "dependencies": {
@@ -56,19 +56,19 @@
       },
       "G-Research.FSharp.Analyzers": {
         "type": "Direct",
-        "requested": "[0.22.0, )",
+        "requested": "[0.22.0, 0.22.0]",
         "resolved": "0.22.0",
         "contentHash": "H0OoKxTX4l6TaTB7feujped+dtg5HdRZczqysEYreBnYtx8YYRPOe/IaSQYxmz+L2v2FVvRXpVWBixtr9am6Vg=="
       },
       "Ionide.Analyzers": {
         "type": "Direct",
-        "requested": "[0.15.0, )",
+        "requested": "[0.15.0, 0.15.0]",
         "resolved": "0.15.0",
         "contentHash": "Sz6bu/glU0cihF0RT8y8+v6FsXonQlN4WCl7yX9EjJW+RzZmQbCc4pxKHwGFwYJNZCLgOnXQj/KZqtFlyXdhWQ=="
       },
       "Ionide.ProjInfo.FCS": {
         "type": "Direct",
-        "requested": "[0.74.2, )",
+        "requested": "[0.74.2, 0.74.2]",
         "resolved": "0.74.2",
         "contentHash": "zAzItdSiIhq4V031YlKworGOv/918LZn2Iu+fJbJbgCunlIImLqH9C0T9T7aZCvMmHi3pDuRKNBgVwQjGzYtGg==",
         "dependencies": {
@@ -79,13 +79,13 @@
       },
       "Microsoft.NET.StringTools": {
         "type": "Direct",
-        "requested": "[18.4.0, )",
+        "requested": "[18.4.0, 18.4.0]",
         "resolved": "18.4.0",
         "contentHash": "iQWOKi3L5QStmWqDjDubcr1KlTDy88qBTe88I0etlUUo1l0zSNebGJXl1Xetyl+ACA+ujP3YUtxo3Nz54JPriw=="
       },
       "Microsoft.NET.Test.Sdk": {
         "type": "Direct",
-        "requested": "[17.12.0, )",
+        "requested": "[17.12.0, 17.12.0]",
         "resolved": "17.12.0",
         "contentHash": "kt/PKBZ91rFCWxVIJZSgVLk+YR+4KxTuHf799ho8WNiK5ZQpJNAEZCAWX86vcKrs+DiYjiibpYKdGZP6+/N17w==",
         "dependencies": {
@@ -95,7 +95,7 @@
       },
       "StreamJsonRpc": {
         "type": "Direct",
-        "requested": "[2.25.29, )",
+        "requested": "[2.25.29, 2.25.29]",
         "resolved": "2.25.29",
         "contentHash": "ebP0ScWRtbd1EWayLRJ6bjM7aPwYZoJIIU1DApmn/cYl2dydR9f4p6Mj3eY77qzAywy6IbZWB9sJPSWeO5hmrg==",
         "dependencies": {
@@ -109,7 +109,7 @@
       },
       "Verify.Xunit": {
         "type": "Direct",
-        "requested": "[31.12.5, )",
+        "requested": "[31.12.5, 31.12.5]",
         "resolved": "31.12.5",
         "contentHash": "i1d2bPonW/3ZzzEZYTWgv8mjPyRWpKaPsIxxp/kYK7Nq8ZeSEmkLA5BkGwInDlybHkxsviFu+s8iF20y+yUcZw==",
         "dependencies": {
@@ -123,7 +123,7 @@
       },
       "xunit": {
         "type": "Direct",
-        "requested": "[2.9.3, )",
+        "requested": "[2.9.3, 2.9.3]",
         "resolved": "2.9.3",
         "contentHash": "TlXQBinK35LpOPKHAqbLY4xlEen9TBafjs0V5KnA4wZsoQLQJiirCR4CbIXvOH8NzkW4YeJKP5P/Bnrodm0h9Q==",
         "dependencies": {
@@ -134,7 +134,7 @@
       },
       "xunit.runner.visualstudio": {
         "type": "Direct",
-        "requested": "[3.0.2, )",
+        "requested": "[3.0.2, 3.0.2]",
         "resolved": "3.0.2",
         "contentHash": "oXbusR6iPq0xlqoikjdLvzh+wQDkMv9If58myz9MEzldS4nIcp442Btgs2sWbYWV+caEluMe2pQCZ0hUZgPiow=="
       },
@@ -688,15 +688,15 @@
       "fslangmcp": {
         "type": "Project",
         "dependencies": {
-          "FSharp.Compiler.Service": "[43.12.203, )",
-          "FSharp.Core": "[10.1.203, )",
-          "FsMcp.Server": "[1.2.2, )",
-          "FsMcp.TaskApi": "[1.2.2, )",
-          "Ionide.ProjInfo.FCS": "[0.74.2, )",
-          "Microsoft.NET.StringTools": "[18.4.0, )",
-          "Microsoft.VisualStudio.Threading.Only": "[17.14.15, )",
-          "Nerdbank.MessagePack": "[1.2.30, )",
-          "StreamJsonRpc": "[2.25.29, )"
+          "FSharp.Compiler.Service": "[43.12.203, 43.12.203]",
+          "FSharp.Core": "[10.1.203, 10.1.203]",
+          "FsMcp.Server": "[1.2.2, 1.2.2]",
+          "FsMcp.TaskApi": "[1.2.2, 1.2.2]",
+          "Ionide.ProjInfo.FCS": "[0.74.2, 0.74.2]",
+          "Microsoft.NET.StringTools": "[18.4.0, 18.4.0]",
+          "Microsoft.VisualStudio.Threading.Only": "[17.14.15, 17.14.15]",
+          "Nerdbank.MessagePack": "[1.2.30, 1.2.30]",
+          "StreamJsonRpc": "[2.25.29, 2.25.29]"
         }
       }
     }

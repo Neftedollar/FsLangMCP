@@ -235,12 +235,13 @@ type FindArgs =
       includePerProject: bool option
       /// .fsproj / .sln / .slnx / directory to sweep. Falls back to active set_project.
       projectPath: string option
-      /// Maximum sites returned per page. Default 40 (keeps the compact payload well
-      /// under the MCP token ceiling on a hot symbol); cursor pages the rest.
+      /// Maximum sites returned per page. Default 80; valid range 1..1000. The compact
+      /// payload stays under the MCP token ceiling; cursor pages the rest.
       maxResults: int option
       /// Overall wall-clock budget in ms for the whole multi-project sweep. Default
       /// 120000 (120 s). Each project's FCS type-check is cancelled at the remaining
       /// budget so a huge/cold solution surfaces a partial result instead of hanging.
+      /// Must be non-negative; 0 requests an immediate, typed timeout result.
       timeoutMs: int option
       /// Opaque cursor from a prior call's nextCursor. Omit for the first page.
       cursor: string option }
@@ -269,7 +270,8 @@ type CheckArgs =
       /// Inline F# source to type-check against the project's references. Implies
       /// scope=snippet. (Consistent rename of fcs_validate_snippet's `content`.)
       snippet: string option
-      /// scope=workspace fast-mode glob over file URIs (e.g. "src/Adapters/*.fs").
+      /// scope=workspace fast-mode glob over workspace-relative evaluated source paths
+      /// (e.g. "src/Adapters/*.fs"); absolute paths and file-URI globs are also accepted.
       fileGlob: string option
       /// Snippet parse mode: "fs" (default) | "fsi". Pick "fsi" for a signature sketch.
       mode: string option
@@ -668,11 +670,16 @@ type RuntimeStatusArgs =
 // ─── CLI parse result ──────────────────────────────────────────────────────────
 
 [<Struct>]
+type internal CliStartOptions =
+    { ProjectPath: string option }
+
+[<Struct>]
 type internal CliParseResult =
-    | Start
+    | Start of options: CliStartOptions
     | BootstrapTools
-    | ShowHelp of string
-    | Fail of string
+    | ShowHelp of message: string
+    | ShowVersion
+    | Fail of error: string
 
 // ─── Helper utility functions ──────────────────────────────────────────────────
 

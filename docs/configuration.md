@@ -35,7 +35,10 @@ To pre-load a project at startup, pass it as an argument:
 }
 ```
 
-After wiring, call `set_project` once at the start of each session to initialize the workspace context. Subsequent calls to `find`, `check`, and other tools use the loaded project automatically.
+`--project` runs the same project-load/readiness pipeline as the MCP `set_project`
+tool before the server starts reading stdio. Startup fails rather than serving with
+a half-loaded context. When `--project` is omitted, call `set_project` once at the
+start of the session.
 
 ## Cursor
 
@@ -62,7 +65,10 @@ With a pre-loaded project:
 }
 ```
 
-Call `set_project` as the first tool call in each agent session. Add the tool-discipline rule to `.cursorrules` so Cursor's agent knows to use `find` and `check` instead of grep — the snippet is in [`AGENT_INTEGRATION.md`](../AGENT_INTEGRATION.md).
+When no `--project` argument is configured, call `set_project` as the first tool
+call. Add the tool-discipline rule to `.cursorrules` so Cursor's agent knows to
+use `find` and `check` instead of grep — the snippet is in
+[`AGENT_INTEGRATION.md`](../AGENT_INTEGRATION.md).
 
 ## Codex (OpenAI)
 
@@ -127,13 +133,16 @@ Place it under whatever key your client uses for MCP server definitions (commonl
 
 ## First-call pattern — all clients
 
-Regardless of client, the first tool call in every agent session must be `set_project`:
+Unless the server was started with `--project` (or `FSA_PROJECT_PATH`), the first
+tool call in every agent session must be `set_project`:
 
 ```json
 set_project { "projectPath": "/absolute/path/to/App.sln" }
 ```
 
-The LSP-proxy tools (`textDocument_*`, `fsharp_signature_data`) require `set_project` to have completed and `readiness.lsp` to be `true` before they'll respond with data.
+The LSP-proxy tools (`textDocument_*`, `fsharp_signature_data`) require project
+preload to have completed and `readiness.lsp` to be `true` before they return
+data. Their responses are bound to `activeProjectPath` and `sessionGeneration`.
 
 ## Parallel agent usage
 
@@ -142,6 +151,11 @@ When multiple agents target the same FsLangMCP instance but different projects, 
 ```json
 { "path": "/abs/path/File.fs", "projectPath": "/abs/path/App.fsproj" }
 ```
+
+FSAC itself still has exactly one active project context. A request for a file or
+project outside it returns `context_mismatch`; switching a live FSAC to another
+project with `restartLsp=false` returns `restart_required` without changing the
+active context.
 
 Concurrency limits:
 
@@ -175,7 +189,8 @@ All clients can pass these args in the `args` array:
 | `--project <path>` / `-p <path>` | Pre-load a project on startup |
 | `--fsac-command <cmd>` | Override the `fsautocomplete` executable |
 | `--fsac-args "<args>"` | Pass extra args to FSAC |
-| `--bootstrap-tools` | Install/update `fsautocomplete` + `ionide.projinfo.tool` |
+| `--bootstrap-tools` | Install/downgrade the exact supported global FSAC/ProjInfo/Fantomas versions from the release's embedded manifest |
+| `--version` | Print the packaged FsLangMCP version and exit |
 
 Environment variable fallbacks and limits:
 
@@ -183,11 +198,12 @@ Environment variable fallbacks and limits:
 |----------|---------|---------|
 | `FSAC_COMMAND` | `fsautocomplete` | FSAC executable |
 | `FSAC_ARGS` | empty | Extra FSAC arguments |
-| `FSA_PROJECT_PATH` | current directory | Initial project/workspace hint |
+| `FSA_PROJECT_PATH` | unset | Pre-load this project/workspace through the same pipeline as `--project` |
 | `FSLANGMCP_MAX_CONCURRENT_FCS` | `2` | Maximum concurrent FCS tool calls |
 | `FSLANGMCP_LSP_STARTUP_TIMEOUT_MS` | `60000` | `initialize` / `workspaceLoad` RPC timeout |
 | `FSLANGMCP_LSP_REQUEST_TIMEOUT_MS` | `30000` | Live LSP request/notification timeout |
-| `FSLANGMCP_PROJ_INFO_TIMEOUT_MS` | `120000` | `proj-info` child-process timeout |
+| `FSLANGMCP_PROJ_INFO_TIMEOUT_MS` | `120000` | ProjInfo child-process, evaluated-project, and readiness-probe timeout |
 | `FSLANGMCP_BOOTSTRAP_TIMEOUT_MS` | `300000` | Per-command `--bootstrap-tools` timeout |
+| `FSLANGMCP_PROCESS_OUTPUT_LIMIT_CHARS` | `4194304` | Maximum retained characters per child stdout/stderr stream; excess is still drained |
 
 LSP concurrency is deliberately fixed at one. Increasing parallelism around a single mutable FSAC workspace can mix document versions or dispose an RPC during `set_project`; the bridge therefore serializes lifecycle, document sync, and invocation internally.

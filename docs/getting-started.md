@@ -10,15 +10,14 @@ FsLangMCP is an MCP stdio server that gives AI coding agents real F# compiler se
 
 ```bash
 dotnet tool install -g FsLangMcp
-fslangmcp --bootstrap-tools   # one-time: installs fsautocomplete + ionide.projinfo.tool
+fslangmcp --bootstrap-tools
 ```
 
-`--bootstrap-tools` is required after first install. It runs `dotnet tool update -g` for the two tools FsLangMCP delegates to at runtime. To install them manually instead:
-
-```bash
-dotnet tool install -g fsautocomplete
-dotnet tool install -g ionide.projinfo.tool
-```
+FsLangMCP delegates LSP, formatting, and project evaluation to external tools.
+Bootstrap reads the exact FSAC, Fantomas, and ProjInfo pins embedded in the
+installed FsLangMCP release, installs or downgrades to them, and creates the
+Fantomas command alias required by FSAC. It never selects an unreviewed latest
+version.
 
 ## Configure your MCP client
 
@@ -38,7 +37,7 @@ For per-client instructions — Claude Code, Cursor, Codex, Copilot, generic std
 
 ### Step 1 — initialize once per session
 
-Call `set_project` with the path to your `.fsproj`, `.sln`, `.slnx`, or project directory. You only need to do this once; the project context persists for all subsequent calls.
+Call `set_project` with the path to your `.fsproj`, `.sln`, `.slnx`, or project directory. A directory is searched recursively when it has no top-level workspace file: one nested project/solution is selected, while multiple candidates return `ambiguous_workspace` so you can choose explicitly. You only need to do this once; the project context persists for all subsequent calls.
 
 ```json
 set_project { "projectPath": "/absolute/path/to/MyApp.sln" }
@@ -71,7 +70,7 @@ Once you have a base signal from `find` and `check`, the other 33 tools let you 
 
 ```
 1. set_project  {"projectPath": "/abs/path/MyApp.sln"}
-   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.13.2"
+   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.14.0"
 
 2. check  {}
    → verdict="clean"

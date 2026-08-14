@@ -8,6 +8,10 @@ tests/*/obj/
 coverage*/
 tests/*/coverage*/
 CoverletSourceRootsMapping_*
+.runtime-tools/
+.fslangmcp-live-format-*.fs
+__pycache__/
+*.py[cod]
 
 # Verify (snapshot testing): *.received.* are produced when a snapshot diverges
 # from its *.verified.* baseline. Reviewed locally, then either approved

@@ -2,7 +2,7 @@
 
 The MCP description tells you *whether* to call a tool; this file tells you *how it works internally*.
 
-**Start here.** `find` and `check` are the primary entry points in the 35-tool v0.13.2 surface.
+**Start here.** `find` and `check` are the primary entry points in the 35-tool v0.14.0 surface.
 The consolidation aliases below were removed in v0.13.1 and are no longer registered:
 
 | Removed names | Current route |
@@ -25,9 +25,11 @@ text search for cross-project refactors.
 **Signature:** `query` is the only required argument. `kind` (default `auto`) and `scope` (default
 `auto`) shape the sweep. `exact` (default `true`) toggles exact-vs-substring matching. `member` /
 `field` restrict the member-usage / record-field unions. `path` + `line` + `word` + `occurrence` +
-`character` anchor `kind=position`. `contextLines` (default 1), `includeDeclaration` (default true),
+`character` anchor `kind=position`. `contextLines` (default 0), `includeDeclaration` (default true),
 `includeInfo` (default false), `projectPath` (falls back to active `set_project`), `maxResults`
-(default 500), and `cursor` round out the surface.
+(default 80, valid range 1..1000), `timeoutMs` (default 120000, non-negative), and `cursor` round
+out the surface. `scope=file` requires `path`; `scope=project` requires a direct `.fsproj` target or
+a `path` that resolves to one member project of the requested solution.
 
 ### Bare-call default
 
@@ -59,8 +61,10 @@ common case is a single argument.
 2. For each project, runs FCS name resolution and unions four site kinds: definitions, references,
    record-field set sites (`{ Field = expr }` and `{ x with Field = expr }`), and member-usage sites.
 3. De-duplicates the union by `(file, range)` and groups by symbol identity.
-4. Falls back to the FSAC `workspace/symbol` index when the FCS sweep returns nothing.
-5. Returns grouped entries with `file`, `range`, `lineText`, plus scoped `projectDiagnostics`.
+4. When FCS finds no sites, probes the project-bound FSAC `workspace/symbol` index without
+   treating a warming, disconnected, or mismatched FSAC session as a valid zero.
+5. Returns flat `sites` entries with `file`, `range`, `lineText`, plus scoped
+   `projectDiagnostics` and explicit project-coverage counts.
 
 ### The cross-project problem it solves
 
@@ -71,8 +75,11 @@ the bare call already swept all of them.
 
 ### Caveats
 
-1. **`matched=false` is a real negative** — it is returned only when both the FCS sweep AND the
-   FSAC index come back empty. A populated `definitions`/`references` group means a hit.
+1. **Read `outcome` and `coverage.complete` before acting on absence.** `matched=false` /
+   `outcome="not_found"` is emitted only after every requested FCS project completed. If any
+   project failed or timed out, `matched` is `null`, `outcome="indeterminate"`, and
+   `status="unknown"` unless another backend positively proves a match. Positive sites from an
+   incomplete sweep use `status="partial"` because more sites may still exist.
 2. **`exact=true` is the default** — set `exact=false` for case-insensitive substring matching;
    broad substrings on common names ("Id", "Create") can return large pages.
 3. **`kind=position` needs coordinates** — supply `path` + `line` + (`word` or `character`).
@@ -117,7 +124,7 @@ project, collapsed to a single `verdict`. No path, no project, no flags needed f
 | `speed` | Behaviour |
 |---------|-----------|
 | `trusted` (default) | Runs a FRESH FCS check; the verdict reflects the current source on disk |
-| `fast` | Reads the cheap cached FSAC `publishDiagnostics` snapshot — may lag a recent edit |
+| `fast` | Reads a project-bound FSAC snapshot; `clean` requires a current publication for every evaluated in-scope source file |
 
 ### How it works internally
 
@@ -125,7 +132,8 @@ project, collapsed to a single `verdict`. No path, no project, no flags needed f
    (escalating to `workspace` when the solution spans more than one `.fsproj`).
 2. At `speed=trusted`, runs a fresh in-process FCS pass (`ParseAndCheckFileInProject` for a file,
    `ParseAndCheckProject` for a project/workspace) so the result reflects the current source — never
-   a stale cached payload. At `speed=fast`, reads the cached FSAC snapshot instead.
+   a stale cached payload. At `speed=fast`, derives the expected files from evaluated FCS project
+   options, then accepts only diagnostics from the matching live FSAC generation.
 3. Collapses the diagnostics into one `verdict` (`clean` / `errors` / `unknown`).
 4. Returns `verdict` + `errorCount` + `warningCount` + a `diagnostics` array filtered to `severity`.
 
@@ -133,8 +141,9 @@ project, collapsed to a single `verdict`. No path, no project, no flags needed f
 
 Right after an `Edit`/`Write`, a cached FSAC diagnostics snapshot can be an empty `{}` while the
 file actually has errors — the false-clean that historically drove agents to fall back to
-`dotnet build`. At `speed=trusted`, `check` re-checks fresh in-process, so a `clean` verdict is
-trustworthy and `errors` is caught immediately. One tool, one verdict, no build-shell fallback.
+`dotnet build`. At `speed=trusted`, `check` re-checks fresh in-process. At `speed=fast`, missing or
+stale files now produce `unknown` with `complete=false`; a current error remains `errors` even if
+the rest of the scope is incomplete.
 
 ### Caveats
 
@@ -142,8 +151,9 @@ trustworthy and `errors` is caught immediately. One tool, one verdict, no build-
    options). Establish project context and retry; do not treat it as a pass.
 2. **`severity` filters the array only** — `errorCount`/`warningCount` always reflect the full
    result regardless of the `severity` cutoff applied to the returned `diagnostics`.
-3. **`speed=fast` can lag** — it reads the cached FSAC snapshot; use the default `trusted` when you
-   need the verdict to reflect a just-written edit.
+3. **`speed=fast` is coverage-aware but still cached** — inspect `complete`, `expectedFiles`,
+   `missingFiles`, `staleFiles`, and `sessionGeneration`. Use the default `trusted` when you need a
+   fresh type-check of a just-written on-disk edit.
 
 ### Related tools
 

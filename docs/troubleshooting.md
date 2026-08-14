@@ -16,7 +16,10 @@ medium projects this can take 5–30 seconds.
 
 1. Wait a few seconds and retry.
 2. If it persists past 60 seconds, check that `fsautocomplete` is on PATH:
-   `which fsautocomplete`. If missing, run `fslangmcp --bootstrap-tools`.
+   `which fsautocomplete` (`Get-Command fsautocomplete` on PowerShell). If it is
+   missing, install the reviewed runtime set: `fsautocomplete` `0.83.0`,
+   `ionide.projinfo.tool` `0.74.2`, and `fantomas` `7.0.5`, using the exact
+   commands in Getting Started.
 3. Inspect the readiness flags in the `set_project` response: if `readiness.lsp`
    stays `false`, the fsautocomplete child process is failing to start — check
    `fsharp_runtime_status` to see if it appears in `children`.
@@ -121,15 +124,18 @@ dotnet tool update -g FsLangMcp
 
 ## `check` or `find` reports stale results after an edit
 
-FCS caches project-wide results in memory. After editing a file, you may see
-a brief window where `check` returns a cached snapshot.
+FCS and FSAC cache project-wide results in memory. After editing a file,
+`check(speed="fast")` may briefly return `verdict="unknown"` with
+`status="not_ready"`, missing files, or stale files while FsLangMCP retires the
+old diagnostic generation and waits for a content-bound replacement snapshot.
 
 **Remediation:** Call `check` with `speed: "trusted"` (the default) rather
 than `speed: "fast"`. Trusted mode always performs a fresh in-process
-type-check; `fast` returns the cached FSAC snapshot and may reflect
-pre-edit state. If stale results persist, call `set_project` again to clear
-semantic-analysis caches. FsLangMCP retains MSBuild project options only while
-their project, imports, restore outputs, and source-directory inputs are unchanged.
+type-check. Fast mode never promotes a pre-edit empty snapshot to `clean`; retry
+it after the replacement generation warms if latency matters. If `unknown`
+persists, call `set_project` again and inspect the coverage fields. FsLangMCP
+retains MSBuild project options only while their project, imports, restore
+outputs, source contents, and source-directory inputs are unchanged.
 
 ---
 

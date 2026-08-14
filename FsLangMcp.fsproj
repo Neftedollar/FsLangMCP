@@ -4,7 +4,7 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <PackageId>FsLangMcp</PackageId>
-    <Version>0.13.2</Version>
+    <Version>0.14.0</Version>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>fslangmcp</ToolCommandName>
     <PackageOutputPath>./nupkg</PackageOutputPath>
@@ -34,12 +34,14 @@
     <Compile Include="Tools.fs" />
     <Compile Include="RuntimeStatus.fs" />
     <Compile Include="Dispatcher.fs" />
+    <Compile Include="McpHost.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="\" />
     <None Include="LICENSE" Pack="true" PackagePath="\" />
+    <EmbeddedResource Include="dotnet-tools.json" LogicalName="FsLangMcp.dotnet-tools.json" />
   </ItemGroup>
 
   <ItemGroup>
@@ -50,40 +52,40 @@
 
   <ItemGroup>
     <PackageReference Include="FSharp.Compiler.Service" Version="$(FSharpCompilerServiceVersion)" />
-    <PackageReference Include="FSharp.Analyzers.Build" Version="0.5.0">
+    <PackageReference Include="FSharp.Analyzers.Build" Version="[0.5.0]">
       <IncludeAssets>build</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="FsMcp.Server" Version="1.2.2" />
-    <PackageReference Include="FsMcp.TaskApi" Version="1.2.2" />
-    <PackageReference Include="G-Research.FSharp.Analyzers" Version="0.22.0" GeneratePathProperty="true">
+    <PackageReference Include="FsMcp.Server" Version="[1.2.2]" />
+    <PackageReference Include="FsMcp.TaskApi" Version="[1.2.2]" />
+    <PackageReference Include="G-Research.FSharp.Analyzers" Version="[0.22.0]" GeneratePathProperty="true">
       <IncludeAssets>analyzers</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="Ionide.Analyzers" Version="0.15.0" GeneratePathProperty="true">
+    <PackageReference Include="Ionide.Analyzers" Version="[0.15.0]" GeneratePathProperty="true">
       <IncludeAssets>analyzers</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="Ionide.ProjInfo.FCS" Version="0.74.2" />
-    <!-- 2.25.* pulls patched MessagePack 2.5.302, clearing the NU1902/NU1903
+    <PackageReference Include="Ionide.ProjInfo.FCS" Version="[0.74.2]" />
+    <!-- 2.25.29 pulls patched MessagePack 2.5.302, clearing the NU1902/NU1903
          advisories on the 2.5.198 that 2.24.* dragged in transitively. -->
-    <PackageReference Include="StreamJsonRpc" Version="2.25.29" />
+    <PackageReference Include="StreamJsonRpc" Version="[2.25.29]" />
     <!-- Override transitive Nerdbank.MessagePack to a patched build:
          1.1.62 carries GHSA-92vj-hp7m-gwcj / GHSA-qjvr-435c-5fjh. -->
-    <PackageReference Include="Nerdbank.MessagePack" Version="1.2.30" />
+    <PackageReference Include="Nerdbank.MessagePack" Version="[1.2.30]" />
     <!-- MessagePack drags a stale Microsoft.NET.StringTools 17.6.3 (2023) that lacks
          SpanBasedStringBuilder.Equals(string, StringComparison), breaking the .NET SDK
          MSBuild that Ionide.ProjInfo loads (project load fails with MethodNotFound).
          Nerdbank.MessagePack 1.1.62 masked it by pulling 18.4.0 transitively; 1.2.30 drops
          that dependency, so pin 18.4.0 explicitly to keep project loading working. -->
-    <PackageReference Include="Microsoft.NET.StringTools" Version="18.4.0" />
+    <PackageReference Include="Microsoft.NET.StringTools" Version="[18.4.0]" />
     <!-- Pin the transitive load so the bind is satisfied at startup probing
          rather than first-use of StreamJsonRpc internals. Without this pin,
          fresh fslangmcp host processes (e.g. those spawned by Claude Code
          subagent sessions) intermittently fail set_project with a
          FileNotFoundException for Microsoft.VisualStudio.Threading 17.14.0.0.
          See issue #121. -->
-    <PackageReference Include="Microsoft.VisualStudio.Threading.Only" Version="17.14.15" />
+    <PackageReference Include="Microsoft.VisualStudio.Threading.Only" Version="[17.14.15]" />
   </ItemGroup>
 
 </Project>

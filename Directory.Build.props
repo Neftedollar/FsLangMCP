@@ -1,7 +1,8 @@
 <Project>
   <PropertyGroup>
-    <FSharpCompilerServiceVersion>43.12.203</FSharpCompilerServiceVersion>
-    <FSharpCoreImplicitPackageVersion>10.1.203</FSharpCoreImplicitPackageVersion>
+    <!-- Bracketed NuGet ranges are exact. A bare x.y.z means >= x.y.z. -->
+    <FSharpCompilerServiceVersion>[43.12.203]</FSharpCompilerServiceVersion>
+    <FSharpCoreImplicitPackageVersion>[10.1.203]</FSharpCoreImplicitPackageVersion>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <WarningLevel>5</WarningLevel>
