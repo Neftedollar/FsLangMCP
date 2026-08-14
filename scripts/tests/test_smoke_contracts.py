@@ -354,6 +354,33 @@ class WorkflowGateContractTests(unittest.TestCase):
 
         self.assertNotIn("--server bin/Release/", live_workflow)
 
+    def test_bootstrap_smoke_project_is_not_an_indented_powershell_here_string(
+        self,
+    ) -> None:
+        live_workflow = (REPOSITORY_ROOT / ".github/workflows/live-fsac.yml").read_text(
+            encoding="utf-8"
+        )
+
+        bootstrap_step = live_workflow.index(
+            "- name: Prove the packaged bootstrap contract outside the local manifest"
+        )
+        next_step = live_workflow.index(
+            "- name: Install exact runtime toolchain", bootstrap_step
+        )
+        bootstrap_contract = live_workflow[bootstrap_step:next_step]
+
+        self.assertNotIn('@"', bootstrap_contract)
+        self.assertNotIn('"@', bootstrap_contract)
+        self.assertRegex(bootstrap_contract, r"(?m)^\s+@\(\s*$")
+        self.assertIn(
+            "'<Project Sdk=\"Microsoft.NET.Sdk\">'",
+            bootstrap_contract,
+        )
+        self.assertIn(
+            ') | Set-Content -Path "Smoke.fsproj" -Encoding utf8',
+            bootstrap_contract,
+        )
+
     def test_publish_smoke_checks_all_three_runtime_version_surfaces(self) -> None:
         publish_workflow = (REPOSITORY_ROOT / ".github/workflows/publish.yml").read_text(
             encoding="utf-8"

@@ -216,16 +216,16 @@ jobs:
               throw "Bootstrap smoke directory unexpectedly contains a local tool manifest."
             }
 
-            @"
-            <Project Sdk="Microsoft.NET.Sdk">
-              <PropertyGroup>
-                <TargetFramework>net10.0</TargetFramework>
-              </PropertyGroup>
-              <ItemGroup>
-                <Compile Include="Smoke.fs" />
-              </ItemGroup>
-            </Project>
-            "@ | Set-Content -Path "Smoke.fsproj" -Encoding utf8
+            @(
+              '<Project Sdk="Microsoft.NET.Sdk">'
+              '  <PropertyGroup>'
+              '    <TargetFramework>net10.0</TargetFramework>'
+              '  </PropertyGroup>'
+              '  <ItemGroup>'
+              '    <Compile Include="Smoke.fs" />'
+              '  </ItemGroup>'
+              '</Project>'
+            ) | Set-Content -Path "Smoke.fsproj" -Encoding utf8
             "module BootstrapSmoke`n`nlet addOne value= value+1`n" |
               Set-Content -Path "Smoke.fs" -Encoding utf8
 
