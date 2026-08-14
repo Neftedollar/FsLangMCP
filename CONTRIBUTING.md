@@ -69,6 +69,7 @@ The v0.13.2 surface ships 35 tools that all follow the same registration shape. 
 - **`Option.ofObj`** is only appropriate for genuinely nullable returns from .NET APIs. For non-optional `string` args coming from the MCP wire (which can still be blank), use `ArgsValidation.requireNonBlank` in `Types.fs` — that is the standard contract.
 - **Warnings-as-errors** is enforced — `dotnet build -c Release` must complete with `0 Warning(s)`.
 - **Tests must include both positive and failure-mode cases.** Smoke tests that only verify happy paths get caught in review.
+- **Locked restore** (#167): package versions are pinned exactly and `packages.lock.json` is committed; CI restores with `--locked-mode`, which fails (NU1004) if the lock is out of sync. After changing any `PackageReference`, run `just restore-update` (`dotnet restore FsLangMcp.slnx --force-evaluate`) and commit the updated lock files together with the fsproj change. Routine version bumps arrive via Dependabot PRs.
 
 ## PR process
 

@@ -8,7 +8,11 @@ default:
     just --list
 
 restore:
-    dotnet restore {{solution}}
+    dotnet restore {{solution}} --locked-mode
+
+# Update packages.lock.json after changing a PackageReference (or to pull new pins).
+restore-update:
+    dotnet restore {{solution}} --force-evaluate
 
 tool-restore:
     dotnet tool restore

@@ -50,24 +50,24 @@
 
   <ItemGroup>
     <PackageReference Include="FSharp.Compiler.Service" Version="$(FSharpCompilerServiceVersion)" />
-    <PackageReference Include="FSharp.Analyzers.Build" Version="0.5.*">
+    <PackageReference Include="FSharp.Analyzers.Build" Version="0.5.0">
       <IncludeAssets>build</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="FsMcp.Server" Version="1.2.*" />
-    <PackageReference Include="FsMcp.TaskApi" Version="1.2.*" />
-    <PackageReference Include="G-Research.FSharp.Analyzers" Version="0.22.*" GeneratePathProperty="true">
+    <PackageReference Include="FsMcp.Server" Version="1.2.2" />
+    <PackageReference Include="FsMcp.TaskApi" Version="1.2.2" />
+    <PackageReference Include="G-Research.FSharp.Analyzers" Version="0.22.0" GeneratePathProperty="true">
       <IncludeAssets>analyzers</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="Ionide.Analyzers" Version="0.15.*" GeneratePathProperty="true">
+    <PackageReference Include="Ionide.Analyzers" Version="0.15.0" GeneratePathProperty="true">
       <IncludeAssets>analyzers</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="Ionide.ProjInfo.FCS" Version="0.74.*" />
+    <PackageReference Include="Ionide.ProjInfo.FCS" Version="0.74.2" />
     <!-- 2.25.* pulls patched MessagePack 2.5.302, clearing the NU1902/NU1903
          advisories on the 2.5.198 that 2.24.* dragged in transitively. -->
-    <PackageReference Include="StreamJsonRpc" Version="2.25.*" />
+    <PackageReference Include="StreamJsonRpc" Version="2.25.29" />
     <!-- Override transitive Nerdbank.MessagePack to a patched build:
          1.1.62 carries GHSA-92vj-hp7m-gwcj / GHSA-qjvr-435c-5fjh. -->
     <PackageReference Include="Nerdbank.MessagePack" Version="1.2.30" />

@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Reproducible restores (#167): all `PackageReference` versions are pinned
+  exactly (floating `*` patch ranges removed), `packages.lock.json` is
+  committed for both projects, and CI/Justfile restore with `--locked-mode`.
+  Dependency updates now arrive as explicit Dependabot PRs that regenerate the
+  lock files; after editing a `PackageReference` locally, run
+  `just restore-update`. The packed tool is unaffected — dependencies were
+  already baked in at pack time; this changes only build reproducibility.
+
 ## [0.13.2] - 2026-08-10
 
 ### Added
