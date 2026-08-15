@@ -971,13 +971,13 @@ let private pkgPathProperty (packageId: string) = "Pkg" + packageId.Replace(".",
 /// paste-ready; unknown packages get a `*` wildcard the caller should pin.
 let private suggestedAnalyzerVersion (packageId: string) =
     match packageId.ToLowerInvariant() with
-    | "g-research.fsharp.analyzers" -> "0.22.*"
-    | "ionide.analyzers" -> "0.15.*"
+    | "g-research.fsharp.analyzers" -> "0.23.*"
+    | "ionide.analyzers" -> "0.16.*"
     | _ -> "*"
 
 let private analyzersBuildPackage = "FSharp.Analyzers.Build"
 let private analyzersBuildVersion = "0.5.*"
-let private fsharpAnalyzersToolVersion = "0.36.0"
+let private fsharpAnalyzersToolVersion = "0.37.2"
 let private analyzerDllSubPath = "analyzers/dotnet/fs"
 
 /// Read an XML doc, returning None when it is missing or unreadable.

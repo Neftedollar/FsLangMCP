@@ -7,6 +7,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Default is 5 open PRs per ecosystem. The first run hit that cap exactly,
+    # so Microsoft.NET.Test.Sdk, xunit.runner.visualstudio and
+    # Nerdbank.MessagePack were silently never proposed — a cap reads as
+    # "nothing else is outdated" unless you check by hand.
+    open-pull-requests-limit: 15
     groups:
       # Analyzers never ship in the packed tool — batch their bumps.
       analyzers:
@@ -17,3 +22,4 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 15

@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Dependency sweep: `Nerdbank.MessagePack` 1.2.30 → 1.2.36,
+  `Microsoft.NET.Test.Sdk` 17.12.0 → 18.9.0, `xunit.runner.visualstudio`
+  3.0.2 → 4.0.0, and the pinned `fsharp-analyzers` runtime tool
+  0.36.0 → 0.37.2. `Microsoft.VisualStudio.Threading.Only` deliberately
+  stays at 17.14.15: StreamJsonRpc 2.25.29 (latest) binds that exact
+  assembly version, and moving it reintroduces the #121 startup
+  `FileNotFoundException`.
+- `fcs_analyzer_setup_preview` snippets no longer recommend analyzer
+  versions older than the ones this project pins. The grouped analyzer bump
+  moved `G-Research.FSharp.Analyzers` to 0.23 and `Ionide.Analyzers` to 0.16
+  in the project files but left the emitted paste-ready snippets on 0.22/0.15.
+
 - FsMcp.Server / FsMcp.TaskApi 1.2.2 → 2.0.0. Handlers are now
   cancellation-aware end to end: the MCP SDK's per-request token is forwarded
   through the stdio adapter into every tool handler, so client-side request
