@@ -1374,6 +1374,64 @@ type CheckTests(fx: CheckFixture) =
         }
 
     [<Fact>]
+    member _.``check(snippet) surfaces the caller's error without wrapper noise duplicates or temp paths (#187)`` () : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            // Bare snippet — the shape agents actually paste: no module header,
+            // exactly one genuine type error.
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        snippet = Some "let x: int = \"nope\"\n"
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            Assert.Equal("errors", gs result "verdict")
+            let diags = result["diagnostics"] :?> JsonArray
+
+            let codes =
+                [ for d in diags -> d["errorNumberText"].GetValue<string>() ]
+
+            // FS0222 (must begin with namespace/module) and FS0225 (source-file
+            // bookkeeping) describe the synthetic temp-file wrapper, never the
+            // snippet's content.
+            Assert.DoesNotContain("FS0222", codes)
+            Assert.DoesNotContain("FS0225", codes)
+            Assert.Contains("FS0001", codes)
+
+            // No byte-identical duplicates (FS0222 used to arrive twice).
+            let rendered = [ for d in diags -> d.ToJsonString() ]
+            Assert.Equal<string list>(List.distinct rendered, rendered)
+
+            // The caller never had a file; the harness temp path must not leak.
+            for d in diags do
+                Assert.Equal("snippet", d["file"].GetValue<string>())
+        }
+
+    [<Fact>]
+    member _.``check(snippet) bare expression code without a module header is clean (#187)`` () : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        snippet = Some "let answer = 42\n"
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            // The missing-module FS0222 is our wrapper's artifact; a valid bare
+            // snippet must not come back as verdict=errors because of it.
+            Assert.Equal("clean", gs result "verdict")
+            Assert.Equal(0, gi result "errorCount")
+        }
+
+    [<Fact>]
     member _.``STALE-GUARD: a fresh trusted check after an on-disk cross-file edit never reports a false-clean``
         ()
         : Task =

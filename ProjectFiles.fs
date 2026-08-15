@@ -182,7 +182,12 @@ let internal isDesignerFile (path: string) =
     Path.GetFileName(path).EndsWith(".Designer.fs", StringComparison.OrdinalIgnoreCase)
 
 let internal isAssemblyInfoFile (path: string) =
-    Path.GetFileName(path).EndsWith(".AssemblyInfo.fs", StringComparison.OrdinalIgnoreCase)
+    let fileName = Path.GetFileName(path)
+
+    fileName.EndsWith(".AssemblyInfo.fs", StringComparison.OrdinalIgnoreCase)
+    // The SDK's TFM attribute stub (".NETCoreApp,Version=v10.0.AssemblyAttributes.fs")
+    // is the other build-generated source every built project carries in obj/.
+    || fileName.EndsWith(".AssemblyAttributes.fs", StringComparison.OrdinalIgnoreCase)
 
 let private isTemporaryFile (path: string) =
     let fileName = Path.GetFileName(path)
@@ -310,18 +315,22 @@ let private classifyFile (workspaceRoot: string) (options: ScanFilterOptions) (f
     let fullPath = Path.GetFullPath(path)
 
     if not (isFsFile path) then Some UnsupportedExtension
-    elif hasSegment "obj" path || hasSegment "bin" path then
-        if options.IncludeObjBin then None else Some ObjOrBinDirectory
     elif hasSegment ".git" path then Some GitDirectory
     elif hasSegment ".claude" path || hasSegment ".codex" path then Some ToolCacheDirectory
     elif isTestResultArtifact path then Some TestResultArtifact
     elif isTemporaryFile path then Some TemporaryFile
+    // Classify by WHAT a file is before WHERE it lives: generated sources live
+    // under obj/ (App.AssemblyInfo.fs, *.AssemblyAttributes.fs), so testing the
+    // obj/bin segment first would shadow IncludeGenerated and make the flag
+    // unreachable for exactly the files it exists to surface (#186).
     elif isAssemblyInfoFile path then
         if options.IncludeGenerated then None else Some AssemblyInfoFile
     elif isDesignerFile path then
         if options.IncludeGenerated then None else Some DesignerFile
     elif isGeneratedFile path then
         if options.IncludeGenerated then None else Some GeneratedFile
+    elif hasSegment "obj" path || hasSegment "bin" path then
+        if options.IncludeObjBin then None else Some ObjOrBinDirectory
     elif isTestFile path && not options.IncludeTests then Some TestResultArtifact
     elif file.Link.IsSome && not options.IncludeExternalLinkedFiles then Some ExternalLinkedFile
     elif not (fullPath.StartsWith(fullWorkspaceRoot, StringComparison.OrdinalIgnoreCase)) then Some OutsideWorkspace

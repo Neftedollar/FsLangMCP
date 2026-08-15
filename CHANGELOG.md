@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `fsharp_project_inspect(includeGeneratedFiles=true)` now actually includes
+  generated sources. `classifyFile` tested the obj/bin segment before the
+  generated-file branches, and generated F# sources (`*.AssemblyInfo.fs`, the
+  SDK's `*.AssemblyAttributes.fs` stub) essentially always live under `obj/`,
+  so the flag was unreachable by construction (#186). Files are now classified
+  by what they are before where they live, `*.AssemblyAttributes.fs` is
+  recognized as generated, and when excluded by default these files report
+  `assembly_info_file` instead of the uninformative `obj_or_bin_directory`.
+- `check(scope="snippet")` diagnostics now describe the snippet, not the
+  harness (#187): the wrapper artifacts FS0222 (must begin with
+  namespace/module) and FS0225 (source-file bookkeeping) are dropped — so a
+  valid bare `let` snippet is `clean`, not `errors` — duplicates arriving via
+  both the parse and check halves are collapsed, diagnostics attached to other
+  project files no longer leak in, and `file` reads `"snippet"` instead of a
+  temp path the caller never created.
+
 ### Changed
 
 - Dependency sweep: `Nerdbank.MessagePack` 1.2.30 → 1.2.36,
