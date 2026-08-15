@@ -72,7 +72,7 @@
     <PackageReference Include="StreamJsonRpc" Version="[2.25.29]" />
     <!-- Override transitive Nerdbank.MessagePack to a patched build:
          1.1.62 carries GHSA-92vj-hp7m-gwcj / GHSA-qjvr-435c-5fjh. -->
-    <PackageReference Include="Nerdbank.MessagePack" Version="[1.2.30]" />
+    <PackageReference Include="Nerdbank.MessagePack" Version="[1.2.36]" />
     <!-- MessagePack drags a stale Microsoft.NET.StringTools 17.6.3 (2023) that lacks
          SpanBasedStringBuilder.Equals(string, StringComparison), breaking the .NET SDK
          MSBuild that Ionide.ProjInfo loads (project load fails with MethodNotFound).
