@@ -59,7 +59,7 @@ type private ToolAIFunction(definition: ToolDefinition) =
     override _.Description = definition.Description
     override _.JsonSchema = schema
 
-    override _.InvokeCoreAsync(arguments, _cancellationToken) =
+    override _.InvokeCoreAsync(arguments, cancellationToken) =
         ValueTask<obj>(task {
             let values =
                 if isNull arguments then
@@ -75,7 +75,9 @@ type private ToolAIFunction(definition: ToolDefinition) =
                     |> Map.ofSeq
 
             try
-                let! result = definition.Handler values
+                // FsMcp 2.0 handlers are cancellation-aware; forward the SDK's token
+                // so client-side request cancellation reaches the tool body.
+                let! result = definition.Handler values cancellationToken
 
                 match result with
                 | Ok contents ->
@@ -117,8 +119,14 @@ let runToolOnly (serverInfoVersion: string) (config: ServerConfig) : Task<unit> 
         if not (List.isEmpty config.Resources) || not (List.isEmpty config.Prompts) then
             invalidOp "The FsLangMCP stdio adapter currently supports tool-only ServerConfig values."
 
+        // ServerConfig.Middleware is obsolete in FsMcp 2.0 (declarations were never
+        // executed; FsMcp itself now fails closed). This adapter bypasses FsMcp's
+        // registration, so keep our own fail-closed guard rather than silently
+        // ignoring a middleware declaration that still compiles via the CE op.
+#nowarn "44"
         if not (List.isEmpty config.Middleware) then
             invalidOp "The FsLangMCP stdio adapter does not silently ignore FsMcp middleware."
+#warnon "44"
 
         let hostBuilder = Host.CreateApplicationBuilder()
         // Stdout is the protocol channel. Disable inherited console providers;
