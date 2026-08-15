@@ -98,12 +98,11 @@ let private testEvaluatedSnapshot referencesExisting referencesTotal projectPath
             |> Seq.choose (fun element ->
                 attr "Include" element
                 |> Option.map (fun includePath ->
-                    let path =
-                        if Path.IsPathFullyQualified includePath then includePath
-                        else Path.Combine(projectDir, includePath)
-
+                    // Mirror MSBuild: `\` is a separator in Include on every OS. Real
+                    // evaluation normalizes it, so this double must too or it hands
+                    // tests a resolution the production provider would never produce.
                     { IncludePath = includePath
-                      ProjectPath = Path.GetFullPath path
+                      ProjectPath = resolveIncludePath projectDir includePath
                       TargetFramework = None }))
             |> Seq.toList
 
@@ -186,6 +185,38 @@ let ``project_health reports source files and analyzer setup`` () =
         Assert.Equal(1, (result["files"]["sourceFileCount"]).GetValue<int>())
         Assert.Equal("analyzers_configured", (result["analyzers"]["status"]).GetValue<string>())
         Assert.Equal("available", (result["projectOptions"]["status"]).GetValue<string>())
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health resolves MSBuild backslash Compile includes on the host OS`` () =
+    // A Windows-authored `Domain\Money.fs` include must not be reported as a
+    // missing file on macOS/Linux (#160).
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_%s{runId}")
+
+    try
+        Directory.CreateDirectory(Path.Combine(root, "Domain")) |> ignore
+        File.WriteAllText(Path.Combine(root, "Domain", "Money.fs"), "module Money\n\nlet value = 1\n")
+
+        let projectPath = Path.Combine(root, "Library.fsproj")
+
+        File.WriteAllText(
+            projectPath,
+            String.concat
+                "\n"
+                [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+                  "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+                  "  <ItemGroup><Compile Include=\"Domain\\Money.fs\" /></ItemGroup>"
+                  "</Project>" ]
+        )
+
+        let result =
+            report (healthArgs projectPath (Some root)) (readySnapshot projectPath root)
+
+        Assert.Equal(1, (result["files"]["sourceFileCount"]).GetValue<int>())
+        Assert.Equal(0, (result["files"]["missingFiles"]).AsArray().Count)
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
@@ -604,6 +635,59 @@ let ``inspection and health share evaluated SDK defaults conditions imports and 
             if Directory.Exists root then
                 Directory.Delete(root, true)
     }
+
+[<Fact>]
+let ``fsharp_project_inspect resolves MSBuild backslash ProjectReference includes on the host OS`` () =
+    // `..\Dep\Dep.fsproj` is how Windows-authored projects reference siblings; it
+    // must resolve (exists=true) on macOS/Linux too (#160).
+    //
+    // What this does NOT prove: production `fsharp_project_inspect` takes project
+    // references from ProjInfo/MSBuild evaluation, which normalizes separators in
+    // the engine — not from this code path. The assertion here pins the evaluated
+    // -snapshot double to that same MSBuild semantic, so the double cannot hand a
+    // test a resolution the real provider would never return.
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_inspect_%s{runId}")
+
+    try
+        let appDir = Path.Combine(root, "App")
+        let depDir = Path.Combine(root, "Dep")
+        Directory.CreateDirectory appDir |> ignore
+        Directory.CreateDirectory depDir |> ignore
+        File.WriteAllText(Path.Combine(depDir, "Dep.fsproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+        File.WriteAllText(Path.Combine(appDir, "Library.fs"), "module Library\n\nlet value = 1\n")
+
+        let projectPath = Path.Combine(appDir, "App.fsproj")
+
+        File.WriteAllText(
+            projectPath,
+            String.concat
+                "\n"
+                [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+                  "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+                  "  <ItemGroup><Compile Include=\"Library.fs\" /></ItemGroup>"
+                  "  <ItemGroup><ProjectReference Include=\"..\\Dep\\Dep.fsproj\" /></ItemGroup>"
+                  "</Project>" ]
+        )
+
+        let result =
+            inspectProject
+                { projectPath = Some projectPath
+                  workspacePath = Some root
+                  scope = None
+                  includeGeneratedFiles = None
+                  includePackageDetails = None
+                  includeResolvedOptions = Some false }
+                testEvaluatedProvider
+            |> Async.RunSynchronously
+
+        let projectReferences = result["references"]["projectReferences"] :?> JsonArray
+        Assert.Equal(1, projectReferences.Count)
+        let firstReference = projectReferences[0]
+        Assert.True(firstReference["exists"].GetValue<bool>())
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
 
 // ─── .sln / .slnx as projectPath ─────────────────────────────────────────────
 

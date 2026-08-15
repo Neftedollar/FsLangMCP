@@ -127,6 +127,25 @@ contracts that callers may have treated as unconditional success.
   duplicate package. This prevents a tag-only release from packaging an assembly
   that still reports the previous project-file version.
 
+- MSBuild-style backslash separators in `<Compile Include>` paths are now
+  normalized to the host OS before any filesystem access, matching MSBuild
+  semantics. Previously on macOS/Linux a Windows-authored `Domain\Money.fs`
+  resolved to a literal `/workspace/Domain\Money.fs`, so `fcs_project_outline`
+  errored on every subdirectory file, `fcs_review_scan` silently scanned only
+  root-level files, and `project_health` reported subdirectory files as missing
+  (#160, reported by @PlandriousX). `<ProjectReference Include>` paths reach
+  `fsharp_project_inspect` through MSBuild evaluation and are normalized by the
+  engine itself; a regression test pins that behaviour.
+- `fcs_review_scan` project mode no longer claims `succeeded` over a partial
+  file set: in-scope compiled files that cannot be found on disk are listed in
+  a new `unresolvedFiles` response field and downgrade `status` to `partial`.
+  Filter-excluded entries (generated, obj/bin, tests) are deliberately not
+  counted — their absence is expected pre-build in parse-only mode; the
+  unfiltered view remains `project_health.missingFiles` (#160).
+- `fcs_project_outline` reports the same aggregate `unresolvedFiles` list over
+  all in-scope files, so missing files stay visible even when the per-file
+  `outlineStatus` errors are on another page (#160).
+
 ## [0.13.2] - 2026-08-10
 
 ### Added

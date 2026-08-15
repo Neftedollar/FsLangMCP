@@ -85,12 +85,6 @@ let private tryReadProject (projectPath: string) =
     with ex ->
         Error ex.Message
 
-let private resolveCompilePath (projectDir: string) (includePath: string) =
-    if Path.IsPathRooted(includePath) then
-        Path.GetFullPath(includePath)
-    else
-        Path.GetFullPath(Path.Combine(projectDir, includePath))
-
 let private compileFiles (projectPath: string) (doc: XDocument) =
     let projectDir = Path.GetDirectoryName(projectPath)
 
@@ -98,7 +92,7 @@ let private compileFiles (projectPath: string) (doc: XDocument) =
     |> Seq.choose (fun element ->
         attr "Include" element
         |> Option.map (fun includePath ->
-            let path = resolveCompilePath projectDir includePath
+            let path = ProjectFiles.resolveIncludePath projectDir includePath
 
             path, includePath, attr "Link" element))
     |> Seq.filter (fun (path, _, _) -> isFsFile path)

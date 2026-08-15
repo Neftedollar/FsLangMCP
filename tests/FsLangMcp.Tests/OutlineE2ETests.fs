@@ -113,6 +113,43 @@ let ``ProjectOutline without filter returns all project files`` () : System.Thre
             if Directory.Exists(root) then Directory.Delete(root, true)
     }
 
+[<Fact>]
+let ``ProjectOutline lists compiled files missing on disk in unresolvedFiles`` () : System.Threading.Tasks.Task =
+    task {
+        // Per-file outlineStatus errors can scroll past on a paginated response; the
+        // aggregate must make the coverage gap prominent (#160).
+        let projectPath, root = createFixtureProject ()
+
+        File.WriteAllText(
+            projectPath,
+            String.concat
+                Environment.NewLine
+                [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+                  "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+                  "  <ItemGroup>"
+                  "    <Compile Include=\"File1.fs\" />"
+                  "    <Compile Include=\"Missing.fs\" />"
+                  "  </ItemGroup>"
+                  "</Project>" ]
+        )
+
+        let bridge = FcsBridge()
+
+        try
+            let! result = bridge.ProjectOutline({ defaultArgs projectPath with maxFiles = Some 100 })
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+
+            let unresolved =
+                result["unresolvedFiles"] :?> JsonArray
+                |> Seq.map (fun n -> n.GetValue<string>())
+                |> Seq.toList
+
+            Assert.Contains(unresolved, fun p -> p.EndsWith "Missing.fs")
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
+
 // ─── G. Filter regex — only matching entries pass through ─────────────────────
 
 [<Fact>]

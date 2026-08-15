@@ -108,3 +108,26 @@ let ``compileFiles pairs fsi and fs files from in memory project xml`` () =
 
     Assert.Equal(Some implementation.Path, signature.PairedImplementationPath)
     Assert.Equal(Some signature.Path, implementation.PairedSignaturePath)
+
+[<Fact>]
+let ``compileFiles normalizes MSBuild backslash separators to the host OS`` () =
+    // MSBuild treats `\` as a separator on every OS; on Unix it is a literal
+    // filename character, so the raw include must be normalized before use (#160).
+    let projectPath = underRoot "App.fsproj"
+
+    let doc =
+        XDocument.Parse(
+            """
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <Compile Include="Domain\Money.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+</Project>
+"""
+        )
+
+    let paths = compileFiles projectPath doc |> List.map _.Path
+
+    Assert.Contains(underRoot (Path.Combine("Domain", "Money.fs")), paths)
+    Assert.Contains(underRoot "Program.fs", paths)
