@@ -78,7 +78,7 @@
          MSBuild that Ionide.ProjInfo loads (project load fails with MethodNotFound).
          Nerdbank.MessagePack 1.1.62 masked it by pulling 18.4.0 transitively; 1.2.30 drops
          that dependency, so pin 18.4.0 explicitly to keep project loading working. -->
-    <PackageReference Include="Microsoft.NET.StringTools" Version="[18.4.0]" />
+    <PackageReference Include="Microsoft.NET.StringTools" Version="[18.9.6]" />
     <!-- Pin the transitive load so the bind is satisfied at startup probing
          rather than first-use of StreamJsonRpc internals. Without this pin,
          fresh fslangmcp host processes (e.g. those spawned by Claude Code
