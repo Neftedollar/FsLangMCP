@@ -5297,7 +5297,7 @@ type internal FcsBridge
                         |> Seq.choose (fun (node, keep) -> if keep then Some node else None)
                         |> Seq.toArray
 
-                    [ "perProject", JsonArray(kept) :> JsonNode ]
+                    [ ("perProject", JsonArray(kept) :> JsonNode) ]
                 else
                     // includePerProject=false still SURFACES failed-sweep entries — the only
                     // place a per-project load/timeout error is visible. Omitting them would
@@ -5306,7 +5306,7 @@ type internal FcsBridge
                     let errored = perProject |> Seq.filter isErrorEntry |> Seq.toArray
 
                     if errored.Length > 0 then
-                        [ "perProject", JsonArray(errored) :> JsonNode ]
+                        [ ("perProject", JsonArray(errored) :> JsonNode) ]
                     else
                         []
 
@@ -5317,15 +5317,15 @@ type internal FcsBridge
                 if matched = Some false && not (String.IsNullOrEmpty query) && query.Contains('.') then
                     let bare = query.Substring(query.LastIndexOf('.') + 1)
 
-                    [ "hint",
+                    [ ("hint",
                       jstr
-                          $"No match for the module-qualified query '{query}'. find matches by simple name or a dotted suffix on a module boundary — try the bare identifier '{bare}'." ]
+                          $"No match for the module-qualified query '{query}'. find matches by simple name or a dotted suffix on a module boundary — try the bare identifier '{bare}'.") ]
                 else
                     []
 
             let completenessFields =
                 completenessMessage
-                |> Option.map (fun message -> [ "message", jstr message ])
+                |> Option.map (fun message -> [ ("message", jstr message) ])
                 |> Option.defaultValue []
 
             let baseFields =
@@ -6354,7 +6354,7 @@ type internal FcsBridge
                         [||]
                         [||]
                         (Some discoveryReason)
-                        [ "projectsSwept", jint 0 ]
+                        [ ("projectsSwept", jint 0) ]
             // ── snippet: always FRESH (ignores speed); old ValidateSnippet logic ──
             | "snippet" ->
                 match args.snippet with
@@ -6812,7 +6812,7 @@ type internal FcsBridge
                                 [||]
                                 [||]
                                 (Some overallTimeoutReason)
-                                [ "projectsSwept", jint 0 ]
+                                [ ("projectsSwept", jint 0) ]
                     | Some(CheckTargetDiscoveryResult.Busy reason) ->
                         return
                             build
@@ -6826,7 +6826,7 @@ type internal FcsBridge
                                 [||]
                                 [||]
                                 (Some reason)
-                                [ "projectsSwept", jint 0 ]
+                                [ ("projectsSwept", jint 0) ]
                     | Some(CheckTargetDiscoveryResult.Project None) ->
                         return invalid $"check could not resolve a single .fsproj to check from: {target}"
                     | Some(CheckTargetDiscoveryResult.Project(Some proj)) ->
@@ -6855,7 +6855,7 @@ type internal FcsBridge
                                     [||]
                                     [||]
                                     (Some overallTimeoutReason)
-                                    [ "projectsSwept", jint 0 ]
+                                    [ ("projectsSwept", jint 0) ]
                         | Some(Error reason) ->
                             return
                                 build
@@ -6869,7 +6869,7 @@ type internal FcsBridge
                                     [||]
                                     [||]
                                     (Some $"Reference resolution probe incomplete: {reason}")
-                                    [ "projectsSwept", jint 0 ]
+                                    [ ("projectsSwept", jint 0) ]
                         | Some(Ok(refExisting, refTotal)) when
                             ReferenceResolution.looksUnrestored refExisting refTotal
                             ->
@@ -6914,7 +6914,7 @@ type internal FcsBridge
                                         [||]
                                         [||]
                                         (Some overallTimeoutReason)
-                                        [ "projectsSwept", jint 1 ]
+                                        [ ("projectsSwept", jint 1) ]
                             | Error msg ->
                                 return
                                     build
@@ -6928,7 +6928,7 @@ type internal FcsBridge
                                         [||]
                                         [||]
                                         (Some $"Project could not be analyzed: {msg}")
-                                        [ "projectsSwept", jint 1 ]
+                                        [ ("projectsSwept", jint 1) ]
                             | Ok(diags, projFileName, optionsSource) ->
                                 let errorCount, warningCount = countDiagnosticsBySeverity diags
                                 let verdict = if errorCount > 0 then "errors" else "clean"
@@ -7001,7 +7001,7 @@ type internal FcsBridge
                                 [||]
                                 [||]
                                 (Some overallTimeoutReason)
-                                [ "projectsSwept", jint 0 ]
+                                [ ("projectsSwept", jint 0) ]
                     elif targetDiscoveryBusy.IsSome then
                         return
                             build
@@ -7015,7 +7015,7 @@ type internal FcsBridge
                                 [||]
                                 [||]
                                 targetDiscoveryBusy
-                                [ "projectsSwept", jint 0 ]
+                                [ ("projectsSwept", jint 0) ]
                     elif projects.Length = 0 then
                         return invalid $"check could not resolve any .fsproj to check from: {target}"
                     else
@@ -7259,7 +7259,7 @@ type internal FcsBridge
                         |> Seq.sortBy (fun (_, _, score) -> score)
                         |> Seq.toList
                     else
-                        [ 0, 0, 0 ]
+                        [ (0, 0, 0) ]
 
                 let resolved =
                     candidates
@@ -8772,7 +8772,7 @@ type internal FcsBridge
             decls
             |> List.collect (fun d ->
                 match d with
-                | SynModuleSigDecl.Val(valSig = SynValSig(ident = SynIdent(id, _))) -> [ id.idText, "val" ]
+                | SynModuleSigDecl.Val(valSig = SynValSig(ident = SynIdent(id, _))) -> [ (id.idText, "val") ]
                 | SynModuleSigDecl.Types(types = types) ->
                     types
                     |> List.choose (fun (SynTypeDefnSig(typeInfo = SynComponentInfo(longId = lid))) ->
@@ -9946,7 +9946,7 @@ type internal FcsBridge
 
                     let props =
                         match fsprojForProject proj with
-                        | Some f -> baseProps @ [ "fsproj", jstr f ]
+                        | Some f -> baseProps @ [ ("fsproj", jstr f) ]
                         | None -> baseProps
 
                     jobj props :> JsonNode)
@@ -10206,17 +10206,17 @@ type internal FcsBridge
             // ── Assemble ─────────────────────────────────────────────────────────────
             let targetNode =
                 jobj
-                    ([ "symbol", jstr resolvedName ]
+                    ([ ("symbol", jstr resolvedName) ]
                      @ (match args.path with
-                        | Some p when not (String.IsNullOrWhiteSpace p) -> [ "path", jstr (normalizePath p) ]
+                        | Some p when not (String.IsNullOrWhiteSpace p) -> [ ("path", jstr (normalizePath p)) ]
                         | _ -> [])
                      @ (match args.line with
-                        | Some l -> [ "line", jint l ]
+                        | Some l -> [ ("line", jint l) ]
                         | None -> [])
                      @ (match args.character with
-                        | Some c -> [ "character", jint c ]
+                        | Some c -> [ ("character", jint c) ]
                         | None -> [])
-                     @ [ "resolvedVia", jstr resolvedVia ])
+                     @ [ ("resolvedVia", jstr resolvedVia) ])
                 :> JsonNode
 
             let impactNode =
@@ -10240,11 +10240,11 @@ type internal FcsBridge
                   "tests", testsNode ]
 
             let optionalProps =
-                (compileOrderNode |> Option.map (fun n -> [ "compileOrder", n ]) |> Option.defaultValue [])
-                @ (apiSurfaceNode |> Option.map (fun n -> [ "apiSurface", n ]) |> Option.defaultValue [])
-                @ (renamePreviewNode |> Option.map (fun n -> [ "renamePreview", n ]) |> Option.defaultValue [])
+                (compileOrderNode |> Option.map (fun n -> [ ("compileOrder", n) ]) |> Option.defaultValue [])
+                @ (apiSurfaceNode |> Option.map (fun n -> [ ("apiSurface", n) ]) |> Option.defaultValue [])
+                @ (renamePreviewNode |> Option.map (fun n -> [ ("renamePreview", n) ]) |> Option.defaultValue [])
 
-            let verifyProp = [ "verify", JsonArray(verify.ToArray() |> Array.map jstr) :> JsonNode ]
+            let verifyProp = [ ("verify", JsonArray(verify.ToArray() |> Array.map jstr) :> JsonNode) ]
 
             return jobj (baseProps @ optionalProps @ verifyProp) :> JsonNode
         }

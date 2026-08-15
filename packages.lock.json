@@ -10,18 +10,18 @@
       },
       "FSharp.Compiler.Service": {
         "type": "Direct",
-        "requested": "[43.12.203, 43.12.203]",
-        "resolved": "43.12.203",
-        "contentHash": "ZrK+g3JdnkCSSkYFXFcsh5i6hdepyG95wkbZqmjFRC77Byhj2fRYGNcBA8PKpiS3fSRB9g/ISZC2uezl3BOuDQ==",
+        "requested": "[43.12.400, 43.12.400]",
+        "resolved": "43.12.400",
+        "contentHash": "Ydo8HRHMewaGL6N1jFwFunI6aqyrv0Ndy1en3tT2jq3rGEDX53H2xqihD6mvbuIODB9TtLZi5hB2BZa2nVDnXg==",
         "dependencies": {
-          "FSharp.Core": "[10.1.203]"
+          "FSharp.Core": "[10.1.400]"
         }
       },
       "FSharp.Core": {
         "type": "Direct",
-        "requested": "[10.1.203, 10.1.203]",
-        "resolved": "10.1.203",
-        "contentHash": "I2MFk72yHqfgI594gKFigq8PVIso0Mh1ZUgG9R4n8gyYQ4IwpBxmvecfjnKA7iMLdVHYULB70PsLwYW/K76gew=="
+        "requested": "[10.1.400, 10.1.400]",
+        "resolved": "10.1.400",
+        "contentHash": "H9wlZ/tWgNp+Q4WQ5aUSi3XOBXrL6z+UkR0PNeyDFyoZR3c3PbtA21B9FqlthrhEwQ6f5AtQV0JLhBBDqjjscw=="
       },
       "FsMcp.Server": {
         "type": "Direct",
