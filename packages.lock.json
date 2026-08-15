@@ -75,9 +75,9 @@
       },
       "Microsoft.NET.StringTools": {
         "type": "Direct",
-        "requested": "[18.4.0, 18.4.0]",
-        "resolved": "18.4.0",
-        "contentHash": "iQWOKi3L5QStmWqDjDubcr1KlTDy88qBTe88I0etlUUo1l0zSNebGJXl1Xetyl+ACA+ujP3YUtxo3Nz54JPriw=="
+        "requested": "[18.9.6, 18.9.6]",
+        "resolved": "18.9.6",
+        "contentHash": "CNZfh4P65tHm1Wh/uuIbYfvHlPnb0dJ9SCaIZbXRzOMn+8JEorSqSdXdGRsrDbKBDJfNG6nmgleYhnfL2pd1oQ=="
       },
       "Microsoft.VisualStudio.Threading.Only": {
         "type": "Direct",

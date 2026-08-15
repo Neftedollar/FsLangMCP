@@ -65,7 +65,7 @@
     <PackageReference Include="StreamJsonRpc" Version="[2.25.29]" />
     <!-- Pin StringTools to 18.4.0; see FsLangMcp.fsproj for rationale
          (MessagePack's transitive 17.6.3 breaks Ionide.ProjInfo project loading). -->
-    <PackageReference Include="Microsoft.NET.StringTools" Version="[18.4.0]" />
+    <PackageReference Include="Microsoft.NET.StringTools" Version="[18.9.6]" />
     <PackageReference Include="xunit" Version="[2.9.3]" />
     <PackageReference Include="xunit.runner.visualstudio" Version="[3.0.2]">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
