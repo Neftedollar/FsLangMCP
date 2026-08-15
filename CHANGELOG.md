@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- FsMcp.Server / FsMcp.TaskApi 1.2.2 → 2.0.0. Handlers are now
+  cancellation-aware end to end: the MCP SDK's per-request token is forwarded
+  through the stdio adapter into every tool handler, so client-side request
+  cancellation reaches the tool body instead of being dropped at the boundary.
+- Typed tool input is strict JSON (FsMcp 2.0): string-encoded scalars such as
+  `"42"` or `"true"` are no longer coerced into numeric or boolean fields and
+  fail with a structured invalid-arguments error. Agents sending properly
+  typed arguments are unaffected.
+
 ## [0.14.0] - 2026-08-14
 
 This is a pre-1.0 SemVer minor because it deliberately tightens several response
