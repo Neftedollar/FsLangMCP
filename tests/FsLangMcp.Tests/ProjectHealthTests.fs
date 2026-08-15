@@ -98,12 +98,11 @@ let private testEvaluatedSnapshot referencesExisting referencesTotal projectPath
             |> Seq.choose (fun element ->
                 attr "Include" element
                 |> Option.map (fun includePath ->
-                    let path =
-                        if Path.IsPathFullyQualified includePath then includePath
-                        else Path.Combine(projectDir, includePath)
-
+                    // Mirror MSBuild: `\` is a separator in Include on every OS. Real
+                    // evaluation normalizes it, so this double must too or it hands
+                    // tests a resolution the production provider would never produce.
                     { IncludePath = includePath
-                      ProjectPath = Path.GetFullPath path
+                      ProjectPath = resolveIncludePath projectDir includePath
                       TargetFramework = None }))
             |> Seq.toList
 
@@ -641,6 +640,12 @@ let ``inspection and health share evaluated SDK defaults conditions imports and 
 let ``fsharp_project_inspect resolves MSBuild backslash ProjectReference includes on the host OS`` () =
     // `..\Dep\Dep.fsproj` is how Windows-authored projects reference siblings; it
     // must resolve (exists=true) on macOS/Linux too (#160).
+    //
+    // What this does NOT prove: production `fsharp_project_inspect` takes project
+    // references from ProjInfo/MSBuild evaluation, which normalizes separators in
+    // the engine — not from this code path. The assertion here pins the evaluated
+    // -snapshot double to that same MSBuild semantic, so the double cannot hand a
+    // test a resolution the real provider would never return.
     let runId = System.Guid.NewGuid().ToString("N")
     let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_inspect_%s{runId}")
 
@@ -673,6 +678,8 @@ let ``fsharp_project_inspect resolves MSBuild backslash ProjectReference include
                   includeGeneratedFiles = None
                   includePackageDetails = None
                   includeResolvedOptions = Some false }
+                testEvaluatedProvider
+            |> Async.RunSynchronously
 
         let projectReferences = result["references"]["projectReferences"] :?> JsonArray
         Assert.Equal(1, projectReferences.Count)
