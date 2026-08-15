@@ -96,23 +96,84 @@ module private FieldFormClassifier =
                 | _ -> acc)
 
 
+// ─── find: typed FSAC fallback result (issue #168, P1-01) ───────────────────────
+
+/// Result of the optional FSAC workspace-symbol fallback used by `find`.
+/// A non-success state is deliberately distinct from `Available 0`: transport,
+/// readiness, and project-context failures must never become authoritative
+/// evidence that a symbol is absent.
+[<RequireQualifiedAccess>]
+type internal FindFsacProbeResult =
+    | Available of hitCount: int
+    | NotReady of reason: string
+    | ContextMismatch of reason: string
+    | Failed of reason: string
+    | Unavailable of reason: string
+
+let rec private findFailureIsTimeout (ex: exn) =
+    match ex with
+    | :? TimeoutException -> true
+    // Find has no caller cancellation token today, so cancellation observed
+    // inside its budgeted sweep is a timeout-equivalent incomplete result.
+    | :? OperationCanceledException -> true
+    | :? AggregateException as aggregate ->
+        aggregate.Flatten().InnerExceptions |> Seq.exists findFailureIsTimeout
+    | _ when not (isNull ex.InnerException) -> findFailureIsTimeout ex.InnerException
+    | _ -> false
+
 // ─── check: cached FSAC diagnostics snapshot (issue #128, Stage 1) ──────────────
 //
 // The `check` tool's speed="fast" path reads the cheap cached FSAC publishDiagnostics
 // snapshot instead of re-type-checking in FCS. The FSAC dictionary lives in
 // FsAutoCompleteBridge, so — exactly like `find` injecting its fsacProbe — the
-// dispatcher projects a workspace_diagnostics response into this struct and hands it
-// to the FCS-only substrate, which therefore stays LSP-agnostic.
+// dispatcher projects a context-bound diagnostics response into this struct and hands
+// it to the FCS-only substrate, which therefore stays LSP-agnostic.
 //
-// Honesty contract: `MostRecentAnalyzedAt = None` (or `Ready = false`) is the stale
-// `{}` ambiguity from #100 — FSAC has not pushed analysis yet, so absence of cached
-// errors does NOT mean "clean". The fast path turns that into verdict="unknown"
-// rather than a false-clean.
+// Honesty contract: a clean fast verdict requires one current publishDiagnostics
+// result (including an explicit empty array) for every evaluated in-scope SourceFile.
+// Project mismatch, incomplete expectation derivation, missing publications, and stale
+// open-document versions are all distinct from a complete zero-error snapshot.
+[<NoComparison; NoEquality>]
+type internal CheckFsacExpectation =
+    { /// Effective project/solution context the snapshot must belong to.
+      RequestedProjectPath: string option
+      /// Resolved check scope (file/project/workspace).
+      Scope: string
+      /// Evaluated FCS SourceFiles in the requested scope, normalized to full paths.
+      ExpectedFiles: string array
+      /// Content-addressed identity of the whole owning project/options/reference
+      /// closure, not merely the files returned by this scope.
+      ContextFingerprint: string option
+      /// False when one or more project options could not be evaluated.
+      Complete: bool
+      /// Why expectation derivation was incomplete, when applicable.
+      FailureReason: string option
+      /// Workspace-only URI glob preserved from CheckArgs.
+      FileGlob: string option }
+
 [<NoComparison; NoEquality>]
 type internal CheckFsacSnapshot =
-    { /// FSAC workspace reached the "ready" state (lspState = "ready").
+    { /// Typed status returned by the context-bound diagnostics bridge.
+      Status: string
+      /// FSAC workspace reached the "ready" state (lspState = "ready").
       Ready: bool
-      /// Number of files FSAC currently holds diagnostics for.
+      /// The active FSAC session contains the requested project/solution context.
+      ContextMatched: bool
+      /// Every expected file has a current diagnostics publication.
+      Complete: bool
+      /// Evaluated files requested from FSAC after scope/glob filtering.
+      ExpectedFiles: string array
+      /// Expected files for which any diagnostics publication was received.
+      ReceivedFiles: string array
+      /// Expected files with no diagnostics publication in the current session.
+      MissingFiles: string array
+      /// Expected open files whose publication version is not current.
+      StaleFiles: string array
+      /// FSAC lifecycle generation that produced this snapshot.
+      SessionGeneration: int64 option
+      /// Typed failure/readiness/context explanation, when present.
+      FailureReason: string option
+      /// Number of expected files FSAC currently holds diagnostics for.
       AnalyzedFileCount: int
       /// Error-severity (LSP code 1) diagnostics across the snapshot.
       ErrorCount: int
@@ -131,18 +192,80 @@ type internal CheckFsacSnapshot =
 module internal CheckFsacSnapshot =
 
     let empty: CheckFsacSnapshot =
-        { Ready = false
+        { Status = "unavailable"
+          Ready = false
+          ContextMatched = false
+          Complete = false
+          ExpectedFiles = [||]
+          ReceivedFiles = [||]
+          MissingFiles = [||]
+          StaleFiles = [||]
+          SessionGeneration = None
+          FailureReason = Some "No context-bound FSAC diagnostics snapshot was supplied."
           AnalyzedFileCount = 0
           ErrorCount = 0
           WarningCount = 0
           MostRecentAnalyzedAt = None
           Diagnostics = JsonArray() }
 
-    /// Projects a workspace_diagnostics response (file or workspace shape) into a
-    /// CheckFsacSnapshot. Tolerant of missing fields — anything it cannot read
-    /// degrades toward `empty`, which the fast path reads as "unknown".
+    let unavailable (expectation: CheckFsacExpectation) (reason: string) : CheckFsacSnapshot =
+        { empty with
+            ExpectedFiles = Array.copy expectation.ExpectedFiles
+            MissingFiles = Array.copy expectation.ExpectedFiles
+            FailureReason = Some reason }
+
+    /// Projects the context-bound DiagnosticsForContext envelope into a snapshot.
+    /// Tolerant of missing fields — anything it cannot read degrades toward `empty`,
+    /// which the fast path reads as "unknown".
     let ofDiagnosticsResponse (resp: JsonNode) : CheckFsacSnapshot =
         try
+            let readString (key: string) =
+                match resp[key] with
+                | :? JsonValue as v ->
+                    let mutable value = ""
+                    if v.TryGetValue(&value) && not (String.IsNullOrWhiteSpace value) then Some value else None
+                | _ -> None
+
+            let readBool (key: string) =
+                match resp[key] with
+                | :? JsonValue as v ->
+                    let mutable value = false
+                    if v.TryGetValue(&value) then Some value else None
+                | _ -> None
+
+            let readInt (key: string) =
+                match resp[key] with
+                | :? JsonValue as v ->
+                    let mutable value = 0
+                    if v.TryGetValue(&value) then Some value else None
+                | _ -> None
+
+            let readInt64 (key: string) =
+                match resp[key] with
+                | :? JsonValue as v ->
+                    let mutable value = 0L
+                    if v.TryGetValue(&value) then Some value else None
+                | _ -> None
+
+            let readStringArray (key: string) =
+                match resp[key] with
+                | :? JsonArray as arr ->
+                    arr
+                    |> Seq.choose (fun node ->
+                        match node with
+                        | :? JsonValue as value ->
+                            let mutable text = ""
+
+                            if value.TryGetValue(&text) && not (String.IsNullOrWhiteSpace text) then
+                                Some text
+                            else
+                                None
+                        | _ -> None)
+                    |> Seq.toArray
+                | _ -> [||]
+
+            let status = readString "status" |> Option.defaultValue "infrastructure_error"
+
             let ready =
                 match resp["lspState"] with
                 | :? JsonValue as v ->
@@ -151,12 +274,15 @@ module internal CheckFsacSnapshot =
                     | _ -> false
                 | _ -> false
 
-            let fileCount =
-                match resp["diagnosticsFileCount"] with
-                | :? JsonValue as v ->
-                    let mutable n = 0
-                    if v.TryGetValue(&n) then n else 0
-                | _ -> 0
+            let contextMatched = readBool "contextMatched" |> Option.defaultValue false
+            let complete = readBool "complete" |> Option.defaultValue false
+            let expectedFiles = readStringArray "expectedFiles"
+            let receivedFiles = readStringArray "receivedFiles"
+            let missingFiles = readStringArray "missingFiles"
+            let staleFiles = readStringArray "staleFiles"
+            let sessionGeneration = readInt64 "sessionGeneration"
+            let fileCount = readInt "diagnosticsFileCount" |> Option.defaultValue receivedFiles.Length
+            let failureReason = readString "message"
 
             let analyzedAt =
                 let read (key: string) =
@@ -213,7 +339,16 @@ module internal CheckFsacSnapshot =
                     | _ -> ()
             | _ -> ()
 
-            { Ready = ready
+            { Status = status
+              Ready = ready
+              ContextMatched = contextMatched
+              Complete = complete
+              ExpectedFiles = expectedFiles
+              ReceivedFiles = receivedFiles
+              MissingFiles = missingFiles
+              StaleFiles = staleFiles
+              SessionGeneration = sessionGeneration
+              FailureReason = failureReason
               AnalyzedFileCount = fileCount
               ErrorCount = errorCount
               WarningCount = warningCount
@@ -873,7 +1008,9 @@ type private ProjectOptionsInputStamp =
       Path: string
       Exists: bool
       LastWriteTimeUtcTicks: int64
-      Length: int64 }
+      Length: int64
+      ContentHash: string
+      Reliable: bool }
 
 [<NoComparison; NoEquality>]
 type private ProjectOptionsFingerprint =
@@ -884,9 +1021,609 @@ type private ProjectOptionsCacheEntry =
     { Options: FSharpProjectOptions
       Source: string
       Fingerprint: ProjectOptionsFingerprint option
-      ScriptSourceHash: string option }
+      ScriptSourceHash: string option
+      EvaluatedSnapshot: EvaluatedProjectSnapshot option }
 
-type internal FcsBridge() =
+/// Builds the content identity shared by every project-analysis cache.
+///
+/// The aggregate is length-framed rather than delimiter-joined: source paths and
+/// compiler options may legally contain punctuation such as `|`, so concatenating
+/// them admits collisions. Source order is deliberately preserved because it is
+/// compile order in F#. File metadata remains part of the identity to retain the
+/// existing rebuild signal, but source and reference contents are hashed as well;
+/// an editor can replace bytes while restoring the original mtime and length.
+module internal AnalysisSnapshotKey =
+
+    [<NoComparison; NoEquality>]
+    type private FileSnapshot =
+        { State: string
+          LastWriteTimeUtcTicks: int64
+          Length: int64
+          ContentHash: string }
+
+    let private pathComparer =
+        if OperatingSystem.IsWindows() then
+            StringComparer.OrdinalIgnoreCase
+        else
+            StringComparer.Ordinal
+
+    let private normalizeFrom (baseDirectory: string) (path: string) =
+        let normalized =
+            try
+                if String.IsNullOrWhiteSpace(path) then
+                    ""
+                else
+                    let candidate = path.Trim().Trim('"')
+
+                    if Path.IsPathFullyQualified(candidate) then
+                        normalizePath candidate
+                    elif String.IsNullOrWhiteSpace(baseDirectory) then
+                        normalizePath candidate
+                    else
+                        normalizePath (Path.Combine(baseDirectory, candidate))
+            with _ ->
+                if isNull path then "" else path
+
+        // Windows paths are case-insensitive but GetFullPath preserves caller casing.
+        // Canonicalize it in the serialized identity as well as in dictionary lookup,
+        // otherwise the same input path can spuriously produce two snapshot keys.
+        if OperatingSystem.IsWindows() then
+            normalized.ToUpperInvariant()
+        else
+            normalized
+
+    let private tryReferencePath baseDirectory (optionText: string) =
+        if optionText.StartsWith("-r:", StringComparison.Ordinal) then
+            Some(normalizeFrom baseDirectory (optionText.Substring 3))
+        elif optionText.StartsWith("--reference:", StringComparison.Ordinal) then
+            Some(normalizeFrom baseDirectory (optionText.Substring 12))
+        else
+            None
+
+    let private captureFile (path: string) =
+        let unavailable state =
+            { State = state
+              LastWriteTimeUtcTicks = -1L
+              Length = -1L
+              ContentHash = "" }
+
+        let rec capture attemptsRemaining =
+            try
+                let before = FileInfo(path)
+                before.Refresh()
+
+                if not before.Exists then
+                    unavailable "missing"
+                else
+                    let beforeTicks = before.LastWriteTimeUtc.Ticks
+                    let beforeLength = before.Length
+
+                    use stream =
+                        new FileStream(
+                            path,
+                            FileMode.Open,
+                            FileAccess.Read,
+                            FileShare.ReadWrite ||| FileShare.Delete
+                        )
+
+                    use sha = System.Security.Cryptography.SHA256.Create()
+                    let contentHash = sha.ComputeHash(stream) |> Convert.ToHexString
+                    let after = FileInfo(path)
+                    after.Refresh()
+
+                    if
+                        attemptsRemaining > 0
+                        && (after.LastWriteTimeUtc.Ticks <> beforeTicks || after.Length <> beforeLength)
+                    then
+                        capture (attemptsRemaining - 1)
+                    else
+                        { State =
+                            if after.LastWriteTimeUtc.Ticks = beforeTicks && after.Length = beforeLength then
+                                "present"
+                            else
+                                "changed-during-read"
+                          LastWriteTimeUtcTicks = after.LastWriteTimeUtc.Ticks
+                          Length = after.Length
+                          ContentHash = contentHash }
+            with _ ->
+                unavailable "unreadable"
+
+        capture 1
+
+    let create (projectOptions: FSharpProjectOptions) =
+        use aggregate =
+            System.Security.Cryptography.IncrementalHash.CreateHash(
+                System.Security.Cryptography.HashAlgorithmName.SHA256
+            )
+
+        let append (value: string) =
+            let bytes = System.Text.Encoding.UTF8.GetBytes(if isNull value then "" else value)
+
+            let header =
+                System.Text.Encoding.ASCII.GetBytes(
+                    bytes.Length.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":"
+                )
+
+            aggregate.AppendData(header)
+            aggregate.AppendData(bytes)
+
+        let appendInt (value: int) =
+            append (value.ToString(System.Globalization.CultureInfo.InvariantCulture))
+
+        let appendInt64 (value: int64) =
+            append (value.ToString(System.Globalization.CultureInfo.InvariantCulture))
+
+        let fileSnapshots = System.Collections.Generic.Dictionary<string, FileSnapshot>(pathComparer)
+
+        let appendFile role index path =
+            let normalized = normalizeFrom "" path
+
+            let snapshot =
+                match fileSnapshots.TryGetValue(normalized) with
+                | true, existing -> existing
+                | false, _ ->
+                    let captured = captureFile normalized
+                    fileSnapshots[normalized] <- captured
+                    captured
+
+            append role
+            appendInt index
+            append normalized
+            append snapshot.State
+            appendInt64 snapshot.LastWriteTimeUtcTicks
+            appendInt64 snapshot.Length
+            append snapshot.ContentHash
+
+        let visitedProjects = System.Collections.Generic.HashSet<string>(pathComparer)
+
+        let rec appendProject relation parentDirectory (options: FSharpProjectOptions) =
+            let projectPath = normalizeFrom parentDirectory options.ProjectFileName
+            let projectDirectory = Path.GetDirectoryName(projectPath)
+
+            append "project"
+            append relation
+            append projectPath
+            append (options.ProjectId |> Option.defaultValue "")
+            append (if options.UseScriptResolutionRules then "script" else "project")
+            append (if options.IsIncompleteTypeCheckEnvironment then "incomplete" else "complete")
+
+            append "compiler-options"
+            appendInt options.OtherOptions.Length
+
+            for index, optionText in options.OtherOptions |> Array.indexed do
+                appendInt index
+                append optionText
+
+                match tryReferencePath projectDirectory optionText with
+                | Some referencePath -> appendFile "assembly-reference" index referencePath
+                | None -> ()
+
+            append "ordered-sources"
+            appendInt options.SourceFiles.Length
+
+            for index, sourcePath in options.SourceFiles |> Array.indexed do
+                appendFile "source" index (normalizeFrom projectDirectory sourcePath)
+
+            append "referenced-projects"
+            appendInt options.ReferencedProjects.Length
+
+            for index, referencedProject in options.ReferencedProjects |> Array.indexed do
+                appendInt index
+
+                match referencedProject with
+                | FSharpReferencedProject.FSharpReference(outputFile, referencedOptions) ->
+                    let referencedProjectPath =
+                        normalizeFrom projectDirectory referencedOptions.ProjectFileName
+
+                    append "fsharp-project-reference"
+                    appendFile "project-output" index (normalizeFrom projectDirectory outputFile)
+                    append referencedProjectPath
+
+                    if visitedProjects.Add(referencedProjectPath) then
+                        appendProject "referenced" projectDirectory referencedOptions
+                    else
+                        append "already-visited"
+                | _ ->
+                    // PE/IL references have no source options. Their evaluated -r:
+                    // inputs and file contents are already included above.
+                    append "binary-project-reference"
+
+        append "fslangmcp-analysis-snapshot-v1"
+        visitedProjects.Add(normalizeFrom "" projectOptions.ProjectFileName) |> ignore
+        appendProject "root" "" projectOptions
+        aggregate.GetHashAndReset() |> Convert.ToHexString
+
+/// Adapts Ionide.ProjInfo's evaluated MSBuild result to the small, stable model
+/// shared by project_health and fsharp_project_inspect.
+module private EvaluatedProjectModel =
+
+    let private nonBlank (value: string) =
+        if String.IsNullOrWhiteSpace value then None else Some value
+
+    let private normalizeFrom (baseDirectory: string) (path: string) =
+        try
+            if Path.IsPathFullyQualified path then
+                Path.GetFullPath path
+            else
+                Path.GetFullPath(Path.Combine(baseDirectory, path))
+        with _ ->
+            path
+
+    let private splitProjectList (values: string list) =
+        values
+        |> List.collect (fun value ->
+            value.Split(';', StringSplitOptions.RemoveEmptyEntries ||| StringSplitOptions.TrimEntries)
+            |> Array.toList)
+
+    let private tryMapValueIgnoreCase name (values: Map<string, string>) =
+        values
+        |> Map.toSeq
+        |> Seq.tryPick (fun (key, value) ->
+            if String.Equals(key, name, StringComparison.OrdinalIgnoreCase) then
+                nonBlank value
+            else
+                None)
+
+    let private evaluatedProperties (project: Ionide.ProjInfo.Types.ProjectOptions) =
+        let fromAllProperties =
+            project.AllProperties
+            |> Map.toList
+            |> List.choose (fun (name, values) ->
+                values
+                |> Set.toList
+                |> List.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right))
+                |> List.tryLast
+                |> Option.bind nonBlank
+                |> Option.map (fun value -> name, value))
+            |> Map.ofList
+
+        project.Properties
+        |> List.fold (fun properties property -> Map.add property.Name property.Value properties) fromAllProperties
+
+    let private tryProperty (names: string list) (properties: Map<string, string>) =
+        names |> List.tryPick (fun name -> tryMapValueIgnoreCase name properties)
+
+    let private inferSdk (importedProjects: string list) =
+        importedProjects
+        |> List.tryPick (fun path ->
+            let segments =
+                path.Split(
+                    [| Path.DirectorySeparatorChar; Path.AltDirectorySeparatorChar |],
+                    StringSplitOptions.RemoveEmptyEntries
+                )
+
+            segments
+            |> Array.tryFindIndex (fun segment -> String.Equals(segment, "Sdks", StringComparison.OrdinalIgnoreCase))
+            |> Option.bind (fun index ->
+                if index + 1 < segments.Length then nonBlank segments[index + 1] else None))
+
+    let private outputType (project: Ionide.ProjInfo.Types.ProjectOptions) =
+        match project.ProjectOutputType with
+        | Ionide.ProjInfo.Types.ProjectOutputType.Library -> Some "Library"
+        | Ionide.ProjInfo.Types.ProjectOutputType.Exe -> Some "Exe"
+        | Ionide.ProjInfo.Types.ProjectOutputType.Custom value -> nonBlank value
+
+    let private compileFiles (project: Ionide.ProjInfo.Types.ProjectOptions) =
+        let projectDirectory = Path.GetDirectoryName(Path.GetFullPath project.ProjectFileName)
+
+        let pathComparer =
+            if OperatingSystem.IsWindows() then
+                StringComparer.OrdinalIgnoreCase
+            else
+                StringComparer.Ordinal
+
+        let compileItems =
+            project.Items
+            |> List.map (function
+                | Ionide.ProjInfo.Types.ProjectItem.Compile(name, fullPath, metadata) ->
+                    let normalized = normalizeFrom projectDirectory fullPath
+
+                    let link =
+                        metadata
+                        |> Option.bind (tryMapValueIgnoreCase "Link")
+
+                    normalized, name, link)
+
+        let allEvaluatedCompileItems =
+            project.AllItems
+            |> Map.toSeq
+            |> Seq.tryPick (fun (itemType, items) ->
+                if String.Equals(itemType, "Compile", StringComparison.OrdinalIgnoreCase) then
+                    Some(Set.toList items)
+                else
+                    None)
+            |> Option.defaultValue []
+            |> List.map (fun (includePath, metadata) ->
+                let fullPath =
+                    tryMapValueIgnoreCase "FullPath" metadata
+                    |> Option.defaultValue includePath
+                    |> normalizeFrom projectDirectory
+
+                fullPath, includePath, tryMapValueIgnoreCase "Link" metadata)
+
+        let metadataByPath =
+            System.Collections.Generic.Dictionary<string, string * string option>(pathComparer)
+
+        for path, includePath, link in allEvaluatedCompileItems @ compileItems do
+            metadataByPath[path] <- includePath, link
+
+        let orderedItems = ResizeArray<string * string * string option>()
+        let seenPaths = System.Collections.Generic.HashSet<string>(pathComparer)
+
+        let add path includePath link =
+            if seenPaths.Add(path) then
+                orderedItems.Add(path, includePath, link)
+
+        // ProjectItem.Compile is the evaluated MSBuild item order and carries Link
+        // metadata. FCS SourceFiles is retained as a fallback/completeness check;
+        // AllItems covers imported/default items omitted by older ProjInfo shapes.
+        for path, includePath, link in compileItems do
+            add path includePath link
+
+        for sourceFile in project.SourceFiles do
+            let path = normalizeFrom projectDirectory sourceFile
+
+            match metadataByPath.TryGetValue(path) with
+            | true, (includePath, link) -> add path includePath link
+            | false, _ -> add path (Path.GetRelativePath(projectDirectory, path)) None
+
+        for path, includePath, link in allEvaluatedCompileItems do
+            add path includePath link
+
+        orderedItems
+        |> projectFilesFromEvaluatedItems
+
+    let private packageReferences (project: Ionide.ProjInfo.Types.ProjectOptions) =
+        let explicitByName =
+            project.PackageReferences
+            |> List.map (fun reference -> reference.Name, reference)
+            |> Map.ofList
+
+        let evaluatedItems =
+            project.AllItems
+            |> Map.toSeq
+            |> Seq.tryPick (fun (itemType, items) ->
+                if String.Equals(itemType, "PackageReference", StringComparison.OrdinalIgnoreCase) then
+                    Some(Set.toList items)
+                else
+                    None)
+            |> Option.defaultValue []
+
+        let fromEvaluatedItem (packageId, metadata) =
+            let explicit = Map.tryFind packageId explicitByName
+
+            let version =
+                tryMapValueIgnoreCase "Version" metadata
+                |> Option.orElseWith (fun () -> tryMapValueIgnoreCase "VersionOverride" metadata)
+                |> Option.orElseWith (fun () -> explicit |> Option.bind (fun reference -> nonBlank reference.Version))
+
+            let fullPath =
+                tryMapValueIgnoreCase "FullPath" metadata
+                |> Option.orElseWith (fun () -> explicit |> Option.bind (fun reference -> nonBlank reference.FullPath))
+
+            { PackageId = packageId
+              Version = version
+              FullPath = fullPath
+              IncludeAssets = tryMapValueIgnoreCase "IncludeAssets" metadata
+              PrivateAssets = tryMapValueIgnoreCase "PrivateAssets" metadata }
+
+        let evaluated = evaluatedItems |> List.map fromEvaluatedItem
+        let evaluatedNames = evaluated |> List.map _.PackageId |> Set.ofList
+
+        let unresolvedSpecific =
+            project.PackageReferences
+            |> List.filter (fun reference -> not (evaluatedNames.Contains reference.Name))
+            |> List.map (fun reference ->
+                { PackageId = reference.Name
+                  Version = nonBlank reference.Version
+                  FullPath = nonBlank reference.FullPath
+                  IncludeAssets = None
+                  PrivateAssets = None })
+
+        evaluated @ unresolvedSpecific
+        |> List.distinctBy (fun reference -> reference.PackageId.ToUpperInvariant())
+
+    let create
+        (evaluationSource: string)
+        (project: Ionide.ProjInfo.Types.ProjectOptions)
+        (fcsOptions: FSharpProjectOptions)
+        =
+        let projectPath = Path.GetFullPath project.ProjectFileName
+        let projectDirectory = Path.GetDirectoryName projectPath
+        let properties = evaluatedProperties project
+
+        let importedProjects =
+            [ yield! project.ProjectSdkInfo.MSBuildAllProjects
+
+              match tryProperty [ "MSBuildAllProjects" ] properties with
+              | Some allProjects -> yield allProjects
+              | None -> ()
+
+              for propertyName in
+                  [ "DirectoryBuildPropsPath"
+                    "DirectoryBuildTargetsPath"
+                    "DirectoryPackagesPropsPath" ] do
+                  match tryProperty [ propertyName ] properties with
+                  | Some importPath -> yield importPath
+                  | None -> () ]
+            |> splitProjectList
+            |> List.map (normalizeFrom projectDirectory)
+            |> List.filter (fun path -> not (String.Equals(path, projectPath, StringComparison.OrdinalIgnoreCase)))
+            |> List.distinct
+
+        let targetFrameworks =
+            match project.ProjectSdkInfo.TargetFrameworks |> List.filter (String.IsNullOrWhiteSpace >> not) with
+            | [] -> project.TargetFramework |> nonBlank |> Option.toList
+            | frameworks -> frameworks
+
+        let projectReferences =
+            project.ReferencedProjects
+            |> List.map (fun reference ->
+                { IncludePath = reference.RelativePath
+                  ProjectPath = normalizeFrom projectDirectory reference.ProjectFileName
+                  TargetFramework = nonBlank reference.TargetFramework })
+
+        let existingReferences, totalReferences = ReferenceResolution.probe fcsOptions.OtherOptions
+
+        { ProjectPath = projectPath
+          ProjectDirectory = projectDirectory
+          ProjectName = Path.GetFileNameWithoutExtension projectPath
+          EvaluationSource = evaluationSource
+          Sdk =
+            tryProperty [ "MSBuildProjectSdk"; "ProjectSdk"; "Sdk" ] properties
+            |> Option.orElseWith (fun () -> inferSdk importedProjects)
+          TargetFramework = nonBlank project.TargetFramework
+          TargetFrameworks = targetFrameworks
+          OutputType = outputType project
+          AssemblyName =
+            tryProperty [ "AssemblyName" ] properties
+            |> Option.defaultValue (Path.GetFileNameWithoutExtension projectPath)
+          Configuration = nonBlank project.ProjectSdkInfo.Configuration
+          IsTestProject = project.ProjectSdkInfo.IsTestProject
+          RestoreSucceeded = project.ProjectSdkInfo.RestoreSuccess
+          TargetPath = nonBlank project.TargetPath
+          Properties = properties
+          Files = compileFiles project
+          PackageReferences = packageReferences project
+          ProjectReferences = projectReferences
+          ImportedProjects = importedProjects
+          OtherOptions = Array.copy fcsOptions.OtherOptions
+          ReferencesExisting = existingReferences
+          ReferencesTotal = totalReferences }
+
+type internal ProjectEvaluationBusyException(projectPath: string) =
+    inherit
+        InvalidOperationException(
+            $"project evaluation busy: another Ionide/MSBuild evaluation is active; retry '{projectPath}' after it completes."
+        )
+
+    member _.ProjectPath = projectPath
+
+/// Admission control for Ionide/MSBuild evaluation. This deliberately has no
+/// cross-key wait queue: same-key sharing happens in optionsInFlight, while a
+/// distinct key is rejected promptly instead of accumulating an unbounded set
+/// of non-cancellable waiters behind a hung MSBuild load.
+type internal ProjectEvaluationAdmission(capacity: int) =
+    do
+        if capacity < 1 then
+            invalidArg (nameof capacity) "Project evaluation capacity must be at least one."
+
+    let slots = new SemaphoreSlim(capacity, capacity)
+    let mutable activeCount = 0
+    let mutable startedCount = 0L
+    let mutable rejectedCount = 0L
+    let mutable maxObservedConcurrency = 0
+
+    let updateMaximum candidate =
+        let mutable observed = Volatile.Read(&maxObservedConcurrency)
+
+        while candidate > observed do
+            let prior = Interlocked.CompareExchange(&maxObservedConcurrency, candidate, observed)
+
+            if prior = observed then
+                observed <- candidate
+            else
+                observed <- prior
+
+    member _.TryRun(projectPath: string, work: unit -> Task<'T>) : Task<'T> =
+        if not (slots.Wait(0)) then
+            Interlocked.Increment(&rejectedCount) |> ignore
+            Task.FromException<'T>(ProjectEvaluationBusyException(projectPath))
+        else
+            let active = Interlocked.Increment(&activeCount)
+            Interlocked.Increment(&startedCount) |> ignore
+            updateMaximum active
+
+            task {
+                try
+                    return! work ()
+                finally
+                    Interlocked.Decrement(&activeCount) |> ignore
+                    slots.Release() |> ignore
+            }
+
+    member _.ActiveCount = Volatile.Read(&activeCount)
+    member _.StartedCount = Volatile.Read(&startedCount)
+    member _.RejectedCount = Volatile.Read(&rejectedCount)
+    member _.MaxObservedConcurrency = Volatile.Read(&maxObservedConcurrency)
+
+type internal BoundedCheckWorkBusyException(operation: string, target: string) =
+    inherit
+        InvalidOperationException(
+            $"{operation} busy: all admitted workers are still active; retry '{target}' after one completes."
+        )
+
+    member _.Operation = operation
+    member _.Target = target
+
+/// No-queue admission for Check work that cannot be cancelled once it has started.
+/// Exact-key callers share a Lazy task outside this type; a distinct key is rejected
+/// immediately rather than becoming an abandoned waiter after its caller times out.
+type internal BoundedCheckWorkAdmission(operation: string, capacity: int) =
+    do
+        if capacity < 1 then
+            invalidArg (nameof capacity) "Check work capacity must be at least one."
+
+    let slots = new SemaphoreSlim(capacity, capacity)
+    let mutable activeCount = 0
+    let mutable startedCount = 0L
+    let mutable rejectedCount = 0L
+    let mutable maxObservedConcurrency = 0
+
+    let updateMaximum candidate =
+        let mutable observed = Volatile.Read(&maxObservedConcurrency)
+
+        while candidate > observed do
+            let prior = Interlocked.CompareExchange(&maxObservedConcurrency, candidate, observed)
+
+            if prior = observed then
+                observed <- candidate
+            else
+                observed <- prior
+
+    member _.TryRun(target: string, work: unit -> Task<'T>) : Task<'T> =
+        if not (slots.Wait(0)) then
+            Interlocked.Increment(&rejectedCount) |> ignore
+            Task.FromException<'T>(BoundedCheckWorkBusyException(operation, target))
+        else
+            let active = Interlocked.Increment(&activeCount)
+            Interlocked.Increment(&startedCount) |> ignore
+            updateMaximum active
+
+            task {
+                try
+                    return! work ()
+                finally
+                    Interlocked.Decrement(&activeCount) |> ignore
+                    slots.Release() |> ignore
+            }
+
+    member _.ActiveCount = Volatile.Read(&activeCount)
+    member _.StartedCount = Volatile.Read(&startedCount)
+    member _.RejectedCount = Volatile.Read(&rejectedCount)
+    member _.MaxObservedConcurrency = Volatile.Read(&maxObservedConcurrency)
+
+[<RequireQualifiedAccess>]
+type private CheckTargetDiscoveryResult =
+    | Scope of string
+    | Project of string option
+    | Projects of string array
+    | Busy of string
+
+type internal FcsBridge
+    (
+        ?projectEvaluationBeforeLoadOverride: (string -> Task),
+        ?analysisSnapshotKeyBeforeComputeOverride: (unit -> unit),
+        ?checkTargetDiscoveryBeforeComputeOverride: (unit -> unit),
+        ?checkProjectDiscoveryBeforeFallbackOverride: (unit -> unit),
+        ?freshProjectCheckWorkerOverride: (FSharpProjectOptions -> Task<FSharpDiagnostic array>),
+        ?freshProjectCheckConcurrencyOverride: int,
+        ?freshProjectCheckBeforeAdmissionOverride: (unit -> Task),
+        ?freshProjectCheckBeforeFcsStartOverride: (unit -> Task),
+        ?checkFastSnapshotDeadlineExpiredOverride: (unit -> bool),
+        ?referenceResolutionProbeOverride: (string array -> int * int),
+        ?projectOptionsCacheValidationBeforeComputeOverride: (string -> unit)
+    ) =
     // FCS default projectCacheSize is 3. The `find` multi-project union sweep
     // (issue #128) re-checks EVERY member project of the active solution on each
     // call; with a cache of 3 a >3-project solution thrashes FCS's project cache
@@ -916,23 +1653,79 @@ type internal FcsBridge() =
     let optionsCache = BoundedCache<string, ProjectOptionsCacheEntry>(50)
     let projectResultsCache = BoundedCache<string, FSharpCheckProjectResults>(3)
 
+    // FCS also owns an incremental project cache beneath our bounded caches. A new
+    // content snapshot must invalidate that layer before a fresh ParseAndCheckProject;
+    // otherwise a same-mtime edit can miss our cache correctly and still receive FCS's
+    // old result. Remember only the most recently observed key per logical project.
+    let analysisSnapshotGate = obj ()
+    let mutable analysisSnapshotComputeCount = 0L
+    let mutable analysisSnapshotCommitCount = 0L
+
+    let lastAnalysisSnapshotByProject =
+        System.Collections.Generic.Dictionary<string, string>(StringComparer.Ordinal)
+
     let optionsInFlight =
         ConcurrentDictionary<string, Lazy<Task<ProjectOptionsCacheEntry>>>()
 
+    // Project-cache validation performs recursive hashing and Ionide/MSBuild loads
+    // race on process-global SDK state. Keep the entire exact-fsproj resolve behind
+    // one admitted worker, with no distinct-key queue; exact-key callers share it.
+    let projectEvaluationAdmission = ProjectEvaluationAdmission(1)
+
     let mutable projectOptionsLoadCount = 0L
+    let mutable projectOptionsCacheValidationCount = 0L
+    let mutable projectTypeCheckStartCount = 0L
+    let mutable freshProjectCheckInvalidationCount = 0L
+    let mutable checkProjectDiscoveryFallbackCount = 0L
+
+    let freshProjectCheckCapacity =
+        match freshProjectCheckConcurrencyOverride with
+        | Some capacity -> max 1 capacity
+        | None ->
+            match Int32.TryParse(Environment.GetEnvironmentVariable("FSLANGMCP_MAX_CONCURRENT_FCS")) with
+            | true, capacity when capacity > 0 -> capacity
+            | _ -> 2
+
+    // Check has a hard caller deadline, but FCS project checking, source-closure
+    // hashing, and directory discovery are not reliably cancellable. Each category
+    // therefore owns an actual-worker admission slot plus exact-key single-flight.
+    // Caller WaitAsync timeouts never release these slots; only real completion does.
+    let freshProjectCheckAdmission =
+        BoundedCheckWorkAdmission("project type-check", freshProjectCheckCapacity)
+
+    let freshProjectChecksInFlight =
+        ConcurrentDictionary<string, Lazy<Task<FSharpDiagnostic array * string * string>>>()
+
+    let snapshotComputationAdmission =
+        BoundedCheckWorkAdmission("project snapshot computation", 1)
+
+    let snapshotComputationsInFlight = ConcurrentDictionary<string, Lazy<Task<string>>>()
+
+    let checkTargetDiscoveryAdmission =
+        BoundedCheckWorkAdmission("check target discovery", 1)
+
+    let checkTargetDiscoveriesInFlight =
+        ConcurrentDictionary<string, Lazy<Task<CheckTargetDiscoveryResult>>>()
+
+    let referenceResolutionProbeAdmission =
+        BoundedCheckWorkAdmission("reference resolution probe", 1)
+
+    let referenceResolutionProbesInFlight =
+        ConcurrentDictionary<string, Lazy<Task<Result<int * int, string>>>>()
+
+    let mutable freshProjectCheckGeneration = 0L
 
     // find sweep (issue #131): memoize each project's whole-symbol-use enumeration +
     // diagnostics. FCS's project cache keeps ParseAndCheckProject warm, but
     // GetAllUsesOfAllSymbols() is NOT memoized — it re-walks every recorded symbol use
     // (~16-18k/project) on EVERY call, so a warm `find` re-paid ~3s/project. The cache
-    // key is (resolved-options key + own source-file stamp + referenced-assembly stamp +
-    // referenced-project source stamp): any own-source edit moves a file's mtime → MISS;
-    // a dependency REBUILD moves the -r: DLL mtime → consumer MISS (0.10.1 Codex P1); a
-    // dependency SOURCE EDIT without a rebuild doesn't move the DLL but DOES change the
-    // referenced F# project's source file mtimes → consumer MISS via the new
-    // referencedProjectSourcesStamp (0.10.1 Codex P2). Every MISS runs the original
-    // ParseAndCheckProject + GetAllUsesOfAllSymbols path — a cached `find` is never staler
-    // than an uncached one (correctness first, speed is the unchanged-project fast path).
+    // key is the same content-addressed AnalysisSnapshotKey used by projectResultsCache:
+    // evaluated options, ordered normalized source paths + bytes, referenced assemblies,
+    // and transitive referenced-project sources. It detects same-mtime/same-length edits
+    // and compile-order/path changes that the former hand-built mtime vectors conflated.
+    // Every MISS invalidates FCS's project configuration before the original
+    // ParseAndCheckProject + GetAllUsesOfAllSymbols path, so FCS cannot serve a stale
+    // same-mtime incremental result underneath a correctly missed application cache.
     // Cleared by ClearAnalysisCaches() (so set_project invalidates it). Sized to the same
     // solution scale as optionsCache so a whole solution stays warm between sweeps.
     let projectUsesCache =
@@ -957,6 +1750,112 @@ type internal FcsBridge() =
             TaskScheduler.Default
         )
         |> ignore
+
+    let normalizedCheckWorkPath (path: string) =
+        let normalized =
+            try
+                normalizePath path
+            with _ ->
+                path
+
+        if OperatingSystem.IsWindows() then
+            normalized.ToUpperInvariant()
+        else
+            normalized
+
+    let checkDiscoveryKey scope target path =
+        let pathPart =
+            path
+            |> Option.filter (String.IsNullOrWhiteSpace >> not)
+            |> Option.map normalizedCheckWorkPath
+            |> Option.defaultValue ""
+
+        let frame (value: string) = $"{value.Length}:{value}"
+
+        // `|` is a legal POSIX filename character. Delimiter concatenation made
+        // (target="/a", path="/b|/c") alias (target="/a|/b", path="/c"), causing
+        // unrelated callers to share the same Lazy discovery task. Length framing
+        // makes each component boundary unambiguous without restricting valid paths.
+        String.Concat(frame scope, frame (normalizedCheckWorkPath target), frame pathPart)
+
+    let runCheckTargetDiscovery
+        (key: string)
+        (remainingBudget: (unit -> TimeSpan) option)
+        (work: unit -> CheckTargetDiscoveryResult)
+        : Task<CheckTargetDiscoveryResult> =
+        let ensureBudget () =
+            match remainingBudget with
+            | Some getRemaining when getRemaining () <= TimeSpan.Zero -> raise (TimeoutException())
+            | _ -> ()
+
+        let pending =
+            checkTargetDiscoveriesInFlight.GetOrAdd(
+                key,
+                fun _ ->
+                    Lazy<Task<CheckTargetDiscoveryResult>>(
+                        (fun () ->
+                            task {
+                                try
+                                    try
+                                        return!
+                                            checkTargetDiscoveryAdmission.TryRun(
+                                                key,
+                                                fun () ->
+                                                    Task.Run(fun () ->
+                                                        // Admission can happen after the
+                                                        // caller's WaitAsync has already
+                                                        // expired. Do not begin a late scan.
+                                                        ensureBudget ()
+
+                                                        checkTargetDiscoveryBeforeComputeOverride
+                                                        |> Option.iter (fun hook -> hook ())
+
+                                                        // Test hooks model a scan blocked
+                                                        // before its first filesystem read.
+                                                        ensureBudget ()
+                                                        work ())
+                                            )
+                                    with :? BoundedCheckWorkBusyException as ex ->
+                                        return CheckTargetDiscoveryResult.Busy ex.Message
+                                finally
+                                    checkTargetDiscoveriesInFlight.TryRemove(key) |> ignore
+                            }),
+                        LazyThreadSafetyMode.ExecutionAndPublication
+                    )
+            )
+
+        let operation = pending.Value
+        observeFault operation
+        operation
+
+    let resolveSingleCheckProject
+        (target: string)
+        (sourcePath: string option)
+        (remainingBudget: (unit -> TimeSpan) option)
+        =
+        if target.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
+            Some target
+        else
+            let nearest =
+                sourcePath
+                |> Option.bind findNearestFsproj
+                |> Option.map normalizePath
+
+            match nearest with
+            | Some fsproj -> Some fsproj
+            | None ->
+                let ensureBudget () =
+                    match remainingBudget with
+                    | Some getRemaining when getRemaining () <= TimeSpan.Zero -> raise (TimeoutException())
+                    | _ -> ()
+
+                // findNearestFsproj can consume the caller's remaining budget. Never
+                // begin the fallback recursive project scan without checking again.
+                ensureBudget ()
+                checkProjectDiscoveryBeforeFallbackOverride |> Option.iter (fun hook -> hook ())
+                ensureBudget ()
+                Interlocked.Increment(&checkProjectDiscoveryFallbackCount) |> ignore
+                SolutionParsing.listProjects target |> Array.tryHead
 
     let jstrOrNull (value: string) : JsonNode =
         if String.IsNullOrWhiteSpace(value) then
@@ -1643,18 +2542,185 @@ type internal FcsBridge() =
 
         $"%s{pp}::%s{po}"
 
-    let makeResolvedProjectCacheKey (projectOptions: FSharpProjectOptions) =
-        let optionsHash = String.concat "|" projectOptions.OtherOptions
-        $"%s{projectOptions.ProjectFileName}::%s{optionsHash}"
+    let computeAnalysisSnapshotKey (projectOptions: FSharpProjectOptions) =
+        let key = AnalysisSnapshotKey.create projectOptions
+        Interlocked.Increment(&analysisSnapshotComputeCount) |> ignore
+        key
+
+    let analysisProjectIdentity (projectOptions: FSharpProjectOptions) =
+        match projectOptions.ProjectId with
+        | Some projectId -> $"id:%s{projectId}"
+        | None -> $"path:%s{normalizedCheckWorkPath projectOptions.ProjectFileName}"
+
+    // Cheap, in-memory identity for sharing the expensive content snapshot walk.
+    // The final AnalysisSnapshotKey still hashes every source/reference byte; this
+    // structural prefix only decides which concurrent callers may share that walk.
+    let snapshotComputationKey (projectOptions: FSharpProjectOptions) =
+        use aggregate =
+            System.Security.Cryptography.IncrementalHash.CreateHash(
+                System.Security.Cryptography.HashAlgorithmName.SHA256
+            )
+
+        let append (value: string) =
+            let bytes = System.Text.Encoding.UTF8.GetBytes(if isNull value then "" else value)
+            aggregate.AppendData(bytes)
+            aggregate.AppendData([| 0uy |])
+
+        append (analysisProjectIdentity projectOptions)
+
+        for sourceFile in projectOptions.SourceFiles do
+            append sourceFile
+
+        for compilerOption in projectOptions.OtherOptions do
+            append compilerOption
+
+        $"{analysisProjectIdentity projectOptions}|{Convert.ToHexString(aggregate.GetHashAndReset())}"
+
+    let referenceResolutionProbeKey (projectOptions: FSharpProjectOptions) =
+        use aggregate =
+            System.Security.Cryptography.IncrementalHash.CreateHash(
+                System.Security.Cryptography.HashAlgorithmName.SHA256
+            )
+
+        for compilerOption in projectOptions.OtherOptions do
+            let bytes =
+                System.Text.Encoding.UTF8.GetBytes(if isNull compilerOption then "" else compilerOption)
+
+            aggregate.AppendData(bytes)
+            aggregate.AppendData([| 0uy |])
+
+        $"{analysisProjectIdentity projectOptions}|{Convert.ToHexString(aggregate.GetHashAndReset())}"
+
+    let runReferenceResolutionProbe
+        (workKey: string)
+        (otherOptions: string array)
+        (remainingBudget: (unit -> TimeSpan) option)
+        : Task<Result<int * int, string>> =
+        let pending =
+            referenceResolutionProbesInFlight.GetOrAdd(
+                workKey,
+                fun _ ->
+                    Lazy<Task<Result<int * int, string>>>(
+                        (fun () ->
+                            task {
+                                try
+                                    try
+                                        let! result =
+                                            referenceResolutionProbeAdmission.TryRun(
+                                                workKey,
+                                                fun () ->
+                                                    Task.Run(fun () ->
+                                                        match remainingBudget with
+                                                        | Some getRemaining when getRemaining () <= TimeSpan.Zero ->
+                                                            raise (TimeoutException())
+                                                        | _ -> ()
+
+                                                        match referenceResolutionProbeOverride with
+                                                        | Some probe -> probe otherOptions
+                                                        | None -> ReferenceResolution.probe otherOptions)
+                                            )
+
+                                        return Ok result
+                                    with
+                                    | :? BoundedCheckWorkBusyException as ex -> return Error ex.Message
+                                    | :? TimeoutException -> return Error "timeout"
+                                    | ex -> return Error ex.Message
+                                finally
+                                    referenceResolutionProbesInFlight.TryRemove(workKey) |> ignore
+                            }),
+                        LazyThreadSafetyMode.ExecutionAndPublication
+                    )
+            )
+
+        let operation = pending.Value
+        observeFault operation
+        operation
+
+    let resolveAnalysisSnapshotKey
+        (projectOptions: FSharpProjectOptions)
+        (remainingBudget: (unit -> TimeSpan) option)
+        : Task<string> =
+        let workKey = snapshotComputationKey projectOptions
+
+        let ensureBudget () =
+            match remainingBudget with
+            | Some getRemaining when getRemaining () <= TimeSpan.Zero -> raise (TimeoutException())
+            | _ -> ()
+
+        let pending =
+            snapshotComputationsInFlight.GetOrAdd(
+                workKey,
+                fun _ ->
+                    Lazy<Task<string>>(
+                        (fun () ->
+                            task {
+                                try
+                                    return!
+                                        snapshotComputationAdmission.TryRun(
+                                            workKey,
+                                            fun () ->
+                                                Task.Run(fun () ->
+                                                    ensureBudget ()
+
+                                                    analysisSnapshotKeyBeforeComputeOverride
+                                                    |> Option.iter (fun hook -> hook ())
+
+                                                    ensureBudget ()
+                                                    computeAnalysisSnapshotKey projectOptions)
+                                        )
+                                finally
+                                    snapshotComputationsInFlight.TryRemove(workKey) |> ignore
+                            }),
+                        LazyThreadSafetyMode.ExecutionAndPublication
+                    )
+            )
+
+        let operation = pending.Value
+        observeFault operation
+        operation
+
+    let commitAnalysisSnapshotKey (projectOptions: FSharpProjectOptions) (key: string) =
+        let projectIdentity = analysisProjectIdentity projectOptions
+
+        Interlocked.Increment(&analysisSnapshotCommitCount) |> ignore
+
+        lock analysisSnapshotGate (fun () ->
+            let invalidate =
+                match lastAnalysisSnapshotByProject.TryGetValue(projectIdentity) with
+                | true, previous when previous <> key ->
+                    lastAnalysisSnapshotByProject[projectIdentity] <- key
+                    true
+                | true, _ -> false
+                | false, _ ->
+                    lastAnalysisSnapshotByProject.Add(projectIdentity, key)
+                    // This bridge may already have populated FCS through a file-level
+                    // operation that does not use a project-results cache. Establish a
+                    // fresh project boundary on the first snapshot too, so a same-mtime
+                    // edit made between that operation and this one cannot survive in
+                    // FCS's incremental cache.
+                    true
+
+            if invalidate then
+                // Keep invalidation inside the gate: a concurrent caller observing the
+                // just-recorded key must not proceed before the FCS cache is actually
+                // invalidated.
+                checker.InvalidateConfiguration(projectOptions))
+
+    let analysisSnapshotKey (projectOptions: FSharpProjectOptions) =
+        let key = computeAnalysisSnapshotKey projectOptions
+        commitAnalysisSnapshotKey projectOptions key
+
+        key
 
     let makeFsprojOptionsCacheKey (fsprojPath: string) =
         $"fsproj::%s{normalizePath fsprojPath}"
 
-    let makeOptionsCacheEntry options source fingerprint scriptSourceHash =
+    let makeOptionsCacheEntry options source fingerprint scriptSourceHash evaluatedSnapshot =
         { Options = options
           Source = source
           Fingerprint = fingerprint
-          ScriptSourceHash = scriptSourceHash }
+          ScriptSourceHash = scriptSourceHash
+          EvaluatedSnapshot = evaluatedSnapshot }
 
     let scriptSourceHash (source: string) =
         source
@@ -1662,25 +2728,120 @@ type internal FcsBridge() =
         |> System.Security.Cryptography.SHA256.HashData
         |> Convert.ToHexString
 
+    let splitProjectInputList (value: string) =
+        value.Split(';', StringSplitOptions.RemoveEmptyEntries ||| StringSplitOptions.TrimEntries)
+
+    let directorySourceListingHash (directoryPath: string) =
+        let ignoredDirectoryNames =
+            set [ "bin"; "obj"; ".git"; ".fslangmcp"; ".vs" ]
+
+        let isFSharpSourceFile (path: string) =
+            match Path.GetExtension(path) with
+            | extension when String.Equals(extension, ".fs", StringComparison.OrdinalIgnoreCase) -> true
+            | extension when String.Equals(extension, ".fsi", StringComparison.OrdinalIgnoreCase) -> true
+            | extension when String.Equals(extension, ".fsx", StringComparison.OrdinalIgnoreCase) -> true
+            | _ -> false
+
+        let rec collect (directory: DirectoryInfo) (files: ResizeArray<string>) =
+            for file in directory.EnumerateFiles() do
+                if isFSharpSourceFile file.Name then
+                    let relativePath =
+                        Path.GetRelativePath(directoryPath, file.FullName).Replace(Path.DirectorySeparatorChar, '/')
+
+                    files.Add(
+                        if OperatingSystem.IsWindows() then
+                            relativePath.ToUpperInvariant()
+                        else
+                            relativePath
+                    )
+
+            for child in directory.EnumerateDirectories() do
+                let ignored = ignoredDirectoryNames.Contains(child.Name.ToLowerInvariant())
+                let isReparsePoint = (child.Attributes &&& FileAttributes.ReparsePoint) <> enum 0
+
+                if not ignored && not isReparsePoint then
+                    collect child files
+
+        let files = ResizeArray<string>()
+        collect (DirectoryInfo(directoryPath)) files
+
+        files
+        |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right))
+        |> String.concat "\u0000"
+        |> fun listing -> $"fslangmcp-project-source-list-v1\u0000%s{listing}"
+        |> System.Text.Encoding.UTF8.GetBytes
+        |> System.Security.Cryptography.SHA256.HashData
+        |> Convert.ToHexString
+
+    let missingInputIsReliable (path: string) =
+        let parent = Path.GetDirectoryName path
+
+        if String.IsNullOrWhiteSpace parent then
+            true
+        else
+            try
+                // FileInfo/DirectoryInfo.Exists intentionally collapse access errors
+                // into false. Probe the parent so an unreadable input is not cached as
+                // a stable "missing" sentinel.
+                Directory.EnumerateFileSystemEntries(parent, Path.GetFileName path, SearchOption.TopDirectoryOnly)
+                |> Seq.isEmpty
+            with
+            | :? DirectoryNotFoundException -> true
+            | :? FileNotFoundException -> true
+            | _ -> false
+
     let captureProjectOptionsInputStamp kind path =
         try
             match kind with
             | FileInput ->
-                let info = FileInfo(path)
-                info.Refresh()
+                let rec capture attemptsRemaining =
+                    let before = FileInfo(path)
+                    before.Refresh()
 
-                if info.Exists then
-                    { Kind = kind
-                      Path = path
-                      Exists = true
-                      LastWriteTimeUtcTicks = info.LastWriteTimeUtc.Ticks
-                      Length = info.Length }
-                else
-                    { Kind = kind
-                      Path = path
-                      Exists = false
-                      LastWriteTimeUtcTicks = -1L
-                      Length = -1L }
+                    if not before.Exists then
+                        { Kind = kind
+                          Path = path
+                          Exists = false
+                          LastWriteTimeUtcTicks = -1L
+                          Length = -1L
+                          ContentHash = ""
+                          Reliable = missingInputIsReliable path }
+                    else
+                        use stream =
+                            new FileStream(
+                                path,
+                                FileMode.Open,
+                                FileAccess.Read,
+                                FileShare.ReadWrite ||| FileShare.Delete
+                            )
+
+                        let contentHash =
+                            System.Security.Cryptography.SHA256.HashData(stream)
+                            |> Convert.ToHexString
+
+                        let after = FileInfo(path)
+                        after.Refresh()
+
+                        if
+                            attemptsRemaining > 0
+                            && (not after.Exists
+                                || before.LastWriteTimeUtc.Ticks <> after.LastWriteTimeUtc.Ticks
+                                || before.Length <> after.Length)
+                        then
+                            capture (attemptsRemaining - 1)
+                        else
+                            { Kind = kind
+                              Path = path
+                              Exists = after.Exists
+                              LastWriteTimeUtcTicks = after.LastWriteTimeUtc.Ticks
+                              Length = after.Length
+                              ContentHash = contentHash
+                              Reliable =
+                                after.Exists
+                                && before.LastWriteTimeUtc.Ticks = after.LastWriteTimeUtc.Ticks
+                                && before.Length = after.Length }
+
+                capture 1
             | DirectoryInput ->
                 let info = DirectoryInfo(path)
                 info.Refresh()
@@ -1690,26 +2851,35 @@ type internal FcsBridge() =
                       Path = path
                       Exists = true
                       LastWriteTimeUtcTicks = info.LastWriteTimeUtc.Ticks
-                      Length = -1L }
+                      Length = -1L
+                      ContentHash = directorySourceListingHash path
+                      Reliable = true }
                 else
                     { Kind = kind
                       Path = path
                       Exists = false
                       LastWriteTimeUtcTicks = -1L
-                      Length = -1L }
+                      Length = -1L
+                      ContentHash = ""
+                      Reliable = missingInputIsReliable path }
         with _ ->
             { Kind = kind
               Path = path
               Exists = false
               LastWriteTimeUtcTicks = -1L
-              Length = -1L }
+              Length = -1L
+              ContentHash = ""
+              Reliable = false }
 
     let projectOptionsInputStampIsCurrent expected =
         let current = captureProjectOptionsInputStamp expected.Kind expected.Path
 
-        current.Exists = expected.Exists
+        expected.Reliable
+        && current.Reliable
+        && current.Exists = expected.Exists
         && current.LastWriteTimeUtcTicks = expected.LastWriteTimeUtcTicks
         && current.Length = expected.Length
+        && String.Equals(current.ContentHash, expected.ContentHash, StringComparison.Ordinal)
 
     let projectOptionsCacheEntryIsCurrent entry =
         match entry.Fingerprint with
@@ -1790,8 +2960,9 @@ type internal FcsBridge() =
             addFile projectDirectory (Path.Combine("obj", $"%s{projectFileName}.nuget.g.props"))
             addFile projectDirectory (Path.Combine("obj", $"%s{projectFileName}.nuget.g.targets"))
 
-            for importedProject in project.ProjectSdkInfo.MSBuildAllProjects do
-                addFile projectDirectory importedProject
+            for importedProjectList in project.ProjectSdkInfo.MSBuildAllProjects do
+                for importedProject in splitProjectInputList importedProjectList do
+                    addFile projectDirectory importedProject
 
             addFile projectDirectory project.ProjectSdkInfo.ProjectAssetsFile
 
@@ -1823,116 +2994,6 @@ type internal FcsBridge() =
 
         { Inputs = inputs }
 
-    // Per-file write-time vector for the find use-cache (issue #131). The stamp changes
-    // when ANY source file's on-disk mtime changes (not just the newest), so an edit to
-    // an older file still invalidates. One stat per source file — sub-millisecond even
-    // for large projects, and the same signal FCS itself uses to decide staleness, so a
-    // cache miss and an FCS re-check stay in lockstep. Missing/unreadable files map to
-    // -1 (a removed file changes the vector; the .fsproj re-resolve changes the options
-    // key independently).
-    let sourceFilesStamp (projectOptions: FSharpProjectOptions) =
-        let sb = System.Text.StringBuilder()
-
-        for f in projectOptions.SourceFiles do
-            let ticks =
-                try
-                    if File.Exists f then File.GetLastWriteTimeUtc(f).Ticks else -1L
-                with _ ->
-                    -1L
-
-            sb.Append(ticks).Append('|') |> ignore
-
-        sb.ToString()
-
-    // Per-reference write-time vector for the find use-cache (issue #131; 0.10.1 Codex
-    // P1). sourceFilesStamp alone is BLIND to cross-project rebuilds: when project A
-    // references project B (P2P) — or any other assembly — a rebuild of B leaves A's own
-    // SourceFiles untouched, so A's source-stamp (and therefore A's cache key) would NOT
-    // move, and ProjectSweepUses would serve A's sweep STALE even though a fresh
-    // ParseAndCheckProject would see B's new metadata. Folding the referenced-assembly
-    // mtimes into the key closes that gap: B's rebuilt output (the -r: target a consumer
-    // resolves to — for a P2P that is B's obj/.../ref/B.dll reference assembly) moves its
-    // mtime → every consumer's key changes → cache MISS → fresh sweep.
-    //
-    // We stamp EVERY -r:/--reference: target, framework and NuGet refs included.
-    // Correctness-first by deliberate choice: a path-based "this ref is immutable" skip
-    // would risk misclassifying a mutable ref (relocated NuGet caches via NUGET_PACKAGES,
-    // non-standard SDK install roots, copied-local DLLs) and reintroducing exactly this
-    // staleness bug, while the saving is marginal — the stats are OS-metadata-cached and
-    // sub-millisecond in aggregate even for ~150 BCL refs, so a warm find stays in the
-    // cache-hit fast path. A reference *path* change (NuGet/SDK version bump) already moves
-    // the options key via makeResolvedProjectCacheKey, which concatenates OtherOptions;
-    // this stamp adds the orthogonal *content-at-a-fixed-path* signal. Missing/unreadable
-    // files map to -1, mirroring sourceFilesStamp — never throws.
-    let referencedAssembliesStamp (projectOptions: FSharpProjectOptions) =
-        let sb = System.Text.StringBuilder()
-
-        for opt in projectOptions.OtherOptions do
-            let refPath =
-                if opt.StartsWith("-r:", StringComparison.Ordinal) then
-                    Some(opt.Substring 3)
-                elif opt.StartsWith("--reference:", StringComparison.Ordinal) then
-                    Some(opt.Substring 12)
-                else
-                    None
-
-            match refPath with
-            | Some path ->
-                let ticks =
-                    try
-                        if File.Exists path then File.GetLastWriteTimeUtc(path).Ticks else -1L
-                    with _ ->
-                        -1L
-
-                sb.Append(ticks).Append('|') |> ignore
-            | None -> ()
-
-        sb.ToString()
-
-    // Source-file write-time vector for the directly AND transitively referenced F# projects
-    // (issue #131; 0.10.1 Codex P2). referencedAssembliesStamp (P1) stamps the -r: DLL
-    // mtimes and catches a REBUILD of a dependency. But an EDIT to a dependency's source
-    // WITHOUT a rebuild doesn't move the DLL mtime — yet FCS's ParseAndCheckProject for a
-    // consumer reads referenced F# project sources directly via ReferencedProjects, so a
-    // fresh consumer check WOULD see the edit. Without this stamp the consumer's key is
-    // unchanged after a dependency source edit → ProjectSweepUses serves the consumer STALE.
-    //
-    // Fix: walk ReferencedProjects for each consumer project. For every FSharpReference case
-    // (an F# P2P project, carrying the referenced project's FSharpProjectOptions), stamp its
-    // SourceFiles the same way sourceFilesStamp does. Recurse transitively (FCS's
-    // ReferencedProjects is NOT pre-flattened — only direct references appear at each level)
-    // using a visited-set keyed on ProjectFileName to avoid re-stamping shared deps and
-    // breaking on any hypothetical cycle. The root project itself is added to visited first
-    // so it's not double-stamped from a transitive back-reference.
-    //
-    // PEReference and ILModuleReference carry no FSharpProjectOptions (they're prebuilt
-    // binaries); those cases fall through to `| _ -> ()` — their mtime is already covered
-    // by referencedAssembliesStamp. Missing/unreadable files map to -1, never throws.
-    let referencedProjectSourcesStamp (projectOptions: FSharpProjectOptions) =
-        let sb = System.Text.StringBuilder()
-        let visited = System.Collections.Generic.HashSet<string>()
-        visited.Add(projectOptions.ProjectFileName) |> ignore
-
-        let rec stampProject (opts: FSharpProjectOptions) =
-            for refProj in opts.ReferencedProjects do
-                match refProj with
-                | FSharpReferencedProject.FSharpReference(_outputFile, refOpts) ->
-                    if visited.Add(refOpts.ProjectFileName) then
-                        for f in refOpts.SourceFiles do
-                            let ticks =
-                                try
-                                    if File.Exists f then File.GetLastWriteTimeUtc(f).Ticks else -1L
-                                with _ ->
-                                    -1L
-
-                            sb.Append(ticks).Append('|') |> ignore
-
-                        stampProject refOpts
-                | _ -> ()
-
-        stampProject projectOptions
-        sb.ToString()
-
     let countDiagnosticsBySeverity (diagnostics: FSharpDiagnostic array) =
         let errors =
             diagnostics
@@ -1946,78 +3007,140 @@ type internal FcsBridge() =
 
     member private _.LoadProjectOptionsFromFsproj
         (fsprojPath: string)
-        : Task<(FSharpProjectOptions * ProjectOptionsFingerprint) option> =
-        // Offload to thread pool — MSBuild/SDK probing is CPU+IO bound.
-        // Assumption: Init.init and WorkspaceLoader do not rely on thread-local or
-        // SynchronizationContext state (safe for file-system-based SDK resolution).
-        Task.Run(fun () ->
-            try
-                let projectDir = Path.GetDirectoryName(fsprojPath)
-                let toolsPath = Init.init (DirectoryInfo(projectDir)) None
-                let loader = WorkspaceLoader.Create(toolsPath, [])
-                Interlocked.Increment(&projectOptionsLoadCount) |> ignore
-                let projects = loader.LoadProjects([ fsprojPath ]) |> Seq.toList
+        : Task<(FSharpProjectOptions * ProjectOptionsFingerprint * EvaluatedProjectSnapshot) option> =
+        task {
+            match projectEvaluationBeforeLoadOverride with
+            | Some beforeLoad -> do! beforeLoad fsprojPath
+            | None -> ()
 
-                match projects with
-                | proj :: _ ->
-                    let fcsOpts = FCS.mapToFSharpProjectOptions proj (projects |> Seq.map id)
-                    let fingerprint = captureProjectOptionsFingerprint projects
-                    Some(fcsOpts, fingerprint)
-                | [] -> None
-            with ex ->
-                Console.Error.WriteLine($"[proj-info] Failed to load %s{fsprojPath}: %s{ex.Message}")
-                None)
+            // Offload to thread pool — MSBuild/SDK probing is CPU+IO bound. The
+            // caller owns the outer admission slot across this actual completion.
+            return!
+                Task.Run(fun () ->
+                    try
+                        let projectDir = Path.GetDirectoryName(fsprojPath)
+                        let toolsPath = Init.init (DirectoryInfo(projectDir)) None
+                        let loader = WorkspaceLoader.Create(toolsPath, [])
+                        Interlocked.Increment(&projectOptionsLoadCount) |> ignore
+                        let projects = loader.LoadProjects([ fsprojPath ]) |> Seq.toList
+
+                        match projects with
+                        | proj :: _ ->
+                            let fcsOpts = FCS.mapToFSharpProjectOptions proj (projects |> Seq.map id)
+                            let fingerprint = captureProjectOptionsFingerprint projects
+                            let snapshot = EvaluatedProjectModel.create "ionide-proj-info" proj fcsOpts
+                            Some(fcsOpts, fingerprint, snapshot)
+                        | [] -> None
+                    with ex ->
+                        Console.Error.WriteLine($"[proj-info] Failed to load %s{fsprojPath}: %s{ex.Message}")
+                        None)
+        }
+
+    member private this.ResolveFsprojEntryWithinBudget
+        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option)
+        : Task<ProjectOptionsCacheEntry> =
+        let fullPath = normalizePath fsprojPath
+        let fsprojKey = makeFsprojOptionsCacheKey fullPath
+
+        let ensureBudget () =
+            match remainingBudget with
+            | Some getRemaining when getRemaining () <= TimeSpan.Zero -> raise (TimeoutException())
+            | _ -> ()
+
+        let pending =
+            optionsInFlight.GetOrAdd(
+                fsprojKey,
+                fun _ ->
+                    Lazy<Task<ProjectOptionsCacheEntry>>(
+                        (fun () ->
+                            task {
+                                try
+                                    return!
+                                        projectEvaluationAdmission.TryRun(
+                                            fullPath,
+                                            fun () ->
+                                                task {
+                                                    ensureBudget ()
+
+                                                    // Cache-hit validation hashes imported
+                                                    // files and recursively inventories
+                                                    // source directories. It belongs inside
+                                                    // the same admitted actual worker as a
+                                                    // cache miss, not before single-flight.
+                                                    let! cached =
+                                                        Task.Run(fun () ->
+                                                            ensureBudget ()
+
+                                                            match optionsCache.TryGet(fsprojKey) with
+                                                            | Some entry ->
+                                                                projectOptionsCacheValidationBeforeComputeOverride
+                                                                |> Option.iter (fun hook -> hook fullPath)
+
+                                                                ensureBudget ()
+
+                                                                Interlocked.Increment(
+                                                                    &projectOptionsCacheValidationCount
+                                                                )
+                                                                |> ignore
+
+                                                                if projectOptionsCacheEntryIsCurrent entry then
+                                                                    Some entry
+                                                                else
+                                                                    None
+                                                            | None -> None)
+
+                                                    match cached with
+                                                    | Some entry -> return entry
+                                                    | None ->
+                                                        ensureBudget ()
+                                                        let! projInfoResult =
+                                                            this.LoadProjectOptionsFromFsproj(fullPath)
+
+                                                        match projInfoResult with
+                                                        | Some(projOpts, fingerprint, evaluatedSnapshot) ->
+                                                            let entry =
+                                                                makeOptionsCacheEntry
+                                                                    projOpts
+                                                                    "ionide-proj-info"
+                                                                    (Some fingerprint)
+                                                                    None
+                                                                    (Some evaluatedSnapshot)
+
+                                                            optionsCache.Set(fsprojKey, entry)
+                                                            return entry
+                                                        | None ->
+                                                            return
+                                                                raise (
+                                                                    InvalidOperationException(
+                                                                        $"Unable to load F# project options from explicit projectPath: %s{fullPath}"
+                                                                    )
+                                                                )
+                                                }
+                                        )
+                                finally
+                                    optionsInFlight.TryRemove(fsprojKey) |> ignore
+                            }),
+                        LazyThreadSafetyMode.ExecutionAndPublication
+                    )
+            )
+
+        let work = pending.Value
+        observeFault work
+        work
+
+    member private this.ResolveFsprojEntry(fsprojPath: string) : Task<ProjectOptionsCacheEntry> =
+        this.ResolveFsprojEntryWithinBudget(fsprojPath, None)
+
+    member private this.ResolveFsprojOptionsWithinBudget
+        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option)
+        : Task<FSharpProjectOptions * string> =
+        task {
+            let! entry = this.ResolveFsprojEntryWithinBudget(fsprojPath, remainingBudget)
+            return entry.Options, entry.Source
+        }
 
     member private this.ResolveFsprojOptions(fsprojPath: string) : Task<FSharpProjectOptions * string> =
-        task {
-            let fullPath = normalizePath fsprojPath
-            let fsprojKey = makeFsprojOptionsCacheKey fullPath
-
-            match optionsCache.TryGet(fsprojKey) with
-            | Some cached when projectOptionsCacheEntryIsCurrent cached ->
-                return cached.Options, cached.Source
-            | _ ->
-
-                let pending =
-                    optionsInFlight.GetOrAdd(
-                        fsprojKey,
-                        fun _ ->
-                            Lazy<Task<ProjectOptionsCacheEntry>>(
-                                (fun () ->
-                                    task {
-                                        try
-                                            let! projInfoResult = this.LoadProjectOptionsFromFsproj(fullPath)
-
-                                            match projInfoResult with
-                                            | Some(projOpts, fingerprint) ->
-                                                let entry =
-                                                    makeOptionsCacheEntry
-                                                        projOpts
-                                                        "ionide-proj-info"
-                                                        (Some fingerprint)
-                                                        None
-
-                                                optionsCache.Set(fsprojKey, entry)
-                                                return entry
-                                            | None ->
-                                                return
-                                                    raise (
-                                                        InvalidOperationException(
-                                                            $"Unable to load F# project options from explicit projectPath: %s{fullPath}"
-                                                        )
-                                                    )
-                                        finally
-                                            optionsInFlight.TryRemove(fsprojKey) |> ignore
-                                    }),
-                                LazyThreadSafetyMode.ExecutionAndPublication
-                            )
-                        )
-
-                let work = pending.Value
-                observeFault work
-                let! entry = work
-                return entry.Options, entry.Source
-        }
+        this.ResolveFsprojOptionsWithinBudget(fsprojPath, None)
 
     member private this.ResolveProjectOptions
         (path: string, text: string, projectPath: string option, projectOptions: string list option)
@@ -2039,7 +3162,7 @@ type internal FcsBridge() =
                     let resolvedOptions =
                         checker.GetProjectOptionsFromCommandLineArgs(projectFileName, options |> List.toArray)
 
-                    optionsCache.Set(cacheKey, makeOptionsCacheEntry resolvedOptions "commandLineArgs" None None)
+                    optionsCache.Set(cacheKey, makeOptionsCacheEntry resolvedOptions "commandLineArgs" None None None)
                     return resolvedOptions, "commandLineArgs"
             | _ ->
                 let requestedFsproj = explicitFsproj projectPath
@@ -2077,7 +3200,7 @@ type internal FcsBridge() =
                         let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
                         optionsCache.Set(
                             scriptKey,
-                            makeOptionsCacheEntry scriptOptions "scriptInference" None (Some contentHash)
+                            makeOptionsCacheEntry scriptOptions "scriptInference" None (Some contentHash) None
                         )
                         return scriptOptions, "scriptInference"
         }
@@ -2126,7 +3249,7 @@ type internal FcsBridge() =
             // Drop the cached semantic results for THIS project only. Resolved project
             // options remain reusable: their own input fingerprint invalidates them when
             // the project graph changes, while source edits are handled by FCS below.
-            let projectResultsKey = makeResolvedProjectCacheKey projectOptions
+            let projectResultsKey = analysisSnapshotKey projectOptions
             projectResultsCache.TryRemove(projectResultsKey) |> ignore
 
             // Ask FCS to drop its incremental-build cache for this project so
@@ -2336,7 +3459,7 @@ type internal FcsBridge() =
 
             let timeoutMs = args.timeoutMs |> Option.defaultValue 60000
             let! projectOptions, optionsSource = this.ResolveFsprojOptions(projectPath)
-            let cacheKey = makeResolvedProjectCacheKey projectOptions
+            let cacheKey = analysisSnapshotKey projectOptions
 
             use timeoutCts = new CancellationTokenSource(timeoutMs)
 
@@ -2588,7 +3711,7 @@ type internal FcsBridge() =
 
             // Use the resolved project as the cache key. When projectPath is omitted,
             // different files may auto-discover different projects.
-            let cacheKey = makeResolvedProjectCacheKey projectOptions
+            let cacheKey = analysisSnapshotKey projectOptions
 
             let! projectResults, cached =
                 task {
@@ -2697,7 +3820,7 @@ type internal FcsBridge() =
                                     "Either 'path' or 'projectPath' must be provided (or call set_project first)."
                 }
 
-            let cacheKey = makeResolvedProjectCacheKey projectOptions
+            let cacheKey = analysisSnapshotKey projectOptions
 
             let! projectResults, cached =
                 task {
@@ -2858,7 +3981,7 @@ type internal FcsBridge() =
                                     "Either 'path' or 'projectPath' must be provided (or call set_project first)."
                 }
 
-            let cacheKey = makeResolvedProjectCacheKey projectOptions
+            let cacheKey = analysisSnapshotKey projectOptions
 
             let! projectResults, cached =
                 task {
@@ -3128,7 +4251,7 @@ type internal FcsBridge() =
             let! _, _, optionsSource, projectOptions, _, _ =
                 this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
 
-            let cacheKey = makeResolvedProjectCacheKey projectOptions
+            let cacheKey = analysisSnapshotKey projectOptions
 
             let! projectResults, cached =
                 task {
@@ -3428,11 +4551,10 @@ type internal FcsBridge() =
     // (de-duped by FULL source range), and auto-unions record-field and member
     // usage sites the single-project fcs_find_symbol / fcs_record_field_audit miss.
     //
-    // HEADLINE TRUST PROPERTY: matched=false is reported ONLY when BOTH the FCS
-    // multi-project sweep AND the FSAC workspace/symbol index (via the injected
-    // fsacProbe) are empty — never a confident "absent" from a single project,
-    // which would false-negative cross-project symbols (the RiskDebatorRole /
-    // TraderRole.Propose port-widening cases).
+    // HEADLINE TRUST PROPERTY: matched=false is reported ONLY after every requested
+    // FCS project completed successfully. A timeout/load failure makes the result
+    // partial or indeterminate; an unavailable/mismatched FSAC probe is never folded
+    // into an authoritative zero.
     //
     // FCS CROSS-COMPILATION INVARIANT (do NOT "fix" with ==): FSharpSymbol instances
     // from DIFFERENT ParseAndCheckProject compilations are NOT reference-equal for
@@ -3441,8 +4563,8 @@ type internal FcsBridge() =
     // and de-dup by source LOCATION, never by symbol identity. FSharpSymbolUse is a
     // struct, so we bind `let r = u.Range` before reading r.FileName (FS0052).
 
-    // issue #131: cache-or-compute one project's whole-symbol-use enumeration +
-    // diagnostics, keyed by (resolved-options + source-stamp). Kept in its own method
+    // issue #131/#168 P1-07: cache-or-compute one project's whole-symbol-use
+    // enumeration + diagnostics, keyed by the shared analysis content snapshot. Kept in its own method
     // so Find's per-project loop awaits a plain Task instead of nesting a task CE
     // (which is not statically compilable under Release optimization → FS3511).
     // The caller waits through a hard Task.WaitAsync boundary. FCS does not expose
@@ -3497,7 +4619,7 @@ type internal FcsBridge() =
                         )
         }
 
-    member this.Find(args: FindArgs, ?fsacProbe: string -> Task<int>) : Task<JsonNode> =
+    member this.Find(args: FindArgs, ?fsacProbe: string -> Task<FindFsacProbeResult>) : Task<JsonNode> =
         task {
             match ArgsValidation.requireNonBlank "query" args.query with
             | Error _ ->
@@ -3539,21 +4661,59 @@ type internal FcsBridge() =
             // complete refactor list stays reachable past the default.
             let pageSize = args.maxResults |> Option.defaultValue 80
 
-            let pageOffset =
-                match args.cursor with
-                | None -> 0
-                | Some cursorStr ->
-                    match Cursor.tryDecode cursorStr with
-                    | Ok payload -> payload.offset
-                    | Error reason -> invalidArg (nameof args.cursor) $"Invalid cursor: %s{reason}"
+            let invalidArgs message =
+                jobj [ "status", jstr "invalid_args"; "message", jstr message ] :> JsonNode
+
+            let mutable validationError =
+                if
+                    not (
+                        Set.ofList [ "auto"; "symbol"; "members"; "field"; "definition"; "position" ]
+                        |> Set.contains kind
+                    )
+                then
+                    Some
+                        $"kind must be one of: auto, symbol, members, field, definition, position; got '%s{kind}'."
+                elif not (Set.ofList [ "auto"; "file"; "project"; "workspace" ] |> Set.contains scope) then
+                    Some $"scope must be one of: auto, file, project, workspace; got '%s{scope}'."
+                elif pageSize < 1 || pageSize > 1000 then
+                    Some $"maxResults must be between 1 and 1000; got %d{pageSize}."
+                elif contextLines < 0 then
+                    Some $"contextLines must be non-negative; got %d{contextLines}."
+                elif sweepBudgetMs < 0 then
+                    Some $"timeoutMs must be non-negative; got %d{sweepBudgetMs}."
+                elif args.line |> Option.exists (fun value -> value < 0) then
+                    Some "line must be non-negative (0-based)."
+                elif args.character |> Option.exists (fun value -> value < 0) then
+                    Some "character must be non-negative (0-based)."
+                elif args.occurrence |> Option.exists (fun value -> value < -1) then
+                    Some "occurrence must be -1 (first match) or a non-negative 0-based index."
+                elif
+                    scope = "file"
+                    && (args.path |> Option.forall String.IsNullOrWhiteSpace)
+                then
+                    Some "scope='file' requires a non-empty path."
+                else
+                    None
+
+            let mutable pageOffset = 0
+
+            match args.cursor with
+            | None -> ()
+            | Some cursorStr ->
+                match Cursor.tryDecode cursorStr with
+                | Ok payload -> pageOffset <- payload.offset
+                | Error reason -> validationError <- Some $"Invalid cursor: %s{reason}"
 
             // kind=position resolves the symbol under the cursor, then sweeps it as a symbol.
             let! queryResult =
                 task {
-                    if kind = "position" then
-                        return! this.ResolveQueryAtPosition(args)
-                    else
-                        return Ok query0
+                    match validationError with
+                    | Some message -> return Error(invalidArgs message)
+                    | None ->
+                        if kind = "position" then
+                            return! this.ResolveQueryAtPosition(args)
+                        else
+                            return Ok query0
                 }
 
             match queryResult with
@@ -3583,33 +4743,57 @@ type internal FcsBridge() =
 
             let memberProjects = SolutionParsing.listProjects sweepTarget
 
+            let sourcePathComparison =
+                if OperatingSystem.IsWindows() then
+                    StringComparison.OrdinalIgnoreCase
+                else
+                    StringComparison.Ordinal
+
+            let isMemberProject (candidate: string) =
+                let fullCandidate = normalizePath candidate
+
+                memberProjects
+                |> Array.exists (fun project ->
+                    String.Equals(normalizePath project, fullCandidate, sourcePathComparison))
+
             // scope=file/project narrows to the single owning project; workspace/auto
             // sweeps every member project of the solution.
+            let mutable projectResolutionError = None
+
             let projectsToSweep =
                 match scope with
                 | "file"
                 | "project" ->
                     let single =
-                        args.path
-                        |> Option.bind findNearestFsproj
-                        |> Option.orElseWith (fun () ->
-                            if sweepTarget.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
-                                Some sweepTarget
-                            else
-                                None)
+                        // An explicit .fsproj is authoritative even when scope=file points
+                        // at a linked Compile item below another project directory.
+                        if sweepTarget.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
+                            Some sweepTarget
+                        else
+                            args.path |> Option.bind findNearestFsproj
 
                     match single with
-                    | Some p -> [| normalizePath p |]
-                    | None -> memberProjects
+                    | Some project when isMemberProject project -> [| normalizePath project |]
+                    | Some project ->
+                        projectResolutionError <-
+                            Some
+                                $"scope='%s{scope}' resolved '%s{normalizePath project}', which is not a member of the requested workspace '%s{sweepTarget}'."
+
+                        [||]
+                    | None ->
+                        projectResolutionError <-
+                            Some
+                                $"scope='%s{scope}' requires projectPath to be a single .fsproj or path to resolve to one member project; a whole solution cannot be used as a single-project scope."
+
+                        [||]
                 | _ -> memberProjects
 
             if projectsToSweep.Length = 0 then
-                return
-                    jobj
-                        [ "status", jstr "invalid_args"
-                          "message",
-                          jstr $"find could not resolve any .fsproj to sweep from: {sweepTarget}" ]
-                    :> JsonNode
+                let message =
+                    projectResolutionError
+                    |> Option.defaultValue $"find could not resolve any .fsproj to sweep from: {sweepTarget}"
+
+                return invalidArgs message
             else
 
             // ── Matching predicates (stable-string, cross-compilation-safe) ───────
@@ -3705,6 +4889,9 @@ type internal FcsBridge() =
             let perProjectKeep = ResizeArray<bool>()
             let aggregatedDiagnostics = ResizeArray<FSharpDiagnostic>()
             let sweepSw = System.Diagnostics.Stopwatch.StartNew()
+            let mutable projectsAnalyzed = 0
+            let mutable projectsFailed = 0
+            let mutable projectsTimedOut = 0
 
             let locationKey (r: range) =
                 $"{normalizePath r.FileName}:{r.StartLine}:{r.StartColumn}:{r.EndLine}:{r.EndColumn}"
@@ -3728,9 +4915,8 @@ type internal FcsBridge() =
                     let! options, _ =
                         optionsTask.WaitAsync(TimeSpan.FromMilliseconds(float remainingBeforeLoad))
 
-                    // issue #131: memoize the whole-symbol-use enumeration per (project,
-                    // source-stamp, referenced-assembly-stamp, referenced-project-sources-
-                    // stamp). A cache HIT on an unchanged project skips BOTH
+                    // issue #131/#168 P1-07: memoize the whole-symbol-use enumeration by
+                    // the shared content-addressed analysis snapshot. A cache HIT skips BOTH
                     // ParseAndCheckProject AND the ~3s GetAllUsesOfAllSymbols re-walk; a
                     // MISS (first sweep, any own-source edit, any rebuild of a referenced
                     // project/assembly [Codex P1], OR any source edit of a referenced F#
@@ -3739,8 +4925,7 @@ type internal FcsBridge() =
                     // own method (ProjectSweepUses) so this outer state machine stays
                     // statically compilable under Release optimization (a nested task CE
                     // inside the loop trips FS3511).
-                    let usesKey =
-                        $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}|{referencedProjectSourcesStamp options}"
+                    let usesKey = analysisSnapshotKey options
                     // #100: overall wall-clock budget across the whole sweep. Each project
                     // gets whatever remains; once exhausted, `max 1` makes the next project's
                     // type-check cancel almost immediately and land in the catch branch as a
@@ -3836,11 +5021,13 @@ type internal FcsBridge() =
                                     add u k false
 
                     projSw.Stop()
+                    projectsAnalyzed <- projectsAnalyzed + 1
 
                     perProject.Add(
                         jobj
                             [ "project", jstr projDisplay
                               "fsproj", jstr (normalizePath fsproj)
+                              "status", jstr "analyzed"
                               "totalProjectSymbolUses", jint allUses.Length
                               "nameMatchUses", jint nameCount
                               "fieldMatchUses", jint fieldCount
@@ -3853,10 +5040,19 @@ type internal FcsBridge() =
                 with ex ->
                     projSw.Stop()
 
+                    let timedOut = findFailureIsTimeout ex
+
+                    if timedOut then
+                        projectsTimedOut <- projectsTimedOut + 1
+                    else
+                        projectsFailed <- projectsFailed + 1
+
                     perProject.Add(
                         jobj
                             [ "project", jstr projDisplay
                               "fsproj", jstr (normalizePath fsproj)
+                              "status", jstr (if timedOut then "timed_out" else "failed")
+                              "errorKind", jstr (if timedOut then "timeout" else "project_failure")
                               "error", jstr ex.Message
                               "elapsedMs", jint (int projSw.ElapsedMilliseconds) ]
                         :> JsonNode
@@ -3874,7 +5070,7 @@ type internal FcsBridge() =
                     match args.path with
                     | Some p when not (String.IsNullOrWhiteSpace p) ->
                         let pf = normalizePath p
-                        allSites0 |> Array.filter (fun s -> String.Equals(s.File, pf, StringComparison.Ordinal))
+                        allSites0 |> Array.filter (fun s -> String.Equals(s.File, pf, sourcePathComparison))
                     | _ -> allSites0
                 else
                     allSites0
@@ -3894,31 +5090,77 @@ type internal FcsBridge() =
             let memCount = countKind "member-usage"
             let totalSites = sortedSites.Length
 
-            // HEADLINE: matched is true if the FCS sweep found anything; only when it
-            // is empty do we consult the FSAC symbol index, and only when THAT is also
-            // empty do we report matched=false.
+            let projectsRequested = projectsToSweep.Length
+            let coverageComplete = projectsAnalyzed = projectsRequested
+
+            // HEADLINE: a positive site is always useful, but absence is conclusive
+            // only when every requested FCS project completed. FSAC outcomes remain
+            // typed so not-ready/mismatch/failure cannot masquerade as zero hits.
             let fcsMatched = totalSites > 0
 
-            let! fsacHits =
+            let! fsacProbeResult =
                 task {
                     if fcsMatched then
-                        return 0
+                        return FindFsacProbeResult.Unavailable "not_needed"
                     else
                         match fsacProbe with
                         | Some probe ->
                             try
                                 return! probe query
-                            with _ ->
-                                return 0
-                        | None -> return 0
+                            with ex ->
+                                return FindFsacProbeResult.Failed ex.Message
+                        | None ->
+                            return FindFsacProbeResult.Unavailable "No FSAC probe was supplied."
                 }
 
-            let matched = fcsMatched || fsacHits > 0
+            let fsacHits, fsacFallbackState, fsacFallbackReason =
+                match fsacProbeResult with
+                | FindFsacProbeResult.Available hits when hits >= 0 -> hits, "available", None
+                | FindFsacProbeResult.Available _ ->
+                    0, "failed", Some "FSAC returned a negative workspace-symbol hit count."
+                | FindFsacProbeResult.NotReady reason -> 0, "not_ready", Some reason
+                | FindFsacProbeResult.ContextMismatch reason -> 0, "context_mismatch", Some reason
+                | FindFsacProbeResult.Failed reason -> 0, "failed", Some reason
+                | FindFsacProbeResult.Unavailable "not_needed" -> 0, "not_needed", None
+                | FindFsacProbeResult.Unavailable reason -> 0, "unavailable", Some reason
+
+            let matched: bool option =
+                if fcsMatched || fsacHits > 0 then
+                    Some true
+                elif coverageComplete then
+                    Some false
+                else
+                    None
+
+            let outcome =
+                match matched with
+                | Some true -> "matched"
+                | Some false -> "not_found"
+                | None -> "indeterminate"
+
+            let responseStatus =
+                if coverageComplete then
+                    "succeeded"
+                elif matched = Some true then
+                    "partial"
+                else
+                    "unknown"
 
             let via =
                 if fcsMatched then "fcs-multiproject-sweep"
                 elif fsacHits > 0 then "fsac-symbol-index"
-                else "none"
+                elif coverageComplete then "none"
+                else "incomplete-fcs-sweep"
+
+            let completenessMessage =
+                match responseStatus with
+                | "partial" ->
+                    Some
+                        $"Matches were found, but only {projectsAnalyzed}/{projectsRequested} requested project(s) were analyzed; the result set may be incomplete."
+                | "unknown" ->
+                    Some
+                        $"Cannot confirm absence: only {projectsAnalyzed}/{projectsRequested} requested project(s) were analyzed ({projectsFailed} failed, {projectsTimedOut} timed out)."
+                | _ -> None
 
             let pageSites =
                 sortedSites |> Array.skip (min pageOffset totalSites) |> Array.truncate pageSize
@@ -3993,15 +5235,38 @@ type internal FcsBridge() =
                 else
                     "workspace"
 
+            let matchedNode =
+                match matched with
+                | Some value -> jbool value
+                | None -> null
+
+            let coverage =
+                jobj
+                    [ "complete", jbool coverageComplete
+                      "projectsRequested", jint projectsRequested
+                      "projectsAnalyzed", jint projectsAnalyzed
+                      "projectsFailed", jint projectsFailed
+                      "projectsTimedOut", jint projectsTimedOut ]
+                :> JsonNode
+
             let resolution =
                 jobj
-                    [ "matched", jbool matched
+                    [ "matched", matchedNode
+                      "outcome", jstr outcome
+                      "complete", jbool coverageComplete
                       "kindResolved", jstr kindResolved
                       "scopeResolved", jstr scopeResolved
-                      "projectsSwept", jint projectsToSweep.Length
+                      "projectsSwept", jint projectsRequested
+                      "projectsRequested", jint projectsRequested
+                      "projectsAnalyzed", jint projectsAnalyzed
+                      "projectsFailed", jint projectsFailed
+                      "projectsTimedOut", jint projectsTimedOut
                       "via", jstr via
                       "fcsSiteCount", jint totalSites
-                      "fsacFallbackHits", jint fsacHits ]
+                      "fsacFallbackHits", jint fsacHits
+                      "fsacFallbackState", jstr fsacFallbackState
+                      "fsacFallbackReason",
+                      (fsacFallbackReason |> Option.map jstr |> Option.defaultValue null) ]
                 :> JsonNode
 
             let breakdown =
@@ -4049,7 +5314,7 @@ type internal FcsBridge() =
             // symbolMatches now accepts a dotted suffix, so this only fires for a genuine miss
             // — point the caller at the bare identifier rather than leaving a silent empty.
             let hintField =
-                if (not matched) && not (String.IsNullOrEmpty query) && query.Contains('.') then
+                if matched = Some false && not (String.IsNullOrEmpty query) && query.Contains('.') then
                     let bare = query.Substring(query.LastIndexOf('.') + 1)
 
                     [ "hint",
@@ -4058,19 +5323,31 @@ type internal FcsBridge() =
                 else
                     []
 
+            let completenessFields =
+                completenessMessage
+                |> Option.map (fun message -> [ "message", jstr message ])
+                |> Option.defaultValue []
+
             let baseFields =
-                [ "status", jstr "succeeded"
+                [ "status", jstr responseStatus
+                  "outcome", jstr outcome
                   "query", jstr query
                   "kind", jstr kind
                   "kindResolved", jstr kindResolved
                   "scope", jstr scope
                   "exact", jbool exact
                   "resolution", resolution
-                  "projectsSwept", jint projectsToSweep.Length
+                  "coverage", coverage
+                  "projectsSwept", jint projectsRequested
+                  "projectsRequested", jint projectsRequested
+                  "projectsAnalyzed", jint projectsAnalyzed
+                  "projectsFailed", jint projectsFailed
+                  "projectsTimedOut", jint projectsTimedOut
                   "totalSites", jint totalSites
                   "matchedUseCount", jint totalSites
                   "breakdown", breakdown
                   "sites", JsonArray(siteNodes) :> JsonNode ]
+                @ completenessFields
                 @ perProjectField
                 @ [ "sweepElapsedMs", jint (int sweepSw.ElapsedMilliseconds)
                     "projectDiagnostics", JsonArray(diagNodes) :> JsonNode ]
@@ -4196,8 +5473,7 @@ type internal FcsBridge() =
                     let projDisplay = Path.GetFileNameWithoutExtension fsproj
                     let! options, _ = this.ResolveFsprojOptions(fsproj)
 
-                    let usesKey =
-                        $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}|{referencedProjectSourcesStamp options}"
+                    let usesKey = analysisSnapshotKey options
 
                     let! allUses, _ = this.ProjectSweepUses(usesKey, options, 120000)
                     scannedOk <- scannedOk + 1
@@ -4299,20 +5575,162 @@ type internal FcsBridge() =
     // diagnostics; Error is a load failure ("timeout" or the exception message), which
     // the caller turns into verdict="unknown" rather than a confident clean.
     member private this.FreshProjectCheck
-        (fsproj: string, timeoutMs: int)
+        (fsproj: string, remainingBudget: unit -> TimeSpan)
         : Task<Result<FSharpDiagnostic array * string * string, string>> =
         task {
             try
-                let! options, optionsSource = this.ResolveFsprojOptions(normalizePath fsproj)
-                let cacheKey = makeResolvedProjectCacheKey options
-                projectResultsCache.TryRemove(cacheKey) |> ignore
-                checker.InvalidateConfiguration(options)
-                use cts = new CancellationTokenSource(timeoutMs)
-                let! results = Async.StartAsTask(checker.ParseAndCheckProject(options), cancellationToken = cts.Token)
-                return Ok(results.Diagnostics, options.ProjectFileName, optionsSource)
+                let! options, optionsSource =
+                    this.ResolveFsprojOptionsWithinBudget(normalizePath fsproj, Some remainingBudget)
+                let remaining = remainingBudget ()
+
+                // ResolveFsprojOptions is not cancellable. If its caller's overall
+                // Check budget elapsed while it was running, do not launch a late FCS
+                // type-check after the original request has already returned unknown.
+                if remaining <= TimeSpan.Zero then
+                    return Error "timeout"
+                else
+                    // Hashing the full source/reference closure is synchronous and can
+                    // be expensive. The single-flight worker remains admitted until the
+                    // real hash completes even when this caller's WaitAsync expires.
+                    let! cacheKey = resolveAnalysisSnapshotKey options (Some remainingBudget)
+
+                    let remainingAfterSnapshot = remainingBudget ()
+
+                    if remainingAfterSnapshot <= TimeSpan.Zero then
+                        return Error "timeout"
+                    else
+                        let workKey = $"{analysisProjectIdentity options}|{cacheKey}"
+                        let generation = Volatile.Read(&freshProjectCheckGeneration)
+
+                        let pending =
+                            freshProjectChecksInFlight.GetOrAdd(
+                                workKey,
+                                fun _ ->
+                                    Lazy<Task<FSharpDiagnostic array * string * string>>(
+                                        (fun () ->
+                                            task {
+                                                try
+                                                    if remainingBudget () <= TimeSpan.Zero then
+                                                        raise (TimeoutException())
+
+                                                    match freshProjectCheckBeforeAdmissionOverride with
+                                                    | Some beforeAdmission -> do! beforeAdmission ()
+                                                    | None -> do! Task.CompletedTask
+
+                                                    return!
+                                                        freshProjectCheckAdmission.TryRun(
+                                                            workKey,
+                                                            fun () ->
+                                                                task {
+                                                                    // Admission itself may happen after the caller
+                                                                    // deadline. This must be the first production
+                                                                    // operation in the real-work closure: no snapshot
+                                                                    // commit, invalidation, counter, or FCS call may
+                                                                    // start for an already-returned request.
+                                                                    if remainingBudget () <= TimeSpan.Zero then
+                                                                        return raise (TimeoutException())
+                                                                    elif
+                                                                        generation
+                                                                        <> Volatile.Read(&freshProjectCheckGeneration)
+                                                                    then
+                                                                        return
+                                                                            raise (
+                                                                                InvalidOperationException(
+                                                                                    "project context changed before type-check admission completed"
+                                                                                )
+                                                                            )
+                                                                    else
+                                                                        // Commit/invalidate only after admission. A
+                                                                        // rejected distinct snapshot must not disturb
+                                                                        // the still-running FCS worker it lost to.
+                                                                        commitAnalysisSnapshotKey options cacheKey
+                                                                        projectResultsCache.TryRemove(cacheKey) |> ignore
+                                                                        Interlocked.Increment(
+                                                                            &freshProjectCheckInvalidationCount
+                                                                        )
+                                                                        |> ignore
+                                                                        checker.InvalidateConfiguration(options)
+
+                                                                        match freshProjectCheckBeforeFcsStartOverride with
+                                                                        | Some beforeFcsStart -> do! beforeFcsStart ()
+                                                                        | None -> do! Task.CompletedTask
+
+                                                                        // Commit/cache invalidation is synchronous but
+                                                                        // may itself cross the overall Check deadline.
+                                                                        // Re-check at the last possible point before the
+                                                                        // real uncancellable FCS worker is counted/started.
+                                                                        if remainingBudget () <= TimeSpan.Zero then
+                                                                            raise (TimeoutException())
+
+                                                                        Interlocked.Increment(&projectTypeCheckStartCount)
+                                                                        |> ignore
+
+                                                                        let! diagnostics =
+                                                                            match freshProjectCheckWorkerOverride with
+                                                                            | Some worker -> worker options
+                                                                            | None ->
+                                                                                task {
+                                                                                    let! results =
+                                                                                        checker.ParseAndCheckProject(options)
+                                                                                        |> asTask
+
+                                                                                    return results.Diagnostics
+                                                                                }
+
+                                                                        // A caller may have timed out while the
+                                                                        // uncancellable worker continued. Keep its FCS
+                                                                        // state only when both the explicit generation
+                                                                        // and the byte-addressed snapshot are still the
+                                                                        // ones this worker checked.
+                                                                        let currentKey =
+                                                                            computeAnalysisSnapshotKey options
+
+                                                                        if
+                                                                            generation
+                                                                            <> Volatile.Read(&freshProjectCheckGeneration)
+                                                                            || not (
+                                                                                String.Equals(
+                                                                                    currentKey,
+                                                                                    cacheKey,
+                                                                                    StringComparison.Ordinal
+                                                                                )
+                                                                            )
+                                                                        then
+                                                                            Interlocked.Increment(
+                                                                                &freshProjectCheckInvalidationCount
+                                                                            )
+                                                                            |> ignore
+                                                                            checker.InvalidateConfiguration(options)
+
+                                                                            return
+                                                                                raise (
+                                                                                    InvalidOperationException(
+                                                                                        "project inputs changed while the type-check was running; stale diagnostics were discarded"
+                                                                                    )
+                                                                                )
+                                                                        else
+                                                                            return
+                                                                                diagnostics,
+                                                                                options.ProjectFileName,
+                                                                                optionsSource
+                                                                }
+                                                        )
+                                                finally
+                                                    freshProjectChecksInFlight.TryRemove(workKey)
+                                                    |> ignore
+                                            }),
+                                        LazyThreadSafetyMode.ExecutionAndPublication
+                                    )
+                            )
+
+                        let work = pending.Value
+                        observeFault work
+                        let! result = work
+                        return Ok result
             with
             | :? OperationCanceledException
-            | :? TaskCanceledException -> return Error "timeout"
+            | :? TaskCanceledException
+            | :? TimeoutException -> return Error "timeout"
             | ex -> return Error ex.Message
         }
 
@@ -4320,15 +5738,272 @@ type internal FcsBridge() =
     /// (#138). Returns (existing, total) `-r:`/`--reference:` targets that exist on disk.
     /// Used to tell an unrestored/unbuilt project apart from a genuinely-erroring one
     /// before running the FCS re-check. Resolution is cached, so this warms the same
-    /// options FreshProjectCheck reuses. Never throws — an unloadable project yields
-    /// (0, 0), which the caller treats as "could not probe" and falls through.
-    member private this.ProbeReferenceResolution(fsproj: string) : Task<int * int> =
+    /// options FreshProjectCheck reuses. Failures remain typed Error values so a busy,
+    /// timed-out, or unloadable probe becomes an honest unknown Check verdict.
+    member private this.ProbeReferenceResolution
+        (fsproj: string, remainingBudget: unit -> TimeSpan)
+        : Task<Result<int * int, string>> =
         task {
             try
-                let! options, _ = this.ResolveFsprojOptions(normalizePath fsproj)
-                return ReferenceResolution.probe options.OtherOptions
-            with _ ->
-                return 0, 0
+                let! options, _ =
+                    this.ResolveFsprojOptionsWithinBudget(normalizePath fsproj, Some remainingBudget)
+
+                if remainingBudget () <= TimeSpan.Zero then
+                    return Error "timeout"
+                else
+                    return!
+                        runReferenceResolutionProbe
+                            (referenceResolutionProbeKey options)
+                            (Array.copy options.OtherOptions)
+                            (Some remainingBudget)
+            with ex ->
+                return Error ex.Message
+        }
+
+    /// Resolve the exact evaluated FCS SourceFiles covered by a fast check. This is
+    /// intentionally based on project options rather than raw XML Compile items, so
+    /// imports, conditions, linked files, and SDK evaluation are reflected honestly.
+    member private this.ResolveFastCheckExpectation
+        (
+            args: CheckArgs,
+            resolvedScope: string,
+            sweepTargetOpt: string option,
+            remainingBudget: (unit -> TimeSpan) option
+        )
+        : Task<CheckFsacExpectation> =
+        task {
+            let comparer =
+                if OperatingSystem.IsWindows() then
+                    StringComparer.OrdinalIgnoreCase
+                else
+                    StringComparer.Ordinal
+
+            let expected = System.Collections.Generic.HashSet<string>(comparer)
+            let failures = ResizeArray<string>()
+            let contextFingerprints = ResizeArray<string>()
+            let mutable deadlineExpired = false
+
+            let markDeadlineExpired description =
+                if not deadlineExpired then
+                    failures.Add($"Fast check expectation timed out while {description}.")
+
+                deadlineExpired <- true
+
+            let awaitWithinDeadline description (start: unit -> Task<'T>) : Task<'T option> =
+                task {
+                    match remainingBudget with
+                    | Some getRemaining ->
+                        let remaining = getRemaining ()
+
+                        if remaining <= TimeSpan.Zero then
+                            markDeadlineExpired description
+                            return None
+                        else
+                            let work =
+                                task {
+                                    do! Task.Yield()
+
+                                    if getRemaining () <= TimeSpan.Zero then
+                                        return raise (TimeoutException())
+                                    else
+                                        return! start ()
+                                }
+
+                            observeFault work
+                            let waitBudget = getRemaining ()
+
+                            if waitBudget <= TimeSpan.Zero then
+                                markDeadlineExpired description
+                                return None
+                            else
+                                try
+                                    let! value = work.WaitAsync(waitBudget)
+
+                                    if getRemaining () <= TimeSpan.Zero then
+                                        markDeadlineExpired description
+                                        return None
+                                    else
+                                        return Some value
+                                with :? TimeoutException ->
+                                    markDeadlineExpired description
+                                    return None
+                    | None ->
+                        let! value = start ()
+                        return Some value
+                }
+
+            let normalizeSource (options: FSharpProjectOptions) (sourceFile: string) =
+                if Path.IsPathFullyQualified sourceFile then
+                    normalizePath sourceFile
+                else
+                    Path.Combine(Path.GetDirectoryName(options.ProjectFileName), sourceFile) |> normalizePath
+
+            let addProjectSources (options: FSharpProjectOptions) =
+                task {
+                    // See FreshProjectCheck: a cached ResolveFsprojOptions can complete
+                    // synchronously, so the snapshot hash itself needs an async boundary
+                    // before the caller's overall WaitAsync can be effective.
+                    let! contextFingerprint = resolveAnalysisSnapshotKey options remainingBudget
+
+                    match remainingBudget with
+                    | Some getRemaining when getRemaining () <= TimeSpan.Zero ->
+                        markDeadlineExpired "computing the project context fingerprint"
+                    | _ ->
+                        contextFingerprints.Add(contextFingerprint)
+
+                        for sourceFile in options.SourceFiles do
+                            if not (String.IsNullOrWhiteSpace sourceFile) then
+                                expected.Add(normalizeSource options sourceFile) |> ignore
+                }
+
+            match resolvedScope with
+            | "file" ->
+                match args.path with
+                | Some path when not (String.IsNullOrWhiteSpace path) ->
+                    try
+                        let fullPath = normalizePath path
+                        let source = File.ReadAllText(fullPath)
+                        let! resolved =
+                            awaitWithinDeadline
+                                $"evaluating SourceFiles for '{fullPath}'"
+                                (fun () -> this.ResolveProjectOptions(fullPath, source, args.projectPath, None))
+
+                        match resolved with
+                        | Some(options, _) ->
+                            contextFingerprints.Add(computeAnalysisSnapshotKey options)
+
+                            let evaluatedFiles =
+                                options.SourceFiles
+                                |> Array.filter (String.IsNullOrWhiteSpace >> not)
+                                |> Array.map (normalizeSource options)
+
+                            expected.Add(fullPath) |> ignore
+
+                            if not (evaluatedFiles |> Array.exists (fun file -> comparer.Equals(file, fullPath))) then
+                                failures.Add($"File is not present in the evaluated SourceFiles: {fullPath}")
+                        | None -> ()
+                    with ex ->
+                        failures.Add($"Could not evaluate SourceFiles for file scope: {ex.Message}")
+                | _ -> failures.Add("scope='file' requires a source path.")
+
+            | "project" ->
+                match sweepTargetOpt with
+                | Some target ->
+                    try
+                        let! discovered =
+                            awaitWithinDeadline
+                                $"resolving a project from '{target}'"
+                                (fun () ->
+                                    runCheckTargetDiscovery
+                                        (checkDiscoveryKey "project" target args.path)
+                                        remainingBudget
+                                        (fun () ->
+                                            CheckTargetDiscoveryResult.Project(
+                                                resolveSingleCheckProject target args.path remainingBudget
+                                            )))
+
+                        match discovered with
+                        | Some(CheckTargetDiscoveryResult.Project(Some fsproj)) ->
+                            let! resolved =
+                                awaitWithinDeadline
+                                    $"evaluating SourceFiles for '{fsproj}'"
+                                    (fun () -> this.ResolveFsprojOptionsWithinBudget(fsproj, remainingBudget))
+
+                            match resolved with
+                            | Some(options, _) -> do! addProjectSources options
+                            | None -> ()
+                        | Some(CheckTargetDiscoveryResult.Project None) ->
+                            failures.Add("Could not resolve a project for the fast check.")
+                        | Some(CheckTargetDiscoveryResult.Busy reason) -> failures.Add(reason)
+                        | None -> ()
+                        | Some _ -> failures.Add("Project discovery returned an unexpected result.")
+                    with ex ->
+                        failures.Add($"Could not resolve/evaluate SourceFiles from '{target}': {ex.Message}")
+                | None -> failures.Add("Could not resolve a project for the fast check.")
+
+            | "workspace" ->
+                match sweepTargetOpt with
+                | Some target ->
+                    try
+                        let! discovered =
+                            awaitWithinDeadline
+                                $"resolving workspace projects from '{target}'"
+                                (fun () ->
+                                    runCheckTargetDiscovery
+                                        (checkDiscoveryKey "workspace" target None)
+                                        remainingBudget
+                                        (fun () ->
+                                            let projects = SolutionParsing.listProjects target
+
+                                            CheckTargetDiscoveryResult.Projects(
+                                                if
+                                                    projects.Length = 0
+                                                    && target.EndsWith(
+                                                        ".fsproj",
+                                                        StringComparison.OrdinalIgnoreCase
+                                                    )
+                                                then
+                                                    [| target |]
+                                                else
+                                                    projects
+                                            )))
+
+                        match discovered with
+                        | Some(CheckTargetDiscoveryResult.Projects projects) when projects.Length = 0 ->
+                            failures.Add($"Could not resolve any projects from '{target}'.")
+                        | Some(CheckTargetDiscoveryResult.Projects projects) ->
+                            for fsproj in projects do
+                                if not deadlineExpired then
+                                    try
+                                        let! resolved =
+                                            awaitWithinDeadline
+                                                $"evaluating SourceFiles for '{fsproj}'"
+                                                (fun () ->
+                                                    this.ResolveFsprojOptionsWithinBudget(fsproj, remainingBudget))
+
+                                        match resolved with
+                                        | Some(options, _) -> do! addProjectSources options
+                                        | None -> ()
+                                    with ex ->
+                                        failures.Add($"Could not evaluate SourceFiles for '{fsproj}': {ex.Message}")
+                        | Some(CheckTargetDiscoveryResult.Busy reason) -> failures.Add(reason)
+                        | None -> ()
+                        | Some _ -> failures.Add("Workspace discovery returned an unexpected result.")
+                    with ex ->
+                        failures.Add($"Could not resolve workspace projects from '{target}': {ex.Message}")
+                | None -> failures.Add("Could not resolve a workspace for the fast check.")
+
+            | other -> failures.Add($"Fast diagnostics do not support resolved scope '{other}'.")
+
+            let expectedFiles =
+                expected
+                |> Seq.sortWith (fun left right -> comparer.Compare(left, right))
+                |> Seq.toArray
+
+            let contextFingerprint =
+                if failures.Count > 0 || contextFingerprints.Count = 0 then
+                    None
+                else
+                    contextFingerprints
+                    |> Seq.sort
+                    |> String.concat "\n"
+                    |> System.Text.Encoding.UTF8.GetBytes
+                    |> System.Security.Cryptography.SHA256.HashData
+                    |> Convert.ToHexString
+                    |> Some
+
+            return
+                { RequestedProjectPath = sweepTargetOpt
+                  Scope = resolvedScope
+                  ExpectedFiles = expectedFiles
+                  ContextFingerprint = contextFingerprint
+                  Complete = failures.Count = 0
+                  FailureReason =
+                    if failures.Count = 0 then
+                        None
+                    else
+                        Some(String.concat " | " failures)
+                  FileGlob = if resolvedScope = "workspace" then args.fileGlob else None }
         }
 
     // ── check: one trustworthy verdict for the active context (issue #128) ───────
@@ -4353,13 +6028,34 @@ type internal FcsBridge() =
     //
     // fsacSnapshot is injected (like find's fsacProbe) so this FCS substrate stays
     // LSP-agnostic; it is consulted only on the speed="fast" path.
-    member this.Check(args: CheckArgs, ?fsacSnapshot: unit -> Task<CheckFsacSnapshot>) : Task<JsonNode> =
+    member this.Check
+        (args: CheckArgs, ?fsacSnapshot: CheckFsacExpectation -> Task<CheckFsacSnapshot>)
+        : Task<JsonNode> =
         task {
             let speed = (args.speed |> Option.defaultValue "trusted").Trim().ToLowerInvariant()
             let mode = (args.mode |> Option.defaultValue "fs").Trim().ToLowerInvariant()
             let severityFloor = (args.severity |> Option.defaultValue "error").Trim().ToLowerInvariant()
             let scopeRaw = (args.scope |> Option.defaultValue "auto").Trim().ToLowerInvariant()
             let timeoutMs = args.timeoutMs |> Option.defaultValue 60000
+            let checkBudget = TimeSpan.FromMilliseconds(float (max 0 timeoutMs))
+            let checkElapsed = System.Diagnostics.Stopwatch.StartNew()
+
+            // WaitAsync's timer and Stopwatch do not have identical wake-up precision:
+            // the caller can observe a timeout a fraction before Elapsed reaches the
+            // requested budget. Publish that terminal state explicitly so an admitted
+            // non-cancellable worker cannot see a tiny positive remainder and start
+            // filesystem/FCS work after Check has already returned unknown.
+            let mutable checkDeadlineExpired = 0
+
+            let markCheckDeadlineExpired () =
+                Interlocked.Exchange(&checkDeadlineExpired, 1) |> ignore
+
+            let remainingCheckBudget () =
+                if Volatile.Read(&checkDeadlineExpired) <> 0 then
+                    TimeSpan.Zero
+                else
+                    let remaining = checkBudget - checkElapsed.Elapsed
+                    if remaining <= TimeSpan.Zero then TimeSpan.Zero else remaining
 
             let invalid msg =
                 jobj [ "status", jstr "invalid_args"; "message", jstr msg ] :> JsonNode
@@ -4378,6 +6074,8 @@ type internal FcsBridge() =
                 return invalid $"severity must be one of error|warning|information|hint|all (got '{severityFloor}')"
             elif not (List.contains scopeRaw [ "auto"; "file"; "project"; "workspace"; "snippet" ]) then
                 return invalid $"scope must be one of auto|file|project|workspace|snippet (got '{scopeRaw}')"
+            elif timeoutMs < 0 then
+                return invalid $"timeoutMs must be non-negative (got {timeoutMs})"
             else
 
             // Severity floor → rank (Error = 1, highest). A diagnostic is surfaced in the
@@ -4405,26 +6103,181 @@ type internal FcsBridge() =
             let passesFloor (sev: FSharpDiagnosticSeverity) = fcsRank sev <= floorRank
 
             // Project / solution target for project + workspace scopes. (Program.fs has
-            // already defaulted projectPath to the active set_project.)
-            let sweepTargetOpt =
+            // already defaulted projectPath to the active set_project.) A nearest-project
+            // filesystem walk is admitted discovery work; never execute Directory.GetFiles
+            // synchronously while constructing this value.
+            let explicitSweepTargetOpt =
                 args.projectPath
                 |> Option.filter (String.IsNullOrWhiteSpace >> not)
                 |> Option.map normalizePath
-                |> Option.orElseWith (fun () -> args.path |> Option.bind findNearestFsproj |> Option.map normalizePath)
 
-            let resolvedScope =
+            let! sweepTargetOpt, targetResolutionFailure =
+                match explicitSweepTargetOpt with
+                | Some target -> Task.FromResult(Some target, None)
+                | None when scopeRaw = "project" || scopeRaw = "workspace" ->
+                    match args.path |> Option.filter (String.IsNullOrWhiteSpace >> not) with
+                    | Some path ->
+                        task {
+                            let remaining = remainingCheckBudget ()
+
+                            if remaining <= TimeSpan.Zero then
+                                markCheckDeadlineExpired ()
+                                return None, Some "timeout"
+                            else
+                                let work =
+                                    runCheckTargetDiscovery
+                                        (checkDiscoveryKey "nearest-project" path None)
+                                        (Some remainingCheckBudget)
+                                        (fun () ->
+                                            CheckTargetDiscoveryResult.Project(
+                                                findNearestFsproj path |> Option.map normalizePath
+                                            ))
+
+                                observeFault work
+
+                                try
+                                    let! result = work.WaitAsync(remaining)
+
+                                    match result with
+                                    | CheckTargetDiscoveryResult.Project target ->
+                                        if remainingCheckBudget () <= TimeSpan.Zero then
+                                            markCheckDeadlineExpired ()
+
+                                        return
+                                            target,
+                                            (if remainingCheckBudget () <= TimeSpan.Zero then
+                                                 Some "timeout"
+                                             else
+                                                 None)
+                                    | CheckTargetDiscoveryResult.Busy reason -> return None, Some reason
+                                    | _ ->
+                                        return
+                                            None,
+                                            Some "Nearest-project discovery returned an unexpected result."
+                                with :? TimeoutException ->
+                                    markCheckDeadlineExpired ()
+                                    return None, Some "timeout"
+                        }
+                    | None -> Task.FromResult(None, None)
+                | None -> Task.FromResult(None, None)
+
+            let! resolvedScope, autoScopeDiscoveryFailure =
                 match scopeRaw with
-                | "file" -> "file"
-                | "project" -> "project"
-                | "workspace" -> "workspace"
-                | "snippet" -> "snippet"
+                | "file" -> Task.FromResult("file", None)
+                | "project" -> Task.FromResult("project", None)
+                | "workspace" -> Task.FromResult("workspace", None)
+                | "snippet" -> Task.FromResult("snippet", None)
                 | _ -> // auto
-                    if hasText args.snippet then "snippet"
-                    elif hasText args.path then "file"
+                    if hasText args.snippet then
+                        Task.FromResult("snippet", None)
+                    elif hasText args.path then
+                        Task.FromResult("file", None)
                     else
                         match sweepTargetOpt with
-                        | Some t -> if (SolutionParsing.listProjects t).Length > 1 then "workspace" else "project"
-                        | None -> "project"
+                        | None -> Task.FromResult("project", None)
+                        | Some target ->
+                            task {
+                                let remaining = remainingCheckBudget ()
+
+                                if remaining <= TimeSpan.Zero then
+                                    markCheckDeadlineExpired ()
+                                    return "workspace", Some "timeout"
+                                else
+                                    // Directory/solution discovery can itself be a large
+                                    // synchronous walk. Its worker stays admitted after
+                                    // caller timeout and exact-key retries share it.
+                                    let work =
+                                        runCheckTargetDiscovery
+                                            (checkDiscoveryKey "auto-scope" target None)
+                                            (Some remainingCheckBudget)
+                                            (fun () ->
+                                                CheckTargetDiscoveryResult.Scope(
+                                                    if (SolutionParsing.listProjects target).Length > 1 then
+                                                        "workspace"
+                                                    else
+                                                        "project"
+                                                ))
+
+                                    observeFault work
+
+                                    try
+                                        let! result = work.WaitAsync(remaining)
+
+                                        match result with
+                                        | CheckTargetDiscoveryResult.Scope scope ->
+                                            if remainingCheckBudget () <= TimeSpan.Zero then
+                                                markCheckDeadlineExpired ()
+
+                                            return
+                                                scope,
+                                                (if remainingCheckBudget () <= TimeSpan.Zero then
+                                                     Some "timeout"
+                                                 else
+                                                     None)
+                                        | CheckTargetDiscoveryResult.Busy reason ->
+                                            return "workspace", Some reason
+                                        | _ ->
+                                            return
+                                                "workspace",
+                                                Some "Check target discovery returned an unexpected result."
+                                    with :? TimeoutException ->
+                                        markCheckDeadlineExpired ()
+                                        return "workspace", Some "timeout"
+                            }
+
+            let scopeDiscoveryFailure =
+                targetResolutionFailure |> Option.orElse autoScopeDiscoveryFailure
+
+            let overallDeadlineApplies = resolvedScope = "project" || resolvedScope = "workspace"
+            let overallTimeoutReason = $"Check timed out after {timeoutMs}ms before analysis completed."
+
+            let awaitWithinOverallBudget (start: unit -> Task<'T>) : Task<'T option> =
+                task {
+                    let remaining = remainingCheckBudget ()
+
+                    if remaining <= TimeSpan.Zero then
+                        markCheckDeadlineExpired ()
+                        return None
+                    else
+                        let work =
+                            task {
+                                do! Task.Yield()
+
+                                if remainingCheckBudget () <= TimeSpan.Zero then
+                                    markCheckDeadlineExpired ()
+                                    return raise (TimeoutException())
+                                else
+                                    return! start ()
+                            }
+
+                        observeFault work
+                        let waitBudget = remainingCheckBudget ()
+
+                        if waitBudget <= TimeSpan.Zero then
+                            markCheckDeadlineExpired ()
+                            return None
+                        else
+                            try
+                                let! value = work.WaitAsync(waitBudget)
+
+                                if remainingCheckBudget () <= TimeSpan.Zero then
+                                    markCheckDeadlineExpired ()
+                                    return None
+                                else
+                                    return Some value
+                            with :? TimeoutException ->
+                                markCheckDeadlineExpired ()
+                                return None
+                }
+
+            let incompleteFastExpectation reason =
+                { RequestedProjectPath = sweepTargetOpt
+                  Scope = resolvedScope
+                  ExpectedFiles = [||]
+                  ContextFingerprint = None
+                  Complete = false
+                  FailureReason = Some reason
+                  FileGlob = if resolvedScope = "workspace" then args.fileGlob else None }
 
             // Single response builder — keeps the actionable header (verdict/analyzed/
             // counts) identical across every scope and speed, then folds in the legacy
@@ -4482,6 +6335,26 @@ type internal FcsBridge() =
                 nodes, files
 
             match resolvedScope with
+            | _ when scopeDiscoveryFailure.IsSome ->
+                let discoveryReason =
+                    match scopeDiscoveryFailure with
+                    | Some "timeout" -> overallTimeoutReason
+                    | Some reason -> reason
+                    | None -> overallTimeoutReason
+
+                return
+                    build
+                        "unknown"
+                        false
+                        (if speed = "fast" then "fsac" else "fcs")
+                        None
+                        0
+                        0
+                        0
+                        [||]
+                        [||]
+                        (Some discoveryReason)
+                        [ "projectsSwept", jint 0 ]
             // ── snippet: always FRESH (ignores speed); old ValidateSnippet logic ──
             | "snippet" ->
                 match args.snippet with
@@ -4565,25 +6438,199 @@ type internal FcsBridge() =
 
             // ── file / project / workspace ───────────────────────────────────────
             | _ when speed = "fast" ->
-                // Cheap cached FSAC snapshot. A cold cache (no analysis pushed yet) is
-                // the stale-`{}` ambiguity → verdict="unknown", NOT a false-clean.
+                // Resolve the requested coverage from evaluated FCS project options,
+                // then ask FSAC for a context-bound snapshot of exactly those files.
+                let expectationDeadline =
+                    if overallDeadlineApplies then Some remainingCheckBudget else None
+
+                let! expectation =
+                    if overallDeadlineApplies && remainingCheckBudget () <= TimeSpan.Zero then
+                        Task.FromResult(incompleteFastExpectation overallTimeoutReason)
+                    else
+                        task {
+                            let work =
+                                task {
+                                    do! Task.Yield()
+
+                                    if overallDeadlineApplies && remainingCheckBudget () <= TimeSpan.Zero then
+                                        return raise (TimeoutException())
+                                    else
+                                        return!
+                                            this.ResolveFastCheckExpectation(
+                                                args,
+                                                resolvedScope,
+                                                sweepTargetOpt,
+                                                expectationDeadline
+                                            )
+                                }
+
+                            observeFault work
+
+                            match expectationDeadline with
+                            | Some getRemaining ->
+                                let remaining = getRemaining ()
+
+                                if remaining <= TimeSpan.Zero then
+                                    markCheckDeadlineExpired ()
+                                    return incompleteFastExpectation overallTimeoutReason
+                                else
+                                    try
+                                        let! completed = work.WaitAsync(remaining)
+
+                                        if getRemaining () <= TimeSpan.Zero then
+                                            markCheckDeadlineExpired ()
+                                            return incompleteFastExpectation overallTimeoutReason
+                                        else
+                                            return completed
+                                    with :? TimeoutException ->
+                                        markCheckDeadlineExpired ()
+                                        return incompleteFastExpectation overallTimeoutReason
+                            | None -> return! work
+                        }
+
                 let! snap =
                     match fsacSnapshot with
-                    | Some thunk -> thunk ()
-                    | None -> Task.FromResult CheckFsacSnapshot.empty
+                    | Some thunk ->
+                        task {
+                            if overallDeadlineApplies && remainingCheckBudget () <= TimeSpan.Zero then
+                                markCheckDeadlineExpired ()
+                                return CheckFsacSnapshot.unavailable expectation overallTimeoutReason
+                            else
+                                try
+                                    let work =
+                                        task {
+                                            do! Task.Yield()
 
-                let hasAnalysis = snap.Ready && snap.MostRecentAnalyzedAt.IsSome
+                                            if overallDeadlineApplies && remainingCheckBudget () <= TimeSpan.Zero then
+                                                markCheckDeadlineExpired ()
+                                                return raise (TimeoutException())
+                                            else
+                                                return! thunk expectation
+                                        }
 
-                let verdict, analyzed, reason =
-                    if not hasAnalysis then
-                        "unknown",
-                        false,
-                        Some
-                            "FSAC has not published diagnostics yet (cold cache); the default trusted check returns a ground-truth verdict."
-                    elif snap.ErrorCount > 0 then
-                        "errors", true, None
+                                    observeFault work
+
+                                    if overallDeadlineApplies then
+                                        let remaining = remainingCheckBudget ()
+
+                                        if remaining <= TimeSpan.Zero then
+                                            markCheckDeadlineExpired ()
+                                            return CheckFsacSnapshot.unavailable expectation overallTimeoutReason
+                                        else
+                                            try
+                                                let! completed = work.WaitAsync(remaining)
+
+                                                // Work and the timeout timer can become
+                                                // runnable together. A successful await is
+                                                // not conclusive unless the overall deadline
+                                                // is still live after its continuation runs.
+                                                let deadlineExpired =
+                                                    remainingCheckBudget () <= TimeSpan.Zero
+                                                    || (checkFastSnapshotDeadlineExpiredOverride
+                                                        |> Option.exists (fun probe -> probe ()))
+
+                                                if deadlineExpired then
+                                                    markCheckDeadlineExpired ()
+
+                                                    return
+                                                        CheckFsacSnapshot.unavailable
+                                                            expectation
+                                                            overallTimeoutReason
+                                                else
+                                                    return completed
+                                            with :? TimeoutException ->
+                                                markCheckDeadlineExpired ()
+                                                return CheckFsacSnapshot.unavailable expectation overallTimeoutReason
+                                    else
+                                        return! work
+                                with ex ->
+                                    return CheckFsacSnapshot.unavailable expectation ex.Message
+                        }
+                    | None ->
+                        Task.FromResult(
+                            CheckFsacSnapshot.unavailable
+                                expectation
+                                "No context-bound FSAC diagnostics snapshot was supplied."
+                        )
+
+                let pathComparer =
+                    if OperatingSystem.IsWindows() then
+                        StringComparer.OrdinalIgnoreCase
                     else
-                        "clean", true, None
+                        StringComparer.Ordinal
+
+                let expectedUniverse =
+                    System.Collections.Generic.HashSet<string>(expectation.ExpectedFiles, pathComparer)
+
+                let snapshotFilesBound =
+                    snap.ExpectedFiles |> Array.forall expectedUniverse.Contains
+
+                let exactExpectedSet =
+                    snap.ExpectedFiles.Length = expectation.ExpectedFiles.Length && snapshotFilesBound
+
+                let globMatchedNoFiles =
+                    expectation.FileGlob.IsSome && snap.ExpectedFiles.Length = 0
+
+                // A workspace glob intentionally narrows the FCS-derived universe; every
+                // other scope must echo the exact expected set to prevent A/B leakage.
+                let expectationBound =
+                    if expectation.FileGlob.IsSome then
+                        not globMatchedNoFiles && snapshotFilesBound
+                    else
+                        exactExpectedSet
+
+                let generationCurrent = snap.SessionGeneration |> Option.exists (fun generation -> generation > 0L)
+
+                let diagnosticsBound =
+                    snap.Status = "ok" && snap.ContextMatched && generationCurrent && expectationBound
+
+                let coverageComplete =
+                    expectation.Complete
+                    && diagnosticsBound
+                    && snap.Ready
+                    && snap.Complete
+                    && snap.MissingFiles.Length = 0
+                    && snap.StaleFiles.Length = 0
+
+                // A current error is positive evidence even if another expected file is
+                // missing/stale. Absence of errors becomes clean only at full coverage.
+                let conclusiveErrors = expectation.Complete && diagnosticsBound && snap.ErrorCount > 0
+
+                let verdict =
+                    if conclusiveErrors then "errors"
+                    elif coverageComplete then "clean"
+                    else "unknown"
+
+                let analyzed = coverageComplete
+
+                let coverageReason =
+                    if verdict = "errors" && not coverageComplete then
+                        Some
+                            $"Current FSAC errors were found, but diagnostics coverage is incomplete ({snap.ReceivedFiles.Length}/{snap.ExpectedFiles.Length} expected file(s) published)."
+                    elif verdict <> "unknown" then
+                        None
+                    elif not expectation.Complete then
+                        expectation.FailureReason
+                        |> Option.orElse (Some "FCS could not derive the complete evaluated SourceFiles set.")
+                    elif not snap.ContextMatched then
+                        snap.FailureReason
+                        |> Option.orElse (Some "The active FSAC session does not match the requested project context.")
+                    elif not snap.Ready then
+                        snap.FailureReason |> Option.orElse (Some "FSAC is still loading the requested project context.")
+                    elif not generationCurrent then
+                        Some "FSAC did not provide a live session generation for the diagnostics snapshot."
+                    elif globMatchedNoFiles then
+                        snap.FailureReason
+                        |> Option.orElse (Some "fileGlob matched no evaluated source files in the requested workspace.")
+                    elif not expectationBound then
+                        Some "FSAC diagnostics were not bound to the evaluated in-scope SourceFiles."
+                    elif snap.StaleFiles.Length > 0 then
+                        Some $"FSAC diagnostics are stale for {snap.StaleFiles.Length} expected file(s)."
+                    elif snap.MissingFiles.Length > 0 then
+                        Some $"FSAC has not published diagnostics for {snap.MissingFiles.Length} expected file(s)."
+                    else
+                        snap.FailureReason
+                        |> Option.orElse (Some "FSAC diagnostics coverage is incomplete.")
 
                 // Surface the snapshot's diagnostics by the requested severity floor —
                 // LSP severity codes (1=Error … 4=Hint) line up with floorRank, so a node
@@ -4647,8 +6694,25 @@ type internal FcsBridge() =
                         totalSnapshotDiagnostics
                         nodes
                         files
-                        reason
+                        coverageReason
                         [ "lspState", jstr (if snap.Ready then "ready" else "warming")
+                          "fsacStatus", jstr snap.Status
+                          "requestedProjectPath",
+                          (expectation.RequestedProjectPath |> Option.map jstr |> Option.defaultValue null)
+                          "fileGlob", (expectation.FileGlob |> Option.map jstr |> Option.defaultValue null)
+                          "contextMatched", jbool snap.ContextMatched
+                          "complete", jbool coverageComplete
+                          "expectationComplete", jbool expectation.Complete
+                          "expectedFileCount", jint snap.ExpectedFiles.Length
+                          "receivedFileCount", jint snap.ReceivedFiles.Length
+                          "missingFileCount", jint snap.MissingFiles.Length
+                          "staleFileCount", jint snap.StaleFiles.Length
+                          "expectedFiles", JsonArray(snap.ExpectedFiles |> Array.map jstr) :> JsonNode
+                          "receivedFiles", JsonArray(snap.ReceivedFiles |> Array.map jstr) :> JsonNode
+                          "missingFiles", JsonArray(snap.MissingFiles |> Array.map jstr) :> JsonNode
+                          "staleFiles", JsonArray(snap.StaleFiles |> Array.map jstr) :> JsonNode
+                          "sessionGeneration",
+                          (snap.SessionGeneration |> Option.map jint64 |> Option.defaultValue null)
                           "mostRecentAnalyzedAt", (match snap.MostRecentAnalyzedAt with Some t -> jstr t | None -> null)
                           "analyzedFileCount", jint snap.AnalyzedFileCount ]
 
@@ -4666,7 +6730,7 @@ type internal FcsBridge() =
                         let! projectOptions, optionsSource =
                             this.ResolveProjectOptions(fullPath, source, args.projectPath, None)
 
-                        let projectResultsKey = makeResolvedProjectCacheKey projectOptions
+                        let projectResultsKey = analysisSnapshotKey projectOptions
                         projectResultsCache.TryRemove(projectResultsKey) |> ignore
                         checker.InvalidateConfiguration(projectOptions)
 
@@ -4721,27 +6785,94 @@ type internal FcsBridge() =
                         invalid
                             "check needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first."
                 | Some target ->
-                    let fsproj =
-                        if target.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
-                            Some target
-                        else
-                            args.path
-                            |> Option.bind findNearestFsproj
-                            |> Option.map normalizePath
-                            |> Option.orElseWith (fun () -> SolutionParsing.listProjects target |> Array.tryHead)
+                    let! boundedFsproj =
+                        awaitWithinOverallBudget (fun () ->
+                            runCheckTargetDiscovery
+                                (checkDiscoveryKey "project" target args.path)
+                                (Some remainingCheckBudget)
+                                (fun () ->
+                                    CheckTargetDiscoveryResult.Project(
+                                        resolveSingleCheckProject
+                                            target
+                                            args.path
+                                            (Some remainingCheckBudget)
+                                    )))
 
-                    match fsproj with
-                    | None -> return invalid $"check could not resolve a single .fsproj to check from: {target}"
-                    | Some proj ->
+                    match boundedFsproj with
+                    | None ->
+                        return
+                            build
+                                "unknown"
+                                false
+                                "fcs"
+                                None
+                                0
+                                0
+                                0
+                                [||]
+                                [||]
+                                (Some overallTimeoutReason)
+                                [ "projectsSwept", jint 0 ]
+                    | Some(CheckTargetDiscoveryResult.Busy reason) ->
+                        return
+                            build
+                                "unknown"
+                                false
+                                "fcs"
+                                None
+                                0
+                                0
+                                0
+                                [||]
+                                [||]
+                                (Some reason)
+                                [ "projectsSwept", jint 0 ]
+                    | Some(CheckTargetDiscoveryResult.Project None) ->
+                        return invalid $"check could not resolve a single .fsproj to check from: {target}"
+                    | Some(CheckTargetDiscoveryResult.Project(Some proj)) ->
                         // Restore-awareness (#138): an unrestored/unbuilt project still
                         // evaluates its .fsproj, so FCS emits HUNDREDS of spurious FS0039
                         // "is not defined" diagnostics at `open` lines (the real cause is
                         // missing external reference assemblies, not the source). Detect
                         // that deterministically and return an honest "unknown" instead of
                         // a misleading false-error wall.
-                        let! refExisting, refTotal = this.ProbeReferenceResolution(proj)
+                        let! boundedProbe =
+                            awaitWithinOverallBudget (fun () ->
+                                this.ProbeReferenceResolution(proj, remainingCheckBudget))
 
-                        if ReferenceResolution.looksUnrestored refExisting refTotal then
+                        match boundedProbe with
+                        | None
+                        | Some(Error "timeout") ->
+                            return
+                                build
+                                    "unknown"
+                                    false
+                                    "fcs"
+                                    (Some "fcs-reanalyze")
+                                    0
+                                    0
+                                    0
+                                    [||]
+                                    [||]
+                                    (Some overallTimeoutReason)
+                                    [ "projectsSwept", jint 0 ]
+                        | Some(Error reason) ->
+                            return
+                                build
+                                    "unknown"
+                                    false
+                                    "fcs"
+                                    (Some "fcs-reanalyze")
+                                    0
+                                    0
+                                    0
+                                    [||]
+                                    [||]
+                                    (Some $"Reference resolution probe incomplete: {reason}")
+                                    [ "projectsSwept", jint 0 ]
+                        | Some(Ok(refExisting, refTotal)) when
+                            ReferenceResolution.looksUnrestored refExisting refTotal
+                            ->
                             let frac = ReferenceResolution.fraction refExisting refTotal
 
                             return
@@ -4762,59 +6893,64 @@ type internal FcsBridge() =
                                       "referencesResolved", JsonValue.Create(Math.Round(frac, 3)) :> JsonNode
                                       "referencesExisting", jint refExisting
                                       "referencesTotal", jint refTotal ]
-                        else
+                        | Some(Ok _) ->
+                            let! boundedResult =
+                                awaitWithinOverallBudget (fun () ->
+                                    this.FreshProjectCheck(proj, remainingCheckBudget))
 
-                        let! result = this.FreshProjectCheck(proj, timeoutMs)
+                            let result = boundedResult |> Option.defaultValue (Error "timeout")
 
-                        match result with
-                        | Error "timeout" ->
-                            return
-                                build
-                                    "unknown"
-                                    false
-                                    "fcs"
-                                    (Some "fcs-reanalyze")
-                                    0
-                                    0
-                                    0
-                                    [||]
-                                    [||]
-                                    (Some $"FCS type-check timed out after {timeoutMs}ms.")
-                                    [ "projectsSwept", jint 1 ]
-                        | Error msg ->
-                            return
-                                build
-                                    "unknown"
-                                    false
-                                    "fcs"
-                                    (Some "fcs-reanalyze")
-                                    0
-                                    0
-                                    0
-                                    [||]
-                                    [||]
-                                    (Some $"Project could not be analyzed: {msg}")
-                                    [ "projectsSwept", jint 1 ]
-                        | Ok(diags, projFileName, optionsSource) ->
-                            let errorCount, warningCount = countDiagnosticsBySeverity diags
-                            let verdict = if errorCount > 0 then "errors" else "clean"
-                            let nodes, files = surfaceFcs diags
+                            match result with
+                            | Error "timeout" ->
+                                return
+                                    build
+                                        "unknown"
+                                        false
+                                        "fcs"
+                                        (Some "fcs-reanalyze")
+                                        0
+                                        0
+                                        0
+                                        [||]
+                                        [||]
+                                        (Some overallTimeoutReason)
+                                        [ "projectsSwept", jint 1 ]
+                            | Error msg ->
+                                return
+                                    build
+                                        "unknown"
+                                        false
+                                        "fcs"
+                                        (Some "fcs-reanalyze")
+                                        0
+                                        0
+                                        0
+                                        [||]
+                                        [||]
+                                        (Some $"Project could not be analyzed: {msg}")
+                                        [ "projectsSwept", jint 1 ]
+                            | Ok(diags, projFileName, optionsSource) ->
+                                let errorCount, warningCount = countDiagnosticsBySeverity diags
+                                let verdict = if errorCount > 0 then "errors" else "clean"
+                                let nodes, files = surfaceFcs diags
 
-                            return
-                                build
-                                    verdict
-                                    true
-                                    "fcs"
-                                    (Some "fcs-reanalyze")
-                                    errorCount
-                                    warningCount
-                                    diags.Length
-                                    nodes
-                                    files
-                                    None
-                                    [ "projectFileName", jstr projFileName
-                                      "optionsSource", jstr optionsSource
-                                      "projectsSwept", jint 1 ]
+                                return
+                                    build
+                                        verdict
+                                        true
+                                        "fcs"
+                                        (Some "fcs-reanalyze")
+                                        errorCount
+                                        warningCount
+                                        diags.Length
+                                        nodes
+                                        files
+                                        None
+                                        [ "projectFileName", jstr projFileName
+                                          "optionsSource", jstr optionsSource
+                                          "projectsSwept", jint 1 ]
+                    | Some _ ->
+                        return invalid "check project discovery returned an unexpected result"
 
             | "workspace" ->
                 match sweepTargetOpt with
@@ -4823,80 +6959,181 @@ type internal FcsBridge() =
                         invalid
                             "check needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first."
                 | Some target ->
-                    let projects0 = SolutionParsing.listProjects target
+                    let! boundedProjects =
+                        awaitWithinOverallBudget (fun () ->
+                            runCheckTargetDiscovery
+                                (checkDiscoveryKey "workspace" target None)
+                                (Some remainingCheckBudget)
+                                (fun () ->
+                                    let projects = SolutionParsing.listProjects target
+
+                                    CheckTargetDiscoveryResult.Projects(
+                                        if
+                                            projects.Length = 0
+                                            && target.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase)
+                                        then
+                                            [| target |]
+                                        else
+                                            projects
+                                    )))
+
+                    let targetDiscoveryTimedOut = boundedProjects.IsNone
+                    let targetDiscoveryBusy =
+                        match boundedProjects with
+                        | Some(CheckTargetDiscoveryResult.Busy reason) -> Some reason
+                        | _ -> None
 
                     let projects =
-                        if projects0.Length = 0 && target.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
-                            [| target |]
-                        else
-                            projects0
+                        match boundedProjects with
+                        | Some(CheckTargetDiscoveryResult.Projects projects) -> projects
+                        | _ -> [||]
 
-                    if projects.Length = 0 then
+                    if targetDiscoveryTimedOut then
+                        return
+                            build
+                                "unknown"
+                                false
+                                "fcs"
+                                None
+                                0
+                                0
+                                0
+                                [||]
+                                [||]
+                                (Some overallTimeoutReason)
+                                [ "projectsSwept", jint 0 ]
+                    elif targetDiscoveryBusy.IsSome then
+                        return
+                            build
+                                "unknown"
+                                false
+                                "fcs"
+                                None
+                                0
+                                0
+                                0
+                                [||]
+                                [||]
+                                targetDiscoveryBusy
+                                [ "projectsSwept", jint 0 ]
+                    elif projects.Length = 0 then
                         return invalid $"check could not resolve any .fsproj to check from: {target}"
                     else
                         let allDiags = ResizeArray<FSharpDiagnostic>()
                         let perProject = ResizeArray<JsonNode>()
                         let mutable failCount = 0
                         let mutable unrestoredCount = 0
+                        let mutable timedOutCount = 0
+                        let mutable deadlineExhausted = false
+
+                        let addTimedOutProject (proj: string) =
+                            failCount <- failCount + 1
+                            timedOutCount <- timedOutCount + 1
+
+                            perProject.Add(
+                                jobj
+                                    [ "project", jstr (Path.GetFileNameWithoutExtension proj)
+                                      "fsproj", jstr (normalizePath proj)
+                                      "error", jstr "timeout"
+                                      "reason", jstr overallTimeoutReason
+                                      "analyzed", jbool false ]
+                                :> JsonNode
+                            )
 
                         for proj in projects do
-                            // Restore-awareness (#138): skip the FCS re-check for an
-                            // unrestored project — it would only produce a spurious
-                            // FS0039 false-error wall. Mark it unrestored instead.
-                            let! refExisting, refTotal = this.ProbeReferenceResolution(proj)
-
-                            if ReferenceResolution.looksUnrestored refExisting refTotal then
-                                unrestoredCount <- unrestoredCount + 1
-                                let frac = ReferenceResolution.fraction refExisting refTotal
-
-                                perProject.Add(
-                                    jobj
-                                        [ "project", jstr (Path.GetFileNameWithoutExtension proj)
-                                          "fsproj", jstr (normalizePath proj)
-                                          "analyzed", jbool false
-                                          "restoreStatus", jstr "unrestored"
-                                          "referencesResolved", JsonValue.Create(Math.Round(frac, 3)) :> JsonNode
-                                          "referencesExisting", jint refExisting
-                                          "referencesTotal", jint refTotal
-                                          "reason",
-                                          jstr
-                                              "project not built/restored — external references unresolved; run dotnet restore && dotnet build" ]
-                                    :> JsonNode
-                                )
+                            if deadlineExhausted || remainingCheckBudget () <= TimeSpan.Zero then
+                                deadlineExhausted <- true
+                                addTimedOutProject proj
                             else
-                                let! result = this.FreshProjectCheck(proj, timeoutMs)
+                                // Restore-awareness (#138): skip the FCS re-check for an
+                                // unrestored project — it would only produce a spurious
+                                // FS0039 false-error wall. Mark it unrestored instead.
+                                let! boundedProbe =
+                                    awaitWithinOverallBudget (fun () ->
+                                        this.ProbeReferenceResolution(proj, remainingCheckBudget))
 
-                                match result with
-                                | Ok(diags, _, _) ->
-                                    allDiags.AddRange diags
-                                    let e, w = countDiagnosticsBySeverity diags
-
-                                    perProject.Add(
-                                        jobj
-                                            [ "project", jstr (Path.GetFileNameWithoutExtension proj)
-                                              "fsproj", jstr (normalizePath proj)
-                                              "errorCount", jint e
-                                              "warningCount", jint w
-                                              "analyzed", jbool true ]
-                                        :> JsonNode
-                                    )
-                                | Error msg ->
+                                match boundedProbe with
+                                | None
+                                | Some(Error "timeout") ->
+                                    deadlineExhausted <- true
+                                    addTimedOutProject proj
+                                | Some(Error reason) ->
                                     failCount <- failCount + 1
 
                                     perProject.Add(
                                         jobj
                                             [ "project", jstr (Path.GetFileNameWithoutExtension proj)
                                               "fsproj", jstr (normalizePath proj)
-                                              "error", jstr msg
+                                              "error", jstr reason
                                               "analyzed", jbool false ]
                                         :> JsonNode
                                     )
+                                | Some(Ok(refExisting, refTotal)) when
+                                    ReferenceResolution.looksUnrestored refExisting refTotal
+                                    ->
+                                    unrestoredCount <- unrestoredCount + 1
+                                    let frac = ReferenceResolution.fraction refExisting refTotal
+
+                                    perProject.Add(
+                                        jobj
+                                            [ "project", jstr (Path.GetFileNameWithoutExtension proj)
+                                              "fsproj", jstr (normalizePath proj)
+                                              "analyzed", jbool false
+                                              "restoreStatus", jstr "unrestored"
+                                              "referencesResolved",
+                                              JsonValue.Create(Math.Round(frac, 3)) :> JsonNode
+                                              "referencesExisting", jint refExisting
+                                              "referencesTotal", jint refTotal
+                                              "reason",
+                                              jstr
+                                                  "project not built/restored — external references unresolved; run dotnet restore && dotnet build" ]
+                                        :> JsonNode
+                                    )
+                                | Some(Ok _) ->
+                                    let! boundedResult =
+                                        awaitWithinOverallBudget (fun () ->
+                                            this.FreshProjectCheck(proj, remainingCheckBudget))
+
+                                    match boundedResult with
+                                    | None
+                                    | Some(Error "timeout") ->
+                                        deadlineExhausted <- true
+                                        addTimedOutProject proj
+                                    | Some(Ok(diags, _, _)) ->
+                                        allDiags.AddRange diags
+                                        let e, w = countDiagnosticsBySeverity diags
+
+                                        perProject.Add(
+                                            jobj
+                                                [ "project", jstr (Path.GetFileNameWithoutExtension proj)
+                                                  "fsproj", jstr (normalizePath proj)
+                                                  "errorCount", jint e
+                                                  "warningCount", jint w
+                                                  "analyzed", jbool true ]
+                                            :> JsonNode
+                                        )
+                                    | Some(Error msg) ->
+                                        failCount <- failCount + 1
+
+                                        perProject.Add(
+                                            jobj
+                                                [ "project", jstr (Path.GetFileNameWithoutExtension proj)
+                                                  "fsproj", jstr (normalizePath proj)
+                                                  "error", jstr msg
+                                                  "analyzed", jbool false ]
+                                            :> JsonNode
+                                        )
 
                         let diags = allDiags.ToArray()
                         let errorCount, warningCount = countDiagnosticsBySeverity diags
 
                         let verdict, analyzed, reason =
-                            if errorCount > 0 then
+                            if timedOutCount > 0 then
+                                "unknown",
+                                false,
+                                Some
+                                    $"{timedOutCount} of {projects.Length} project(s) timed out or were skipped after the overall {timeoutMs}ms Check budget expired."
+                            elif errorCount > 0 then
                                 "errors", true, None
                             elif unrestoredCount > 0 || failCount > 0 then
                                 "unknown",
@@ -4922,6 +7159,7 @@ type internal FcsBridge() =
                                 reason
                                 [ "projectsSwept", jint projects.Length
                                   "unrestoredCount", jint unrestoredCount
+                                  "timedOutCount", jint timedOutCount
                                   "perProject", JsonArray(perProject.ToArray()) :> JsonNode ]
 
             | _ -> return invalid $"unsupported scope '{resolvedScope}'"
@@ -5798,7 +8036,7 @@ type internal FcsBridge() =
                             )
 
                 let! options, optionsSource = this.ResolveFsprojOptions(fsproj)
-                let cacheKey = $"{makeResolvedProjectCacheKey options}::sources::{sourceFilesStamp options}"
+                let cacheKey = analysisSnapshotKey options
 
                 let! results =
                     task {
@@ -6803,12 +9041,17 @@ type internal FcsBridge() =
 
     member _.ClearAnalysisCaches() =
         Interlocked.Increment(&projectUsesCacheGeneration) |> ignore
+        Interlocked.Increment(&freshProjectCheckGeneration) |> ignore
         projectResultsCache.Clear()
         // issue #131: a new set_project (or any explicit cache clear) must drop the
         // memoized find sweeps too, so a project switch never serves stale symbol uses.
         // Project options intentionally survive: every fsproj entry is validated against
         // its complete ProjInfo input fingerprint before reuse (issue #150).
         projectUsesCache.Clear()
+
+        // The next project-level analysis must establish a new FCS freshness
+        // boundary as well as repopulating the application caches above.
+        lock analysisSnapshotGate lastAnalysisSnapshotByProject.Clear
 
     /// Returns configuration flags captured at checker creation time, for use by RuntimeStatus.
     member _.CheckerConfig: FcsCheckerConfig =
@@ -6823,21 +9066,86 @@ type internal FcsBridge() =
     /// Number of actual Ionide/MSBuild project loads attempted by this bridge. Cache hits
     /// do not increment it; exposed for deterministic project-options cache tests.
     member _.ProjectOptionsLoadCount = Volatile.Read(&projectOptionsLoadCount)
+    member _.ProjectOptionsCacheValidationCount = Volatile.Read(&projectOptionsCacheValidationCount)
 
-    /// Number of entries in the find sweep use-cache (issue #131). One per (project,
-    /// source-stamp); unchanged between sweeps of the same projects, grows by one per
-    /// project when a swept source file is edited. Exposed for cache-behaviour tests.
+    /// Admission/load counters exposed internally for deterministic containment tests.
+    member _.ProjectEvaluationActiveCount = projectEvaluationAdmission.ActiveCount
+    member _.ProjectEvaluationStartedCount = projectEvaluationAdmission.StartedCount
+    member _.ProjectEvaluationRejectedCount = projectEvaluationAdmission.RejectedCount
+    member _.ProjectEvaluationMaxObservedConcurrency = projectEvaluationAdmission.MaxObservedConcurrency
+    member _.ProjectOptionsInFlightCount = optionsInFlight.Count
+    member _.ProjectTypeCheckStartCount = Volatile.Read(&projectTypeCheckStartCount)
+    member _.FreshProjectCheckActiveCount = freshProjectCheckAdmission.ActiveCount
+    member _.FreshProjectCheckStartedCount = freshProjectCheckAdmission.StartedCount
+    member _.FreshProjectCheckRejectedCount = freshProjectCheckAdmission.RejectedCount
+    member _.FreshProjectCheckMaxObservedConcurrency = freshProjectCheckAdmission.MaxObservedConcurrency
+    member _.FreshProjectCheckInFlightCount = freshProjectChecksInFlight.Count
+    member _.FreshProjectCheckInvalidationCount = Volatile.Read(&freshProjectCheckInvalidationCount)
+    member _.SnapshotComputationActiveCount = snapshotComputationAdmission.ActiveCount
+    member _.SnapshotComputationStartedCount = snapshotComputationAdmission.StartedCount
+    member _.SnapshotComputationRejectedCount = snapshotComputationAdmission.RejectedCount
+    member _.SnapshotComputationInFlightCount = snapshotComputationsInFlight.Count
+    member _.CheckTargetDiscoveryActiveCount = checkTargetDiscoveryAdmission.ActiveCount
+    member _.CheckTargetDiscoveryStartedCount = checkTargetDiscoveryAdmission.StartedCount
+    member _.CheckTargetDiscoveryRejectedCount = checkTargetDiscoveryAdmission.RejectedCount
+    member _.CheckTargetDiscoveryInFlightCount = checkTargetDiscoveriesInFlight.Count
+    member _.CheckProjectDiscoveryFallbackCount = Volatile.Read(&checkProjectDiscoveryFallbackCount)
+
+    /// Pure deterministic seam for verifying collision-free discovery key framing.
+    member _.CheckDiscoveryKeyForTest(scope: string, target: string, path: string option) =
+        checkDiscoveryKey scope target path
+
+    member _.ReferenceResolutionProbeActiveCount = referenceResolutionProbeAdmission.ActiveCount
+    member _.ReferenceResolutionProbeStartedCount = referenceResolutionProbeAdmission.StartedCount
+    member _.ReferenceResolutionProbeRejectedCount = referenceResolutionProbeAdmission.RejectedCount
+    member _.ReferenceResolutionProbeInFlightCount = referenceResolutionProbesInFlight.Count
+    member _.AnalysisSnapshotComputeCount = Volatile.Read(&analysisSnapshotComputeCount)
+    member _.AnalysisSnapshotCommitCount = Volatile.Read(&analysisSnapshotCommitCount)
+
+    /// Narrow deterministic seam for containment tests. Production Check obtains the
+    /// same key from evaluated FSharpProjectOptions before calling this helper.
+    member _.ProbeReferencesForTest(workKey: string, otherOptions: string array) =
+        runReferenceResolutionProbe workKey (Array.copy otherOptions) None
+
+    /// Number of entries in the find sweep use-cache (issue #131/#168 P1-07). One per
+    /// project analysis snapshot; unchanged between identical sweeps and grows when any
+    /// evaluated/source/reference input changes. Exposed for cache-behaviour tests.
     member _.ProjectUsesCacheCount = projectUsesCache.Count
+
+    /// Return the cached MSBuild-evaluated model that backs both project_health
+    /// and fsharp_project_inspect. It is produced by the same Ionide load as the
+    /// FCS options, so defaults, imports, Conditions, files, and references cannot
+    /// disagree between the two tools.
+    member this.GetEvaluatedProjectSnapshot
+        (fsprojPath: string)
+        : Task<Result<EvaluatedProjectSnapshot, string>> =
+        task {
+            try
+                let! entry = this.ResolveFsprojEntry(fsprojPath)
+
+                match entry.EvaluatedSnapshot with
+                | Some snapshot -> return Ok snapshot
+                | None ->
+                    return
+                        Error
+                            $"Evaluated project information is unavailable for '%s{Path.GetFullPath fsprojPath}'."
+            with ex ->
+                return Error ex.Message
+        }
 
     member this.ProbeProjectOptions(fsprojPath: string) : Task<Result<ProjectOptionsInfo, string>> =
         task {
             try
-                let! options, source = this.ResolveFsprojOptions(fsprojPath)
-                let existing, total = ReferenceResolution.probe options.OtherOptions
+                let! entry = this.ResolveFsprojEntry(fsprojPath)
+
+                let existing, total =
+                    match entry.EvaluatedSnapshot with
+                    | Some snapshot -> snapshot.ReferencesExisting, snapshot.ReferencesTotal
+                    | None -> ReferenceResolution.probe entry.Options.OtherOptions
 
                 return
                     Ok
-                        { Source = source
+                        { Source = entry.Source
                           ReferencesExisting = existing
                           ReferencesTotal = total }
             with ex ->
@@ -7339,8 +9647,7 @@ type internal FcsBridge() =
 
                     options.SourceFiles |> Array.iteri (fun i f -> fileIndex[normalizePath f] <- i)
 
-                    let usesKey =
-                        $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}|{referencedProjectSourcesStamp options}"
+                    let usesKey = analysisSnapshotKey options
 
                     let! allUses, diagnostics = this.ProjectSweepUses(usesKey, options, 120000)
 
@@ -8659,8 +10966,7 @@ type internal FcsBridge() =
                     let projDisplay = Path.GetFileNameWithoutExtension fsproj
                     let! options, _ = this.ResolveFsprojOptions(fsproj)
 
-                    let usesKey =
-                        $"{makeResolvedProjectCacheKey options}|{sourceFilesStamp options}|{referencedAssembliesStamp options}|{referencedProjectSourcesStamp options}"
+                    let usesKey = analysisSnapshotKey options
 
                     let! allUses, _ = this.ProjectSweepUses(usesKey, options, 120000)
                     scannedOk <- scannedOk + 1

@@ -114,6 +114,29 @@ let ``build returns no_symbol when the workspace edit is null`` () =
     Assert.Equal("no_symbol", result["status"].GetValue<string>())
 
 [<Fact>]
+let ``build reports malformed rename payload as protocol failure`` () =
+    let ctx =
+        contextFor "renamed" fileUri 0 0 (Map.ofList [ fileUri, singleFileSource ]) (fun _ -> None)
+
+    let result = RenamePreviewShape.build ctx (parse "[]")
+
+    Assert.Equal("infrastructure_error", result["status"].GetValue<string>())
+    Assert.Equal("protocol_error", result["errorKind"].GetValue<string>())
+
+[<Fact>]
+let ``build does not turn malformed text edits into no_symbol`` () =
+    let ctx =
+        contextFor "renamed" fileUri 0 0 (Map.ofList [ fileUri, singleFileSource ]) (fun _ -> None)
+
+    let malformed =
+        $$"""{ "changes": { "{{fileUri}}": [ { "newText": "renamed" } ] } }"""
+
+    let result = RenamePreviewShape.build ctx (parse malformed)
+
+    Assert.Equal("infrastructure_error", result["status"].GetValue<string>())
+    Assert.Equal("protocol_error", result["errorKind"].GetValue<string>())
+
+[<Fact>]
 let ``build flags crossProject when edits span two distinct projects`` () =
     let uriA = "file:///solution/projA/A.fs"
     let uriB = "file:///solution/projB/B.fs"

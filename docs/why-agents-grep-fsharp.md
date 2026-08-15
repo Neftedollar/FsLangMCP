@@ -224,7 +224,9 @@ the compiler's internals instead of the agent's goal.
 
 ```bash
 dotnet tool install -g FsLangMcp
-fslangmcp --bootstrap-tools   # one-time: fetches fsautocomplete + ionide.projinfo.tool
+dotnet tool install -g fsautocomplete --version 0.83.0
+dotnet tool install -g ionide.projinfo.tool --version 0.74.2
+dotnet tool install -g fantomas --version 7.0.5
 ```
 
 Add to your MCP client config:

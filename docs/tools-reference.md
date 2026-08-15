@@ -18,16 +18,25 @@ These two tools replace the legacy search/check entry points removed in v0.13.1.
 - `query` (required) — symbol name, dotted suffix, or qualified name
 - `kind` — `auto` | `symbol` | `members` | `field` | `definition` | `position` (default: `auto`; unions symbol/member/field sites)
 - `member` — narrow to a specific member name when `kind=members`
-- `scope` — narrow to a file or project
-- `contextLines` — include surrounding source lines in the response
+- `scope` — `auto` | `file` | `project` | `workspace` (default: `auto`); file requires `path`, project requires one member `.fsproj`
+- `contextLines` — non-negative surrounding source-line count (default: `0`)
+- `maxResults` — page size from 1 to 1000 (default: `80`)
+- `timeoutMs` — non-negative whole-sweep budget; `0` returns an immediate typed timeout (default: `120000`)
 
 **Use when:** "Where is `X` defined?", "What calls `OrderId`?", "Which files set this record field?"
+
+**Absence contract:** inspect `outcome` and `coverage.complete`. A complete miss returns
+`outcome="not_found"` and `resolution.matched=false`. A failed/timed-out project makes absence
+indeterminate (`status="unknown"`, `outcome="indeterminate"`, `matched=null`); positive results
+from an incomplete sweep return `status="partial"`.
 
 ---
 
 ### `check`
 
-**Purpose:** One trustworthy compile verdict — `clean` | `errors` | `unknown` — from a fresh in-process type-check. Never returns a stale-cache false-clean.
+**Purpose:** One trustworthy compile verdict — `clean` | `errors` | `unknown`. The default uses a
+fresh in-process type-check; fast mode requires complete, current, project-bound FSAC coverage
+before it can return `clean`.
 
 **Key args:**
 - `scope` — `auto` | `file` | `project` | `workspace` | `snippet` (default: `auto`)
@@ -38,6 +47,10 @@ These two tools replace the legacy search/check entry points removed in v0.13.1.
 
 **Use when:** "Did my edit compile?", "Are there errors in this file?", "Is the workspace clean?"
 
+In `speed=fast`, inspect `complete`, `expectedFiles`, `missingFiles`, `staleFiles`, and
+`sessionGeneration`. Current errors remain actionable with `complete=false`; an incomplete
+zero-error snapshot is `unknown`, never `clean`.
+
 ---
 
 ## Navigate / understand
@@ -47,10 +60,10 @@ These two tools replace the legacy search/check entry points removed in v0.13.1.
 **Purpose:** Initialize or switch the FSAC/LSP project context. Must be called before raw LSP-proxy tools.
 
 **Key args:**
-- `projectPath` (required) — `.fsproj`, `.sln`, `.slnx`, or directory path
+- `projectPath` (required) — `.fsproj`, `.sln`, `.slnx`, or directory path; a directory recursively selects one candidate and reports ambiguity for multiple candidates
 - `restartLsp` — request an FSAC restart (default `true`)
 
-**Response includes:** `loadedProjects`, `readiness` (`lsp` / `projectOptions` / `symbolIndex` flags plus `symbolIndexState` / `symbolIndexHint`), `lspRestartRequested`, legacy `lspRestarted`, `lspReplacedExistingProcess`, and `fslangmcpVersion`. `lspRestarted` keeps mirroring the request for compatibility; `lspReplacedExistingProcess=true` means a pre-existing FSAC process was actually replaced, so first launch reports `false` there.
+**Response includes:** `loadedProjects`, `readiness` (`lsp` / `projectOptions` / `symbolIndex` flags plus `symbolIndexState` / `symbolIndexHint`), `lspLifecycleState`, `sessionGeneration`, `lspRestartRequested`, legacy `lspRestarted`, `lspReplacedExistingProcess`, and `fslangmcpVersion`. `lspRestarted` keeps mirroring the request for compatibility; `lspReplacedExistingProcess=true` means a pre-existing FSAC process was actually replaced, so first launch reports `false` there. Switching to a different context with `restartLsp=false` while FSAC is live returns `status="restart_required"` and leaves the active context unchanged.
 
 **Use when:** Starting a session or switching to a different project. Call once; context persists.
 
@@ -58,10 +71,12 @@ These two tools replace the legacy search/check entry points removed in v0.13.1.
 
 ### `project_health`
 
-**Purpose:** Fast read-only preflight for one F# project. Reports FCS trust status, project options availability, source file readability, analyzer setup, test project discovery, and current LSP readiness. Does not start FSAC, build, or run tests.
+**Purpose:** Fast read-only preflight for one F# project. Reports FCS trust status, project options availability, source file readability, analyzer setup, test project discovery, and current LSP readiness. Project files, properties, package/project references, and imported configuration come from the same MSBuild-evaluated ProjInfo snapshot used by project inspection, so SDK default items, `Condition`, and `Directory.Build.*` imports are applied. Does not start FSAC, build, or run tests.
 
 **Key args:**
 - `projectPath` — optional after `set_project`
+
+The `evaluation` object identifies the evaluated source and restore state. LSP readiness is context-bound: a live, ready session for project A is not reported as ready while inspecting unrelated project B; use `workspace.lspContextMatched` and `workspace.lspLoadedProjects` to diagnose that case.
 
 **Use when:** Diagnosing why FCS tools return incomplete data, or before starting a long agent run.
 
@@ -93,10 +108,12 @@ These two tools replace the legacy search/check entry points removed in v0.13.1.
 
 ### `fsharp_project_inspect`
 
-**Purpose:** Read-only `.fsproj` inspection with MSBuild evaluation. Returns project identity, compile order, package/project references, and signature/implementation pairing. Does not build, restore, or edit files.
+**Purpose:** Read-only project inspection backed by an evaluated ProjInfo/MSBuild snapshot. Returns project identity, SDK-default and imported compile items in compiler order, conditional/imported package and project references, and signature/implementation pairing. Raw XML is not treated as the effective project model. Does not build, restore, or edit files.
 
 **Key args:**
 - `projectPath` — optional after `set_project`
+
+The response includes `evaluation.status`, `evaluation.source`, `evaluation.imports`, and per-section `evaluationSource` metadata. An evaluation failure is explicit (`evaluation.status = "unavailable"`) instead of silently falling back to an incomplete XML interpretation.
 
 **Use when:** Checking compile order, package references, or `.fsi` pairing without reading raw XML.
 

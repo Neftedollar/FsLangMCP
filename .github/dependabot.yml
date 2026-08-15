@@ -1,0 +1,19 @@
+# Dependency update PRs. Versions are pinned exactly and restore runs in
+# --locked-mode (#167), so upstream patches arrive only through these PRs —
+# each one regenerates packages.lock.json alongside the version bump.
+version: 2
+updates:
+  - package-ecosystem: nuget
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # Analyzers never ship in the packed tool — batch their bumps.
+      analyzers:
+        patterns:
+          - "*Analyzers*"
+          - "FSharp.Analyzers.Build"
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

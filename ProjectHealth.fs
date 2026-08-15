@@ -5,10 +5,13 @@ open System.IO
 open System.Xml.Linq
 open System.Text.Json.Nodes
 open FsLangMcp.Types
+open FsLangMcp.ProjectFiles
 
 type LspHealthSnapshot =
     { ProjectPath: string option
       WorkspaceRoot: string option
+      LoadedProjects: string array
+      SessionLive: bool
       WorkspaceReady: bool
       DiagnosticsFileCount: int }
 
@@ -152,33 +155,32 @@ let analyzerPackageInfoToJson (p: AnalyzerPackageInfo) : JsonNode =
 let private analyzerPackages (doc: XDocument) =
     analyzerPackageInfos doc |> List.map analyzerPackageInfoToJson |> List.toArray
 
-let private sourceSummary (files: (string * string * string option) list) =
+let private sourceSummary (files: ProjectFile list) =
     let missing, unreadable =
         files
         |> List.fold
-            (fun (missingAcc, unreadableAcc) (path, _, _) ->
-                if not (File.Exists path) then
-                    path :: missingAcc, unreadableAcc
+            (fun (missingAcc, unreadableAcc) file ->
+                if not (File.Exists file.Path) then
+                    file.Path :: missingAcc, unreadableAcc
                 else
                     try
-                        use stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)
+                        use stream = File.Open(file.Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)
                         missingAcc, unreadableAcc
                     with ex ->
-                        missingAcc, $"%s{path}: %s{ex.Message}" :: unreadableAcc)
+                        missingAcc, $"%s{file.Path}: %s{ex.Message}" :: unreadableAcc)
             ([], [])
 
     let signatureCount =
-        files
-        |> List.filter (fun (path, _, _) -> Path.GetExtension(path).Equals(".fsi", StringComparison.OrdinalIgnoreCase))
-        |> List.length
+        files |> List.filter _.IsSignature |> List.length
 
     jobj
         [ "sourceFileCount", jint files.Length
           "signatureFileCount", jint signatureCount
           "missingFiles", JsonArray(missing |> List.rev |> List.map jstr |> List.toArray) :> JsonNode
           "unreadableFiles", JsonArray(unreadable |> List.rev |> List.map jstr |> List.toArray) :> JsonNode
-          "hasLinkedFiles", jbool (files |> List.exists (fun (_, _, link) -> link.IsSome))
-          "hasGeneratedFiles", jbool (files |> List.exists (fun (path, _, _) -> isGeneratedFile path)) ]
+          "hasLinkedFiles", jbool (files |> List.exists (fun file -> file.Link.IsSome))
+          "hasGeneratedFiles", jbool (files |> List.exists (fun file -> isGeneratedFile file.Path))
+          "evaluationSource", jstr "msbuild-evaluated" ]
 
 let private projectReferencesCurrentProject
     (referencedProject: string)
@@ -300,21 +302,17 @@ let private findLatestBuildArtifact (projectDir: string) (projectName: string) =
             None
 
 /// Build the test-discovery + last-build JSON sub-object for one project.
-let private testProjectInfo
-    (projectPath: string)
-    (doc: XDocument)
-    (compiledFiles: (string * string * string option) list)
-    : JsonNode =
-    let projectDir = Path.GetDirectoryName(projectPath)
+let private evaluatedTestFrameworks (snapshot: EvaluatedProjectSnapshot) =
+    snapshot.PackageReferences
+    |> List.choose (fun package -> tryMapTestFramework package.PackageId)
+    |> List.distinct
+    |> List.toArray
 
-    // Prefer the .fsproj's `<AssemblyName>` over the file basename — they differ
-    // in plenty of real projects. Fallback chain: AssemblyName → file basename.
-    let assemblyBasename =
-        childValue "AssemblyName" doc
-        |> Option.defaultValue (Path.GetFileNameWithoutExtension(projectPath))
-
-    let frameworks = detectTestFrameworks doc
-    let isTest     = frameworks.Length > 0
+let private testProjectInfo (snapshot: EvaluatedProjectSnapshot) : JsonNode =
+    let projectDir = snapshot.ProjectDirectory
+    let assemblyBasename = snapshot.AssemblyName
+    let frameworks = evaluatedTestFrameworks snapshot
+    let isTest = snapshot.IsTestProject || frameworks.Length > 0
 
     // Count test attributes only when this is a recognised test project.
     // Best-effort: read each compile source; sum [<Fact>] + [<Theory>] occurrences.
@@ -323,8 +321,7 @@ let private testProjectInfo
             null
         else
             let total =
-                compiledFiles
-                |> List.sumBy (fun (path, _, _) -> countTestAttributesInFile path)
+                snapshot.Files |> List.sumBy (fun file -> countTestAttributesInFile file.Path)
             JsonValue.Create(total)
 
     let frameworkArray =
@@ -362,43 +359,68 @@ let private testProjectInfo
           "binaryOutputPath", binaryOutputPath
           "configuration", configuration ]
 
-let private discoverTestProjects (workspaceRoot: string) (currentProjectPath: string) =
-    if not (Directory.Exists workspaceRoot) then
-        [||]
-    else
-        let separator: string = string Path.DirectorySeparatorChar
-        let binSegment = $"%s{separator}bin%s{separator}"
-        let objSegment = $"%s{separator}obj%s{separator}"
+let private discoverTestProjects
+    (workspaceRoot: string)
+    (currentProjectPath: string)
+    (evaluatedProjectProvider: EvaluatedProjectSnapshotProvider)
+    =
+    async {
+        if not (Directory.Exists workspaceRoot) then
+            return [||]
+        else
+            let separator: string = string Path.DirectorySeparatorChar
+            let binSegment = $"%s{separator}bin%s{separator}"
+            let objSegment = $"%s{separator}obj%s{separator}"
 
-        Directory.EnumerateFiles(workspaceRoot, "*.fsproj", SearchOption.AllDirectories)
-        |> Seq.filter (fun path ->
-            not (path.Contains(binSegment, StringComparison.OrdinalIgnoreCase))
-            && not (path.Contains(objSegment, StringComparison.OrdinalIgnoreCase)))
-        |> Seq.choose (fun projectPath ->
-            match tryReadProject projectPath with
-            | Error _ -> None
-            | Ok doc ->
-                let projectDir = Path.GetDirectoryName(projectPath)
+            let projectPaths =
+                Directory.EnumerateFiles(workspaceRoot, "*.fsproj", SearchOption.AllDirectories)
+                |> Seq.filter (fun path ->
+                    not (path.Contains(binSegment, StringComparison.OrdinalIgnoreCase))
+                    && not (path.Contains(objSegment, StringComparison.OrdinalIgnoreCase)))
+                |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right))
+                |> Seq.toArray
 
-                let referencesCurrent =
-                    doc.Descendants(xname "ProjectReference")
-                    |> Seq.exists (fun reference ->
-                        attr "Include" reference
-                        |> Option.exists (fun includePath ->
-                            projectReferencesCurrentProject includePath currentProjectPath projectDir))
+            // ProjInfo/MSBuild evaluation is process-global and can race while distinct
+            // project graphs restore/read shared obj state. Keep discovery deterministic
+            // and serialize loads; the outer project_health handler already has its own
+            // request gate, but that does not protect sibling loads started in parallel.
+            let evaluated = ResizeArray<Result<EvaluatedProjectSnapshot, string>>()
 
-                if looksLikeTestProject doc && referencesCurrent then
-                    Some(
-                        jobj
-                            [ "projectPath", jstr projectPath
-                              "targetFramework",
-                              childValue "TargetFramework" doc |> Option.map jstr |> Option.defaultValue null
-                              "referencesProject", jbool true ]
-                        :> JsonNode
-                    )
-                else
-                    None)
-        |> Seq.toArray
+            for projectPath in projectPaths do
+                let! result = evaluatedProjectProvider projectPath
+                evaluated.Add result
+
+            return
+                Array.zip projectPaths (evaluated.ToArray())
+                |> Array.choose (fun (projectPath, result) ->
+                    match result with
+                    | Error _ -> None
+                    | Ok snapshot ->
+                        let referencesCurrent =
+                            snapshot.ProjectReferences
+                            |> List.exists (fun reference ->
+                                String.Equals(
+                                    Path.GetFullPath reference.ProjectPath,
+                                    Path.GetFullPath currentProjectPath,
+                                    StringComparison.OrdinalIgnoreCase
+                                ))
+
+                        let isTest =
+                            snapshot.IsTestProject || (evaluatedTestFrameworks snapshot).Length > 0
+
+                        if isTest && referencesCurrent then
+                            Some(
+                                jobj
+                                    [ "projectPath", jstr projectPath
+                                      "targetFramework",
+                                      snapshot.TargetFramework |> Option.map jstr |> Option.defaultValue null
+                                      "referencesProject", jbool true
+                                      "evaluationSource", jstr snapshot.EvaluationSource ]
+                                :> JsonNode
+                            )
+                        else
+                            None)
+    }
 
 /// Walk up from `startDir` to the filesystem root, returning the first existing path among
 /// the relative candidates. Mirrors MSBuild's nearest-Directory.Build.* lookup and the
@@ -475,6 +497,43 @@ let private analyzerConfigOfDoc (projectDir: string) (doc: XDocument) : Analyzer
       Packages = packages
       ConfigFiles = configFiles }
 
+let private analyzerConfigOfSnapshot (snapshot: EvaluatedProjectSnapshot) : AnalyzerConfig =
+    let packages =
+        snapshot.PackageReferences
+        |> List.choose (fun reference ->
+            let includeAssets = reference.IncludeAssets |> Option.defaultValue ""
+
+            if
+                reference.PackageId.Contains("Analyzer", StringComparison.OrdinalIgnoreCase)
+                || includeAssets.Contains("analyzers", StringComparison.OrdinalIgnoreCase)
+            then
+                Some
+                    { PackageId = reference.PackageId
+                      Version = reference.Version
+                      IncludeAssets = includeAssets
+                      PrivateAssets = reference.PrivateAssets }
+            else
+                None)
+        |> List.distinctBy (fun package -> package.PackageId.ToUpperInvariant())
+
+    let importedConfigFiles =
+        snapshot.ImportedProjects
+        |> List.filter (fun path ->
+            let name = Path.GetFileName path
+
+            name.Equals("Directory.Build.props", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("Directory.Build.targets", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("Directory.Packages.props", StringComparison.OrdinalIgnoreCase))
+
+    let configFiles =
+        importedConfigFiles
+        @ (findNearestUpwards snapshot.ProjectDirectory [ ".editorconfig" ] |> Option.toList)
+        |> List.distinct
+
+    { Configured = not packages.IsEmpty
+      Packages = packages
+      ConfigFiles = configFiles }
+
 /// Detect the analyzer configuration of one .fsproj the SAME way project_health does:
 /// `Configured` is driven ONLY by real analyzer PackageReferences — config files
 /// (Directory.Build.*, Directory.Packages.props, .editorconfig) are collected as
@@ -544,10 +603,10 @@ let private listSolutionProjects (input: string option) : (string * string array
         if projects.Length > 1 then Some(fullPath, projects) else None
     | _ -> None
 
-let createReport
+let internal createReport
     (args: ProjectHealthArgs)
     (lspSnapshot: LspHealthSnapshot)
-    (projectOptionsProbe: ProjectOptionsProbe)
+    (evaluatedProjectProvider: EvaluatedProjectSnapshotProvider)
     : Async<JsonNode> =
     async {
         let compileCheck = args.compileCheck |> Option.defaultValue "Skip"
@@ -625,12 +684,14 @@ let createReport
                             "exists", jbool false ] ]
                 :> JsonNode
         | Ok projectPath ->
-            match tryReadProject projectPath with
+            let! evaluatedResult = evaluatedProjectProvider projectPath
+
+            match evaluatedResult with
             | Error reason ->
                 let blockedAxis r =
                     jobj [ "status", jstr "blocked"; "reason", jstr r ] :> JsonNode
 
-                let readReason = $"Project file cannot be read: %s{reason}"
+                let evaluationReason = $"Project cannot be evaluated: %s{reason}"
 
                 return
                     jobj
@@ -638,14 +699,19 @@ let createReport
                           "reportKind", jstr "project"
                           "toolingReadiness",
                           jobj
-                              [ "fcs", blockedAxis readReason
-                                "lsp", blockedAxis readReason
+                              [ "fcs", blockedAxis evaluationReason
+                                "lsp", blockedAxis evaluationReason
                                 "overall", jstr "blocked" ]
                           "compileStatus", jobj [ "status", jstr "not_checked" ]
-                          "project", jobj [ "projectPath", jstr projectPath; "exists", jbool true ] ]
+                          "project", jobj [ "projectPath", jstr projectPath; "exists", jbool true ]
+                          "evaluation",
+                          jobj
+                              [ "status", jstr "unavailable"
+                                "source", jstr "ionide-proj-info"
+                                "reason", jstr reason ] ]
                     :> JsonNode
-            | Ok doc ->
-                let projectDir = Path.GetDirectoryName(projectPath)
+            | Ok evaluatedProject ->
+                let projectDir = evaluatedProject.ProjectDirectory
 
                 let normalizeWorkspaceRoot (path: string) =
                     let fullPath = Path.GetFullPath path
@@ -673,43 +739,42 @@ let createReport
                         |> Option.filter (fun root -> Directory.Exists root && containsProject root)
                         |> Option.defaultValue projectDir
 
-                let files = compileFiles projectPath doc
+                let files = evaluatedProject.Files
                 let fileSummary = sourceSummary files
-                let testInfo = testProjectInfo projectPath doc files
+                let testInfo = testProjectInfo evaluatedProject
                 let hasMissingFiles = fileSummary["missingFiles"].AsArray().Count > 0
                 let hasUnreadableFiles = fileSummary["unreadableFiles"].AsArray().Count > 0
 
-                let! projectOptionsHealth, restoreUnresolved =
-                    async {
-                        match! projectOptionsProbe projectPath with
-                        | Ok info ->
-                            let frac =
-                                ReferenceResolution.fraction info.ReferencesExisting info.ReferencesTotal
+                let referenceFraction =
+                    ReferenceResolution.fraction
+                        evaluatedProject.ReferencesExisting
+                        evaluatedProject.ReferencesTotal
 
-                            let unrestored =
-                                ReferenceResolution.looksUnrestored info.ReferencesExisting info.ReferencesTotal
+                let restoreUnresolved =
+                    not evaluatedProject.RestoreSucceeded
+                    || ReferenceResolution.looksUnrestored
+                        evaluatedProject.ReferencesExisting
+                        evaluatedProject.ReferencesTotal
 
-                            let fields =
-                                [ "status", jstr "available"
-                                  "source", jstr info.Source
-                                  "restoreStatus", jstr (if unrestored then "unrestored" else "restored")
-                                  "referencesResolved", JsonValue.Create(Math.Round(frac, 3)) :> JsonNode
-                                  "referencesExisting", jint info.ReferencesExisting
-                                  "referencesTotal", jint info.ReferencesTotal ]
+                let projectOptionsFields =
+                    [ "status", jstr "available"
+                      "source", jstr evaluatedProject.EvaluationSource
+                      "evaluationStatus", jstr "evaluated"
+                      "restoreStatus", jstr (if restoreUnresolved then "unrestored" else "restored")
+                      "referencesResolved", JsonValue.Create(Math.Round(referenceFraction, 3)) :> JsonNode
+                      "referencesExisting", jint evaluatedProject.ReferencesExisting
+                      "referencesTotal", jint evaluatedProject.ReferencesTotal ]
 
-                            let fields =
-                                if unrestored then
-                                    fields
-                                    @ [ "warning",
-                                        jstr
-                                            "External references unresolved — run dotnet restore (then build). FCS semantic tools will fail with 'FSharp.Core.dll not found' until restored." ]
-                                else
-                                    fields
+                let projectOptionsFields =
+                    if restoreUnresolved then
+                        projectOptionsFields
+                        @ [ "warning",
+                            jstr
+                                "External references unresolved — run dotnet restore (then build). FCS semantic tools will fail with 'FSharp.Core.dll not found' until restored." ]
+                    else
+                        projectOptionsFields
 
-                            return jobj fields :> JsonNode, unrestored
-                        | Error reason ->
-                            return jobj [ "status", jstr "unavailable"; "reason", jstr reason ] :> JsonNode, false
-                    }
+                let projectOptionsHealth = jobj projectOptionsFields :> JsonNode
 
                 let fcsWarnings = ResizeArray<JsonNode>()
 
@@ -739,15 +804,39 @@ let createReport
                     else
                         jobj [ "status", jstr "ready"; "warnings", JsonArray() :> JsonNode ]
 
+                let pathsEqual left right =
+                    try
+                        String.Equals(
+                            Path.GetFullPath left,
+                            Path.GetFullPath right,
+                            if OperatingSystem.IsWindows() then
+                                StringComparison.OrdinalIgnoreCase
+                            else
+                                StringComparison.Ordinal
+                        )
+                    with _ ->
+                        false
+
+                let lspContextMatched =
+                    (lspSnapshot.ProjectPath |> Option.exists (pathsEqual projectPath))
+                    || (lspSnapshot.LoadedProjects |> Array.exists (pathsEqual projectPath))
+
                 let lspReadiness =
-                    if lspSnapshot.WorkspaceReady then
-                        jobj [ "status", jstr "ready" ]
+                    if lspSnapshot.SessionLive && lspSnapshot.WorkspaceReady && lspContextMatched then
+                        jobj [ "status", jstr "ready"; "contextMatched", jbool true ]
                     else
+                        let reason =
+                            if not lspSnapshot.SessionLive then
+                                "no live FSAC session is active for this project"
+                            elif not lspSnapshot.WorkspaceReady then
+                                "workspace not initialized; auto-warmed on first textDocument_*/workspace_* call"
+                            else
+                                "the live FSAC workspace does not contain the inspected project; call set_project for this project or its solution"
+
                         jobj
                             [ "status", jstr "not_ready"
-                              "reason",
-                              jstr
-                                  "workspace not initialized; auto-warmed on first textDocument_*/workspace_* call" ]
+                              "contextMatched", jbool lspContextMatched
+                              "reason", jstr reason ]
 
                 let fcsStatus = fcsReadiness["status"].GetValue<string>()
                 let lspStatus = lspReadiness["status"].GetValue<string>()
@@ -765,11 +854,9 @@ let createReport
                           "lsp", lspReadiness :> JsonNode
                           "overall", jstr overallStatus ]
 
-                // Reuse the shared detection so this block and detectAnalyzerConfig agree:
-                // analyzer PackageReferences from the .fsproj AND from centralized MSBuild
-                // imports (Directory.Build.props/.targets) both count; a bare .editorconfig
-                // does not (#100 review + Codex review).
-                let analyzerCfg = analyzerConfigOfDoc projectDir doc
+                // Analyzer references are taken from the same evaluated item set as
+                // inspection, so imported/conditional packages cannot disagree.
+                let analyzerCfg = analyzerConfigOfSnapshot evaluatedProject
 
                 let analyzers =
                     analyzerCfg.Packages |> List.map analyzerPackageInfoToJson |> List.toArray
@@ -790,7 +877,8 @@ let createReport
                               "configurationFiles",
                               JsonArray(analyzerConfigFiles |> List.map jstr |> List.toArray) :> JsonNode ]
 
-                let testProjects = discoverTestProjects workspaceRoot projectPath
+                let! testProjects =
+                    discoverTestProjects workspaceRoot projectPath evaluatedProjectProvider
 
                 let testHealth =
                     if testProjects.Length = 0 then
@@ -804,6 +892,18 @@ let createReport
                     jobj
                         [ "status", jstr "ok"
                           "reportKind", jstr "project"
+                          "evaluation",
+                          jobj
+                              [ "status", jstr "evaluated"
+                                "source", jstr evaluatedProject.EvaluationSource
+                                "projectPath", jstr evaluatedProject.ProjectPath
+                                "targetFramework",
+                                evaluatedProject.TargetFramework |> Option.map jstr |> Option.defaultValue null
+                                "restoreSucceeded", jbool evaluatedProject.RestoreSucceeded
+                                "importCount", jint evaluatedProject.ImportedProjects.Length
+                                "imports",
+                                JsonArray(evaluatedProject.ImportedProjects |> List.map jstr |> List.toArray)
+                                :> JsonNode ]
                           "toolingReadiness", readiness :> JsonNode
                           "compileStatus",
                           jobj
@@ -816,15 +916,19 @@ let createReport
                                 ) ]
                           "project",
                           jobj
-                              [ "projectPath", jstr projectPath
+                              [ "projectPath", jstr evaluatedProject.ProjectPath
                                 "projectDirectory", jstr projectDir
-                                "projectName", jstr (Path.GetFileNameWithoutExtension(projectPath))
-                                "sdk", attr "Sdk" doc.Root |> Option.map jstr |> Option.defaultValue null
-                                "outputType", childValue "OutputType" doc |> Option.map jstr |> Option.defaultValue null
+                                "projectName", jstr evaluatedProject.ProjectName
+                                "sdk", evaluatedProject.Sdk |> Option.map jstr |> Option.defaultValue null
+                                "outputType",
+                                evaluatedProject.OutputType |> Option.map jstr |> Option.defaultValue null
                                 "targetFramework",
-                                childValue "TargetFramework" doc |> Option.map jstr |> Option.defaultValue null
+                                evaluatedProject.TargetFramework |> Option.map jstr |> Option.defaultValue null
                                 "targetFrameworks",
-                                childValue "TargetFrameworks" doc |> Option.map jstr |> Option.defaultValue null
+                                (match evaluatedProject.TargetFrameworks with
+                                 | [] -> null
+                                 | frameworks -> jstr (String.concat ";" frameworks))
+                                "evaluationSource", jstr evaluatedProject.EvaluationSource
                                 "isTestProject",    testInfo["isTestProject"].DeepClone()
                                 "testFrameworks",   testInfo["testFrameworks"].DeepClone()
                                 "testCount",        (let n = testInfo["testCount"] in if isNull n then null else n.DeepClone())
@@ -838,6 +942,10 @@ let createReport
                                 "lspWorkspaceRoot",
                                 lspSnapshot.WorkspaceRoot |> Option.map jstr |> Option.defaultValue null
                                 "lspProjectPath", lspSnapshot.ProjectPath |> Option.map jstr |> Option.defaultValue null
+                                "lspLoadedProjects",
+                                JsonArray(lspSnapshot.LoadedProjects |> Array.map jstr) :> JsonNode
+                                "lspSessionLive", jbool lspSnapshot.SessionLive
+                                "lspContextMatched", jbool lspContextMatched
                                 "lspWorkspaceReady", jbool lspSnapshot.WorkspaceReady
                                 "diagnosticsFileCount", jint lspSnapshot.DiagnosticsFileCount ]
                           "projectOptions", projectOptionsHealth

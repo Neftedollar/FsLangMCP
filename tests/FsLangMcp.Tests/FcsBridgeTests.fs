@@ -151,6 +151,95 @@ let private writeProjectWithSource (root: string) (projectName: string) (source:
     sourcePath, projectPath
 
 [<Fact>]
+let ``project evaluation rejects distinct keys without queueing and admits retry after completion`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_eval_admission_{Guid.NewGuid():N}")
+        let projectPath name = Path.Combine(root, $"{name}.fsproj")
+        let projectA = projectPath "A"
+        let projectB = projectPath "B"
+        let aStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let bStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let releaseA = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let releaseB = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        Directory.CreateDirectory(root) |> ignore
+
+        let controlledLoad (path: string) : Task =
+            (task {
+                if String.Equals(Path.GetFullPath(path), Path.GetFullPath(projectA), StringComparison.Ordinal) then
+                    aStarted.TrySetResult(()) |> ignore
+                    do! releaseA.Task
+                    return raise (InvalidOperationException("controlled A completion"))
+                elif String.Equals(Path.GetFullPath(path), Path.GetFullPath(projectB), StringComparison.Ordinal) then
+                    bStarted.TrySetResult(()) |> ignore
+                    do! releaseB.Task
+                    return raise (InvalidOperationException("controlled B completion"))
+                else
+                    return raise (InvalidOperationException($"Unexpected admitted project: {path}"))
+             }
+             :> Task)
+
+        let bridge = FcsBridge(projectEvaluationBeforeLoadOverride = controlledLoad)
+
+        try
+            let firstA = bridge.GetEvaluatedProjectSnapshot(projectA)
+            do! aStarted.Task.WaitAsync(TimeSpan.FromSeconds(1.0))
+
+            // Same key must join the existing Lazy rather than consume/reject a slot.
+            let sharedA = bridge.GetEvaluatedProjectSnapshot(projectA)
+
+            let rejectedPaths =
+                [| yield projectB
+                   for index in 1..8 -> projectPath $"Rejected{index}" |]
+
+            let rejectedTasks = rejectedPaths |> Array.map bridge.GetEvaluatedProjectSnapshot
+
+            let! rejected =
+                Task.WhenAll(rejectedTasks).WaitAsync(TimeSpan.FromSeconds(1.0))
+
+            for result in rejected do
+                match result with
+                | Error message -> Assert.Contains("project evaluation busy", message)
+                | Ok _ -> Assert.Fail("A distinct project unexpectedly entered the active evaluation slot.")
+
+            Assert.False(firstA.IsCompleted)
+            Assert.False(sharedA.IsCompleted)
+            Assert.Equal(1L, bridge.ProjectEvaluationStartedCount)
+            Assert.Equal(int64 rejectedPaths.Length, bridge.ProjectEvaluationRejectedCount)
+            Assert.Equal(1, bridge.ProjectEvaluationActiveCount)
+            Assert.Equal(1, bridge.ProjectEvaluationMaxObservedConcurrency)
+            Assert.Equal(1, bridge.ProjectOptionsInFlightCount)
+
+            releaseA.TrySetResult(()) |> ignore
+
+            let! _ =
+                Task.WhenAll([| firstA; sharedA |]).WaitAsync(TimeSpan.FromSeconds(1.0))
+
+            Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
+            Assert.Equal(0, bridge.ProjectOptionsInFlightCount)
+
+            // Once A really completes and releases admission, retrying the formerly
+            // rejected B key starts a new loader instead of inheriting a busy failure.
+            let retryB = bridge.GetEvaluatedProjectSnapshot(projectB)
+            do! bStarted.Task.WaitAsync(TimeSpan.FromSeconds(1.0))
+            Assert.False(retryB.IsCompleted)
+            Assert.Equal(2L, bridge.ProjectEvaluationStartedCount)
+            Assert.Equal(1, bridge.ProjectEvaluationActiveCount)
+            Assert.Equal(1, bridge.ProjectOptionsInFlightCount)
+
+            releaseB.TrySetResult(()) |> ignore
+            let! _ = retryB.WaitAsync(TimeSpan.FromSeconds(1.0))
+            Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
+            Assert.Equal(0, bridge.ProjectOptionsInFlightCount)
+        finally
+            releaseA.TrySetResult(()) |> ignore
+            releaseB.TrySetResult(()) |> ignore
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
 let ``fcs_parse_and_check_file succeeds on valid F# snippet`` () : Task =
     task {
         let src =
@@ -298,6 +387,108 @@ let ``FcsBridge CompileProject succeeds through FCS project typecheck`` () : Tas
 
             Assert.Equal("succeeded", cachedResult["status"].GetValue<string>())
             Assert.True(cachedResult["cached"].GetValue<bool>())
+        finally
+            if Directory.Exists(tempRoot) then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``FcsBridge CompileProject invalidates a same-mtime content edit (P1-07)`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_compile_snapshot_%s{runId}")
+        let validSource = "module SameMtime.Library\n\nlet value: int = 42\n"
+        let invalidSource = "module SameMtime.Library\n\nlet value: int = ()\n"
+        let bridge = FcsBridge()
+
+        try
+            Assert.Equal(validSource.Length, invalidSource.Length)
+
+            let sourcePath, projectPath =
+                writeProjectWithSource tempRoot "SameMtime" validSource
+
+            let! before =
+                bridge.CompileProject(
+                    { projectPath = Some projectPath
+                      workspacePath = None
+                      timeoutMs = Some 30000 }
+                )
+
+            Assert.Equal("succeeded", before["status"].GetValue<string>())
+            Assert.False(before["cached"].GetValue<bool>())
+
+            // Preserve both metadata fields used by the former cache key. Only the
+            // bytes change, so a metadata-only key would return the cached success.
+            let originalMtime = File.GetLastWriteTimeUtc sourcePath
+            File.WriteAllText(sourcePath, invalidSource)
+            File.SetLastWriteTimeUtc(sourcePath, originalMtime)
+
+            Assert.Equal(originalMtime, File.GetLastWriteTimeUtc sourcePath)
+            Assert.Equal(int64 validSource.Length, FileInfo(sourcePath).Length)
+
+            let! after =
+                bridge.CompileProject(
+                    { projectPath = Some projectPath
+                      workspacePath = None
+                      timeoutMs = Some 30000 }
+                )
+
+            Assert.Equal("failed", after["status"].GetValue<string>())
+            Assert.False(after["cached"].GetValue<bool>())
+            Assert.True(after["errorCount"].GetValue<int>() > 0)
+        finally
+            if Directory.Exists(tempRoot) then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``analysis snapshot key distinguishes compile order and normalized source paths (P1-07)`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_snapshot_key_%s{runId}")
+        Directory.CreateDirectory(tempRoot) |> ignore
+
+        try
+            let source = "module Snapshot\n\nlet value = 1\n"
+
+            let sourcePaths =
+                [| "A.fs"; "B.fs"; "C.fs"; "D.fs" |]
+                |> Array.map (fun fileName ->
+                    let path = Path.Combine(tempRoot, fileName)
+                    File.WriteAllText(path, source)
+                    path)
+
+            let sharedMtime = DateTime.UtcNow.AddMinutes(-1.0)
+            sourcePaths |> Array.iter (fun path -> File.SetLastWriteTimeUtc(path, sharedMtime))
+
+            let! baseOptions, _ =
+                checker.GetProjectOptionsFromScript(sourcePaths[0], SourceText.ofString source)
+                |> asTask
+
+            let optionsFor sources =
+                { baseOptions with
+                    ProjectFileName = Path.Combine(tempRoot, "Snapshot.fsproj")
+                    ProjectId = Some "snapshot-key-test"
+                    SourceFiles = sources }
+
+            let forward = optionsFor [| sourcePaths[0]; sourcePaths[1] |]
+            let reversed = optionsFor [| sourcePaths[1]; sourcePaths[0] |]
+            let sameBytesAtDifferentPaths = optionsFor [| sourcePaths[2]; sourcePaths[3] |]
+            let samePathsRelativeToProject = optionsFor [| "A.fs"; "B.fs" |]
+
+            let forwardKey = AnalysisSnapshotKey.create forward
+
+            Assert.True(
+                (forwardKey = AnalysisSnapshotKey.create samePathsRelativeToProject),
+                "equivalent absolute and project-relative source paths must normalize to one key"
+            )
+
+            Assert.True((forwardKey <> AnalysisSnapshotKey.create reversed), "compile order must change the key")
+
+            Assert.True(
+                (forwardKey <> AnalysisSnapshotKey.create sameBytesAtDifferentPaths),
+                "normalized source paths must change the key even when content and metadata match"
+            )
         finally
             if Directory.Exists(tempRoot) then
                 Directory.Delete(tempRoot, true)

@@ -1,99 +1,109 @@
-# Autonomous Orchestrator — runs the multi-agent pipeline in CI
+# Read-only orchestrator analysis.
 #
-# Triggers:
-#   • workflow_dispatch — manual run with a task description
-#   • schedule          — nightly autonomous backlog processing (optional)
-#   • issues labeled    — run when an issue gets the 'orchestrator' label
+# Security boundary:
+#   * manual dispatch only — public issue text is never used as a prompt;
+#   * the job has read-only repository permissions and checkout stores no token;
+#   * Claude receives no GitHub write credential and is restricted to read tools;
+#   * project settings, hooks, slash commands, and MCP servers are not loaded;
+#   * output is an Actions artifact, never a commit, issue comment, or pull request.
 #
-# Required secrets:
-#   ANTHROPIC_API_KEY — Claude API key (Settings → Secrets → Actions)
-#
-# Usage:
-#   1. Enable this workflow by committing to your workspace repo
-#   2. Go to Actions → Autonomous Orchestrator → Run workflow
-#   3. Enter your task (or leave blank for autonomous backlog mode)
+# Required configuration:
+#   * secret ANTHROPIC_API_KEY
+#   * repository variable CLAUDE_CODE_VERSION set to one reviewed, exact SemVer
+#     release (for example X.Y.Z, never "latest", a tag, or a version range).
+# No source-controlled default is provided because this repository has no evidence
+# establishing which Claude Code release its original unpinned workflow used.
 
-name: Autonomous Orchestrator
+name: Read-only Orchestrator Analysis
 
 on:
   workflow_dispatch:
     inputs:
       task:
-        description: "Task for the orchestrator (leave blank for autonomous backlog mode)"
-        required: false
-        default: ""
-  issues:
-    types: [labeled]
-  # Uncomment to enable nightly autonomous runs:
-  # schedule:
-  #   - cron: '0 8 * * 1-5'   # 8:00 UTC, Mon–Fri
+        description: "Read-only analysis task for the orchestrator"
+        required: true
+        type: string
+
+env:
+  CLAUDE_CODE_VERSION: ${{ vars.CLAUDE_CODE_VERSION }}
 
 jobs:
-  orchestrate:
-    # Only run on issues if labeled with 'orchestrator'
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'schedule' ||
-      (github.event_name == 'issues' && github.event.label.name == 'orchestrator')
-
+  analyze:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
     permissions:
-      contents: write
-      issues: write
-      pull-requests: write
+      contents: read
 
     steps:
-      - name: Checkout workspace
-        uses: actions/checkout@v4
+      - name: Checkout workspace without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
 
-      - name: Install Claude Code
-        run: npm install -g @anthropic-ai/claude-code
-
-      - name: Set up git identity
+      - name: Install the reviewed exact Claude Code version
+        shell: bash
         run: |
-          git config --global user.name "orchestrator[bot]"
-          git config --global user.email "orchestrator@users.noreply.github.com"
+          set -euo pipefail
+          EXACT_SEMVER_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
 
-      - name: Build task prompt
-        id: task
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          ISSUE_TITLE: ${{ github.event.issue.title }}
-          INPUT_TASK: ${{ inputs.task }}
-        run: |
-          # Use heredoc output pattern to prevent newline injection into GITHUB_OUTPUT
-          if [ "$EVENT_NAME" = "issues" ]; then
-            {
-              echo 'prompt<<EOF'
-              printf '/orchestrator #%s: %s' "$ISSUE_NUMBER" "$ISSUE_TITLE"
-              echo
-              echo 'EOF'
-            } >> "$GITHUB_OUTPUT"
-          elif [ -n "$INPUT_TASK" ]; then
-            {
-              echo 'prompt<<EOF'
-              printf '/orchestrator %s' "$INPUT_TASK"
-              echo
-              echo 'EOF'
-            } >> "$GITHUB_OUTPUT"
-          else
-            echo "prompt=/orchestrator Pick the top task from the GitHub backlog and execute it." >> "$GITHUB_OUTPUT"
+          if [[ -z "${CLAUDE_CODE_VERSION}" || ! "${CLAUDE_CODE_VERSION}" =~ ${EXACT_SEMVER_RE} ]]; then
+            echo "::error::Set repository variable CLAUDE_CODE_VERSION to one reviewed exact SemVer release (X.Y.Z)."
+            exit 1
           fi
 
-      - name: Run orchestrator
+          npm install --global --no-audit --no-fund \
+            "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+          claude --version
+
+      - name: Prepare analysis artifact
+        env:
+          OUTPUT_DIRECTORY: ${{ runner.temp }}/orchestrator-output
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${OUTPUT_DIRECTORY}"
+          printf 'Analysis did not complete. Inspect the workflow log.\n' \
+            > "${OUTPUT_DIRECTORY}/analysis.txt"
+          git rev-parse HEAD > "${OUTPUT_DIRECTORY}/repository-commit.txt"
+
+      - name: Run read-only analysis
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ORCHESTRATOR_PROMPT: ${{ steps.task.outputs.prompt }}
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          GITHUB_TOKEN: ""
+          GH_TOKEN: ""
+          ORCHESTRATOR_PROMPT: ${{ inputs.task }}
+          OUTPUT_DIRECTORY: ${{ runner.temp }}/orchestrator-output
+        shell: bash
         run: |
-          claude --print "$ORCHESTRATOR_PROMPT" \
-                 --max-turns 50 \
-                 --output-format text
+          set -euo pipefail
+
+          claude --print "${ORCHESTRATOR_PROMPT}" \
+            --append-system-prompt "Perform read-only repository analysis. Do not modify files, execute commands, contact external systems, or request credentials. Return findings for human review." \
+            --setting-sources user \
+            --disable-slash-commands \
+            --strict-mcp-config \
+            --mcp-config '{"mcpServers":{}}' \
+            --permission-mode plan \
+            --tools "Read,Glob,Grep" \
+            --disallowedTools "mcp__*" \
+            --no-session-persistence \
+            --max-turns 50 \
+            --output-format text \
+            > "${OUTPUT_DIRECTORY}/analysis.txt"
+
+          claude --version > "${OUTPUT_DIRECTORY}/claude-version.txt"
+
+      - name: Upload analysis artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: orchestrator-analysis-${{ github.run_id }}
+          path: ${{ runner.temp }}/orchestrator-output/
+          if-no-files-found: error
+          retention-days: 14

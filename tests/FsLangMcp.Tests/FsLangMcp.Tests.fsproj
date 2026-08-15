@@ -47,39 +47,39 @@
 
   <ItemGroup>
     <PackageReference Include="FSharp.Compiler.Service" Version="$(FSharpCompilerServiceVersion)" />
-    <PackageReference Include="FSharp.Analyzers.Build" Version="0.5.*">
+    <PackageReference Include="FSharp.Analyzers.Build" Version="[0.5.0]">
       <IncludeAssets>build</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="FsMcp.Server" Version="1.2.*" />
-    <PackageReference Include="G-Research.FSharp.Analyzers" Version="0.22.*" GeneratePathProperty="true">
+    <PackageReference Include="FsMcp.Server" Version="[1.2.2]" />
+    <PackageReference Include="G-Research.FSharp.Analyzers" Version="[0.22.0]" GeneratePathProperty="true">
       <IncludeAssets>analyzers</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="Ionide.Analyzers" Version="0.15.*" GeneratePathProperty="true">
+    <PackageReference Include="Ionide.Analyzers" Version="[0.15.0]" GeneratePathProperty="true">
       <IncludeAssets>analyzers</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="Ionide.ProjInfo.FCS" Version="0.74.*" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.*" />
-    <PackageReference Include="StreamJsonRpc" Version="2.25.*" />
+    <PackageReference Include="Ionide.ProjInfo.FCS" Version="[0.74.2]" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="[17.12.0]" />
+    <PackageReference Include="StreamJsonRpc" Version="[2.25.29]" />
     <!-- Pin StringTools to 18.4.0; see FsLangMcp.fsproj for rationale
          (MessagePack's transitive 17.6.3 breaks Ionide.ProjInfo project loading). -->
-    <PackageReference Include="Microsoft.NET.StringTools" Version="18.4.0" />
-    <PackageReference Include="xunit" Version="2.9.*" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="3.0.*">
+    <PackageReference Include="Microsoft.NET.StringTools" Version="[18.4.0]" />
+    <PackageReference Include="xunit" Version="[2.9.3]" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="[3.0.2]">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <!-- coverlet.msbuild instruments FsLangMcp.dll (referenced via <ProjectReference>).
          The default behaviour — exclude the test assembly from coverage — is correct now that
          prod and test code live in separate assemblies (per ADR-0001). -->
-    <PackageReference Include="coverlet.msbuild" Version="10.0.*">
+    <PackageReference Include="coverlet.msbuild" Version="[10.0.1]">
       <IncludeAssets>build; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="FsCheck.Xunit" Version="3.3.*" />
-    <PackageReference Include="Verify.Xunit" Version="31.12.*" />
+    <PackageReference Include="FsCheck.Xunit" Version="[3.3.4]" />
+    <PackageReference Include="Verify.Xunit" Version="[31.12.5]" />
   </ItemGroup>
 
 </Project>

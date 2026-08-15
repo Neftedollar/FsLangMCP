@@ -24,6 +24,7 @@ open Xunit
 open Xunit.Abstractions
 open FsLangMcp.Types
 open FsLangMcp.FcsBridge
+open FsLangMcp.Dispatcher
 
 // ── Fixture sources ────────────────────────────────────────────────────────────
 
@@ -94,6 +95,14 @@ let private slnx =
           "  <Project Path=\"App/App.fsproj\" />"
           "</Solution>" ]
 
+let private partialSlnx =
+    String.concat
+        "\n"
+        [ "<Solution>"
+          "  <Project Path=\"Domain/Domain.fsproj\" />"
+          "  <Project Path=\"Broken/Broken.fsproj\" />"
+          "</Solution>" ]
+
 // ── Class fixture: written + built ONCE, shared by every test in the class ───────
 
 type FindFixture() =
@@ -112,7 +121,11 @@ type FindFixture() =
     do write "Stubs/Stubs.fs" stubsFs |> ignore
     do write "App/App.fsproj" (refProject "App.fs" "../Domain/Domain.fsproj") |> ignore
     do write "App/App.fs" appFs |> ignore
+    // Deliberately malformed project used to prove that a failed member cannot
+    // be interpreted as a zero-match project.
+    do write "Broken/Broken.fsproj" "<Project><ItemGroup>" |> ignore
     let slnxPath = write "FindSolution.slnx" slnx
+    let partialSlnxPath = write "PartialFindSolution.slnx" partialSlnx
 
     // dotnet build is ground truth and also produces Domain.dll so per-project FCS
     // sweeps resolve the cross-project TraderRole reference. -m:1 serializes MSBuild
@@ -154,6 +167,7 @@ type FindFixture() =
 
     member _.Root = root
     member _.Slnx = slnxPath
+    member _.PartialSlnx = partialSlnxPath
     member _.DomainFsproj = domainFsproj
     member _.DomainFs = domainSource
     member _.BuildExitCode = buildExit
@@ -407,6 +421,105 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
         }
 
     [<Fact>]
+    member _.``find rejects unknown enums unsafe ranges missing scoped context and malformed cursors``() : Task =
+        task {
+            let bridge = FcsBridge()
+            let baseline = findArgs fx.Slnx "TraderRole"
+
+            let cases =
+                [ "kind", { baseline with kind = Some "typo" }, "kind must be one of"
+                  "scope", { baseline with scope = Some "solution" }, "scope must be one of"
+                  "maxResults-low", { baseline with maxResults = Some 0 }, "maxResults"
+                  "maxResults-high", { baseline with maxResults = Some 1001 }, "maxResults"
+                  "contextLines", { baseline with contextLines = Some -1 }, "contextLines"
+                  "timeoutMs", { baseline with timeoutMs = Some -1 }, "timeoutMs"
+                  "line", { baseline with line = Some -1 }, "line"
+                  "character", { baseline with character = Some -1 }, "character"
+                  "occurrence", { baseline with occurrence = Some -2 }, "occurrence"
+                  "file-path", { baseline with scope = Some "file" }, "requires a non-empty path"
+                  "project-context", { baseline with scope = Some "project" }, "whole solution"
+                  "cursor", { baseline with cursor = Some "not-base64" }, "Invalid cursor" ]
+
+            for (label, invalidArgs, expectedMessage) in cases do
+                let! result = bridge.Find(invalidArgs)
+
+                Assert.True(
+                    String.Equals("invalid_args", gs result "status", StringComparison.Ordinal),
+                    $"%s{label} should return invalid_args: %s{result.ToJsonString()}"
+                )
+
+                Assert.Contains(expectedMessage, gs result "message")
+        }
+
+    [<Fact>]
+    member _.``find project scope cannot escape the requested solution membership``() : Task =
+        task {
+            let outsideRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_outside_{Guid.NewGuid():N}")
+            let outsideProject = Path.Combine(outsideRoot, "Outside.fsproj")
+            let outsideSource = Path.Combine(outsideRoot, "Outside.fs")
+
+            try
+                Directory.CreateDirectory(outsideRoot) |> ignore
+                File.WriteAllText(outsideProject, leafProject "Outside.fs")
+                File.WriteAllText(outsideSource, "module Outside")
+                let bridge = FcsBridge()
+
+                let! result =
+                    bridge.Find(
+                        { findArgs fx.Slnx "TraderRole" with
+                            scope = Some "project"
+                            path = Some outsideSource }
+                    )
+
+                Assert.Equal("invalid_args", gs result "status")
+                Assert.Contains("not a member", gs result "message")
+                Assert.Contains(Path.GetFullPath(outsideProject), gs result "message")
+            finally
+                if Directory.Exists outsideRoot then
+                    Directory.Delete(outsideRoot, true)
+        }
+
+    [<Fact>]
+    member _.``find file scope keeps an explicit fsproj authoritative for an external path``() : Task =
+        task {
+            let outsideRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_linked_{Guid.NewGuid():N}")
+            let outsideProject = Path.Combine(outsideRoot, "Outside.fsproj")
+            let outsideSource = Path.Combine(outsideRoot, "Linked.fs")
+
+            try
+                Directory.CreateDirectory(outsideRoot) |> ignore
+                File.WriteAllText(outsideProject, leafProject "Linked.fs")
+                File.WriteAllText(outsideSource, "module Linked")
+                let bridge = FcsBridge()
+
+                // A zero budget avoids loading FCS; the per-project timeout envelope
+                // still reveals which project the scope resolver selected.
+                let! result =
+                    bridge.Find(
+                        { findArgs fx.DomainFsproj "TraderRole" with
+                            scope = Some "file"
+                            path = Some outsideSource
+                            timeoutMs = Some 0 }
+                    )
+
+                Assert.Equal("unknown", gs result "status")
+                Assert.Equal(1, gi result "projectsRequested")
+                let perProject = result["perProject"].AsArray()
+                Assert.Single(perProject) |> ignore
+                Assert.Equal(Path.GetFullPath(fx.DomainFsproj), gs perProject[0] "fsproj")
+                Assert.False(
+                    String.Equals(
+                        Path.GetFullPath(outsideProject),
+                        gs perProject[0] "fsproj",
+                        StringComparison.Ordinal
+                    )
+                )
+            finally
+                if Directory.Exists outsideRoot then
+                    Directory.Delete(outsideRoot, true)
+        }
+
+    [<Fact>]
     member _.``find reports matched=false ONLY when the symbol is truly absent everywhere``() : Task =
         task {
             Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
@@ -420,9 +533,178 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
             Assert.Equal(0, gi find "totalSites")
             let resolution = find["resolution"]
             Assert.False(gb resolution "matched", "absent symbol must report matched=false")
+            Assert.Equal("not_found", gs find "outcome")
+            Assert.True(gb find["coverage"] "complete")
+            Assert.Equal(3, gi find "projectsRequested")
+            Assert.Equal(3, gi find "projectsAnalyzed")
+            Assert.Equal(0, gi find "projectsFailed")
+            Assert.Equal(0, gi find "projectsTimedOut")
             Assert.Equal("none", gs resolution "via")
             Assert.Equal(3, gi resolution "projectsSwept")
         }
+
+    [<Fact>]
+    member _.``P1-01 incomplete project sweep returns partial or unknown and never authoritative false``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // Domain is valid and contains TraderRole; Broken.fsproj is malformed.
+            // A positive result is useful, but the full result set is incomplete.
+            let! partial = bridge.Find(findArgs fx.PartialSlnx "TraderRole")
+            let partialCoverage = partial["coverage"]
+            let partialResolution = partial["resolution"]
+
+            Assert.Equal("partial", gs partial "status")
+            Assert.Equal("matched", gs partial "outcome")
+            Assert.True(gb partialResolution "matched")
+            Assert.False(gb partialCoverage "complete")
+            Assert.Equal(2, gi partialCoverage "projectsRequested")
+            Assert.Equal(1, gi partialCoverage "projectsAnalyzed")
+            Assert.Equal(1, gi partialCoverage "projectsFailed")
+            Assert.Equal(0, gi partialCoverage "projectsTimedOut")
+
+            // A genuine zero from the FSAC index cannot fill a hole in the FCS
+            // project sweep. Absence is still indeterminate, so matched is JSON null.
+            let! indexedMiss =
+                bridge.Find(
+                    findArgs fx.PartialSlnx "ZzzNoSuchSymbol_168",
+                    fsacProbe = (fun _ -> Task.FromResult(FindFsacProbeResult.Available 0))
+                )
+
+            let indexedMissResolution = indexedMiss["resolution"]
+            Assert.Equal("unknown", gs indexedMiss "status")
+            Assert.Equal("indeterminate", gs indexedMiss "outcome")
+            Assert.Null(indexedMissResolution["matched"])
+            Assert.Equal("available", gs indexedMissResolution "fsacFallbackState")
+            Assert.Equal("incomplete-fcs-sweep", gs indexedMissResolution "via")
+
+            // A context-mismatched FSAC response must also remain typed rather than
+            // being folded into an authoritative zero-hit result.
+            let! contextUnknown =
+                bridge.Find(
+                    findArgs fx.PartialSlnx "ZzzNoSuchSymbol_168",
+                    fsacProbe = (fun _ ->
+                        Task.FromResult(
+                            FindFsacProbeResult.ContextMismatch
+                                "active FSAC workspace differs from the requested project"
+                        ))
+                )
+
+            let contextUnknownResolution = contextUnknown["resolution"]
+            Assert.Equal("unknown", gs contextUnknown "status")
+            Assert.Equal("indeterminate", gs contextUnknown "outcome")
+            Assert.Null(contextUnknownResolution["matched"])
+            Assert.Equal("context_mismatch", gs contextUnknownResolution "fsacFallbackState")
+            Assert.Equal("incomplete-fcs-sweep", gs contextUnknownResolution "via")
+
+            // A valid positive FSAC result proves presence, but cannot make the
+            // incomplete FCS site set look complete.
+            let! fsacPositive =
+                bridge.Find(
+                    findArgs fx.PartialSlnx "ZzzFsacOnly_168",
+                    fsacProbe = (fun _ -> Task.FromResult(FindFsacProbeResult.Available 1))
+                )
+
+            Assert.Equal("partial", gs fsacPositive "status")
+            Assert.Equal("matched", gs fsacPositive "outcome")
+            Assert.True(gb fsacPositive["resolution"] "matched")
+            Assert.Equal("fsac-symbol-index", gs fsacPositive["resolution"] "via")
+        }
+
+    [<Fact>]
+    member _.``P1-01 exhausted find budget classifies every skipped project as timed out``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // Zero is already an exhausted wall-clock budget. This makes the
+            // classification deterministic without starting background FCS work.
+            let! result =
+                bridge.Find(
+                    { findArgs fx.Slnx "ZzzTimeout_168" with
+                        timeoutMs = Some 0 }
+                )
+
+            Assert.Equal("unknown", gs result "status")
+            Assert.Equal("indeterminate", gs result "outcome")
+            Assert.Null(result["resolution"]["matched"])
+            Assert.Equal(3, gi result "projectsRequested")
+            Assert.Equal(0, gi result "projectsAnalyzed")
+            Assert.Equal(0, gi result "projectsFailed")
+            Assert.Equal(3, gi result "projectsTimedOut")
+
+            let perProject = result["perProject"].AsArray()
+            Assert.Equal(3, perProject.Count)
+
+            for project in perProject do
+                Assert.Equal("timed_out", gs project "status")
+                Assert.Equal("timeout", gs project "errorKind")
+        }
+
+    [<Fact>]
+    member _.``P1-01 dispatcher preserves context mismatch and infrastructure failure as typed probe states``() =
+        let mismatch =
+            JsonNode.Parse("""{"status":"context_mismatch","message":"wrong project"}""")
+            |> FindDispatch.classifyFsacProbeResponse
+
+        let failure =
+            JsonNode.Parse("""{"status":"infrastructure_error","message":"rpc disconnected"}""")
+            |> FindDispatch.classifyFsacProbeResponse
+
+        let available =
+            JsonNode.Parse("""{"status":"ok","contextMatched":true,"sessionGeneration":7,"result":[{},{}]}""")
+            |> FindDispatch.classifyFsacProbeResponse
+
+        let unbound =
+            JsonNode.Parse("""{"status":"ok","result":[]}""")
+            |> FindDispatch.classifyFsacProbeResponse
+
+        match mismatch with
+        | FindFsacProbeResult.ContextMismatch reason -> Assert.Contains("wrong project", reason)
+        | other -> Assert.Fail($"expected ContextMismatch, got {other}")
+
+        match failure with
+        | FindFsacProbeResult.Failed reason -> Assert.Contains("disconnected", reason)
+        | other -> Assert.Fail($"expected Failed, got {other}")
+
+        match available with
+        | FindFsacProbeResult.Available hits -> Assert.Equal(2, hits)
+        | other -> Assert.Fail($"expected Available, got {other}")
+
+        match unbound with
+        | FindFsacProbeResult.Failed reason -> Assert.Contains("contextMatched", reason)
+        | other -> Assert.Fail($"expected Failed, got {other}")
+
+    [<Fact>]
+    member _.``P1-02 FSAC workspace fallback cannot escape the requested find scope``() =
+        let projectA = Path.Combine(fx.Root, "Domain", "Domain.fsproj")
+        let solution = fx.Slnx
+
+        let eligible scope requested active =
+            FindDispatch.fsacWorkspaceProbeEligibility
+                { findArgs requested "OnlyInAnotherScope" with scope = Some scope }
+                (Some active)
+
+        match eligible "file" projectA projectA with
+        | Error reason -> Assert.Contains("scope=file", reason)
+        | Ok() -> Assert.Fail("workspace/symbol must never prove a file-scoped match")
+
+        match eligible "project" solution solution with
+        | Error reason -> Assert.Contains("project-scoped", reason)
+        | Ok() -> Assert.Fail("an active solution is broader than scope=project")
+
+        match eligible "project" projectA solution with
+        | Error reason -> Assert.Contains("broader", reason)
+        | Ok() -> Assert.Fail("a solution workspace must not satisfy a member-project request")
+
+        match eligible "project" projectA projectA with
+        | Ok() -> ()
+        | Error reason -> Assert.Fail($"the exact active fsproj is a safe project scope: {reason}")
+
+        match eligible "workspace" solution solution with
+        | Ok() -> ()
+        | Error reason -> Assert.Fail($"the exact active solution is a safe workspace scope: {reason}")
 
     [<Fact>]
     member _.``find defaults to compact one-line-per-site output; contextLines>0 restores before/after``() : Task =
@@ -682,6 +964,59 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
             finally
                 // Restore Domain.fs mtime so the edit doesn't bleed into sibling tests.
                 try
+                    File.SetLastWriteTimeUtc(fx.DomainFs, originalMtime)
+                with _ ->
+                    ()
+        }
+
+    [<Fact>]
+    member _.``find use-cache invalidates referenced projects after a same-mtime content edit (P1-07)``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+            let originalMtime = File.GetLastWriteTimeUtc fx.DomainFs
+
+            try
+                let! before = bridge.Find(findArgs fx.Slnx "TraderRole")
+                Assert.Equal("succeeded", gs before "status")
+                let beforeSites = gi before "totalSites"
+                let beforeCacheCount = bridge.ProjectUsesCacheCount
+                Assert.Equal(gi before "projectsSwept", beforeCacheCount)
+
+                // Replace the dependency's declaration without changing its byte count
+                // or timestamp. The former mtime/length stamps re-keyed neither Domain
+                // nor its consumers and therefore returned their cached symbol sweeps.
+                let edited =
+                    domainFs.Replace("TraderRole", "DealerRole", StringComparison.Ordinal)
+
+                Assert.Equal(domainFs.Length, edited.Length)
+                File.WriteAllText(fx.DomainFs, edited)
+                File.SetLastWriteTimeUtc(fx.DomainFs, originalMtime)
+
+                Assert.Equal(originalMtime, File.GetLastWriteTimeUtc fx.DomainFs)
+                Assert.Equal(int64 domainFs.Length, FileInfo(fx.DomainFs).Length)
+
+                let! after = bridge.Find(findArgs fx.Slnx "TraderRole")
+                Assert.Equal("succeeded", gs after "status")
+                let afterSites = gi after "totalSites"
+
+                // One new entry is the edited Domain project. Growth by more than one
+                // proves that at least one consumer key also includes the referenced
+                // project's source bytes, even though all metadata is unchanged.
+                Assert.True(
+                    bridge.ProjectUsesCacheCount > beforeCacheCount + 1,
+                    $"a same-mtime dependency edit must re-key consumer entries: before={beforeCacheCount}, after={bridge.ProjectUsesCacheCount} (expected > {beforeCacheCount + 1})"
+                )
+
+                output.WriteLine(
+                    $"P1-07 same-mtime dependency edit: beforeCache={beforeCacheCount}, afterCache={bridge.ProjectUsesCacheCount}, beforeSites={beforeSites}, afterSites={afterSites}"
+                )
+            finally
+                // Restore both bytes and metadata for sibling tests sharing this fixture.
+                try
+                    File.WriteAllText(fx.DomainFs, domainFs)
                     File.SetLastWriteTimeUtc(fx.DomainFs, originalMtime)
                 with _ ->
                     ()

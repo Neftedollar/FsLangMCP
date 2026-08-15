@@ -1,13 +1,12 @@
-# Publishes the NuGet package on a v* tag push (or manual dispatch).
+# Publishes one tested NuGet package artifact from a v* tag.
 #
 # Auth: NuGet Trusted Publishing via OIDC (NuGet/login@v1) — no long-lived
-# API keys. Configured at https://www.nuget.org/account/trusted-publishing
-# for repository Neftedollar/FsLangMCP, workflow publish.yml, environment
-# `release`. Pattern mirrors Neftedollar/FsMcp's publish flow.
+# API keys. The `release` environment is configured on GitHub for this repo.
 #
-# Version source of truth is the git tag: PackageVersion is overridden at
-# pack time from the tag name (v0.5.0 → 0.5.0), so patch releases can ship
-# by tag alone without touching FsLangMcp.fsproj.
+# The git tag is the single version source of truth. The tag version is
+# validated before restore/build and is passed unchanged through build, test,
+# and pack. The publish job downloads the already-tested package; it never
+# rebuilds or repacks release bits.
 
 name: Publish NuGet
 
@@ -18,7 +17,169 @@ on:
       - "v*"
 
 jobs:
+  live-fsac:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/live-fsac.yml
+
+  build-and-verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      package_name: ${{ steps.package.outputs.package_name }}
+      checksum_name: ${{ steps.package.outputs.checksum_name }}
+      package_sha256: ${{ steps.package.outputs.package_sha256 }}
+
+    steps:
+      - name: Validate and extract version from tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_TYPE}" != "tag" || "${GITHUB_REF_NAME}" != v* ]]; then
+            echo "::error::This workflow must run against a v* tag. Got ref_type=${GITHUB_REF_TYPE} ref_name=${GITHUB_REF_NAME}."
+            exit 1
+          fi
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          SEMVER_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+
+          if [[ ! "${VERSION}" =~ ${SEMVER_RE} ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} is not a supported SemVer release tag (vMAJOR.MINOR.PATCH[-PRERELEASE])."
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: "10.0.400"
+
+      - name: Verify pinned SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(dotnet --version)" = "10.0.400"
+
+      - name: Restore locked dependencies
+        run: dotnet restore FsLangMcp.slnx --locked-mode
+
+      - name: Build release bits with tag version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dotnet build FsLangMcp.slnx \
+            --configuration Release \
+            --no-restore \
+            -p:Version="${VERSION}" \
+            -p:PackageVersion="${VERSION}" \
+            -p:ContinuousIntegrationBuild=true
+
+      - name: Test release bits with tag version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dotnet test FsLangMcp.slnx \
+            --configuration Release \
+            --no-build \
+            --no-restore \
+            -p:Version="${VERSION}" \
+            -p:PackageVersion="${VERSION}" \
+            -p:ContinuousIntegrationBuild=true
+
+      - name: Pack the tested release bits
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dotnet pack FsLangMcp.fsproj \
+            --configuration Release \
+            --no-build \
+            --no-restore \
+            -p:Version="${VERSION}" \
+            -p:PackageVersion="${VERSION}" \
+            -p:ContinuousIntegrationBuild=true \
+            -o ./nupkgs
+
+      - name: Install and smoke-test the exact package
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PACKAGE_NAME="FsLangMcp.${VERSION}.nupkg"
+          CHECKSUM_NAME="${PACKAGE_NAME}.sha256"
+          PACKAGE_PATH="nupkgs/${PACKAGE_NAME}"
+          SMOKE_ROOT="${RUNNER_TEMP}/fslangmcp-package-smoke"
+          SMOKE_TOOL_PATH="${SMOKE_ROOT}/tool"
+          SMOKE_CONFIG="${SMOKE_ROOT}/NuGet.config"
+
+          mkdir -p "${SMOKE_ROOT}"
+          cat > "${SMOKE_CONFIG}" <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="release-artifact" value="${GITHUB_WORKSPACE}/nupkgs" />
+            </packageSources>
+          </configuration>
+          EOF
+
+          dotnet tool install \
+            --tool-path "${SMOKE_TOOL_PATH}" \
+            --configfile "${SMOKE_CONFIG}" \
+            --no-http-cache \
+            FsLangMcp \
+            --version "${VERSION}"
+
+          INSTALLED_TOOL="${SMOKE_TOOL_PATH}/fslangmcp"
+          INSTALLED_VERSION="$("${INSTALLED_TOOL}" --version)"
+
+          if [[ "${INSTALLED_VERSION}" != "${VERSION}" ]]; then
+            echo "::error::Installed package reports ${INSTALLED_VERSION}; expected ${VERSION}."
+            exit 1
+          fi
+
+          python3 scripts/verify-package-version.py \
+            --package "${PACKAGE_PATH}" \
+            --expected-version "${VERSION}" \
+            --installed-tool "${INSTALLED_TOOL}" \
+            --write-sha256 "nupkgs/${CHECKSUM_NAME}"
+
+          PACKAGE_SHA256="$(cut -d ' ' -f 1 "nupkgs/${CHECKSUM_NAME}")"
+          echo "package_name=${PACKAGE_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "checksum_name=${CHECKSUM_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "package_sha256=${PACKAGE_SHA256}" >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "### Release package"
+            echo
+            echo "- Version: \`${VERSION}\`"
+            echo "- SHA-256: \`${PACKAGE_SHA256}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload the single verified release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nuget-release-package
+          path: |
+            ./nupkgs/${{ steps.package.outputs.package_name }}
+            ./nupkgs/${{ steps.package.outputs.checksum_name }}
+          if-no-files-found: error
+          retention-days: 30
+
   publish:
+    needs: [build-and-verify, live-fsac]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -26,67 +187,55 @@ jobs:
       id-token: write
 
     steps:
-      - name: Guard — refuse non-tag refs
-        # workflow_dispatch defaults to running against the default branch, where
-        # GITHUB_REF_NAME = "main". The pack step below derives PackageVersion from
-        # ${GITHUB_REF_NAME#v}, which would emit "main" — not a valid NuGet version.
-        # Force callers to dispatch against an explicit v* tag (UI: "Use workflow from"
-        # → "Tags" → vX.Y.Z) or push a tag.
-        if: ${{ github.ref_type != 'tag' || !startsWith(github.ref_name, 'v') }}
-        run: |
-          echo "::error::This workflow must run against a v* tag. Got ref_type=${{ github.ref_type }} ref_name=${{ github.ref_name }}."
-          exit 1
-
-      - uses: actions/checkout@v6
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v5
+      - name: Download the verified release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          dotnet-version: 10.0.x
+          name: nuget-release-package
+          path: ./release-artifacts
 
-      - name: Restore
-        run: dotnet restore FsLangMcp.slnx
-
-      - name: Build
-        run: dotnet build FsLangMcp.slnx --configuration Release --no-restore
-
-      - name: Test
-        run: dotnet test FsLangMcp.slnx --configuration Release --no-build
-
-      - name: Extract version from tag
-        id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Pack
+      - name: Verify downloaded artifact identity
+        env:
+          CHECKSUM_NAME: ${{ needs.build-and-verify.outputs.checksum_name }}
+          EXPECTED_SHA256: ${{ needs.build-and-verify.outputs.package_sha256 }}
+          PACKAGE_NAME: ${{ needs.build-and-verify.outputs.package_name }}
+          VERSION: ${{ needs.build-and-verify.outputs.version }}
+        shell: bash
         run: |
-          dotnet pack FsLangMcp.fsproj \
-            --configuration Release \
-            --no-build \
-            -p:PackageVersion=${{ steps.version.outputs.VERSION }} \
-            -o ./nupkgs
+          set -euo pipefail
+          cd release-artifacts
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7
+          sha256sum --check "${CHECKSUM_NAME}"
+          ACTUAL_SHA256="$(sha256sum "${PACKAGE_NAME}" | cut -d ' ' -f 1)"
+
+          if [[ "${ACTUAL_SHA256}" != "${EXPECTED_SHA256}" ]]; then
+            echo "::error::Downloaded package SHA-256 ${ACTUAL_SHA256} does not match verified SHA-256 ${EXPECTED_SHA256}."
+            exit 1
+          fi
+
+          echo "Publishing FsLangMcp ${VERSION} with SHA-256 ${ACTUAL_SHA256}."
+
+      # Upload the GitHub Release first. If this step fails, NuGet has not been
+      # modified. A successful NuGet push is therefore the final irreversible
+      # release action, and both destinations receive the same verified bytes.
+      - name: Create or update GitHub Release with verified package
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          name: nuget-packages
-          path: ./nupkgs/*.nupkg
-          if-no-files-found: error
+          generate_release_notes: true
+          files: |
+            ./release-artifacts/${{ needs.build-and-verify.outputs.package_name }}
+            ./release-artifacts/${{ needs.build-and-verify.outputs.checksum_name }}
 
       - name: NuGet login (Trusted Publishing)
         id: nuget-login
-        uses: NuGet/login@v1
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
         with:
           user: Neftedollar
 
-      - name: Push to NuGet
+      - name: Push the same verified package to NuGet
+        env:
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+          PACKAGE_NAME: ${{ needs.build-and-verify.outputs.package_name }}
         run: |
-          dotnet nuget push "./nupkgs/*.nupkg" \
-            --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" \
-            --source https://api.nuget.org/v3/index.json \
-            --skip-duplicate
-
-      - name: Create / update GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: ./nupkgs/*.nupkg
+          dotnet nuget push "./release-artifacts/${PACKAGE_NAME}" \
+            --api-key "${NUGET_API_KEY}" \
+            --source https://api.nuget.org/v3/index.json

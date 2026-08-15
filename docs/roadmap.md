@@ -4,7 +4,7 @@ A living document. **Not a delivery contract** — priorities shift with real us
 
 ## Current status (pre-1.0)
 
-`v0.13.2` ships **35 MCP tools** across headline, semantic, LSP-proxy, and meta categories. The surface is still evolving toward a stable shape: v0.13.1 consolidated the former search/check aliases behind `find` and `check`. A 1.0 release will lock the contract.
+`v0.14.0` ships **35 MCP tools** across headline, semantic, LSP-proxy, and meta categories. The surface is still evolving toward a stable shape: v0.13.1 consolidated the former search/check aliases behind `find` and `check`, while v0.14.0 made incomplete evidence explicit. A 1.0 release will lock the contract.
 
 ## 1.0 exit criteria
 

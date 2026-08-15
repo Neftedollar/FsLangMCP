@@ -2,10 +2,31 @@
   "version": 1,
   "isRoot": true,
   "tools": {
+    "fantomas": {
+      "version": "7.0.5",
+      "commands": [
+        "fantomas"
+      ],
+      "rollForward": false
+    },
+    "fsautocomplete": {
+      "version": "0.83.0",
+      "commands": [
+        "fsautocomplete"
+      ],
+      "rollForward": false
+    },
     "fsharp-analyzers": {
       "version": "0.36.0",
       "commands": [
         "fsharp-analyzers"
+      ],
+      "rollForward": false
+    },
+    "ionide.projinfo.tool": {
+      "version": "0.74.2",
+      "commands": [
+        "proj-info"
       ],
       "rollForward": false
     }

@@ -18,6 +18,8 @@ open FsMcp.Core.Validation
 open FsMcp.Server
 open System.Text.Json
 open System.Text.Json.Nodes
+open System.Reflection
+open System.Text.RegularExpressions
 
 // ─── CLI helpers ───────────────────────────────────────────────────────────────
 
@@ -103,22 +105,124 @@ let private runLimited (gate: SemaphoreSlim) (work: unit -> Task<JsonNode>) : Ta
             gate.Release() |> ignore
     }
 
-let private ensureDotnetGlobalTool (toolId: string) =
+type internal RuntimeToolPin =
+    { PackageId: string
+      Version: string
+      Command: string }
+
+[<RequireQualifiedAccess>]
+module internal RuntimeToolManifest =
+    [<Literal>]
+    let ResourceName = "FsLangMcp.dotnet-tools.json"
+
+    let private requiredRuntimeTools =
+        [ "fantomas", "fantomas"
+          "fsautocomplete", "fsautocomplete"
+          "ionide.projinfo.tool", "proj-info" ]
+
+    let loadPinnedRuntimeTools () : RuntimeToolPin list =
+        use stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(ResourceName)
+
+        if isNull stream then
+            invalidOp $"Embedded runtime tool manifest '{ResourceName}' was not found."
+
+        use document = JsonDocument.Parse(stream)
+        let root = document.RootElement
+
+        if root.GetProperty("version").GetInt32() <> 1 || not (root.GetProperty("isRoot").GetBoolean()) then
+            invalidOp "The embedded dotnet-tools.json must be a root version-1 tool manifest."
+
+        let tools = root.GetProperty("tools")
+
+        requiredRuntimeTools
+        |> List.map (fun (packageId, command) ->
+            let mutable entry = Unchecked.defaultof<JsonElement>
+
+            if not (tools.TryGetProperty(packageId, &entry)) then
+                invalidOp $"The embedded tool manifest does not pin required runtime tool '{packageId}'."
+
+            let version = entry.GetProperty("version").GetString()
+
+            if
+                String.IsNullOrWhiteSpace version
+                || not (Regex.IsMatch(version, "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$"))
+            then
+                invalidOp $"Runtime tool '{packageId}' must use one exact SemVer; got '{version}'."
+
+            let commands =
+                entry.GetProperty("commands").EnumerateArray()
+                |> Seq.map _.GetString()
+                |> Seq.toArray
+
+            if commands <> [| command |] then
+                invalidOp $"Runtime tool '{packageId}' must expose exactly the '{command}' command."
+
+            if entry.GetProperty("rollForward").GetBoolean() then
+                invalidOp $"Runtime tool '{packageId}' must set rollForward=false."
+
+            { PackageId = packageId
+              Version = version
+              Command = command })
+
+    let dotnetToolArgs (verb: string) (pin: RuntimeToolPin) =
+        [ "tool"
+          verb
+          "-g"
+          pin.PackageId
+          "--version"
+          pin.Version
+          "--allow-downgrade" ]
+
+    let globalToolsDirectory () =
+        let cliHome =
+            Environment.GetEnvironmentVariable("DOTNET_CLI_HOME")
+            |> Option.ofObj
+            |> Option.filter (String.IsNullOrWhiteSpace >> not)
+            |> Option.defaultWith (fun () -> Environment.GetFolderPath(Environment.SpecialFolder.UserProfile))
+
+        Path.Combine(cliHome, ".dotnet", "tools")
+
+    /// Fantomas.Client 0.9.x invokes `dotnet fantomas --daemon`. The current
+    /// Fantomas package exposes only a `fantomas` tool command, so a sibling
+    /// `dotnet-fantomas` shim is required for the dotnet driver to resolve it.
+    let ensureFantomasDotnetAlias () =
+        let directory = globalToolsDirectory ()
+        let extension = if OperatingSystem.IsWindows() then ".exe" else ""
+        let source = Path.Combine(directory, "fantomas" + extension)
+        let destination = Path.Combine(directory, "dotnet-fantomas" + extension)
+
+        if not (File.Exists source) then
+            invalidOp $"The exact Fantomas install did not create its expected shim: {source}"
+
+        let temporary = destination + $".tmp-{Guid.NewGuid():N}"
+
+        try
+            if OperatingSystem.IsWindows() then
+                File.Copy(source, temporary, true)
+            else
+                File.CreateSymbolicLink(temporary, Path.GetFileName(source)) |> ignore
+
+            File.Move(temporary, destination, true)
+        finally
+            if File.Exists temporary then
+                File.Delete temporary
+
+let private ensureDotnetGlobalTool (pin: RuntimeToolPin) =
     let updateCode, _, updateErr =
-        runProcess "dotnet" [ "tool"; "update"; "-g"; toolId ]
+        runProcess "dotnet" (RuntimeToolManifest.dotnetToolArgs "update" pin)
 
     if updateCode = 0 then
-        Console.Error.WriteLine($"[bootstrap] updated %s{toolId}")
+        Console.Error.WriteLine($"[bootstrap] updated {pin.PackageId} to exact {pin.Version}")
         true
     else
         let installCode, _, installErr =
-            runProcess "dotnet" [ "tool"; "install"; "-g"; toolId ]
+            runProcess "dotnet" (RuntimeToolManifest.dotnetToolArgs "install" pin)
 
         if installCode = 0 then
-            Console.Error.WriteLine($"[bootstrap] installed %s{toolId}")
+            Console.Error.WriteLine($"[bootstrap] installed {pin.PackageId} exact {pin.Version}")
             true
         else
-            Console.Error.WriteLine($"[bootstrap] failed for %s{toolId}")
+            Console.Error.WriteLine($"[bootstrap] failed for {pin.PackageId} {pin.Version}")
 
             if not (String.IsNullOrWhiteSpace(updateErr)) then
                 Console.Error.WriteLine(updateErr)
@@ -129,14 +233,24 @@ let private ensureDotnetGlobalTool (toolId: string) =
             false
 
 let private bootstrapTools () =
-    [ "fsautocomplete"; "ionide.projinfo.tool" ]
-    |> List.map ensureDotnetGlobalTool
-    |> List.forall id
+    try
+        let installed =
+            RuntimeToolManifest.loadPinnedRuntimeTools ()
+            |> List.map ensureDotnetGlobalTool
+            |> List.forall id
+
+        if installed then
+            RuntimeToolManifest.ensureFantomasDotnetAlias ()
+
+        installed
+    with ex ->
+        Console.Error.WriteLine($"[bootstrap] {ex.Message}")
+        false
 
 let private applyCliOverrides (argv: string array) =
-    let rec loop index =
+    let rec loop index projectPath =
         if index >= argv.Length then
-            Start
+            Start { ProjectPath = projectPath }
         else
             match argv[index] with
             | "--project"
@@ -144,48 +258,180 @@ let private applyCliOverrides (argv: string array) =
                 if index + 1 >= argv.Length then
                     Fail "--project requires a value."
                 else
-                    Environment.SetEnvironmentVariable("FSA_PROJECT_PATH", argv[index + 1])
-                    loop (index + 2)
+                    loop (index + 2) (Some argv[index + 1])
             | "--fsac-command" ->
                 if index + 1 >= argv.Length then
                     Fail "--fsac-command requires a value."
                 else
                     Environment.SetEnvironmentVariable("FSAC_COMMAND", argv[index + 1])
-                    loop (index + 2)
+                    loop (index + 2) projectPath
             | "--fsac-args" ->
                 if index + 1 >= argv.Length then
                     Fail "--fsac-args requires a value."
                 else
                     Environment.SetEnvironmentVariable("FSAC_ARGS", argv[index + 1])
-                    loop (index + 2)
+                    loop (index + 2) projectPath
             | "--help"
             | "-h" ->
                 ShowHelp
-                    "Usage: fslangmcp [--project <path-to-fsproj>] [--fsac-command <cmd>] [--fsac-args \"...\"] [--bootstrap-tools]"
+                    "Usage: fslangmcp [--project <path-to-fsproj|sln|slnx|directory>] [--fsac-command <cmd>] [--fsac-args \"...\"] [--bootstrap-tools] [--version]"
+            | "--version" -> ShowVersion
             | "--bootstrap-tools" -> BootstrapTools
             | unknown -> Fail $"Unknown argument: %s{unknown}"
 
-    loop 0
+    let projectFromEnvironment =
+        Environment.GetEnvironmentVariable("FSA_PROJECT_PATH")
+        |> Option.ofObj
+        |> Option.filter (String.IsNullOrWhiteSpace >> not)
+
+    loop 0 projectFromEnvironment
 
 // ─── Entry point ───────────────────────────────────────────────────────────────
 
-[<EntryPoint>]
-let main argv =
+let private mainCore argv =
     match applyCliOverrides argv with
     | BootstrapTools -> if bootstrapTools () then 0 else 1
+    | ShowVersion ->
+        Console.WriteLine(FsLangMcp.Version.current)
+        0
     | ShowHelp message ->
         Console.WriteLine(message)
         0
     | Fail message ->
         Console.Error.WriteLine(message)
         1
-    | Start ->
-        use bridge = new FsAutoCompleteBridge()
+    | Start startOptions ->
         let fcsBridge = new FcsBridge()
+        let projInfoTimeout = timeoutFromEnv "FSLANGMCP_PROJ_INFO_TIMEOUT_MS" 120_000
+
+        let waitForProjInfo operationName projectPath (work: Task<Result<'T, string>>) =
+            task {
+                try
+                    return! work.WaitAsync(projInfoTimeout)
+                with :? TimeoutException ->
+                    return
+                        Error
+                            $"%s{operationName} timed out after %d{int64 projInfoTimeout.TotalMilliseconds} ms for '%s{projectPath}'."
+            }
+
+        let getEvaluatedProjectSnapshot projectPath =
+            fcsBridge.GetEvaluatedProjectSnapshot(projectPath)
+            |> waitForProjInfo "MSBuild project evaluation" projectPath
+
+        let probeProjectOptions projectPath =
+            fcsBridge.ProbeProjectOptions(projectPath)
+            |> waitForProjInfo "FCS project-options probe" projectPath
+
+        let evaluatedSourceFilesProvider
+            (projectPath: string)
+            : Task<Result<string array, string>> =
+            task {
+                let! result = getEvaluatedProjectSnapshot projectPath
+
+                return
+                    result
+                    |> Result.map (fun snapshot ->
+                        snapshot.Files |> List.map (fun file -> file.Path) |> List.toArray)
+            }
+
+        use bridge =
+            new FsAutoCompleteBridge(evaluatedSourceFilesProvider = evaluatedSourceFilesProvider)
+
         use fcsGate = new SemaphoreSlim(readPositiveIntEnv "FSLANGMCP_MAX_CONCURRENT_FCS" 2)
         // FSAC owns one mutable workspace. Keep the public gate fixed at one; the bridge
         // also serializes internally because some FCS orchestrators call LSP directly.
         use lspGate = new SemaphoreSlim(1, 1)
+
+        let setProjectAndRefresh (args: SetProjectArgs) : Task<JsonNode> =
+            task {
+                let! result = bridge.SetProject args
+
+                let succeeded =
+                    match result["status"] with
+                    | :? JsonValue as value ->
+                        try
+                            value.GetValue<string>() = "ok"
+                        with _ ->
+                            false
+                    | _ -> false
+
+                if succeeded then
+                    // A rejected restartLsp=false transition must not invalidate the
+                    // still-active context. Only accepted transitions clear analysis.
+                    fcsBridge.ClearAnalysisCaches()
+
+                    // Enrich readiness.projectOptions by probing the first evaluated
+                    // project. CLI preload and the MCP tool share this exact coordinator.
+                    match result["result"] with
+                    | :? JsonObject as resultObj ->
+                        let probeTarget =
+                            match resultObj["loadedProjects"] with
+                            | :? JsonArray as arr when arr.Count > 0 ->
+                                match arr[0] with
+                                | null -> None
+                                | node ->
+                                    let value = node.GetValue<string>()
+                                    if String.IsNullOrWhiteSpace value then None else Some value
+                            | _ -> None
+
+                        match probeTarget with
+                        | Some path ->
+                            let! probe = probeProjectOptions path
+
+                            match resultObj["readiness"] with
+                            | :? JsonObject as readinessObj ->
+                                match probe with
+                                | Ok info ->
+                                    readinessObj["projectOptions"] <- jbool true
+
+                                    if
+                                        FsLangMcp.Types.ReferenceResolution.looksUnrestored
+                                            info.ReferencesExisting
+                                            info.ReferencesTotal
+                                    then
+                                        readinessObj["restoreStatus"] <- jstr "unrestored"
+
+                                        readinessObj["restoreHint"] <-
+                                            jstr
+                                                "external references unresolved — run dotnet restore && dotnet build before using FCS tools"
+                                | Error error ->
+                                    readinessObj["projectOptions"] <- jbool false
+                                    readinessObj["projectOptionsError"] <- jstr error
+                            | _ -> ()
+                        | None -> ()
+                    | _ -> ()
+
+                return result
+            }
+
+        match startOptions.ProjectPath with
+        | Some projectPath ->
+            let preload =
+                setProjectAndRefresh
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some true }
+                |> fun operation -> operation.GetAwaiter().GetResult()
+
+            let ready =
+                match preload["status"], preload["result"] with
+                | (:? JsonValue as status), (:? JsonObject as resultObj) when status.GetValue<string>() = "ok" ->
+                    match resultObj["readiness"] with
+                    | :? JsonObject as readiness ->
+                        let readBool (key: string) =
+                            match readiness[key] with
+                            | :? JsonValue as value ->
+                                let mutable parsed = false
+                                value.TryGetValue(&parsed) && parsed
+                            | _ -> false
+
+                        readBool "lsp" && readBool "projectOptions"
+                    | _ -> false
+                | _ -> false
+
+            if not ready then
+                invalidOp $"--project preload failed: {preload.ToJsonString()}"
+        | None -> ()
 
         let versionResponse: Task<JsonNode> =
             task {
@@ -230,59 +476,7 @@ let main argv =
                         "Initialize or switch the FSAC/LSP project context. Required before raw LSP proxies. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load and clears stale FCS analysis while retaining validated MSBuild project options. Response includes loadedProjects, readiness, restart intent, and whether a running FSAC process was actually replaced."
                         (fun args ->
                             toolResult (
-                                runLimited lspGate (fun () ->
-                                    task {
-                                        let! result = bridge.SetProject args
-                                        // Repeated set_project calls still need fresh semantic results, but
-                                        // re-running Ionide/MSBuild for an unchanged project creates orphaned
-                                        // in-process MSBuild node threads (issue #150). Project options carry
-                                        // their own input stamps; retain them and clear only FCS analysis data.
-                                        fcsBridge.ClearAnalysisCaches()
-
-                                        // Enrich readiness.projectOptions by probing the first loaded .fsproj.
-                                        // Bridge cannot do this itself (no FCS handle); we own that wiring here.
-                                        match result["result"] with
-                                        | :? JsonObject as resultObj ->
-                                            let probeTarget =
-                                                match resultObj["loadedProjects"] with
-                                                | :? JsonArray as arr when arr.Count > 0 ->
-                                                    match arr[0] with
-                                                    | null -> None
-                                                    | node ->
-                                                        let v = node.GetValue<string>()
-                                                        if System.String.IsNullOrWhiteSpace v then None else Some v
-                                                | _ -> None
-
-                                            match probeTarget with
-                                            | Some path ->
-                                                let! probe = fcsBridge.ProbeProjectOptions path
-
-                                                match resultObj["readiness"] with
-                                                | :? JsonObject as readinessObj ->
-                                                    match probe with
-                                                    | Ok info ->
-                                                        readinessObj["projectOptions"] <- jbool true
-
-                                                        // Restore-awareness (#138): options can load while the
-                                                        // project's external references are absent on disk, which
-                                                        // leaves symbolIndex empty and makes FCS tools fail with
-                                                        // 'FSharp.Core.dll not found'. Surface "restore first"
-                                                        // rather than letting `ready` imply it's usable.
-                                                        if FsLangMcp.Types.ReferenceResolution.looksUnrestored
-                                                               info.ReferencesExisting
-                                                               info.ReferencesTotal then
-                                                            readinessObj["restoreStatus"] <- jstr "unrestored"
-
-                                                            readinessObj["restoreHint"] <-
-                                                                jstr
-                                                                    "external references unresolved — run dotnet restore && dotnet build before using FCS tools"
-                                                    | Error _ -> readinessObj["projectOptions"] <- jbool false
-                                                | _ -> ()
-                                            | None -> ()
-                                        | _ -> ()
-
-                                        return result
-                                    })
+                                runLimited lspGate (fun () -> setProjectAndRefresh args)
                             ))
                     |> unwrapResult
                 )
@@ -298,14 +492,17 @@ let main argv =
                             let snapshot =
                                 { ProjectPath = bridge.CurrentProjectPath
                                   WorkspaceRoot = bridge.CurrentWorkspaceRoot
+                                  LoadedProjects = bridge.LoadedProjects
+                                  SessionLive = bridge.IsSessionLive
                                   WorkspaceReady = bridge.IsWorkspaceReady
                                   DiagnosticsFileCount = bridge.DiagnosticsFileCount }
 
-                            let probe path =
-                                fcsBridge.ProbeProjectOptions(path) |> Async.AwaitTask
+                            let evaluatedProject path =
+                                getEvaluatedProjectSnapshot path |> Async.AwaitTask
 
                             toolResult (
-                                runLimited fcsGate (fun () -> createReport args snapshot probe |> Async.StartAsTask)
+                                runLimited fcsGate (fun () ->
+                                    createReport args snapshot evaluatedProject |> Async.StartAsTask)
                             ))
                     |> unwrapResult
                 )
@@ -318,7 +515,13 @@ let main argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (Task.FromResult(inspectProject args)))
+                            let evaluatedProject path =
+                                getEvaluatedProjectSnapshot path |> Async.AwaitTask
+
+                            toolResult (
+                                runLimited fcsGate (fun () ->
+                                    inspectProject args evaluatedProject |> Async.StartAsTask)
+                            ))
                     |> unwrapResult
                 )
 
@@ -673,7 +876,7 @@ let main argv =
             let serverTask =
                 try
                     Environment.SetEnvironmentVariable(reloadConfigKey, "false")
-                    Server.run server
+                    FsLangMcp.McpHost.runToolOnly FsLangMcp.Version.current server
                 finally
                     // Server.run creates the Generic Host synchronously before returning
                     // its pending task. Restore immediately so FSAC children inherit the
@@ -682,6 +885,21 @@ let main argv =
 
             serverTask.GetAwaiter().GetResult()
             0
+        with ex ->
+            Console.Error.WriteLine($"Fatal error: %s{ex.Message}")
+            1
+
+[<EntryPoint>]
+let main argv =
+    if argv.Length > 0 && argv[0] = InternalProcessSessionWrapperArgument then
+        if argv.Length < 2 then
+            Console.Error.WriteLine("The internal process-session wrapper requires a command.")
+            64
+        else
+            runUnixSessionWrapper argv[1] argv[2..]
+    else
+        try
+            mainCore argv
         with ex ->
             Console.Error.WriteLine($"Fatal error: %s{ex.Message}")
             1

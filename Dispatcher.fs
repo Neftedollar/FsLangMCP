@@ -24,8 +24,8 @@ open FsLangMcp.FcsBridge
 /// hides which backend each member resolves to.
 type FindRequest =
     /// Consolidated multi-project symbol search (issue #128, Stage 1). Routes to the
-    /// FCS union sweep; the FSAC workspace/symbol index is consulted only as the
-    /// matched=false tie-breaker, injected here so the substrate stays LSP-agnostic.
+    /// FCS union sweep; after an empty FCS result the project-bound FSAC symbol index
+    /// can still prove presence. It is injected here so the substrate stays LSP-agnostic.
     | Find of FindArgs
 
 /// Internal request representation for the "check" tool cluster.
@@ -40,24 +40,125 @@ type CheckRequest =
 [<RequireQualifiedAccess>]
 module FindDispatch =
 
+    let private normalizeContextPath (path: string) =
+        let full = System.IO.Path.GetFullPath(path)
+        let root = System.IO.Path.GetPathRoot(full)
+
+        if System.String.Equals(full, root, System.StringComparison.Ordinal) then
+            full
+        else
+            full.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar)
+
+    let private contextPathsEqual (left: string) (right: string) =
+        let comparison =
+            if System.OperatingSystem.IsWindows() then
+                System.StringComparison.OrdinalIgnoreCase
+            else
+                System.StringComparison.Ordinal
+
+        try
+            System.String.Equals(normalizeContextPath left, normalizeContextPath right, comparison)
+        with _ ->
+            false
+
+    /// `workspace/symbol` is workspace-wide, so it may only prove a positive result
+    /// when that workspace is exactly the scope requested by `find`. In particular,
+    /// an active solution must never satisfy scope=file or a member-project request.
+    let internal fsacWorkspaceProbeEligibility
+        (args: FindArgs)
+        (activeProjectPath: string option)
+        : Result<unit, string> =
+        let scope =
+            args.scope
+            |> Option.defaultValue "auto"
+            |> fun value -> value.Trim().ToLowerInvariant()
+
+        if scope = "file" then
+            Error "FSAC workspace symbols are broader than find scope=file."
+        else
+            match args.projectPath |> Option.filter (System.String.IsNullOrWhiteSpace >> not), activeProjectPath with
+            | None, _ -> Error "The requested find context was not explicit."
+            | _, None -> Error "FSAC has no active project context."
+            | Some requested, Some active when not (contextPathsEqual requested active) ->
+                Error "The active FSAC workspace is broader than or different from the requested find context."
+            | Some requested, Some _
+                when scope = "project"
+                     && not (requested.EndsWith(".fsproj", System.StringComparison.OrdinalIgnoreCase)) ->
+                Error "FSAC workspace symbols cannot prove a project-scoped result inside an active solution."
+            | Some _, Some _ -> Ok()
+
+    let private tryString (node: JsonNode) (key: string) =
+        match node with
+        | :? JsonObject as obj ->
+            match obj[key] with
+            | :? JsonValue as value ->
+                try
+                    Some(value.GetValue<string>())
+                with _ ->
+                    None
+            | _ -> None
+        | _ -> None
+
+    let private tryBool (node: JsonNode) (key: string) =
+        match node with
+        | :? JsonObject as obj ->
+            match obj[key] with
+            | :? JsonValue as value ->
+                let mutable result = false
+                if value.TryGetValue(&result) then Some result else None
+            | _ -> None
+        | _ -> None
+
+    /// Convert the project-bound LSP response into a typed probe result. Only an
+    /// explicit status=ok response for the requested context may be Available;
+    /// every other state remains distinguishable from a genuine zero-hit index.
+    let internal classifyFsacProbeResponse (response: JsonNode) : FindFsacProbeResult =
+        let message fallback = tryString response "message" |> Option.defaultValue fallback
+
+        match tryString response "status" with
+        | Some "ok" ->
+            match tryBool response "contextMatched" with
+            | None ->
+                FindFsacProbeResult.Failed
+                    "FSAC workspace-symbol response omitted contextMatched."
+            | Some false ->
+                FindFsacProbeResult.ContextMismatch(message "FSAC response belongs to another project context.")
+            | Some true ->
+                match tryBool response "symbolIndexReady" with
+                | Some false -> FindFsacProbeResult.NotReady(message "FSAC symbol index is still warming.")
+                | _ ->
+                    match response["result"] with
+                    | :? JsonArray as arr -> FindFsacProbeResult.Available arr.Count
+                    | _ ->
+                        FindFsacProbeResult.Failed
+                            "FSAC workspace-symbol response did not contain an array result."
+        | Some "context_mismatch" ->
+            FindFsacProbeResult.ContextMismatch(message "FSAC active project does not match the requested project.")
+        | Some "not_ready" -> FindFsacProbeResult.NotReady(message "FSAC is not ready.")
+        | Some "infrastructure_error" -> FindFsacProbeResult.Failed(message "FSAC infrastructure failure.")
+        | Some status -> FindFsacProbeResult.Failed(message $"Unexpected FSAC status '{status}'.")
+        | None -> FindFsacProbeResult.Failed "FSAC workspace-symbol response omitted status."
+
     /// Route a find-cluster request to the same backend call its handler made
     /// before the dispatcher seam was introduced.
     let internal run (fcsBridge: FcsBridge) (lspBridge: FsAutoCompleteBridge) (request: FindRequest) : Task<JsonNode> =
         match request with
         | Find args ->
-            // FSAC symbol-index probe: the ONLY consulted signal when the FCS sweep is
-            // empty. Defensive — any FSAC error (not ready, RPC failure) counts as 0,
-            // so matched=false still requires a genuinely empty index.
-            let fsacProbe (q: string) : Task<int> =
+            // FSAC symbol-index probe: consulted only when the FCS sweep has no
+            // hits. Keep every non-success state typed; failure or project mismatch
+            // is not equivalent to a valid zero-hit result.
+            let fsacProbe (q: string) : Task<FindFsacProbeResult> =
                 task {
-                    try
-                        let! response = lspBridge.WorkspaceSymbol { query = q }
+                    match fsacWorkspaceProbeEligibility args lspBridge.CurrentProjectPath with
+                    | Error reason -> return FindFsacProbeResult.Unavailable reason
+                    | Ok() ->
+                        try
+                            let! response =
+                                lspBridge.WorkspaceSymbolForContext(args.projectPath, { query = q })
 
-                        match response["result"] with
-                        | :? JsonArray as arr -> return arr.Count
-                        | _ -> return 0
-                    with _ ->
-                        return 0
+                            return classifyFsacProbeResponse response
+                        with ex ->
+                            return FindFsacProbeResult.Failed ex.Message
                 }
 
             fcsBridge.Find(args, fsacProbe = fsacProbe)
@@ -70,22 +171,23 @@ module CheckDispatch =
     let internal run (fcsBridge: FcsBridge) (lspBridge: FsAutoCompleteBridge) (request: CheckRequest) : Task<JsonNode> =
         match request with
         | Check args ->
-            // speed="fast" reads the cheap cached FSAC snapshot; project it from a
-            // workspace_diagnostics response so the FCS substrate stays LSP-agnostic.
-            // Defensive — any FSAC error (not ready, RPC failure) degrades to `empty`,
-            // which the fast path honestly reports as verdict="unknown".
-            let fsacSnapshot () : Task<CheckFsacSnapshot> =
+            // speed="fast" reads only the context-bound FSAC publications for the
+            // evaluated FCS SourceFiles derived by Check. Missing/stale/mismatched
+            // coverage stays typed and can never become a clean verdict.
+            let fsacSnapshot (expectation: CheckFsacExpectation) : Task<CheckFsacSnapshot> =
                 task {
                     try
-                        let diagArgs: DiagnosticsArgs =
-                            { path = args.path
-                              fileGlob = args.fileGlob
-                              severity = None }
+                        let! response =
+                            lspBridge.DiagnosticsForContext(
+                                expectation.RequestedProjectPath,
+                                expectation.ExpectedFiles,
+                                expectation.FileGlob,
+                                expectation.ContextFingerprint
+                            )
 
-                        let! response = lspBridge.Diagnostics diagArgs
                         return CheckFsacSnapshot.ofDiagnosticsResponse response
-                    with _ ->
-                        return CheckFsacSnapshot.empty
+                    with ex ->
+                        return CheckFsacSnapshot.unavailable expectation ex.Message
                 }
 
             fcsBridge.Check(args, fsacSnapshot = fsacSnapshot)

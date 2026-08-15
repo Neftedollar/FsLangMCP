@@ -1,3 +1,4 @@
+[<Xunit.Collection("FsLangMcp LSP process isolation")>]
 module FsLangMcp.Tests.LspBridgeTests
 
 open System
@@ -8,9 +9,18 @@ open System.Threading.Tasks
 open Xunit
 open FsLangMcp.LspBridge
 
+[<CollectionDefinition("FsLangMcp LSP process isolation", DisableParallelization = true)>]
+type LspBridgeProcessIsolationCollection() = class end
+
 let private jsonElement (json: string) =
     use doc = JsonDocument.Parse(json)
     doc.RootElement.Clone()
+
+let private diagnosticEnvelope generation payload serverVersion =
+    { Generation = generation
+      Payload = payload
+      ServerVersion = serverVersion
+      ReceivedAt = DateTimeOffset.UtcNow }
 
 let private fakeFsacScript =
     """open System
@@ -61,18 +71,542 @@ while true do
         writeResponse (id.GetRawText()) result
 """
 
+let private fakeFsacScriptWithSlowFormatting (markerPath: string) (delayMilliseconds: int) =
+    let markerLiteral = JsonSerializer.Serialize(markerPath)
+    let responseLine = "        let result = if methodName = \"initialize\" then \"{\\\"capabilities\\\":{}}\" else \"null\""
+
+    let slowResponse =
+        $"""        if methodName = "textDocument/formatting" then
+            System.IO.File.WriteAllText({markerLiteral}, "entered")
+            System.Threading.Thread.Sleep({delayMilliseconds})
+
+{responseLine}"""
+
+    fakeFsacScript.Replace(responseLine, slowResponse)
+
 [<Fact>]
-let ``Disposing bridge clears diagnostics and their freshness timestamps`` () =
+let ``Disposing bridge clears atomic diagnostic snapshots`` () =
     let bridge = new FsAutoCompleteBridge()
     let diagnostics = bridge.DiagnosticsStore
-    let analyzedAt = bridge.DiagnosticsAnalyzedAtStore
-    diagnostics["file:///old.fs"] <- System.Text.Json.Nodes.JsonArray()
-    analyzedAt["file:///old.fs"] <- DateTimeOffset.UtcNow
+
+    diagnostics[Path.GetFullPath("/old.fs")] <-
+        diagnosticEnvelope 1L (System.Text.Json.Nodes.JsonArray()) None
 
     (bridge :> IDisposable).Dispose()
 
     Assert.Empty(diagnostics)
-    Assert.Empty(analyzedAt)
+
+[<Fact>]
+let ``retired diagnostics notification cannot repopulate a replacement generation`` () : Task =
+    task {
+        let store =
+            System.Collections.Concurrent.ConcurrentDictionary<string, DiagnosticEnvelope>(
+                DiagnosticIdentity.pathComparer
+            )
+        let synchronizationRoot = obj()
+        let mutable currentGeneration = 1L
+        let generationChecked = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let releaseNotification = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let transitionStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let target =
+            DiagnosticsTarget(
+                store,
+                1L,
+                (fun candidate ->
+                    let accepted = currentGeneration = candidate
+                    generationChecked.TrySetResult(()) |> ignore
+                    releaseNotification.Task.GetAwaiter().GetResult()
+                    accepted),
+                synchronizationRoot
+            )
+
+        let payload = System.Text.Json.Nodes.JsonObject()
+        payload["uri"] <- System.Text.Json.Nodes.JsonValue.Create("file:///retired.fs")
+        payload["version"] <- System.Text.Json.Nodes.JsonValue.Create(1)
+        payload["diagnostics"] <- System.Text.Json.Nodes.JsonArray()
+
+        let publish = Task.Run(fun () -> target.PublishDiagnostics(payload))
+        do! generationChecked.Task
+
+        let transition =
+            Task.Run(fun () ->
+                transitionStarted.TrySetResult(()) |> ignore
+
+                lock synchronizationRoot (fun () ->
+                    currentGeneration <- 2L
+                    store.Clear()))
+
+        do! transitionStarted.Task
+        releaseNotification.TrySetResult(()) |> ignore
+        do! Task.WhenAll([| publish; transition |])
+
+        Assert.Empty(store)
+    }
+
+[<Fact>]
+let ``failed FSAC startup clears every diagnostic store`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_failed_start_{Guid.NewGuid():N}")
+        let projectPath = Path.Combine(root, "App.fsproj")
+
+        try
+            Directory.CreateDirectory(root) |> ignore
+            File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+
+            use bridge =
+                new FsAutoCompleteBridge(fsacCommandOverride = $"missing-fsac-{Guid.NewGuid():N}")
+
+            bridge.DiagnosticsStore[Path.GetFullPath("/stale.fs")] <-
+                diagnosticEnvelope 1L (System.Text.Json.Nodes.JsonArray()) (Some 7)
+
+            let operation =
+                bridge.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some true }
+                )
+
+            let! _ = Assert.ThrowsAnyAsync<Exception>(fun () -> operation :> Task)
+            Assert.Empty(bridge.DiagnosticsStore)
+            Assert.Equal(0L, bridge.SessionGeneration)
+            Assert.True(bridge.FsacProcess.IsNone)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``FSAC escaped Windows drive URI and client URI share one diagnostic key`` () =
+    let clientUri = "file:///C:/Repo%20A/App.fs"
+    let fsacUri = "file:///C%3A/Repo%20A/App.fs"
+    let clientKey = DiagnosticIdentity.tryCanonicalFileKeyFromUri clientUri
+    let fsacKey = DiagnosticIdentity.tryCanonicalFileKeyFromUri fsacUri
+
+    Assert.True(clientKey.IsSome)
+    Assert.Equal(clientKey, fsacKey)
+
+    let store =
+        System.Collections.Concurrent.ConcurrentDictionary<string, DiagnosticEnvelope>(
+            DiagnosticIdentity.pathComparer
+        )
+
+    let target = DiagnosticsTarget(store, 1L, ((=) 1L), obj())
+    let payload = System.Text.Json.Nodes.JsonObject()
+    payload["uri"] <- System.Text.Json.Nodes.JsonValue.Create(fsacUri)
+    payload["diagnostics"] <- System.Text.Json.Nodes.JsonArray()
+    target.PublishDiagnostics(payload)
+
+    Assert.True(store.ContainsKey(clientKey.Value))
+
+[<Fact>]
+let ``versionless diagnostics never survive a same-mtime disk edit and recover after rebaseline`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_diag_baseline_{Guid.NewGuid():N}")
+        let projectPath = Path.Combine(root, "App.fsproj")
+        let sourcePath = Path.Combine(root, "App.fs")
+        let scriptPath = Path.Combine(root, "fake-fsac.fsx")
+        let initialSource = "module App\nlet value = 1\n"
+        let changedSource = "module App\nlet value = x\n"
+
+        try
+            Directory.CreateDirectory(root) |> ignore
+            File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+            File.WriteAllText(sourcePath, initialSource)
+            File.WriteAllText(scriptPath, fakeFsacScript)
+
+            let evaluatedFiles (_: string) = Task.FromResult(Ok [| sourcePath |])
+
+            use bridge =
+                new FsAutoCompleteBridge(
+                    startupTimeoutOverride = TimeSpan.FromSeconds(10.0),
+                    fsacCommandOverride = "dotnet",
+                    fsacArgsOverride = [ "fsi"; "--exec"; scriptPath ],
+                    evaluatedSourceFilesProvider = evaluatedFiles
+                )
+
+            let! selected =
+                bridge.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some true }
+                )
+
+            Assert.Equal("ok", selected["status"].GetValue<string>())
+            let generation1 = bridge.SessionGeneration
+            let fileKey = DiagnosticIdentity.canonicalFileKeyFromPath sourcePath
+
+            bridge.DiagnosticsStore[fileKey] <-
+                diagnosticEnvelope generation1 (System.Text.Json.Nodes.JsonArray()) None
+
+            let! beforeEdit =
+                bridge.DiagnosticsForContext(Some projectPath, [| sourcePath |], None, None)
+
+            Assert.True(beforeEdit["complete"].GetValue<bool>())
+
+            let originalWriteTime = File.GetLastWriteTimeUtc(sourcePath)
+            Assert.Equal(initialSource.Length, changedSource.Length)
+            File.WriteAllText(sourcePath, changedSource)
+            File.SetLastWriteTimeUtc(sourcePath, originalWriteTime)
+
+            // Simulate a delayed empty publication from generation 1 arriving after
+            // the edit. The content baseline, not receipt time, must reject it.
+            bridge.DiagnosticsStore[fileKey] <-
+                diagnosticEnvelope generation1 (System.Text.Json.Nodes.JsonArray()) None
+
+            let! afterEdit =
+                bridge.DiagnosticsForContext(Some projectPath, [| sourcePath |], None, None)
+
+            Assert.False(afterEdit["complete"].GetValue<bool>())
+            Assert.Equal("not_ready", afterEdit["status"].GetValue<string>())
+            let generation2 = bridge.SessionGeneration
+            Assert.True(generation2 > generation1)
+
+            bridge.DiagnosticsStore[fileKey] <-
+                diagnosticEnvelope generation2 (System.Text.Json.Nodes.JsonArray()) None
+
+            let! afterRebaseline =
+                bridge.DiagnosticsForContext(Some projectPath, [| sourcePath |], None, None)
+
+            Assert.True(afterRebaseline["complete"].GetValue<bool>())
+            Assert.Equal(0, afterRebaseline["staleFileCount"].GetValue<int>())
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``diagnostic context fingerprint changes retire the old generation before cached diagnostics are reused`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_diag_context_{Guid.NewGuid():N}")
+        let projectPath = Path.Combine(root, "App.fsproj")
+        let sourcePath = Path.Combine(root, "App.fs")
+        let scriptPath = Path.Combine(root, "fake-fsac.fsx")
+
+        try
+            Directory.CreateDirectory(root) |> ignore
+            File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+            File.WriteAllText(sourcePath, "module App\nlet value = 1\n")
+            File.WriteAllText(scriptPath, fakeFsacScript)
+
+            let evaluatedFiles (_: string) = Task.FromResult(Ok [| sourcePath |])
+
+            use bridge =
+                new FsAutoCompleteBridge(
+                    startupTimeoutOverride = TimeSpan.FromSeconds(10.0),
+                    fsacCommandOverride = "dotnet",
+                    fsacArgsOverride = [ "fsi"; "--exec"; scriptPath ],
+                    evaluatedSourceFilesProvider = evaluatedFiles
+                )
+
+            let! _ =
+                bridge.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some true }
+                )
+
+            let generation1 = bridge.SessionGeneration
+
+            let! firstBinding =
+                bridge.DiagnosticsForContext(Some projectPath, [| sourcePath |], None, Some "context-a")
+
+            Assert.Equal("not_ready", firstBinding["status"].GetValue<string>())
+            let generation2 = bridge.SessionGeneration
+            Assert.True(generation2 > generation1)
+
+            let fileKey = DiagnosticIdentity.canonicalFileKeyFromPath sourcePath
+            bridge.DiagnosticsStore[fileKey] <-
+                diagnosticEnvelope generation2 (System.Text.Json.Nodes.JsonArray()) None
+
+            let! sameContext =
+                bridge.DiagnosticsForContext(Some projectPath, [| sourcePath |], None, Some "context-a")
+
+            Assert.True(sameContext["complete"].GetValue<bool>())
+            Assert.Equal(generation2, bridge.SessionGeneration)
+
+            let! changedContext =
+                bridge.DiagnosticsForContext(Some projectPath, [| sourcePath |], None, Some "context-b")
+
+            Assert.Equal("not_ready", changedContext["status"].GetValue<string>())
+            let generation3 = bridge.SessionGeneration
+            Assert.True(generation3 > generation2)
+            Assert.Empty(bridge.DiagnosticsStore)
+
+            bridge.DiagnosticsStore[fileKey] <-
+                diagnosticEnvelope generation3 (System.Text.Json.Nodes.JsonArray()) None
+
+            let! rebound =
+                bridge.DiagnosticsForContext(Some projectPath, [| sourcePath |], None, Some "context-b")
+
+            Assert.True(rebound["complete"].GetValue<bool>())
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``versionless unsaved diagnostics remain stale while an exact server version is current`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_diag_unsaved_{Guid.NewGuid():N}")
+        let projectPath = Path.Combine(root, "App.fsproj")
+        let sourcePath = Path.Combine(root, "App.fs")
+        let scriptPath = Path.Combine(root, "fake-fsac.fsx")
+        let diskSource = "module App\nlet value = 1\n"
+        let unsavedSource = "module App\nlet value = x\n"
+
+        try
+            Directory.CreateDirectory(root) |> ignore
+            File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+            File.WriteAllText(sourcePath, diskSource)
+            File.WriteAllText(scriptPath, fakeFsacScript)
+
+            let evaluatedFiles (_: string) = Task.FromResult(Ok [| sourcePath |])
+
+            use bridge =
+                new FsAutoCompleteBridge(
+                    startupTimeoutOverride = TimeSpan.FromSeconds(10.0),
+                    fsacCommandOverride = "dotnet",
+                    fsacArgsOverride = [ "fsi"; "--exec"; scriptPath ],
+                    evaluatedSourceFilesProvider = evaluatedFiles
+                )
+
+            let! _ =
+                bridge.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some true }
+                )
+
+            let! _ = bridge.Formatting({ path = sourcePath; text = Some unsavedSource })
+            let generation = bridge.SessionGeneration
+            let fileKey = DiagnosticIdentity.canonicalFileKeyFromPath sourcePath
+
+            bridge.DiagnosticsStore[fileKey] <-
+                diagnosticEnvelope generation (System.Text.Json.Nodes.JsonArray()) None
+
+            let! versionless =
+                bridge.DiagnosticsForContext(Some projectPath, [| sourcePath |], None, None)
+
+            Assert.False(versionless["complete"].GetValue<bool>())
+            Assert.Equal("not_ready", versionless["status"].GetValue<string>())
+            Assert.Equal(1, versionless["staleFileCount"].GetValue<int>())
+            let reboundGeneration = bridge.SessionGeneration
+            Assert.True(reboundGeneration > generation)
+
+            // Re-open in the replacement generation. An exact server version is
+            // causal evidence for this document transition and remains usable;
+            // only versionless publications are barred by the taint.
+            let! _ = bridge.Formatting({ path = sourcePath; text = Some unsavedSource })
+
+            bridge.DiagnosticsStore[fileKey] <-
+                diagnosticEnvelope reboundGeneration (System.Text.Json.Nodes.JsonArray()) (Some 1)
+
+            let! versioned =
+                bridge.DiagnosticsForContext(Some projectPath, [| sourcePath |], None, None)
+
+            Assert.True(versioned["complete"].GetValue<bool>())
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``baseline-equivalent initial open accepts versionless diagnostics without rebasing`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_diag_equivalent_open_{Guid.NewGuid():N}")
+        let projectPath = Path.Combine(root, "App.fsproj")
+        let sourcePath = Path.Combine(root, "App.fs")
+        let scriptPath = Path.Combine(root, "fake-fsac.fsx")
+        let sourceA = "module App\nlet value = 1\n"
+
+        try
+            Directory.CreateDirectory(root) |> ignore
+            File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+            File.WriteAllText(sourcePath, sourceA)
+            File.WriteAllText(scriptPath, fakeFsacScript)
+
+            let evaluatedFiles (_: string) = Task.FromResult(Ok [| sourcePath |])
+
+            use bridge =
+                new FsAutoCompleteBridge(
+                    startupTimeoutOverride = TimeSpan.FromSeconds(10.0),
+                    fsacCommandOverride = "dotnet",
+                    fsacArgsOverride = [ "fsi"; "--exec"; scriptPath ],
+                    evaluatedSourceFilesProvider = evaluatedFiles
+                )
+
+            let! _ =
+                bridge.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some true }
+                )
+
+            let generation = bridge.SessionGeneration
+            let! opened = bridge.Formatting({ path = sourcePath; text = Some sourceA })
+            Assert.Equal("ok", opened["status"].GetValue<string>())
+
+            let fileKey = DiagnosticIdentity.canonicalFileKeyFromPath sourcePath
+
+            bridge.DiagnosticsStore[fileKey] <-
+                diagnosticEnvelope generation (System.Text.Json.Nodes.JsonArray()) None
+
+            let! snapshot =
+                bridge.DiagnosticsForContext(Some projectPath, [| sourcePath |], None, None)
+
+            Assert.Equal("ok", snapshot["status"].GetValue<string>())
+            Assert.True(snapshot["complete"].GetValue<bool>())
+            Assert.Equal(0, snapshot["staleFileCount"].GetValue<int>())
+            Assert.Equal(generation, bridge.SessionGeneration)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``versionless diagnostics cannot cross an open content ABA transition`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_diag_aba_{Guid.NewGuid():N}")
+        let projectPath = Path.Combine(root, "App.fsproj")
+        let sourcePath = Path.Combine(root, "App.fs")
+        let scriptPath = Path.Combine(root, "fake-fsac.fsx")
+        let sourceA = "module App\nlet value = 1\n"
+        let sourceB = "module App\nlet value = x\n"
+
+        try
+            Directory.CreateDirectory(root) |> ignore
+            File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+            File.WriteAllText(sourcePath, sourceA)
+            File.WriteAllText(scriptPath, fakeFsacScript)
+
+            let evaluatedFiles (_: string) = Task.FromResult(Ok [| sourcePath |])
+
+            use bridge =
+                new FsAutoCompleteBridge(
+                    startupTimeoutOverride = TimeSpan.FromSeconds(10.0),
+                    fsacCommandOverride = "dotnet",
+                    fsacArgsOverride = [ "fsi"; "--exec"; scriptPath ],
+                    evaluatedSourceFilesProvider = evaluatedFiles
+                )
+
+            let! _ =
+                bridge.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some true }
+                )
+
+            let generation1 = bridge.SessionGeneration
+            let fileKey = DiagnosticIdentity.canonicalFileKeyFromPath sourcePath
+
+            // Baseline A -> didOpen B -> didChange A. Disk and current document
+            // hashes now both equal the generation baseline again, which made the
+            // old hash-only proof vulnerable to a delayed versionless B result.
+            let! _ = bridge.Formatting({ path = sourcePath; text = Some sourceB })
+            let! _ = bridge.Formatting({ path = sourcePath; text = Some sourceA })
+
+            bridge.DiagnosticsStore[fileKey] <-
+                diagnosticEnvelope generation1 (System.Text.Json.Nodes.JsonArray()) None
+
+            let! delayedVersionless =
+                bridge.DiagnosticsForContext(Some projectPath, [| sourcePath |], None, None)
+
+            Assert.False(delayedVersionless["complete"].GetValue<bool>())
+            Assert.Equal("not_ready", delayedVersionless["status"].GetValue<string>())
+            Assert.Equal("warming", delayedVersionless["lspState"].GetValue<string>())
+            Assert.Equal(1, delayedVersionless["staleFileCount"].GetValue<int>())
+
+            let generation2 = bridge.SessionGeneration
+            Assert.True(generation2 > generation1)
+            Assert.Empty(bridge.DiagnosticsStore)
+
+            bridge.DiagnosticsStore[fileKey] <-
+                diagnosticEnvelope generation2 (System.Text.Json.Nodes.JsonArray()) None
+
+            let! recovered =
+                bridge.DiagnosticsForContext(Some projectPath, [| sourcePath |], None, None)
+
+            Assert.True(recovered["complete"].GetValue<bool>())
+            Assert.Equal("ok", recovered["status"].GetValue<string>())
+            Assert.Equal(0, recovered["staleFileCount"].GetValue<int>())
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``diagnostic snapshots fail fast instead of queueing behind an in-flight LSP request`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_diag_gate_{Guid.NewGuid():N}")
+        let projectPath = Path.Combine(root, "App.fsproj")
+        let sourcePath = Path.Combine(root, "App.fs")
+        let scriptPath = Path.Combine(root, "slow-fsac.fsx")
+        let markerPath = Path.Combine(root, "formatting-entered")
+
+        try
+            Directory.CreateDirectory(root) |> ignore
+            File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+            File.WriteAllText(sourcePath, "module App\nlet value = 1\n")
+            File.WriteAllText(scriptPath, fakeFsacScriptWithSlowFormatting markerPath 1500)
+
+            let evaluatedFiles (_: string) = Task.FromResult(Ok [| sourcePath |])
+
+            use bridge =
+                new FsAutoCompleteBridge(
+                    startupTimeoutOverride = TimeSpan.FromSeconds(10.0),
+                    requestTimeoutOverride = TimeSpan.FromSeconds(10.0),
+                    fsacCommandOverride = "dotnet",
+                    fsacArgsOverride = [ "fsi"; "--exec"; scriptPath ],
+                    evaluatedSourceFilesProvider = evaluatedFiles
+                )
+
+            let! _ =
+                bridge.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some true }
+                )
+
+            let generation = bridge.SessionGeneration
+            let formatting = bridge.Formatting({ path = sourcePath; text = None })
+            let markerDeadline = DateTimeOffset.UtcNow.AddSeconds(3.0)
+
+            while not (File.Exists markerPath) && DateTimeOffset.UtcNow < markerDeadline do
+                do! Task.Delay(10)
+
+            let markerObserved = File.Exists markerPath
+
+            let snapshots =
+                Array.init 32 (fun _ ->
+                    bridge.DiagnosticsForContext(Some projectPath, [| sourcePath |], None, None))
+
+            let allSnapshots = Task.WhenAll(snapshots)
+            let! first = Task.WhenAny(allSnapshots :> Task, Task.Delay(500))
+            let settledPromptly = obj.ReferenceEquals(first, allSnapshots)
+            let formattingStillRunning = not formatting.IsCompleted
+
+            let! formatted = formatting.WaitAsync(TimeSpan.FromSeconds(5.0))
+            let! responses = allSnapshots.WaitAsync(TimeSpan.FromSeconds(5.0))
+            do! Task.Delay(100)
+
+            Assert.True(markerObserved, "The fake FSAC did not enter the delayed formatting request.")
+            Assert.True(formattingStillRunning, "The formatting request did not hold the lifecycle gate.")
+            Assert.True(settledPromptly, "DiagnosticsForContext queued behind the lifecycle gate.")
+            Assert.Equal("ok", formatted["status"].GetValue<string>())
+            Assert.Equal(generation, bridge.SessionGeneration)
+
+            for response in responses do
+                Assert.Equal("not_ready", response["status"].GetValue<string>())
+                Assert.False(response["ready"].GetValue<bool>())
+                Assert.False(response["contextMatched"].GetValue<bool>())
+                Assert.False(response["complete"].GetValue<bool>())
+                Assert.Equal("lsp_lifecycle_gate_busy", response["reason"].GetValue<string>())
+                Assert.Contains("no snapshot work was queued", response["message"].GetValue<string>())
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
 
 [<Fact>]
 let ``Startup timeout kills an unresponsive FSAC child`` () : Task =
@@ -303,6 +837,7 @@ let ``workspace selection reports ambiguous solutions in a directory`` () =
             Assert.Equal(2, candidates.Length)
             Assert.All(candidates, fun candidate -> Assert.Equal(WorkspaceSelection.Solution, candidate.Kind))
         | WorkspaceSelection.Selected _ -> Assert.Fail("Expected ambiguous workspace selection.")
+        | WorkspaceSelection.Invalid reason -> Assert.Fail($"Expected ambiguous workspace selection, got: {reason}")
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
@@ -322,9 +857,412 @@ let ``workspace selection prefers single solution over directory auto selection`
             Assert.Equal(solutionPath, path)
             Assert.Single(candidates) |> ignore
         | WorkspaceSelection.Ambiguous _ -> Assert.Fail("Expected selected workspace.")
+        | WorkspaceSelection.Invalid reason -> Assert.Fail($"Expected selected workspace, got: {reason}")
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
+
+[<Fact>]
+let ``workspace selection resolves a single project nested below a repository root`` () =
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_workspace_nested_{Guid.NewGuid():N}")
+    let projectPath = Path.Combine(root, "src", "App", "App.fsproj")
+
+    try
+        Directory.CreateDirectory(Path.GetDirectoryName(projectPath)) |> ignore
+        File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+
+        match WorkspaceSelection.select root with
+        | WorkspaceSelection.Selected(path, candidates) ->
+            Assert.Equal(Path.GetFullPath(projectPath), path)
+            let candidate = Assert.Single(candidates)
+            Assert.Equal(WorkspaceSelection.Project, candidate.Kind)
+        | WorkspaceSelection.Ambiguous _ -> Assert.Fail("Expected the single nested project to be selected.")
+        | WorkspaceSelection.Invalid reason -> Assert.Fail($"Expected a selected workspace, got: {reason}")
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``workspace selection keeps multiple nested projects ambiguous`` () =
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_workspace_nested_many_{Guid.NewGuid():N}")
+
+    try
+        for name in [ "App"; "Worker" ] do
+            let projectPath = Path.Combine(root, "src", name, $"%s{name}.fsproj")
+            Directory.CreateDirectory(Path.GetDirectoryName(projectPath)) |> ignore
+            File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+
+        match WorkspaceSelection.select root with
+        | WorkspaceSelection.Ambiguous candidates ->
+            Assert.Equal(2, candidates.Length)
+            Assert.All(candidates, fun candidate -> Assert.Equal(WorkspaceSelection.Project, candidate.Kind))
+        | WorkspaceSelection.Selected _ -> Assert.Fail("Expected nested projects to remain ambiguous.")
+        | WorkspaceSelection.Invalid reason -> Assert.Fail($"Expected ambiguous workspace selection, got: {reason}")
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``workspace selection rejects an arbitrary file`` () =
+    let path = Path.Combine(Path.GetTempPath(), $"fslangmcp-invalid-{Guid.NewGuid():N}.txt")
+
+    try
+        File.WriteAllText(path, "not a project")
+
+        match WorkspaceSelection.select path with
+        | WorkspaceSelection.Invalid reason -> Assert.Contains(".fsproj", reason)
+        | _ -> Assert.Fail("Expected an invalid workspace selection.")
+    finally
+        if File.Exists path then
+            File.Delete path
+
+[<Fact>]
+let ``project-bound workspace symbol rejects another project without starting FSAC`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_context_{Guid.NewGuid():N}")
+        let projectA = Path.Combine(root, "A.fsproj")
+        let projectB = Path.Combine(root, "B.fsproj")
+
+        try
+            Directory.CreateDirectory(root) |> ignore
+            File.WriteAllText(projectA, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+            File.WriteAllText(projectB, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+
+            use bridge =
+                new FsAutoCompleteBridge(fsacCommandOverride = "this-command-must-not-be-started")
+
+            let! selected =
+                bridge.SetProject(
+                    { projectPath = projectA
+                      workspacePath = None
+                      restartLsp = Some false }
+                )
+
+            Assert.Equal("ok", selected["status"].GetValue<string>())
+
+            let! response =
+                bridge.WorkspaceSymbolForContext(Some projectB, { query = "missing" })
+
+            Assert.Equal("context_mismatch", response["status"].GetValue<string>())
+            Assert.False(response["contextMatched"].GetValue<bool>())
+            Assert.True(bridge.FsacProcess.IsNone)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``file-bound helpers reject another project without starting FSAC`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_file_context_{Guid.NewGuid():N}")
+        let projectADirectory = Path.Combine(root, "A")
+        let projectBDirectory = Path.Combine(root, "B")
+        let projectA = Path.Combine(projectADirectory, "A.fsproj")
+        let projectB = Path.Combine(projectBDirectory, "B.fsproj")
+        let sourceB = Path.Combine(projectBDirectory, "Library.fs")
+
+        try
+            Directory.CreateDirectory(projectADirectory) |> ignore
+            Directory.CreateDirectory(projectBDirectory) |> ignore
+            File.WriteAllText(projectA, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+            File.WriteAllText(projectB, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+            File.WriteAllText(sourceB, "module Library")
+
+            use bridge =
+                new FsAutoCompleteBridge(fsacCommandOverride = "this-command-must-not-be-started")
+
+            let! selected =
+                bridge.SetProject(
+                    { projectPath = projectA
+                      workspacePath = None
+                      restartLsp = Some false }
+                )
+
+            Assert.Equal("ok", selected["status"].GetValue<string>())
+
+            let! formatting = bridge.Formatting({ path = sourceB; text = None })
+
+            let! diagnosticFixes =
+                bridge.DiagnosticFixes(
+                    { path = sourceB
+                      text = None
+                      line = None
+                      character = None }
+                )
+
+            for response in [ formatting; diagnosticFixes ] do
+                Assert.Equal("context_mismatch", response["status"].GetValue<string>())
+                Assert.False(response["contextMatched"].GetValue<bool>())
+
+            Assert.True(bridge.FsacProcess.IsNone)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``evaluated Compile membership accepts an external linked source file`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_linked_context_{Guid.NewGuid():N}")
+        let projectDirectory = Path.Combine(root, "App")
+        let linkedDirectory = Path.Combine(root, "Shared")
+        let projectPath = Path.Combine(projectDirectory, "App.fsproj")
+        let unrelatedProjectPath = Path.Combine(linkedDirectory, "Shared.fsproj")
+        let linkedSourcePath = Path.Combine(linkedDirectory, "Linked.fs")
+        let scriptPath = Path.Combine(root, "fake-fsac.fsx")
+
+        Directory.CreateDirectory(projectDirectory) |> ignore
+        Directory.CreateDirectory(linkedDirectory) |> ignore
+        File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+        File.WriteAllText(unrelatedProjectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+        File.WriteAllText(linkedSourcePath, "module Linked")
+        File.WriteAllText(scriptPath, fakeFsacScript)
+
+        let evaluatedFiles (candidateProject: string) =
+            if String.Equals(Path.GetFullPath(candidateProject), Path.GetFullPath(projectPath), StringComparison.Ordinal) then
+                Task.FromResult(Ok [| linkedSourcePath |])
+            else
+                Task.FromResult(Error "unexpected project")
+
+        let bridge =
+            new FsAutoCompleteBridge(
+                startupTimeoutOverride = TimeSpan.FromSeconds(10.0),
+                fsacCommandOverride = "dotnet",
+                fsacArgsOverride = [ "fsi"; "--exec"; scriptPath ],
+                evaluatedSourceFilesProvider = evaluatedFiles
+            )
+
+        try
+            let! selected =
+                bridge.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some true }
+                )
+
+            Assert.Equal("ok", selected["status"].GetValue<string>())
+
+            let! response = bridge.Formatting({ path = linkedSourcePath; text = None })
+
+            Assert.Equal("ok", response["status"].GetValue<string>())
+            Assert.True(response["contextMatched"].GetValue<bool>())
+        finally
+            (bridge :> IDisposable).Dispose()
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``SetProject bounds a stuck evaluated Compile provider by startup timeout`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_evaluated_deadline_{Guid.NewGuid():N}")
+        let projectPath = Path.Combine(root, "App.fsproj")
+        let startupTimeout = TimeSpan.FromMilliseconds(150.0)
+        let watchdog = TimeSpan.FromSeconds(2.0)
+
+        let providerStarted =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let providerCompletion =
+            TaskCompletionSource<Result<string array, string>>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        Directory.CreateDirectory(root) |> ignore
+        File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+
+        let evaluatedFiles (_: string) =
+            providerStarted.TrySetResult(()) |> ignore
+            providerCompletion.Task
+
+        let bridge =
+            new FsAutoCompleteBridge(
+                startupTimeoutOverride = startupTimeout,
+                evaluatedSourceFilesProvider = evaluatedFiles
+            )
+
+        try
+            let elapsed = Stopwatch.StartNew()
+
+            let selectionTask =
+                bridge.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some false }
+                )
+
+            do! providerStarted.Task.WaitAsync(TimeSpan.FromSeconds(1.0))
+            let! completed = Task.WhenAny(selectionTask :> Task, Task.Delay(watchdog))
+
+            if not (obj.ReferenceEquals(completed, selectionTask)) then
+                // Unblock the fake provider before failing so the old unbounded
+                // implementation cannot leak a SetProject continuation into later tests.
+                providerCompletion.TrySetResult(Error "test cleanup") |> ignore
+                let! _ = selectionTask.WaitAsync(TimeSpan.FromSeconds(1.0))
+                Assert.Fail($"SetProject exceeded the {watchdog.TotalMilliseconds:F0}ms watchdog.")
+
+            let! selected = selectionTask
+            elapsed.Stop()
+
+            Assert.Equal("ok", selected["status"].GetValue<string>())
+            Assert.True(bridge.FsacProcess.IsNone)
+
+            Assert.True(
+                elapsed.Elapsed < TimeSpan.FromSeconds(1.0),
+                $"SetProject took {elapsed.Elapsed.TotalMilliseconds:F0}ms for a {startupTimeout.TotalMilliseconds:F0}ms startup timeout."
+            )
+        finally
+            providerCompletion.TrySetResult(Error "test cleanup") |> ignore
+            (bridge :> IDisposable).Dispose()
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``directory SetProject loads and probes its single nested project and accepts its source`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_nested_context_{Guid.NewGuid():N}")
+        let projectDirectory = Path.Combine(root, "src", "App")
+        let projectPath = Path.Combine(projectDirectory, "App.fsproj")
+        let sourcePath = Path.Combine(projectDirectory, "Program.fs")
+        let scriptPath = Path.Combine(root, "fake-fsac.fsx")
+        let evaluatedProjects = ResizeArray<string>()
+
+        Directory.CreateDirectory(projectDirectory) |> ignore
+        File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+        File.WriteAllText(sourcePath, "module Program")
+        File.WriteAllText(scriptPath, fakeFsacScript)
+
+        let evaluatedFiles (candidateProject: string) =
+            evaluatedProjects.Add(Path.GetFullPath(candidateProject))
+            Task.FromResult(Ok [| sourcePath |])
+
+        let bridge =
+            new FsAutoCompleteBridge(
+                startupTimeoutOverride = TimeSpan.FromSeconds(10.0),
+                fsacCommandOverride = "dotnet",
+                fsacArgsOverride = [ "fsi"; "--exec"; scriptPath ],
+                evaluatedSourceFilesProvider = evaluatedFiles
+            )
+
+        try
+            let! selected =
+                bridge.SetProject(
+                    { projectPath = root
+                      workspacePath = None
+                      restartLsp = Some true }
+                )
+
+            Assert.Equal("ok", selected["status"].GetValue<string>())
+            let result = selected["result"]
+            Assert.Equal(Path.GetFullPath(projectPath), result["projectPath"].GetValue<string>())
+            Assert.Equal(Path.GetFullPath(root), result["workspaceRoot"].GetValue<string>())
+            let loadedProjects = result["loadedProjects"].AsArray()
+            Assert.Single(loadedProjects) |> ignore
+            Assert.Equal(Path.GetFullPath(projectPath), loadedProjects[0].GetValue<string>())
+            Assert.Equal<string>([| Path.GetFullPath(projectPath) |], evaluatedProjects.ToArray())
+
+            let! formatting = bridge.Formatting({ path = sourcePath; text = None })
+            Assert.Equal("ok", formatting["status"].GetValue<string>())
+            Assert.True(formatting["contextMatched"].GetValue<bool>())
+        finally
+            (bridge :> IDisposable).Dispose()
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``SetProject without restart never splits active project from a live FSAC`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_restart_required_{Guid.NewGuid():N}")
+        let projectA = Path.Combine(root, "A.fsproj")
+        let projectB = Path.Combine(root, "B.fsproj")
+        let scriptPath = Path.Combine(root, "fake-fsac.fsx")
+
+        try
+            Directory.CreateDirectory(root) |> ignore
+            File.WriteAllText(projectA, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+            File.WriteAllText(projectB, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+            File.WriteAllText(scriptPath, fakeFsacScript)
+
+            use bridge =
+                new FsAutoCompleteBridge(
+                    startupTimeoutOverride = TimeSpan.FromSeconds(10.0),
+                    fsacCommandOverride = "dotnet",
+                    fsacArgsOverride = [ "fsi"; "--exec"; scriptPath ]
+                )
+
+            let! _ =
+                bridge.SetProject(
+                    { projectPath = projectA
+                      workspacePath = None
+                      restartLsp = Some true }
+                )
+
+            let originalPid = bridge.FsacProcess.Value.Id
+            let originalGeneration = bridge.SessionGeneration
+
+            let! rejected =
+                bridge.SetProject(
+                    { projectPath = projectB
+                      workspacePath = None
+                      restartLsp = Some false }
+                )
+
+            Assert.Equal("restart_required", rejected["status"].GetValue<string>())
+            Assert.Equal(Path.GetFullPath(projectA), bridge.CurrentProjectPath.Value)
+            Assert.Equal(originalPid, bridge.FsacProcess.Value.Id)
+            Assert.Equal(originalGeneration, bridge.SessionGeneration)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``A completed FSAC session is reaped and restarted on the next request`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_dead_fsac_{Guid.NewGuid():N}")
+        let projectPath = Path.Combine(root, "App.fsproj")
+        let scriptPath = Path.Combine(root, "fake-fsac.fsx")
+
+        try
+            Directory.CreateDirectory(root) |> ignore
+            File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+            File.WriteAllText(scriptPath, fakeFsacScript)
+
+            use bridge =
+                new FsAutoCompleteBridge(
+                    startupTimeoutOverride = TimeSpan.FromSeconds(10.0),
+                    fsacCommandOverride = "dotnet",
+                    fsacArgsOverride = [ "fsi"; "--exec"; scriptPath ]
+                )
+
+            let! _ =
+                bridge.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some true }
+                )
+
+            let first = bridge.FsacProcess.Value
+            let firstPid = first.Id
+            let firstGeneration = bridge.SessionGeneration
+            first.Kill(true)
+            do! first.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            let! response =
+                bridge.WorkspaceSymbolForContext(Some projectPath, { query = "anything" })
+
+            Assert.Equal("ok", response["status"].GetValue<string>())
+            Assert.True(response["contextMatched"].GetValue<bool>())
+            Assert.NotEqual(firstPid, bridge.FsacProcess.Value.Id)
+            Assert.True(bridge.SessionGeneration > firstGeneration)
+            Assert.Equal("ready", bridge.LifecycleState)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
 
 // ─── LspResponseShape (response building, pure) ──────────────────────────────
 
@@ -480,6 +1418,26 @@ let ``listProjects returns the single fsproj when given a fsproj path`` () =
 
         Assert.Equal(1, result.Length)
         Assert.Equal(Path.GetFullPath fsproj, result[0])
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``listProjects recursively discovers projects for a directory target`` () =
+    let root = Path.Combine(Path.GetTempPath(), $"sp_directory_{Guid.NewGuid():N}")
+    let appProject = Path.Combine(root, "src", "App", "App.fsproj")
+    let ignoredProject = Path.Combine(root, "src", "App", "obj", "Generated.fsproj")
+
+    try
+        Directory.CreateDirectory(Path.GetDirectoryName(appProject)) |> ignore
+        Directory.CreateDirectory(Path.GetDirectoryName(ignoredProject)) |> ignore
+        File.WriteAllText(appProject, "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+        File.WriteAllText(ignoredProject, "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+
+        let result = listProjects root
+
+        let discovered = Assert.Single(result)
+        Assert.Equal(Path.GetFullPath(appProject), discovered)
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
@@ -688,6 +1646,20 @@ let ``fileMatchesGlob trailing double-star matches everything inside`` () =
     Assert.False(fileMatchesGlob "src/**" "other/Foo.fs")
 
 [<Fact>]
+let ``workspace glob matches evaluated files relative to the selected root`` () =
+    let root = Path.Combine(Path.GetTempPath(), "fslangmcp-glob-root")
+    let adapter = Path.Combine(root, "src", "Adapters", "GitHub.fs")
+    let nested = Path.Combine(root, "src", "Adapters", "Generated", "GitHub.fs")
+    let other = Path.Combine(root, "tests", "Adapters", "GitHub.fs")
+
+    Assert.True(fileMatchesWorkspaceGlob (Some root) "src/Adapters/*.fs" adapter)
+    Assert.False(fileMatchesWorkspaceGlob (Some root) "src/Adapters/*.fs" nested)
+    Assert.False(fileMatchesWorkspaceGlob (Some root) "src/Adapters/*.fs" other)
+    Assert.True(fileMatchesWorkspaceGlob (Some root) "src/**/*.fs" nested)
+    let uriPattern = Uri(adapter).AbsoluteUri.Replace("GitHub.fs", "*.fs")
+    Assert.True(fileMatchesWorkspaceGlob (Some root) uriPattern adapter)
+
+[<Fact>]
 let ``diagnosticsResponseForFile preserves payload when no severity filter`` () =
     // path + severity combo verified at the pure helper layer: severity filter
     // applies before this builder is called.
@@ -875,4 +1847,72 @@ let ``SetProject with blank projectPath returns invalid_args`` () : System.Threa
             )
 
         Assert.Equal("invalid_args", result["status"].GetValue<string>())
+    }
+
+[<Fact>]
+let ``SetProject rejects a non-directory workspacePath`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_workspace_arg_{Guid.NewGuid():N}")
+        let projectPath = Path.Combine(root, "App.fsproj")
+        let workspaceFile = Path.Combine(root, "workspace.txt")
+
+        try
+            Directory.CreateDirectory(root) |> ignore
+            File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+            File.WriteAllText(workspaceFile, "not a directory")
+            use bridge = new FsAutoCompleteBridge()
+
+            let! result =
+                bridge.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = Some workspaceFile
+                      restartLsp = Some false }
+                )
+
+            Assert.Equal("invalid_args", result["status"].GetValue<string>())
+            Assert.Contains("workspacePath", result["message"].GetValue<string>())
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``RenamePreview reports missing FSAC executable as infrastructure error`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_rename_infra_{Guid.NewGuid():N}")
+        let projectPath = Path.Combine(root, "App.fsproj")
+        let sourcePath = Path.Combine(root, "App.fs")
+
+        try
+            Directory.CreateDirectory(root) |> ignore
+            File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+            File.WriteAllText(sourcePath, "module App\nlet value = 1\n")
+
+            use bridge =
+                new FsAutoCompleteBridge(fsacCommandOverride = $"missing-fsac-{Guid.NewGuid():N}")
+
+            let! _ =
+                bridge.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some false }
+                )
+
+            let! result =
+                bridge.RenamePreview(
+                    { path = sourcePath
+                      line = 1
+                      character = 5
+                      newName = "renamed"
+                      text = None }
+                )
+
+            Assert.Equal("infrastructure_error", result["status"].GetValue<string>())
+            Assert.Equal("executable_missing", result["errorKind"].GetValue<string>())
+            Assert.True(result["contextMatched"].GetValue<bool>())
+            Assert.Equal(Path.GetFullPath(projectPath), result["activeProjectPath"].GetValue<string>())
+            Assert.Equal(0L, result["sessionGeneration"].GetValue<int64>())
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
     }

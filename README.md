@@ -26,8 +26,13 @@ In a live-execution A/B, shaping the tool surface to agent intent **cut agents' 
 
 ```bash
 dotnet tool install -g FsLangMcp
-fslangmcp --bootstrap-tools   # one-time: fetches fsautocomplete + ionide.projinfo.tool
+fslangmcp --bootstrap-tools
 ```
+
+Bootstrap reads the manifest embedded in the installed FsLangMCP binary and
+installs (or downgrades) FSAC, ProjInfo, and Fantomas to the exact reviewed
+versions for that release. It also creates the `dotnet-fantomas` command alias
+required by FSAC formatting.
 
 Add to your MCP client config:
 
@@ -55,14 +60,14 @@ Full setup: [`docs/getting-started.md`](docs/getting-started.md) · Per-client c
 
 | Tool | What it does |
 |------|--------------|
-| `find` | Multi-project semantic search: definitions, references, record-field set sites, member call-sites, all solution `.fsproj`s. Beats textual `rg` on partial application, aliased opens, and cross-project sites. |
-| `check` | One trustworthy verdict (`clean`/`errors`/`unknown`) from a fresh in-process type-check. Never reports a stale-cache false-clean; bare `check()` suffices. |
+| `find` | Multi-project semantic search with explicit coverage. A failed/timed-out project makes absence indeterminate instead of returning a false `matched=false`. |
+| `check` | One trustworthy verdict (`clean`/`errors`/`unknown`). Default mode is a fresh FCS check; fast FSAC mode returns `clean` only with complete current coverage. |
 
 ### Navigate / understand
 
 | Tool | What it does |
 |------|--------------|
-| `set_project` | Initialize or switch FSAC/LSP context. Accepts `.fsproj`, `.sln`, `.slnx`, or directory. Required before LSP-proxy tools. |
+| `set_project` | Initialize or switch FSAC/LSP context. Results are bound to the active project and session generation; a no-restart cross-project switch is rejected. |
 | `project_health` | Fast read-only preflight: options readiness, source files, analyzer setup, test project discovery. No build, no tests. |
 | `fcs_project_outline` | Compact project-wide outline over all compile files. |
 | `fcs_file_outline` | Per-file outline; `summaryOnly=true` (default) keeps token cost low. |
@@ -139,7 +144,7 @@ Prefer the semantic tools above for free-form agent flows.
 
 ```
 1. set_project  {"projectPath": "/abs/path/MyApp.sln"}
-   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.13.2"
+   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.14.0"
 
 2. check  {}
    → verdict="clean"
@@ -161,7 +166,8 @@ Command-line args:
 - `--project <path>` / `-p <path>` — pre-load a project on startup
 - `--fsac-command <cmd>` — override the `fsautocomplete` executable
 - `--fsac-args "<args>"` — pass extra args to FSAC
-- `--bootstrap-tools` — install/update `fsautocomplete` + `ionide.projinfo.tool`
+- `--bootstrap-tools` — install/update the exact supported global runtime-tool versions
+- `--version` — print the packaged FsLangMCP version and exit
 
 Environment fallbacks: `FSAC_COMMAND`, `FSAC_ARGS`, `FSA_PROJECT_PATH`.
 
@@ -222,19 +228,29 @@ Process and RPC timeouts (milliseconds):
 - `FSLANGMCP_LSP_REQUEST_TIMEOUT_MS=30000`
 - `FSLANGMCP_PROJ_INFO_TIMEOUT_MS=120000`
 - `FSLANGMCP_BOOTSTRAP_TIMEOUT_MS=300000`
+- `FSLANGMCP_PROCESS_OUTPUT_LIMIT_CHARS=4194304` (per redirected stream; excess output is drained but not retained)
 
 ## Response Shape
 
 - **Success**: `{"status": "ok", ...fields}` or `{"status": "ok", "result": <payload>}`
 - **Not ready**: `{"status": "not_ready", "message": "..."}` — FSAC workspace still loading
+- **Wrong FSAC context**: `{"status": "context_mismatch", "contextMatched": false, ...}`
+- **Restart required**: `{"status": "restart_required", ...}` — a live FSAC belongs to another project and the requested no-restart switch was not applied
 - **Invalid args**: `{"status": "invalid_args", "message": "..."}` — required arg blank/missing
-- **Error**: MCP protocol error with `{"errorKind": "...", "message": "..."}` payload
+- **Infrastructure failure**: `{"status": "infrastructure_error", "errorKind": "...", "message": "..."}`
 
 `set_project` keeps the boolean readiness flags for compatibility and adds
 `readiness.symbolIndexState` / `readiness.symbolIndexHint` when the symbol index
 is not ready. `lspRestartRequested` reports intent; legacy `lspRestarted` keeps
 mirroring that request, while `lspReplacedExistingProcess` reports whether a
-running FSAC process was actually replaced.
+running FSAC process was actually replaced. FSAC-derived responses include
+`activeProjectPath`, `contextMatched`, and `sessionGeneration`.
+
+`find` has its own completeness contract: `status="partial"` means matches were
+found but some projects were not analyzed; `status="unknown"` plus
+`resolution.matched=null` means absence could not be proven. `check(speed="fast")`
+similarly exposes expected/received/missing/stale file coverage and never turns an
+incomplete empty snapshot into `clean`.
 
 LSP positions (`line`, `character`) are **0-based**.
 
@@ -257,20 +273,42 @@ dotnet tool restore
 ## Known Issues
 
 - LSP proxy tools return `{"status": "not_ready"}` if called before `fsautocomplete` finishes loading. `set_project` waits up to 30 seconds for workspace readiness; the preceding RPC handshake has its own configurable 60-second timeout and kills/reset FSAC on expiry.
-- FCS does not expose cancellation once synchronous project-option evaluation or `GetAllUsesOfAllSymbols()` has started. `find` still returns at its requested timeout and reuses one in-flight task per project/cache key on retries, but that computation may continue in the background until FCS returns. Restart FsLangMCP to terminate a genuinely stuck FCS operation.
+- FCS does not expose cancellation once synchronous compiler work has started.
+  `find` and project/workspace `check` still return at their requested deadline;
+  identical retries share the real in-flight worker, while a different key is
+  rejected as busy instead of joining an unbounded queue. The admitted worker
+  may continue until FCS returns. Restart FsLangMCP to terminate a genuinely
+  stuck in-process compiler operation.
 - FCS tools fall back to script-style inference (`GetProjectOptionsFromScript`) only when no `.fsproj` is found. Diagnostics and symbol data can be incomplete for multi-project solutions in this mode.
 - `project_health` is project-focused — it does not inspect whole solutions or resolve ambiguous directories.
 
 ## About Tool Dependencies
 
-`dotnet tool` packages cannot automatically install other global tools during installation. `fslangmcp --bootstrap-tools` runs `dotnet tool update -g` (or install if missing) for:
+`dotnet tool` packages cannot automatically install other global tools during
+installation. The reviewed compatibility set is pinned in
+[`dotnet-tools.json`](dotnet-tools.json):
 
-- `fsautocomplete`
-- `ionide.projinfo.tool`
+- `fsautocomplete` `0.83.0`
+- `ionide.projinfo.tool` `0.74.2`
+- `fantomas` `7.0.5`
 
-To install them manually instead:
+The FsLangMCP package dependency graph is audited separately from those external
+tools. The latest available FSAC and Fantomas packages still carry
+advisory-listed MessagePack assemblies, although the supported FsLangMCP paths
+explicitly use JSON and do not select a MessagePack formatter. No patched
+upstream tool package is currently available, so the exact pins above are a
+documented, process-contained risk acceptance rather than a guarantee that every
+file shipped inside the external tools is advisory-free. See the `0.14.0`
+release notes for the advisory links and scope.
+
+Install that exact set (including FSAC's required Fantomas command alias) for
+normal use:
 
 ```bash
-dotnet tool install -g fsautocomplete
-dotnet tool install -g ionide.projinfo.tool
+fslangmcp --bootstrap-tools
 ```
+
+For repository development, `just runtime-tools` materializes the same versions
+under `.runtime-tools/`, and `just live-fsac` performs a real MCP → FSAC and
+ProjInfo smoke. Both paths validate the same exact root manifest; the repository
+path is isolated from any other globally installed tools.
