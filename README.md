@@ -144,7 +144,7 @@ Prefer the semantic tools above for free-form agent flows.
 
 ```
 1. set_project  {"projectPath": "/abs/path/MyApp.sln"}
-   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.14.0"
+   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.15.0"
 
 2. check  {}
    → verdict="clean"
@@ -299,7 +299,8 @@ explicitly use JSON and do not select a MessagePack formatter. No patched
 upstream tool package is currently available, so the exact pins above are a
 documented, process-contained risk acceptance rather than a guarantee that every
 file shipped inside the external tools is advisory-free. See the `0.14.0`
-release notes for the advisory links and scope.
+section of the changelog for the advisory links and scope (that work ships to
+consumers as part of `0.15.0`; `0.14.0` was never published).
 
 Install that exact set (including FSAC's required Fantomas command alias) for
 normal use:

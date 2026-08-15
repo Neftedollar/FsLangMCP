@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-08-16
+
+`0.14.0` was prepared but never tagged or published to NuGet — the last release
+on NuGet is `0.13.2`. Everything listed under `0.14.0` below therefore reaches
+consumers for the first time in `0.15.0`, together with the changes here.
+
+This is a minor bump rather than a `0.14.0` release because the FsMcp 2.0
+migration tightened a wire contract after the `0.14.0` notes were finalized:
+typed tool input is now strict JSON. Pre-1.0, breaking surface changes ride
+minor bumps.
+
 ### Fixed
 
 - `fsharp_project_inspect(includeGeneratedFiles=true)` now actually includes

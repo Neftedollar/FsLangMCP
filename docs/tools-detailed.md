@@ -2,7 +2,7 @@
 
 The MCP description tells you *whether* to call a tool; this file tells you *how it works internally*.
 
-**Start here.** `find` and `check` are the primary entry points in the 35-tool v0.14.0 surface.
+**Start here.** `find` and `check` are the primary entry points in the 35-tool v0.15.0 surface.
 The consolidation aliases below were removed in v0.13.1 and are no longer registered:
 
 | Removed names | Current route |
