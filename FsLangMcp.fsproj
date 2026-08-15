@@ -85,7 +85,7 @@
          subagent sessions) intermittently fail set_project with a
          FileNotFoundException for Microsoft.VisualStudio.Threading 17.14.0.0.
          See issue #121. -->
-    <PackageReference Include="Microsoft.VisualStudio.Threading.Only" Version="[17.14.15]" />
+    <PackageReference Include="Microsoft.VisualStudio.Threading.Only" Version="[18.7.23]" />
   </ItemGroup>
 
 </Project>
