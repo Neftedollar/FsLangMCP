@@ -6400,7 +6400,25 @@ type internal FcsBridge
                                 | FSharpCheckFileAnswer.Succeeded r -> r.Diagnostics, true
                                 | FSharpCheckFileAnswer.Aborted -> [||], false
 
-                            let allDiags = Array.append parseResults.Diagnostics checkDiagnostics
+                            // The caller sent text, not a file: everything below scopes the
+                            // diagnostic list to the snippet's CONTENT (#187).
+                            //  - keep only diagnostics attached to the temp file — the rest
+                            //    (missing Compile entries, synthetic 'startup') describe the
+                            //    project context, which file/project scope already reports;
+                            //  - drop FS0222 (must begin with namespace/module) and FS0225
+                            //    (source-file bookkeeping): both describe the temp-file
+                            //    wrapper, so a valid bare `let` snippet is clean, not errors;
+                            //  - dedup — FS0222-style diagnostics arrive identically in both
+                            //    the parse and the check halves of the append.
+                            let snippetPath = normalizePath snippetFile
+
+                            let allDiags =
+                                Array.append parseResults.Diagnostics checkDiagnostics
+                                |> Array.filter (fun d -> normalizePath d.FileName = snippetPath)
+                                |> Array.filter (fun d -> d.ErrorNumber <> 222 && d.ErrorNumber <> 225)
+                                |> Array.distinctBy (fun d ->
+                                    d.ErrorNumber, d.Severity, d.StartLine, d.StartColumn, d.EndLine, d.EndColumn, d.Message)
+
                             let errorCount, warningCount = countDiagnosticsBySeverity allDiags
 
                             let verdict, analyzed, reason =
@@ -6412,6 +6430,11 @@ type internal FcsBridge
                                     "clean", true, None
 
                             let nodes, _ = surfaceFcs allDiags
+
+                            // Every surviving diagnostic points at the temp file; surface the
+                            // logical name instead of leaking a /tmp path the caller never made.
+                            for node in nodes do
+                                node["file"] <- jstr "snippet"
 
                             return
                                 build

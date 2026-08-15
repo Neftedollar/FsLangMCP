@@ -27,6 +27,7 @@ let ``filterProjectFiles excludes generated build linked and test artifacts by d
     let files =
         [ projectFile "Library.fs"
           projectFile "obj/Debug/net10.0/App.AssemblyInfo.fs"
+          projectFile "obj/Debug/net10.0/Plain.fs"
           projectFile "Generated.g.fs"
           projectFile "View.Designer.fs"
           projectFile "tests/LibraryTests.fs"
@@ -37,10 +38,36 @@ let ``filterProjectFiles excludes generated build linked and test artifacts by d
 
     Assert.Equal<string>([ "Library.fs" ], filtered.Included |> List.map _.IncludePath)
     Assert.Contains(ObjOrBinDirectory, excludedReasons filtered)
+    Assert.Contains(AssemblyInfoFile, excludedReasons filtered)
     Assert.Contains(GeneratedFile, excludedReasons filtered)
     Assert.Contains(DesignerFile, excludedReasons filtered)
     Assert.Contains(TestResultArtifact, excludedReasons filtered)
     Assert.Contains(ExternalLinkedFile, excludedReasons filtered)
+
+[<Fact>]
+let ``IncludeGenerated surfaces generated files even when they live under obj (#186)`` () =
+    // Real generated sources live in obj/ (SDK writes App.AssemblyInfo.fs and
+    // .NETCoreApp,…AssemblyAttributes.fs there), so the obj/bin gate must not
+    // shadow the IncludeGenerated gate.
+    let files =
+        [ projectFile "Library.fs"
+          projectFile "obj/Debug/net10.0/App.AssemblyInfo.fs"
+          projectFile "obj/Debug/net10.0/.NETCoreApp,Version=v10.0.AssemblyAttributes.fs" ]
+
+    let flagged =
+        filterProjectFiles
+            workspaceRoot
+            { defaultFilterOptions ProjectInspection with
+                IncludeGenerated = true }
+            files
+
+    Assert.Equal(3, flagged.Included.Length)
+
+    // Off by default — and the exclusion reason names WHAT the file is, not
+    // merely where it lives, so a caller can see the flag is what gates it.
+    let defaults = filterProjectFiles workspaceRoot (defaultFilterOptions ProjectInspection) files
+    Assert.Equal<string>([ "Library.fs" ], defaults.Included |> List.map _.IncludePath)
+    Assert.Equal<ExclusionReason>([ AssemblyInfoFile; AssemblyInfoFile ], excludedReasons defaults)
 
 [<Fact>]
 let ``filterProjectFiles honors include flags and max files`` () =
