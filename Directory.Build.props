@@ -2,6 +2,11 @@
   <PropertyGroup>
     <!-- Bracketed NuGet ranges are exact. A bare x.y.z means >= x.y.z. -->
     <FSharpCompilerServiceVersion>[43.12.400]</FSharpCompilerServiceVersion>
+    <!-- The SDK bundles its own FSharp.Core nupkg (sdk/*/FSharp/library-packs) whose
+         bytes — and therefore packages.lock.json contentHash — differ per platform
+         build. Locked restore then fails NU1403 on any OS other than the one that
+         wrote the lock. Resolve FSharp.Core from nuget.org everywhere instead. -->
+    <DisableImplicitLibraryPacksFolder>true</DisableImplicitLibraryPacksFolder>
     <FSharpCoreImplicitPackageVersion>[10.1.400]</FSharpCoreImplicitPackageVersion>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
