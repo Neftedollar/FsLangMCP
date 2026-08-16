@@ -459,6 +459,24 @@ module internal LspResponseShape =
     let lspRestartOccurred (restartRequested: bool) (lspWasRunning: bool) =
         restartRequested && lspWasRunning
 
+    /// Warm-up grace period after workspace-ready before an empty/never-warmed
+    /// symbol index is treated as stalled rather than "still indexing". Shared
+    /// by assessSymbolIndex (workspace_symbol) and setProjectReadiness
+    /// (set_project) — one timing source, not two (#194).
+    let symbolIndexWarmupWindow = TimeSpan.FromSeconds 3.0
+
+    /// True once `warmupWindow` has elapsed since workspace-ready; false when
+    /// workspace-ready hasn't happened yet (nothing to measure the elapsed
+    /// time from).
+    let private warmupWindowElapsed
+        (workspaceReadyAt: DateTimeOffset voption)
+        (now: DateTimeOffset)
+        (warmupWindow: TimeSpan)
+        : bool =
+        match workspaceReadyAt with
+        | ValueSome readyAt -> now - readyAt > warmupWindow
+        | ValueNone -> false
+
     /// Builds the additive readiness detail returned by set_project. Keep the
     /// original boolean fields stable while giving callers a recovery path when
     /// the symbol index is not ready yet.
@@ -466,10 +484,20 @@ module internal LspResponseShape =
         (lspReady: bool)
         (symbolIndexReady: bool)
         (restartRequested: bool)
+        (workspaceReadyAt: DateTimeOffset voption)
+        (now: DateTimeOffset)
+        (warmupWindow: TimeSpan)
         : JsonNode =
         let symbolIndexState, symbolIndexHint =
             if symbolIndexReady then
                 "ready", null
+            elif lspReady && warmupWindowElapsed workspaceReadyAt now warmupWindow then
+                // The window has passed and the index still hasn't produced a
+                // single non-empty result (#194) — "warming" would be a lie at
+                // this point, so say plainly that it stalled and what still works.
+                "not_warmed",
+                jstr
+                    $"FSAC's symbol index did not warm within {int warmupWindow.TotalSeconds}s. find and check are unaffected (they use FCS sweeps); only the symbol-index fallback inside position-based LSP tools may be degraded."
             elif lspReady then
                 "warming",
                 jstr
@@ -644,10 +672,7 @@ module internal LspResponseShape =
         (warmupWindow: TimeSpan)
         : bool =
         match response with
-        | :? JsonArray as arr when arr.Count = 0 ->
-            match workspaceReadyAt with
-            | ValueSome readyAt -> now - readyAt > warmupWindow
-            | ValueNone -> false
+        | :? JsonArray as arr when arr.Count = 0 -> warmupWindowElapsed workspaceReadyAt now warmupWindow
         | _ -> true
 
     /// Formats a UTC DateTimeOffset as an ISO-8601 "Z"-suffixed string for JSON
@@ -2034,7 +2059,13 @@ type internal FsAutoCompleteBridge
                                     "warming"
 
                             let readinessNode =
-                                LspResponseShape.setProjectReadiness ready symbolIndexEverWarmed (restartLsp || live)
+                                LspResponseShape.setProjectReadiness
+                                    ready
+                                    symbolIndexEverWarmed
+                                    (restartLsp || live)
+                                    workspaceReadyAt
+                                    DateTimeOffset.UtcNow
+                                    LspResponseShape.symbolIndexWarmupWindow
 
                             return
                                 jobj
@@ -2532,7 +2563,7 @@ type internal FsAutoCompleteBridge
                                 response
                                 workspaceReadyAt
                                 DateTimeOffset.UtcNow
-                                (TimeSpan.FromSeconds 3.0)
+                                LspResponseShape.symbolIndexWarmupWindow
 
                         match shaped with
                         | :? JsonObject as obj ->

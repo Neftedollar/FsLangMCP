@@ -69,13 +69,16 @@ wait for partial readiness automatically.
 
 `set_project` can report `readiness.symbolIndex=false` immediately after load.
 Read `readiness.symbolIndexState` and `readiness.symbolIndexHint`: they distinguish
-a normally `warming` index from an LSP that is `blocked_on_lsp` or `not_started`,
-and state whether to wait/retry or call `set_project` with `restartLsp=true`.
+a normally `warming` index from one that is `not_warmed` (past the warm-up window
+with no result yet — see `docs/tools-detailed.md#set_project`), or an LSP that is
+`blocked_on_lsp` or `not_started`, and state whether to wait/retry or call
+`set_project` with `restartLsp=true`.
 
 **What to do:** Start using `find`, `check`, and outline tools normally. They
 trigger on-demand type-checking per file and don't depend on a fully warmed
-global index. If `symbolIndex` stays `false` for more than a few minutes on a
-medium-sized project, run `project_health` to check for underlying issues.
+global index — this holds for `not_warmed` too, not just `warming`. If
+`symbolIndex` stays `false` for more than a few minutes on a medium-sized
+project, run `project_health` to check for underlying issues.
 
 ---
 

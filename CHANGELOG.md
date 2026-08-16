@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `set_project`'s `readiness.symbolIndexState` no longer claims `warming`
+  forever when the FSAC symbol index never warms up (#194). `assessSymbolIndex`
+  already compared elapsed-since-workspace-ready against a warm-up window for
+  `workspace_symbol` responses, but `setProjectReadiness` never saw that
+  signal. It now reuses the same `workspaceReadyAt` timestamp and warm-up
+  window: past the window with no result yet, the state reads `not_warmed`
+  with a hint that `find`/`check` are unaffected (they use FCS sweeps, not
+  the symbol index) — only the symbol-index fallback inside position-based
+  LSP tools may be degraded. `warming` still applies within the window; the
+  boolean `symbolIndex` field and the other states are unchanged.
+
 ## [0.15.0] - 2026-08-16
 
 `0.14.0` was prepared but never tagged or published to NuGet — the last release
