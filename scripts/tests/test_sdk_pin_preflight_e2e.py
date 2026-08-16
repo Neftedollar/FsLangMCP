@@ -10,9 +10,12 @@ This is the only check that exercises the real transport. The in-process xUnit t
 (`tests/FsLangMcp.Tests/SdkPreflightTests.fs`) cover the verdict logic and the
 pre-flight call sites; they cannot observe what an MCP client actually receives.
 
-Needs a built server assembly. Set `FSLANGMCP_SERVER_DLL`, or let it find
-`bin/{Release,Debug}/net10.0/FsLangMcp.dll`; the test skips when neither exists, so
-`python -m unittest discover -s scripts/tests` stays runnable before a build.
+Needs a built server assembly. With `FSLANGMCP_SERVER_DLL` unset it looks for
+`bin/{Release,Debug}/net10.0/FsLangMcp.dll` and *skips* when neither exists, so
+`python -m unittest discover -s scripts/tests` stays runnable before a build. Setting
+`FSLANGMCP_SERVER_DLL` is an explicit "run this": a missing file then raises rather
+than skipping, so path drift cannot turn the dedicated CI step green while the
+acceptance guard silently evaporates.
 """
 
 from __future__ import annotations
@@ -60,7 +63,18 @@ def locate_server_dll() -> Path | None:
         # Resolve against the caller's cwd: the server is started inside a temp
         # directory, so a relative path would not survive the spawn.
         candidate = Path(override).resolve()
-        return candidate if candidate.is_file() else None
+
+        if not candidate.is_file():
+            # Setting the variable is an explicit "run this". Skipping here would let
+            # path drift (a TFM bump the workflow env missed) silently turn the
+            # dedicated CI step green while the acceptance guard evaporates. The skip
+            # below exists only for the pre-build discovery run, which never sets it.
+            raise FileNotFoundError(
+                f"FSLANGMCP_SERVER_DLL is set to {override!r} (resolved to {candidate}) "
+                "but no file is there — build the server or correct the path."
+            )
+
+        return candidate
 
     for configuration in ("Release", "Debug"):
         candidate = REPOSITORY_ROOT / "bin" / configuration / "net10.0" / "FsLangMcp.dll"

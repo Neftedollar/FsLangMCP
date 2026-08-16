@@ -508,6 +508,57 @@ let ``a pin poisoned after set_project is caught on the next lazy FSAC start`` (
     }
 
 [<Fact>]
+let ``a solution member poisoned after set_project is caught on the next lazy FSAC start`` () : Task =
+    task {
+        // Narrower time-shift variant of the test above: the root stays clean, so
+        // screening only the workspace root would pass and let FSAC die during the
+        // `fsharp/workspaceLoad` handshake — the member projects must be screened too.
+        let root = tempRoot "lazystartmember"
+        let memberDirectory = Path.Combine(root, "src", "Member")
+        let sourcePath = Path.Combine(memberDirectory, "Library.fs")
+
+        try
+            writeMinimalProject memberDirectory |> ignore
+            let solutionPath = Path.Combine(root, "Poison.slnx")
+
+            File.WriteAllText(
+                solutionPath,
+                "<Solution>\n  <Project Path=\"src/Member/Poison.fsproj\" />\n</Solution>\n"
+            )
+
+            use bridge =
+                new FsAutoCompleteBridge(fsacCommandOverride = $"missing-fsac-{Guid.NewGuid():N}")
+
+            let! selected =
+                bridge.SetProject(
+                    { projectPath = solutionPath
+                      workspacePath = None
+                      restartLsp = Some false }
+                )
+
+            Assert.Equal("ok", selected["status"].GetValue<string>())
+
+            // Only the member is poisoned, and only after the context was established.
+            writeGlobalJson memberDirectory (pin absentVersion (Some "disable"))
+
+            let! result =
+                bridge.RenamePreview(
+                    { path = sourcePath
+                      line = 2
+                      character = 4
+                      newName = "renamed"
+                      text = None }
+                )
+
+            Assert.Equal("infrastructure_error", result["status"].GetValue<string>())
+            Assert.Equal("sdk_not_found", result["errorKind"].GetValue<string>())
+            Assert.Contains(absentVersion, result["message"].GetValue<string>())
+            Assert.True(bridge.FsacProcess.IsNone, "No FSAC process may be spawned into a poisoned workspace.")
+        finally
+            Directory.Delete(root, true)
+    }
+
+[<Fact>]
 let ``a solution member's own poisoned global.json is caught before fsautocomplete starts`` () : Task =
     task {
         // A nested global.json under one member project kills FSAC's startup exactly

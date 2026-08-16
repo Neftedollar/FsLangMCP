@@ -2130,11 +2130,17 @@ type internal FsAutoCompleteBridge
             // answers `initialize`. Raised, not returned: this method owes its caller a
             // JsonRpc, and every caller funnels the exception into the shared typed
             // envelope. Nothing has been mutated yet, so the failure is state-neutral.
+            //
+            // The member projects belong in the candidate list too: `fsharp/workspaceLoad`
+            // hands FSAC the solution, so it loads every member, and a nested global.json
+            // under one of them kills the handshake exactly like a root one. Screening
+            // only workspaceRoot would leave that case reporting `disconnected` again.
             do!
                 Task.Run(fun () ->
                     SdkPreflight.ensure
                         [ workspaceRoot
-                          yield! (runtimeProjectPath |> Option.map resolveWorkspaceFromProjectPath |> Option.toList) ])
+                          yield! (runtimeProjectPath |> Option.map resolveWorkspaceFromProjectPath |> Option.toList)
+                          yield! (runtimeLoadedProjects |> Seq.map resolveWorkspaceFromProjectPath) ])
 
             let generation = Interlocked.Increment(&nextSessionGeneration)
             // Capture before the FSAC process exists: a versionless publication from
