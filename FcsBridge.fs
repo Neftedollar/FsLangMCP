@@ -3505,6 +3505,34 @@ type internal FcsBridge
             d.Severity = FSharpDiagnosticSeverity.Info || d.Severity = FSharpDiagnosticSeverity.Hidden)
         |> Array.length
 
+    // #206: shared serialized-size ceiling for FileOutline and PublicApi. Both emit
+    // per-member signature detail whose per-entry cost is data-dependent (unlike a
+    // uniform "site", an API-dense type's member list can run to hundreds of chars),
+    // so a type-count/entry-count cap alone (maxResults) still lets a page or a
+    // single-file outline overflow the MCP token ceiling — the #100 field failure
+    // (2.5k-line project, default call, client-side spill).
+    //
+    // Measured via `Types.renderedLength` / `Types.isOverRenderedBudget` — the SAME
+    // options `Tools.renderToken` ships every response with (`Types.mcpRenderOptions`,
+    // one shared definition; see its doc comment for why it lives in `Types.fs`), never
+    // `JsonNode.ToJsonString()`'s compact default (~1.46-1.48x smaller — #206 review
+    // round 1, Imp-1).
+    //
+    // The 45k value itself (not 60k) accounts for a SECOND, separate gap: each node is
+    // measured standalone at depth 0, but a shipped entity actually sits two levels
+    // deeper — inside `entities`/`entries` inside the root response object — so every
+    // line of its rendered form carries 4 more leading spaces than the depth-0
+    // measurement counted, plus the ~600-char envelope (status/project/pagination
+    // fields) on top. That per-LINE penalty (not per-char) hits hardest on
+    // signature-*sparse* shapes that pack many short lines per node — a record with a
+    // handful of short-typed fields (`F0: int`), or a member-less module — where #206
+    // review round 2 measured the real shipped response at 1.14-1.28x the depth-0
+    // sum, worst case 76,526 shipped chars from a page whose depth-0 sum was under
+    // 60,000. 45,000 x 1.28 = 57,600 — comfortably under the ~25k-token / ~72k-char MCP
+    // ceiling even on that worst-case shape, with the same reasoning `Find`'s `pageSize`
+    // comment below applies to its own (already-shipped-measured) budget.
+    let responseCharBudget = 45_000
+
     member private _.LoadProjectOptionsFromFsproj
         (fsprojPath: string)
         : Task<(FSharpProjectOptions * ProjectOptionsFingerprint * EvaluatedProjectSnapshot) option> =
@@ -4170,50 +4198,83 @@ type internal FcsBridge
                 let containerKinds =
                     [| "module"; "record"; "union"; "class"; "interface"; "enum"; "delegate"; "namespace" |]
 
-                // summaryOnly (default): keep only module/type headers with name/kind/
-                // fullName/range (no per-member signatures). summaryOnly=false restores
-                // the full per-member output.
-                let outEntries: JsonNode =
-                    if summaryOnly then
-                        let headers =
-                            entries
-                            |> Array.filter (fun e ->
-                                match e["kind"] with
-                                | null -> false
-                                | k -> containerKinds |> Array.contains (k.GetValue<string>()))
-                            |> Array.map (fun e ->
-                                jobj
-                                    [ "name", e["name"].DeepClone()
-                                      "kind", e["kind"].DeepClone()
-                                      "fullName",
-                                      (match e["fullName"] with
-                                       | null -> null
-                                       | fn -> fn.DeepClone())
-                                      "range",
-                                      (match e["range"] with
-                                       | null -> null
-                                       | r -> r.DeepClone()) ]
-                                :> JsonNode)
+                let headersOf (fullEntries: JsonNode array) : JsonNode =
+                    fullEntries
+                    |> Array.filter (fun e ->
+                        match e["kind"] with
+                        | null -> false
+                        | k -> containerKinds |> Array.contains (k.GetValue<string>()))
+                    |> Array.map (fun e ->
+                        jobj
+                            [ "name", e["name"].DeepClone()
+                              "kind", e["kind"].DeepClone()
+                              "fullName",
+                              (match e["fullName"] with
+                               | null -> null
+                               | fn -> fn.DeepClone())
+                              "range",
+                              (match e["range"] with
+                               | null -> null
+                               | r -> r.DeepClone()) ]
+                        :> JsonNode)
+                    |> fun headers -> JsonArray(headers) :> JsonNode
 
-                        JsonArray(headers) :> JsonNode
+                // #206: summaryOnly=false asked for full per-member signatures, but a
+                // large file's full outline can still cross the shared response-char
+                // budget (54KB/65KB outlines observed in the field — issue #100 batch 6)
+                // even though maxResults already bounds entry COUNT; a handful of
+                // signature-heavy entries is enough. Measure the would-be full payload
+                // BEFORE committing to it and downgrade to the same header-only shape
+                // summaryOnly=true produces, rather than ever emitting an over-budget
+                // outline. Only measured when summaryOnly=false was actually requested —
+                // an explicit summaryOnly=true request is already small by construction.
+                // #206 review round 1 Imp-1 / round 2 N6: measured via the shared
+                // `Types.isOverRenderedBudget` — same shipped serialization as
+                // `responseCharBudget`'s comment describes, and it stops serializing
+                // further entries the moment the budget is already crossed rather than
+                // summing every one of `entries` (up to `maxResults`) regardless.
+                let overBudget = not summaryOnly && isOverRenderedBudget responseCharBudget entries
+
+                let downgradedToSummary = overBudget
+
+                // summaryOnly (default) OR a budget downgrade: module/type headers with
+                // name/kind/fullName/range only (no per-member signatures). Otherwise the
+                // full per-member output requested.
+                let outEntries: JsonNode =
+                    if summaryOnly || downgradedToSummary then
+                        headersOf entries
                     else
                         JsonArray(entries) :> JsonNode
 
+                // Additive-only (#206): present exactly when the requested summaryOnly=false
+                // was downgraded to headers because the full outline exceeded the budget —
+                // absent on every other path, so a small file with summaryOnly=false is a
+                // byte-for-byte unchanged response.
+                let downgradeFields =
+                    if downgradedToSummary then
+                        let hint =
+                            $"Full outline for this file exceeds the ~%d{responseCharBudget}-char response budget; returning summary-level headers (name/kind/fullName/range, no signatures) instead. Narrow with a smaller maxResults (currently %d{maxResults}) so the full per-member signatures for that slice fit within budget."
+
+                        [ "downgradedToSummary", jbool true; "hint", jstr hint ]
+                    else
+                        []
+
                 return
                     jobj
-                        [ "status", jstr "succeeded"
-                          "file", jstr path
-                          "optionsSource", jstr optionsSource
-                          "includePrivate", jbool includePrivate
-                          "includeLocal", jbool includeLocal
-                          "summaryOnly", jbool summaryOnly
-                          "count", jint entries.Length
-                          "memberCounts", memberCounts
-                          "entries", outEntries
-                          "parseDiagnostics",
-                          JsonArray(parseResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode
-                          "checkDiagnostics",
-                          JsonArray(checkResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ]
+                        ([ "status", jstr "succeeded"
+                           "file", jstr path
+                           "optionsSource", jstr optionsSource
+                           "includePrivate", jbool includePrivate
+                           "includeLocal", jbool includeLocal
+                           "summaryOnly", jbool summaryOnly
+                           "count", jint entries.Length
+                           "memberCounts", memberCounts
+                           "entries", outEntries ]
+                         @ downgradeFields
+                         @ [ "parseDiagnostics",
+                             JsonArray(parseResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode
+                             "checkDiagnostics",
+                             JsonArray(checkResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ])
                     :> JsonNode
         }
 
@@ -9559,13 +9620,19 @@ type internal FcsBridge
             let totalEntityCount = allEntities.Length
             let totalMemberCount = allEntities |> List.sumBy (fun e -> e.members.Length)
 
-            let pageEntities =
+            // Type-count page (existing behavior, kept as the outer cap): up to
+            // `pageSize` entities starting at pageOffset. An entity's member list is
+            // never split across pages.
+            let countPageEntities =
                 allEntities
                 |> List.skip (min pageOffset totalEntityCount)
                 |> List.truncate pageSize
 
-            let entityNodes =
-                pageEntities
+            // Built exactly as before (one node per entity in the count-page) — the
+            // budget close below operates on the already-serialized nodes so it never
+            // needs its own type annotation for the entity's anonymous record shape.
+            let countPageNodes =
+                countPageEntities
                 |> List.map (fun e ->
                     let memberNodes =
                         e.members
@@ -9586,6 +9653,35 @@ type internal FcsBridge
                     :> JsonNode)
                 |> List.toArray
 
+            // #206: close the page early on serialized size too. A handful of
+            // API-dense types (long member lists) can blow responseCharBudget well
+            // before pageSize entities are reached — the #100 field failure (default
+            // call on a 2.5k-line project spilled to a client-side file) even though
+            // maxResults left plenty of "room" by count. Walk the pre-built nodes and
+            // stop once the running total would cross the budget; always keep at least
+            // one entity (runningChars starts at 0, so the first node is never cut) so
+            // a single oversized type can never yield an empty page.
+            let mutable runningChars = 0
+            let mutable budgetClosed = false
+
+            let entityNodes =
+                countPageNodes
+                |> Array.takeWhile (fun node ->
+                    // #206: shared `Types.renderedLength` — the SHIPPED (indented)
+                    // length, not compact `ToJsonString()` — see `responseCharBudget`
+                    // comment above for the full accounting, including the per-line
+                    // depth-nesting penalty this constant already budgets for.
+                    let nodeChars = renderedLength node
+
+                    if runningChars > 0 && runningChars + nodeChars > responseCharBudget then
+                        budgetClosed <- true
+                        false
+                    else
+                        runningChars <- runningChars + nodeChars
+                        true)
+
+            let returnedCount = entityNodes.Length
+
             let baseFields =
                 [ "status", jstr "ok"
                   "project", jstr options.ProjectFileName
@@ -9600,9 +9696,51 @@ type internal FcsBridge
                   "entities", JsonArray(entityNodes) :> JsonNode ]
 
             let paginationFields =
-                Cursor.paginationFields "entities" totalEntityCount pageOffset pageSize pageEntities.Length
+                Cursor.paginationFields "entities" totalEntityCount pageOffset pageSize returnedCount
 
-            return jobj (baseFields @ paginationFields) :> JsonNode
+            // Additive-only (#206): present only when this page closed BECAUSE of the
+            // char budget rather than maxResults / end-of-list, so callers can tell the
+            // two close reasons apart (both leave `truncated: true`).
+            let budgetFields =
+                if budgetClosed then [ ("truncatedByBudget", jbool true) ] else []
+
+            // Additive-only (#206): whenever the page closed early (budget OR count)
+            // with more entities remaining, name namespaceFilter with 2-3 REAL
+            // namespaces pulled from the remainder — copy-pasteable, not a placeholder —
+            // so the "retry narrower" answer ships before any client spill (#100).
+            let hintFields =
+                let remaining =
+                    allEntities |> List.skip (min (pageOffset + returnedCount) totalEntityCount)
+
+                if List.isEmpty remaining then
+                    []
+                else
+                    let namespaceOf (fullName: string) =
+                        let idx = fullName.LastIndexOf('.')
+                        if idx > 0 then fullName.Substring(0, idx) else fullName
+
+                    let topNamespaces =
+                        remaining
+                        |> List.countBy (fun e -> namespaceOf e.fullName)
+                        |> List.sortByDescending snd
+                        |> List.truncate 3
+                        |> List.map (fun (ns, _) -> $"'%s{ns}'")
+                        |> String.concat ", "
+
+                    let reason =
+                        if budgetClosed then
+                            $"the ~%d{responseCharBudget}-char response budget"
+                        else
+                            $"maxResults=%d{pageSize}"
+
+                    let entityWord = if remaining.Length = 1 then "entity" else "entities"
+
+                    let hint =
+                        $"Page closed at {reason} with {remaining.Length} more {entityWord} beyond this page. Narrow with namespaceFilter to pull just what you need — top namespaces in the remainder: {topNamespaces}. Or keep paging with the returned nextCursor for the rest."
+
+                    [ ("hint", jstr hint) ]
+
+            return jobj (baseFields @ paginationFields @ budgetFields @ hintFields) :> JsonNode
         }
 
     /// Read-only ".fsi drift" preview for one implementation file. Type-checks the .fs

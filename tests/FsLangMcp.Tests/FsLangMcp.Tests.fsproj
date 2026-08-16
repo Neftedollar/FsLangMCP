@@ -39,6 +39,8 @@
     <Compile Include="DiagnosticFixesTests.fs" />
     <Compile Include="CodeActionTests.fs" />
     <Compile Include="PublicApiTests.fs" />
+    <Compile Include="PublicApiCharBudgetTests.fs" />
+    <Compile Include="FileOutlineBudgetTests.fs" />
     <Compile Include="RefactorImpactTests.fs" />
     <Compile Include="SignatureStatusTests.fs" />
     <Compile Include="ReviewScanTests.fs" />

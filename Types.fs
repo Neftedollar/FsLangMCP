@@ -2,6 +2,7 @@ module FsLangMcp.Types
 
 open System
 open System.IO
+open System.Text.Encodings.Web
 open System.Text.Json
 open System.Text.Json.Nodes
 
@@ -711,6 +712,48 @@ let jbool (value: bool) : JsonNode = JsonValue.Create(value)
 let toFileUri (path: string) =
     let fullPath = Path.GetFullPath(path)
     Uri(fullPath).AbsoluteUri
+
+// ─── Shared MCP response rendering (#206) ───────────────────────────────────────
+//
+// Defined HERE, not in `Tools.fs` (which owns the actual response transport) and not
+// in `FcsBridge.fs` (which needs it for response-size budget checks), because
+// `Types.fs` compiles before both in `FsLangMcp.fsproj`, and both already
+// `open FsLangMcp.Types` — one definition, nothing to duplicate or drift. `Tools.fs`'s
+// `renderToken` (every MCP tool response goes out through it) and `FcsBridge.fs`'s
+// `fcs_public_api` / `fcs_file_outline` response-size budgets MUST measure against the
+// exact same options, or a budget that believes it fits can still ship over the real
+// MCP token ceiling (#206 review round 1, Imp-1: a prior version had FcsBridge measure
+// with its own duplicate options, which round-1 fixed by duplicating `Tools.renderOpts`
+// field-for-field — correct but a drift risk the review round-2 adjudication called
+// out as unnecessary, since this shared location was reachable the whole time).
+
+/// Serialization options every MCP response actually ships with: `WriteIndented` for
+/// readability, relaxed JSON escaping. The single source of truth for "what the wire
+/// format looks like" — `Tools.renderToken` and any response-size budget check must
+/// both use this, never a private copy.
+let mcpRenderOptions =
+    JsonSerializerOptions(Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping, WriteIndented = true)
+
+/// Serialized length of `node` in the SAME shape an MCP response actually ships in
+/// (`mcpRenderOptions`), not `JsonNode.ToJsonString()`'s compact default — the two
+/// differ by ~1.46-1.48x (#206 review round 1, Imp-1).
+let renderedLength (node: JsonNode) : int =
+    JsonSerializer.Serialize(node, mcpRenderOptions).Length
+
+/// True as soon as the cumulative rendered length of `nodes` would exceed `budget`.
+/// Stops calling `renderedLength` (a real `JsonSerializer.Serialize` call) on further
+/// nodes the moment the answer is known, rather than summing every node regardless of
+/// how early the budget was already crossed (#206 review round 2, N6).
+let isOverRenderedBudget (budget: int) (nodes: JsonNode seq) : bool =
+    let mutable total = 0
+    let mutable over = false
+    let enumerator = nodes.GetEnumerator()
+
+    while not over && enumerator.MoveNext() do
+        total <- total + renderedLength enumerator.Current
+        over <- total > budget
+
+    over
 
 // ─── Argument validation helpers ──────────────────────────────────────────────
 

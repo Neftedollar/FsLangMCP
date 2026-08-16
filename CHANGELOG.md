@@ -47,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   analysis completed, it reports "analyzed K of N" instead of claiming a
   sweep that didn't happen, and for `scope='file'` it names the additional
   file-level filter, not just the sibling-project blind spot (#193).
+- `fcs_public_api` now closes a page on a shared 45,000-character response
+  budget in addition to the existing `maxResults` type-count cap, so a
+  handful of API-dense types (long member lists) can no longer produce an
+  over-budget page just because `maxResults` still had "room" by count — the
+  field failure behind this: a 2.5k-line project's default call spilled to a
+  client-side file instead of returning inline. The additive
+  `truncatedByBudget: true` field distinguishes a budget-close from a
+  count-close; either way, whenever a page closes early with entities left
+  over, an additive `hint` names `namespaceFilter` together with 2-3 real
+  namespaces pulled from the remainder, so the next call can narrow instead
+  of re-fetching the same oversized shape. `fcs_file_outline` shares the same
+  budget: a `summaryOnly=false` request whose full per-member entries would
+  cross it now downgrades to the header-only shape `summaryOnly=true`
+  produces, flagged by an additive `downgradedToSummary: true` plus a `hint`
+  naming `maxResults` as the narrowing knob, instead of ever emitting the
+  oversized payload. Both changes are additive-only — a page/outline that
+  already fit the budget is unchanged (#206).
 
 ### Changed
 

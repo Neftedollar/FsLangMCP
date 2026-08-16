@@ -602,3 +602,101 @@ exact cursor column.
 
 - `find(kind="position")` — exact-position resolution when coordinates are already known.
 - `fcs_signature_help` — overload/parameter info at a call site.
+
+---
+
+## fcs_public_api
+
+**Routing description:** Emit an F# project's public API surface — every public type and its
+public members with signatures — sorted stably by `fullName` then member name, so two version
+snapshots diff cleanly. Public-only by default (`includeInternal=true` adds `internal`; `private`
+is never emitted).
+
+### Response budget and `truncatedByBudget` (#206)
+
+A page is closed for either of two independent reasons, and the response tells you which:
+`maxResults` (default 100, hard ceiling 1000) caps the page by **type count**, and a shared
+45,000-character serialized-size budget (`responseCharBudget` in `FcsBridge.fs`, the same
+constant `fcs_file_outline` uses — see below) caps it by **response size**, closing the page early
+even when `maxResults` would still allow more entities. The 45,000 figure is deliberately below the
+~72,000-char MCP ceiling it targets: it is measured per-entity, standalone, before the entity is
+embedded two levels deeper in the actual response (`entities` inside the root object) and before
+the response envelope is added, both of which cost real characters the per-entity measurement can't
+see — the margin covers that gap even on signature-*sparse* shapes (short-field records,
+member-less modules) where the gap is largest. A handful of API-dense types — long member lists,
+verbose generic signatures — can also cross that budget well before the count cap does; this is
+what the field failure behind #206 looked like: a 2.5k-line project's default `fcs_public_api` call
+produced a page so large the MCP client spilled it to a side file instead of returning it inline.
+
+`truncated: true` means more entities remain regardless of which cap closed the page.
+`truncatedByBudget: true` is additive and appears **only** when the char budget was the reason —
+absent when the page closed at `maxResults` or reached the end of the (filtered) list. Either way,
+whenever a page closes early with entities left over, an additive `hint` field names
+`namespaceFilter` together with 2–3 real namespaces pulled from the remainder (not placeholders —
+copy-pasteable values from the actual unreturned entities), so the next call can narrow instead of
+re-fetching the same oversized shape. A page always contains at least one entity — a single
+oversized type is never dropped into an empty page just because it alone exceeds the budget.
+
+### Caveats
+
+1. **An entity's member list is never split across pages.** The budget close operates on whole
+   entities, so one page never returns half of a type's members.
+2. **The MCP client may still spill an oversized response to a side file, with a client-defined
+   shape.** `truncatedByBudget` and the char budget exist to make that spill unnecessary in the
+   common case, but a very large single entity (one type with an enormous member list) can still
+   exceed the budget on its own. Prefer `namespaceFilter` over parsing a spilled side file — that
+   file's shape belongs to the client, not this server.
+
+### Related tools
+
+- `fcs_project_outline` — whole-project structural overview; prefer `fcs_public_api` specifically
+  for API-stability/breaking-change diffs.
+- `fcs_file_outline` — shares the same response-char-budget mechanism for one file's outline.
+
+---
+
+## fcs_file_outline
+
+**Routing description:** Agent-friendly compact F# outline for one file. `summaryOnly=true`
+(default) returns module/type headers plus per-kind `memberCounts` only — no per-member
+signatures — which keeps the response small on large files by construction. `summaryOnly=false`
+restores full per-member `name`/`kind`/`range`/`signature`/`accessibility` entries.
+
+### `downgradedToSummary` size guard (#206)
+
+`summaryOnly=false` has no count-based ceiling of its own beyond `maxResults` (default 200), and a
+file with many signature-heavy top-level bindings can still serialize past the shared 45,000-
+character `responseCharBudget` within that count — two field-observed outlines hit 54KB and 65KB.
+Rather than ever return that oversized payload, a `summaryOnly=false` request whose full
+entries would cross the budget is downgraded to the same header-only shape `summaryOnly=true`
+produces (name/kind/fullName/range, no signatures), plus an additive `hint` explaining the
+downgrade and naming `maxResults` — the narrowing knob available today — as the way to fit full
+signatures in one page. The `summaryOnly` field in the response always echoes what was
+**requested**, not what was actually returned; check the additive `downgradedToSummary: true` flag
+to know the entries shape actually changed. Neither field appears when the full output already
+fits the budget — a small file with `summaryOnly=false` gets the unmodified pre-#206 response.
+`count` is the length of the returned `entries` slice — it is capped by `maxResults` exactly like
+`entries` itself (`count = min(definitionsInFile, maxResults)`), and unaffected only by the
+downgrade: lowering `maxResults` shrinks `count` on either shape, downgraded or not.
+`memberCounts` is the one field that is genuinely uncapped — it is computed from the full,
+untruncated definition set regardless of `maxResults` or the downgrade, so it is the field to read
+for "how many of kind X does this file really have," never `count`.
+
+### Caveats
+
+1. **`downgradedToSummary` only fires for an explicit `summaryOnly=false` request.**
+   `summaryOnly=true` is already small by construction and is never measured against the budget.
+2. **A future per-type narrowing parameter (tracked separately, #157) is not implemented here.**
+   Until it lands, `maxResults` is the only narrowing knob the downgrade hint can point to.
+3. **The MCP client may still spill an oversized response to a side file, with a client-defined
+   shape** — same caveat as `fcs_public_api` above.
+
+### Related tools
+
+- `fcs_project_outline` — whole-project structural overview; prefer `fcs_file_outline` for one
+  file's structure.
+- `find` (`kind="symbol"`) — raw, unfiltered, cross-file symbol search when this tool's
+  local/noisy-symbol filtering or summary/budget shaping gets in the way.
+- `fcs_symbol_at_word` — a single symbol at an exact position, no whole-file shaping at all.
+- `fcs_public_api` — shares the same response-char-budget mechanism for a project's public
+  surface.
