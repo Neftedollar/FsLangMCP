@@ -89,6 +89,9 @@ let private releaseOnDispose (semaphore: SemaphoreSlim) =
 
 let rec private classifyRenameInfrastructureError (error: exn) =
     match error with
+    // #192: must precede the InvalidOperationException arm — SdkNotFoundException
+    // derives from it, and an unsatisfiable SDK pin is not a protocol error.
+    | SdkPreflight.SdkPinUnsatisfiable _ -> "sdk_not_found", false
     | :? TimeoutException -> "timeout", true
     | :? System.ComponentModel.Win32Exception -> "executable_missing", false
     | :? IOException
@@ -1990,6 +1993,38 @@ type internal FsAutoCompleteBridge
                                   :> JsonNode ]
                             :> JsonNode
                     | WorkspaceSelection.Selected(projectPath, selectionCandidates) ->
+                        // #192: Init.init resolves the SDK from the *target's* global.json,
+                        // and fsautocomplete calls it during its own startup with nothing to
+                        // catch the failure — the child dies before answering `initialize`
+                        // and the only symptom reaching the agent is StreamJsonRpc's
+                        // "The JSON-RPC connection with the remote party was lost". Decide
+                        // the provable case here, before any MSBuild evaluation or FSAC
+                        // process exists, and leave the active context untouched.
+                        // Off the dispatch thread: the (cached, once-per-process) SDK
+                        // enumeration spawns `dotnet --list-sdks`.
+                        // listProjects is pure solution-file parsing (no MSBuild), so it is
+                        // safe to enumerate before the pre-flight; a nested global.json under
+                        // one member project would kill FSAC just as effectively as the root.
+                        let loadedProjects = FsLangMcp.ProjectFiles.SolutionParsing.listProjects projectPath
+
+                        // FSAC calls Init.init with its *process working directory*, which
+                        // StartLspUnsafe sets to the resolved workspace root — so the
+                        // workspace candidates matter as much as the project's own directory.
+                        let preflightDirectories =
+                            [ resolveWorkspaceFromProjectPath projectPath
+                              if Directory.Exists inputPath then
+                                  inputPath
+                              yield! (args.workspacePath |> Option.map Path.GetFullPath |> Option.toList)
+                              for memberProject in loadedProjects do
+                                  resolveWorkspaceFromProjectPath memberProject ]
+
+                        let! sdkVerdict = Task.Run(fun () -> SdkPreflight.check preflightDirectories)
+
+                        match sdkVerdict with
+                        | SdkPreflight.SdkNotFound(pin, installedSdks) ->
+                            return SdkPreflight.toEnvelope pin installedSdks
+                        | SdkPreflight.Proceed ->
+
                         let isSolution =
                             projectPath.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
                             || projectPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
@@ -2008,7 +2043,6 @@ type internal FsAutoCompleteBridge
                                 else
                                     resolveWorkspaceFromProjectPath projectPath)
 
-                        let loadedProjects = FsLangMcp.ProjectFiles.SolutionParsing.listProjects projectPath
                         let! evaluatedSourceFiles = resolveEvaluatedSourceFiles loadedProjects
                         let restartLsp = args.restartLsp |> Option.defaultValue true
                         let mutable lspWasRunning = false
@@ -2167,6 +2201,28 @@ type internal FsAutoCompleteBridge
             let command = fsacCommand ()
             let args = fsacArgs ()
             let workspaceRoot = getWorkspaceRoot ()
+
+            // #192: set_project screens the pin up front, but a pin can be poisoned
+            // AFTER a successful set_project — a branch switch that adds a global.json,
+            // an SDK removed from the machine — and every later lazy start
+            // (EnsureStartedUnsafe) or diagnostic-input restart lands here. Without this,
+            // those paths reproduce the original opaque "connection lost": fsautocomplete
+            // calls Init.init with exactly this working directory and dies before it
+            // answers `initialize`. Raised, not returned: this method owes its caller a
+            // JsonRpc, and every caller funnels the exception into the shared typed
+            // envelope. Nothing has been mutated yet, so the failure is state-neutral.
+            //
+            // The member projects belong in the candidate list too: `fsharp/workspaceLoad`
+            // hands FSAC the solution, so it loads every member, and a nested global.json
+            // under one of them kills the handshake exactly like a root one. Screening
+            // only workspaceRoot would leave that case reporting `disconnected` again.
+            do!
+                Task.Run(fun () ->
+                    SdkPreflight.ensure
+                        [ workspaceRoot
+                          yield! (runtimeProjectPath |> Option.map resolveWorkspaceFromProjectPath |> Option.toList)
+                          yield! (runtimeLoadedProjects |> Seq.map resolveWorkspaceFromProjectPath) ])
+
             let generation = Interlocked.Increment(&nextSessionGeneration)
             // Capture before the FSAC process exists: a versionless publication from
             // this generation cannot legitimately describe content older than this

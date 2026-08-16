@@ -25,6 +25,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only sent as a fallback and a healthy session may never need it.
   `warming` still applies within the window; the boolean `symbolIndex` field
   and the other states are unchanged.
+- An unsatisfiable `global.json` SDK pin no longer reduces `set_project` to an
+  opaque transport error (#192). When the nearest `global.json` pins a version
+  with `rollForward: "disable"` and that exact SDK is not installed, both
+  `Ionide.ProjInfo`'s `Init.init` (in-process) and `fsautocomplete` (which calls
+  it during its own startup, with nothing to catch the failure) die on the
+  `dotnet --version` exit-155 the muxer returns. The FSAC child died before
+  answering `initialize`, so the only thing reaching the agent was StreamJsonRpc's
+  `"The JSON-RPC connection with the remote party was lost"` — naming neither the
+  SDK nor the file. `set_project` now screens the pin before any MSBuild
+  evaluation or FSAC process exists and returns
+  `{ status: "infrastructure_error", errorKind: "sdk_not_found", … }` carrying the
+  requested version, the `global.json` path, the installed SDK list, and both
+  remedies. The same typed envelope replaces the generic
+  "Unable to load F# project options" for every tool that loads project options.
+
+  The screen is deliberately one-sided: only `rollForward: "disable"` with an
+  exact version confirmed absent from `dotnet --list-sdks` can fail it. Any other
+  policy, an `sdk.paths` redirect, an unreadable `global.json`, or an SDK list we
+  could not obtain proceeds to the normal load path unchanged.
+
+  Behaviour change worth noting: `set_project(restartLsp=false)` on such a project
+  previously answered `status: "ok"` with `readiness.projectOptions: false`. It now
+  answers with the typed error, because the project genuinely cannot be evaluated.
 
 ## [0.15.0] - 2026-08-16
 
