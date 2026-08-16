@@ -1314,8 +1314,37 @@ type internal FsAutoCompleteBridge
     [<VolatileField>]
     let mutable workspaceReady = false
 
-    [<VolatileField>]
-    let mutable workspaceReadyAt: DateTimeOffset voption = ValueNone
+    // The workspace-ready timestamp has three writers: markWorkspaceReady, called
+    // (a) synchronously under `gate` from StartLspUnsafe's explicit-workspace path,
+    // and (b) from the JSON-RPC dispatch thread with NO lock at all, whenever FSAC's
+    // WorkspaceLoadTarget notification fires; and the reset in StopLspUnsafe, also
+    // gate-holding. Because (b) takes no gate, no amount of gate discipline on the
+    // *readers* closes the race — a `DateTimeOffset voption` is a multi-field struct
+    // with no atomic read/write guarantee even marked [<VolatileField>], so a reader
+    // could observe a torn value while writer (b) is mid-update (#194 review, M7).
+    // Storing UTC ticks as int64 instead sidesteps the problem: int64 reads/writes
+    // via Volatile.Read/Volatile.Write are genuinely atomic (same pattern already
+    // used for activeSessionGeneration below), so every writer — gated or not — can
+    // just Volatile.Write it and every reader gets a whole, untorn value with no lock
+    // needed anywhere. 0L is the "unknown" sentinel (ValueNone); UtcNow.UtcTicks is
+    // never 0 in practice. Go through readWorkspaceReadyAt/writeWorkspaceReadyAt
+    // below rather than touching the field directly, so both readers
+    // (setProjectReadiness's call site and WorkspaceSymbolForContext) and both
+    // writer call sites share the one place that knows about the ticks encoding.
+    let mutable workspaceReadyAtTicks: int64 = 0L
+
+    let readWorkspaceReadyAt () : DateTimeOffset voption =
+        match Volatile.Read(&workspaceReadyAtTicks) with
+        | 0L -> ValueNone
+        | ticks -> ValueSome(DateTimeOffset(ticks, TimeSpan.Zero))
+
+    let writeWorkspaceReadyAt (value: DateTimeOffset voption) : unit =
+        let ticks =
+            match value with
+            | ValueNone -> 0L
+            | ValueSome dto -> dto.UtcTicks
+
+        Volatile.Write(&workspaceReadyAtTicks, ticks)
 
     [<VolatileField>]
     let mutable symbolIndexEverWarmed = false
@@ -1690,7 +1719,7 @@ type internal FsAutoCompleteBridge
     let markWorkspaceReady generation () =
         if Volatile.Read(&activeSessionGeneration) = generation then
             workspaceReady <- true
-            workspaceReadyAt <- ValueSome DateTimeOffset.UtcNow
+            writeWorkspaceReadyAt (ValueSome DateTimeOffset.UtcNow)
             lifecycleState <- LspLifecycleState.Ready generation
 
     let isTransportFailure (jsonRpc: JsonRpc) (ex: exn) =
@@ -1753,7 +1782,7 @@ type internal FsAutoCompleteBridge
                     System.Collections.Generic.Dictionary<string, string>(DiagnosticIdentity.pathComparer)
                 diagnosticGenerationContextFingerprint <- None)
             workspaceReady <- false
-            workspaceReadyAt <- ValueNone
+            writeWorkspaceReadyAt ValueNone
             symbolIndexEverWarmed <- false
 
             this.BeginLspCleanupUnsafe(stoppedRpc, stoppedProcess, stoppedContainment, stoppedPump)
@@ -2061,26 +2090,18 @@ type internal FsAutoCompleteBridge
                                 else
                                     "warming"
 
-                            // workspaceReadyAt is a multi-field struct (DateTimeOffset voption),
-                            // unlike its bool neighbours above it isn't read-atomic, and it can be
-                            // written concurrently by another gate-holding SetProject/cleanup call
-                            // (#194 review, M7). Snapshot it under the same gate discipline as
-                            // WorkspaceSymbolForContext's read of the same field, rather than
-                            // reading the mutable field directly after the gate was released above.
-                            do! gate.WaitAsync()
-
-                            let workspaceReadyAtSnapshot =
-                                try
-                                    workspaceReadyAt
-                                finally
-                                    gate.Release() |> ignore
-
+                            // readWorkspaceReadyAt() is a plain Volatile.Read — no gate needed
+                            // (or wanted: a second gate.WaitAsync() here would count contended
+                            // wait time into "elapsed since ready", per #194 review N1, and could
+                            // block this call on an unrelated in-flight request for up to
+                            // requestTimeout/startupTimeout for no reason, per N2). `now` is read
+                            // in the same expression so nothing sits between the two.
                             let readinessNode =
                                 LspResponseShape.setProjectReadiness
                                     ready
                                     symbolIndexEverWarmed
                                     (restartLsp || live)
-                                    workspaceReadyAtSnapshot
+                                    (readWorkspaceReadyAt ())
                                     DateTimeOffset.UtcNow
                                     LspResponseShape.symbolIndexWarmupWindow
 
@@ -2578,7 +2599,7 @@ type internal FsAutoCompleteBridge
                         let shaped =
                             LspResponseShape.workspaceSymbolResponse
                                 response
-                                workspaceReadyAt
+                                (readWorkspaceReadyAt ())
                                 DateTimeOffset.UtcNow
                                 LspResponseShape.symbolIndexWarmupWindow
 

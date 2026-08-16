@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `set_project`'s `readiness.symbolIndexState` no longer claims `warming`
   forever when no warm signal from the FSAC symbol index is ever observed
   (#194). `assessSymbolIndex` already compared elapsed-since-workspace-ready
-  against a warm-up window for `workspace_symbol` responses, but
-  `setProjectReadiness` never saw that signal. It now reuses the same
+  against a warm-up window for the internal FSAC `workspace/symbol` probe
+  `find` falls back to, but `setProjectReadiness` never saw that signal. It
+  now reuses the same
   `workspaceReadyAt` timestamp and warm-up window: past the window with no
   non-empty index result observed yet, the state reads `not_warmed` with a
   hint that `find`/`check` are unaffected (they use FCS sweeps, not the

@@ -36,14 +36,15 @@ to do about it.
 
 `warming` and `not_warmed` compare elapsed time since `workspaceReadyAt` against a shared warm-up
 window (`symbolIndexWarmupWindow`, 3 seconds) — the same window and the same `workspaceReadyAt`
-timestamp that `find`-adjacent `workspace_symbol` calls use. Sharing the inputs is where the
-agreement ends: past that window, `assessSymbolIndex` (used by `workspace_symbol`) and
-`setProjectReadiness` (used by `set_project`) answer different questions from the same elapsed
+timestamp used by the internal FSAC `workspace/symbol` probe that `find` falls back to when its
+own FCS sweep finds nothing (see `## find`, "How it works internally", step 4). Sharing the inputs
+is where the agreement ends: past that window, `assessSymbolIndex` (the probe's readiness check)
+and `setProjectReadiness` (used by `set_project`) answer different questions from the same elapsed
 time. `assessSymbolIndex` returns `true` — "an empty result is now trustworthy; stop treating it
-as still-indexing." `setProjectReadiness` returns `not_warmed` — "no warm signal has been
-observed yet." Reusing the window and timestamp gives `set_project` one timing source instead of
-two duplicated `TimeSpan.FromSeconds 3.0` literals; it does not make the two surfaces agree on
-what elapsed time means.
+as still-indexing." `setProjectReadiness` returns `not_warmed` — "no warm signal has been observed
+yet." Reusing the window and timestamp gives `set_project` one timing source instead of two
+duplicated `TimeSpan.FromSeconds 3.0` literals; it does not make the two surfaces agree on what
+elapsed time means.
 
 ### Caveats
 
