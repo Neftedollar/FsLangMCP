@@ -4,11 +4,19 @@ module FsLangMcp.Tests.PublicApiCharBudgetTests
 /// narrowing hint (issue #206).
 ///
 /// Coverage:
-///   * A synthetic API surface big enough to trip the ~60k-char response budget:
-///     the page closes under budget (truncatedByBudget=true) even though
-///     maxResults left plenty of count-based room; hint names real namespaces
-///     from the remainder; cursor pagination still reconstructs the whole
-///     surface with no overlap between pages.
+///   * A synthetic API surface (signature-dense: functions with long parameter
+///     lists) big enough to trip the response budget: the page closes under
+///     budget (truncatedByBudget=true) even though maxResults left plenty of
+///     count-based room; hint names real namespaces from the remainder; cursor
+///     pagination still reconstructs the whole surface with no overlap between
+///     pages.
+///   * A SECOND, signature-sparse surface (records with short-typed fields) —
+///     #206 review round 2 found this shape class is the one that actually
+///     breaches the MCP ceiling: the per-line indentation-nesting penalty (a
+///     shipped entity sits 2 levels deeper than the depth-0 measurement) hits
+///     hardest on shapes with many short lines per node, not signature-dense
+///     ones. Asserts the SHIPPED (rendered) response still fits under the same
+///     ceiling on this harsher shape.
 ///   * Count-close (pre-#206 behavior): a page that closes because maxResults
 ///     was reached (not the budget) gets the new hint but NOT truncatedByBudget.
 ///   * Small-surface regression guard: a surface that fits on one page emits
@@ -48,8 +56,10 @@ let private smallSurfaceFs =
 /// Three namespaces (Wide.Alpha / Wide.Beta / Wide.Gamma), `perGroup` modules
 /// each, every module carrying two functions with a six-parameter signature.
 /// Sized (see the module doc comment) so the first page's cumulative
-/// serialized size crosses the ~60k-char responseCharBudget (FcsBridge.fs)
-/// well before `perGroup * 3` entities or the requested maxResults are reached.
+/// serialized size crosses `FcsBridge.fs`'s `responseCharBudget` well before
+/// `perGroup * 3` entities or the requested maxResults are reached. This is
+/// the signature-DENSE, most forgiving shape — see `sparseSurfaceFs` below for
+/// the shape #206 review round 2 found actually breaches the shipped ceiling.
 let private wideSurfaceFs (perGroup: int) =
     let groups = [ "Alpha"; "Beta"; "Gamma" ]
 
@@ -66,6 +76,31 @@ let private wideSurfaceFs (perGroup: int) =
         [ $"namespace Wide.{g}"
           "" ]
         @ (List.init perGroup moduleLines |> List.concat)
+        @ [ "" ]
+
+    groups |> List.collect groupLines |> String.concat "\n"
+
+/// Three namespaces (Sparse.Alpha / Sparse.Beta / Sparse.Gamma), `perGroup`
+/// records each, every record carrying six short-typed `int` fields (`F0: int`
+/// .. `F5: int`) and NOTHING else — no long signatures, no generic types. This
+/// is the signature-SPARSE shape #206 review round 2 measured as the worst
+/// case: indented JSON puts one field per line, so a record like this packs
+/// many short lines per entity, and the fixed per-line depth-nesting penalty
+/// (a shipped entity sits 2 levels deeper than a depth-0 measurement) costs
+/// proportionally more here than on a few long-signature functions. The
+/// record with six short-typed fields was the review's own "not adversarial —
+/// the single most common shape in an F# public surface" example.
+let private sparseSurfaceFs (perGroup: int) =
+    let groups = [ "Alpha"; "Beta"; "Gamma" ]
+
+    let recordLines (i: int) =
+        let n = i.ToString("D4")
+        [ $"    type R{n} = {{ F0: int; F1: int; F2: int; F3: int; F4: int; F5: int }}" ]
+
+    let groupLines (g: string) =
+        [ $"namespace Sparse.{g}"
+          "" ]
+        @ (List.init perGroup recordLines |> List.concat)
         @ [ "" ]
 
     groups |> List.collect groupLines |> String.concat "\n"
@@ -129,7 +164,7 @@ let private optString (node: JsonNode) (key: string) : string option =
 let ``budget close: page closes under the char budget, hint names real namespaces, cursor reconstructs the whole surface`` () : Task =
     task {
         // 90 modules/group * 3 groups = 270 entities; each ~600-900 serialized
-        // chars comfortably crosses the 60k budget well before maxResults=1000
+        // chars comfortably crosses the char budget well before maxResults=1000
         // (the hard ceiling) or the full 270-entity count would.
         let project, root = writeFixture "wide" (wideSurfaceFs 90)
         let bridge = FcsBridge()
@@ -165,8 +200,9 @@ let ``budget close: page closes under the char budget, hint names real namespace
 
             // #206 review Min-1: the invariant this whole issue exists for is that the
             // SHIPPED response fits the ~72k-char MCP ceiling — not that the internal
-            // accumulator believes it closed at "60k". Assert the actual rendered bytes
-            // (the same `renderToken` every tool response goes out through), not a proxy.
+            // accumulator believes it closed under responseCharBudget. Assert the
+            // actual rendered bytes (the same `renderToken` every tool response goes
+            // out through), not a proxy.
             let rendered = renderToken page1
             Assert.True(
                 rendered.Length <= 72_000,
@@ -202,6 +238,44 @@ let ``budget close: page closes under the char budget, hint names real namespace
 
             Assert.True(pages > 1, "expected the budget to force more than one page")
             Assert.Equal(total, acc.Count)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``budget close on a signature-SPARSE surface: the shipped response still fits under the ceiling`` () : Task =
+    task {
+        // #206 review round 2: the original budget-close test only ever exercised a
+        // signature-dense shape (long function signatures), the most FORGIVING case for
+        // the per-line depth-nesting penalty. A record with a handful of short-typed
+        // fields packs many short lines per entity — the shape the review measured
+        // shipping over the ceiling when the budget was calibrated against only the
+        // dense shape. 120 records/group * 3 groups = 360 entities is comfortably more
+        // than any one page can hold regardless of exact per-entity size.
+        let project, root = writeFixture "sparse" (sparseSurfaceFs 120)
+        let bridge = FcsBridge()
+
+        try
+            let! page1 = bridge.PublicApi({ baseArgs project with maxResults = Some 1000 })
+
+            Assert.Equal("ok", page1["status"].GetValue<string>())
+
+            let total = page1["entityCount"].GetValue<int>()
+            Assert.Equal(360, total)
+
+            let returned = (entities page1).Length
+            Assert.True(returned > 0 && returned < total, $"expected a partial page, got {returned}/{total}")
+            Assert.Equal(Some true, optBool page1 "truncatedByBudget")
+
+            // The assertion that matters: the ACTUAL shipped bytes, on the shape that
+            // actually breached in review round 2 — not the internal accumulator, and
+            // not the forgiving signature-dense shape the other test already covers.
+            let rendered = renderToken page1
+            Assert.True(
+                rendered.Length <= 72_000,
+                $"sparse-shape budget-closed page rendered to {rendered.Length} chars, over the ~72k MCP ceiling"
+            )
         finally
             if Directory.Exists root then
                 Directory.Delete(root, true)

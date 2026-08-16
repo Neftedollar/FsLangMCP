@@ -5,9 +5,8 @@ module FsLangMcp.Tests.FileOutlineBudgetTests
 ///
 /// Coverage:
 ///   * A file whose requested summaryOnly=false output would exceed the shared
-///     ~60k-char response budget downgrades to header-only entries
-///     (downgradedToSummary=true) plus an explanatory hint, instead of ever
-///     emitting the over-budget payload.
+///     response budget downgrades to header-only entries (downgradedToSummary=true)
+///     plus an explanatory hint, instead of ever emitting the over-budget payload.
 ///   * A small file with summaryOnly=false is unchanged: full per-member
 ///     entries, no downgradedToSummary, no hint.
 
@@ -25,7 +24,8 @@ open FsLangMcp.Tools
 /// `count` top-level functions, each with a six-parameter signature. At the
 /// default maxResults=200 this is rich enough (name + fullName + kind +
 /// accessibility + range + declarationRange + signature per entry) that 200
-/// of them cross the shared responseCharBudget (FcsBridge.fs, ~60k chars).
+/// of them cross the shared responseCharBudget (FcsBridge.fs, `Types.fs`'s
+/// `renderedLength`).
 let private bigOutlineSource (count: int) =
     let lines = ResizeArray<string>()
     lines.Add("module Big.Outline")
@@ -143,7 +143,8 @@ let ``over-budget file downgrades summaryOnly=false to headers plus a hint`` () 
 
             // #206 review Min-1: assert the actual SHIPPED (indented) response fits the
             // ~72k-char MCP ceiling, not just that the internal accumulator believes it
-            // closed under "60k" — this is the assertion that would have caught Imp-1.
+            // closed under responseCharBudget — this is the assertion that would have
+            // caught round-1's Imp-1 (wrong unit) and round-2's depth residual alike.
             let rendered = renderToken result
             Assert.True(
                 rendered.Length <= 72_000,

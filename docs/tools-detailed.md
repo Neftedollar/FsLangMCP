@@ -536,13 +536,17 @@ is never emitted).
 
 A page is closed for either of two independent reasons, and the response tells you which:
 `maxResults` (default 100, hard ceiling 1000) caps the page by **type count**, and a shared
-~60,000-character serialized-size budget (`responseCharBudget` in `FcsBridge.fs`, the same
+45,000-character serialized-size budget (`responseCharBudget` in `FcsBridge.fs`, the same
 constant `fcs_file_outline` uses — see below) caps it by **response size**, closing the page early
-even when `maxResults` would still allow more entities. A handful of API-dense types — long
-member lists, verbose generic signatures — can cross that budget well before the count cap does;
-this is what the field failure behind #206 looked like: a 2.5k-line project's default
-`fcs_public_api` call produced a page so large the MCP client spilled it to a side file instead of
-returning it inline.
+even when `maxResults` would still allow more entities. The 45,000 figure is deliberately below the
+~72,000-char MCP ceiling it targets: it is measured per-entity, standalone, before the entity is
+embedded two levels deeper in the actual response (`entities` inside the root object) and before
+the response envelope is added, both of which cost real characters the per-entity measurement can't
+see — the margin covers that gap even on signature-*sparse* shapes (short-field records,
+member-less modules) where the gap is largest. A handful of API-dense types — long member lists,
+verbose generic signatures — can also cross that budget well before the count cap does; this is
+what the field failure behind #206 looked like: a 2.5k-line project's default `fcs_public_api` call
+produced a page so large the MCP client spilled it to a side file instead of returning it inline.
 
 `truncated: true` means more entities remain regardless of which cap closed the page.
 `truncatedByBudget: true` is additive and appears **only** when the char budget was the reason —
@@ -581,9 +585,9 @@ restores full per-member `name`/`kind`/`range`/`signature`/`accessibility` entri
 ### `downgradedToSummary` size guard (#206)
 
 `summaryOnly=false` has no count-based ceiling of its own beyond `maxResults` (default 200), and a
-file with many signature-heavy top-level bindings can still serialize past the shared
-~60,000-character `responseCharBudget` within that count — two field-observed outlines hit 54KB
-and 65KB. Rather than ever return that oversized payload, a `summaryOnly=false` request whose full
+file with many signature-heavy top-level bindings can still serialize past the shared 45,000-
+character `responseCharBudget` within that count — two field-observed outlines hit 54KB and 65KB.
+Rather than ever return that oversized payload, a `summaryOnly=false` request whose full
 entries would cross the budget is downgraded to the same header-only shape `summaryOnly=true`
 produces (name/kind/fullName/range, no signatures), plus an additive `hint` explaining the
 downgrade and naming `maxResults` — the narrowing knob available today — as the way to fit full

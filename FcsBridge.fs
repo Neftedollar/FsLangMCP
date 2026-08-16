@@ -3329,35 +3329,28 @@ type internal FcsBridge
     // uniform "site", an API-dense type's member list can run to hundreds of chars),
     // so a type-count/entry-count cap alone (maxResults) still lets a page or a
     // single-file outline overflow the MCP token ceiling — the #100 field failure
-    // (2.5k-line project, default call, client-side spill). 60k chars ≈ 20k tokens,
-    // comfortably under the ~25k-token / ~72k-char ceiling with headroom for the rest
-    // of the envelope (status, project, pagination fields, hint) — same reasoning as
-    // `Find`'s `pageSize` comment below (80-site page ≈ 43k chars under ~72k).
+    // (2.5k-line project, default call, client-side spill).
     //
-    // MEASURED IN THE SHIPPED SERIALIZATION, not JsonNode.ToJsonString(). Every tool
-    // response goes out via Tools.fs `renderToken` → `JsonSerializer.Serialize(token,
-    // renderOpts)` with `WriteIndented = true` — indented is ~1.46-1.48x the length of
-    // `ToJsonString()`'s compact default across a wide member-density sweep (#206
-    // review, Imp-1), so a budget measured compact ships 78k-89k chars against this
-    // same "60k" cap. `renderedLength` below reproduces `renderOpts` exactly
-    // (`FcsBridge.fs` compiles before `Tools.fs` in `FsLangMcp.fsproj`, so it cannot
-    // reference `Tools.renderOpts` directly — this is a deliberate duplicate, not an
-    // oversight; keep the two in sync if `Tools.fs`'s `JsonSerializerOptions` ever
-    // change).
-    let responseCharBudget = 60_000
-
-    let renderedJsonOptions =
-        JsonSerializerOptions(
-            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-            WriteIndented = true
-        )
-
-    /// Serialized length of `node` in the SAME shape the MCP response ships in
-    /// (`Tools.renderToken`'s `WriteIndented = true`), not `JsonNode.ToJsonString()`'s
-    /// compact default. Both `PublicApi` and `FileOutline` budget checks must use this,
-    /// not `ToJsonString().Length` — see the `responseCharBudget` comment above.
-    let renderedLength (node: JsonNode) : int =
-        JsonSerializer.Serialize(node, renderedJsonOptions).Length
+    // Measured via `Types.renderedLength` / `Types.isOverRenderedBudget` — the SAME
+    // options `Tools.renderToken` ships every response with (`Types.mcpRenderOptions`,
+    // one shared definition; see its doc comment for why it lives in `Types.fs`), never
+    // `JsonNode.ToJsonString()`'s compact default (~1.46-1.48x smaller — #206 review
+    // round 1, Imp-1).
+    //
+    // The 45k value itself (not 60k) accounts for a SECOND, separate gap: each node is
+    // measured standalone at depth 0, but a shipped entity actually sits two levels
+    // deeper — inside `entities`/`entries` inside the root response object — so every
+    // line of its rendered form carries 4 more leading spaces than the depth-0
+    // measurement counted, plus the ~600-char envelope (status/project/pagination
+    // fields) on top. That per-LINE penalty (not per-char) hits hardest on
+    // signature-*sparse* shapes that pack many short lines per node — a record with a
+    // handful of short-typed fields (`F0: int`), or a member-less module — where #206
+    // review round 2 measured the real shipped response at 1.14-1.28x the depth-0
+    // sum, worst case 76,526 shipped chars from a page whose depth-0 sum was under
+    // 60,000. 45,000 x 1.28 = 57,600 — comfortably under the ~25k-token / ~72k-char MCP
+    // ceiling even on that worst-case shape, with the same reasoning `Find`'s `pageSize`
+    // comment below applies to its own (already-shipped-measured) budget.
+    let responseCharBudget = 45_000
 
     member private _.LoadProjectOptionsFromFsproj
         (fsprojPath: string)
@@ -4054,12 +4047,12 @@ type internal FcsBridge
                 // summaryOnly=true produces, rather than ever emitting an over-budget
                 // outline. Only measured when summaryOnly=false was actually requested —
                 // an explicit summaryOnly=true request is already small by construction.
-                // #206 review Imp-1: measured in the SHIPPED (indented) serialization via
-                // `renderedLength`, not `ToJsonString()`'s compact default — see the
-                // `responseCharBudget` comment for why the two are ~1.47x apart.
-                let overBudget =
-                    not summaryOnly
-                    && (entries |> Array.sumBy renderedLength) > responseCharBudget
+                // #206 review round 1 Imp-1 / round 2 N6: measured via the shared
+                // `Types.isOverRenderedBudget` — same shipped serialization as
+                // `responseCharBudget`'s comment describes, and it stops serializing
+                // further entries the moment the budget is already crossed rather than
+                // summing every one of `entries` (up to `maxResults`) regardless.
+                let overBudget = not summaryOnly && isOverRenderedBudget responseCharBudget entries
 
                 let downgradedToSummary = overBudget
 
@@ -9355,8 +9348,10 @@ type internal FcsBridge
             let entityNodes =
                 countPageNodes
                 |> Array.takeWhile (fun node ->
-                    // #206 review Imp-1: SHIPPED (indented) length via `renderedLength`,
-                    // not compact `ToJsonString()` — see `responseCharBudget` comment.
+                    // #206: shared `Types.renderedLength` — the SHIPPED (indented)
+                    // length, not compact `ToJsonString()` — see `responseCharBudget`
+                    // comment above for the full accounting, including the per-line
+                    // depth-nesting penalty this constant already budgets for.
                     let nodeChars = renderedLength node
 
                     if runningChars > 0 && runningChars + nodeChars > responseCharBudget then

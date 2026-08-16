@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   analysis completed, it reports "analyzed K of N" instead of claiming a
   sweep that didn't happen, and for `scope='file'` it names the additional
   file-level filter, not just the sibling-project blind spot (#193).
-- `fcs_public_api` now closes a page on a shared ~60,000-character response
+- `fcs_public_api` now closes a page on a shared 45,000-character response
   budget in addition to the existing `maxResults` type-count cap, so a
   handful of API-dense types (long member lists) can no longer produce an
   over-budget page just because `maxResults` still had "room" by count — the

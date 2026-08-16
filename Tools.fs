@@ -14,9 +14,6 @@ open System.Text.Json.Nodes
 let private serializeOpts =
     JsonSerializerOptions(Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping)
 
-let private renderOpts =
-    JsonSerializerOptions(Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping, WriteIndented = true)
-
 let toolErrorToJson (err: ToolError) : string =
     match err with
     | InvalidArgs msg ->
@@ -29,8 +26,12 @@ let toolErrorToJson (err: ToolError) : string =
     | FileNotFound msg ->
         sprintf """{"errorKind":"FileNotFound","message":%s}""" (JsonSerializer.Serialize(msg, serializeOpts))
 
+// #206: renders through the shared `Types.mcpRenderOptions` — the same options
+// `FcsBridge.fs`'s response-size budget checks measure against (`Types.renderedLength`
+// / `Types.isOverRenderedBudget`), so a budget-checked response and the response that
+// actually ships can never silently use different serializations.
 let renderToken (token: JsonNode) =
-    JsonSerializer.Serialize(token, renderOpts)
+    JsonSerializer.Serialize(token, mcpRenderOptions)
 
 let toolResult (work: Task<JsonNode>) : Task<Result<Content list, McpError>> =
     task {
