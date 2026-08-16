@@ -114,7 +114,7 @@ Full setup: [`docs/getting-started.md`](docs/getting-started.md) · Per-client c
 
 | Tool | What it does |
 |------|--------------|
-| `fcs_nuget_types` | Enumerate types in one referenced assembly (exact `SimpleName` match, case-insensitive). |
+| `fcs_nuget_types` | Enumerate types in one referenced assembly, by NuGet package id or by the assembly `SimpleName` it ships (exact, case-insensitive). |
 | `fcs_nuget_members` | Enumerate members of one type from a referenced assembly. |
 | `fcs_referenced_symbols` | Substring search across all referenced assemblies (NuGet + framework). |
 

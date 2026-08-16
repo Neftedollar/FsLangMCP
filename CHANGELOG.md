@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `fcs_nuget_types` / `fcs_nuget_members` now resolve a NuGet **package id** whose
+  assembly is named something else. Both matched the assembly `SimpleName` alone, so
+  `Microsoft.Orleans.Core.Abstractions` (which ships `Orleans.Core.Abstractions.dll`)
+  resolved to zero assemblies and returned an empty — but `status: "ok"` — payload that
+  reads as "the type does not exist" (#191, reported from the field in #100). `packageId`
+  now accepts either spelling, resolved through a packageId → assembly map built from the
+  project's own restore output: `obj/project.assets.json` when present, otherwise derived
+  from the `-r:` reference paths under the NuGet global-packages cache (honouring
+  `NUGET_PACKAGES`). Prefix matching remains rejected in both directions — `System` still
+  does not match `System.Text.Json`, and `Newtonsoft.Json.Schema` still does not fall back
+  to `Newtonsoft.Json`. Side effect: a package that ships several assemblies (e.g.
+  `TypeShape` → `TypeShape.dll` + `TypeShape.CSharp.dll`) now returns all of them in one
+  call instead of requiring one call per assembly.
+- **Miss payloads on both tools now explain themselves.** When no assembly matches the
+  `packageId`, the response additively carries `hint` (which names the
+  package-id-vs-assembly-name distinction, and separates "not in this project's restore
+  graph" from "restored, but no assembly of it is on the compile line") and
+  `candidatePackages` (up to 5 `{ packageId, assemblies }` entries from the restore graph
+  whose id or assembly names relate to the query). `fcs_nuget_members` additionally emits a
+  `hint` when the assembly resolved but exports no such type, naming the assembly searched
+  and pointing at `fcs_nuget_types`. Success-path responses are unchanged — the fields are
+  absent on a hit.
+
 ## [0.15.0] - 2026-08-16
 
 `0.14.0` was prepared but never tagged or published to NuGet — the last release

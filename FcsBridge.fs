@@ -1610,6 +1610,290 @@ type private CheckTargetDiscoveryResult =
     | Projects of string array
     | Busy of string
 
+// ─── NugetPackageMap (issue #191) ───────────────────────────────────────────────
+// A NuGet package id and the assembly it ships are NOT the same string.
+// `Microsoft.Orleans.Core.Abstractions` ships `Orleans.Core.Abstractions.dll`; this repo's own
+// `Microsoft.VisualStudio.Threading.Only` ships `Microsoft.VisualStudio.Threading.dll`.
+// fcs_nuget_types / fcs_nuget_members matched on assembly SimpleName ALONE, so every such
+// package resolved to zero assemblies and returned an empty — but `status: "ok"` — payload,
+// which reads as "the type does not exist" (#100 field report).
+//
+// The fix is a real package→assembly map built from the project's OWN restore output, not
+// fuzzier string matching: prefix matching stays rejected in both directions ("System" must
+// not match every System.* assembly, "Newtonsoft.Json.Schema" must not fall back to
+// "Newtonsoft.Json").
+module internal NugetPackageMap =
+
+    /// packageId (lower-cased — NuGet ids are case-insensitive) → assembly SimpleNames in
+    /// their shipped casing.
+    type PackageAssemblies = Map<string, Set<string>>
+
+    let private fileNameOf (path: string) =
+        let index = path.LastIndexOfAny [| '/'; '\\' |]
+        if index >= 0 then path.Substring(index + 1) else path
+
+    /// The assembly SimpleName a package payload path contributes, if any. `_._` is NuGet's
+    /// "this package intentionally contributes nothing for this TFM" placeholder, and satellite
+    /// resources / xml docs / native payloads are not assembly references either — only `.dll`
+    /// entries name an assembly.
+    let private simpleNameOfPath (path: string) =
+        let fileName = fileNameOf path
+
+        if
+            fileName.Length > 4
+            && fileName.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+        then
+            Some(fileName.Substring(0, fileName.Length - 4))
+        else
+            None
+
+    let private addAssembly (packageId: string) (assemblyName: string) (map: PackageAssemblies) =
+        if String.IsNullOrWhiteSpace packageId || String.IsNullOrWhiteSpace assemblyName then
+            map
+        else
+            let key = packageId.ToLowerInvariant()
+            let existing = map |> Map.tryFind key |> Option.defaultValue Set.empty
+            Map.add key (Set.add assemblyName existing) map
+
+    /// Parse a `project.assets.json` PAYLOAD (the file's text, not its path) into
+    /// packageId → assembly SimpleNames. Pure — no I/O, no network — so it is unit-testable
+    /// against a synthetic assets file.
+    ///
+    /// Shape, verified against real restores (assets schema versions 3 and 4):
+    ///   targets: { "<tfm>" or "<tfm>/<rid>": { "<Id>/<Version>": { compile: { path: {} },
+    ///                                                              runtime: { path: {} } } } }
+    /// Every target is folded in, so a RID-qualified graph contributes the same package ids.
+    /// `compile` and `runtime` can list different assemblies (`ref/` vs `lib/`); both count,
+    /// because FCS references whichever one the SDK put on the compile line.
+    /// `type: "project"` entries (ProjectReference, payload `bin/placeholder/<AssemblyName>.dll`)
+    /// are kept deliberately: they give the same project-name → assembly-name mapping for a
+    /// project whose <AssemblyName> was renamed, and their key is `<Name>/<Version>` too.
+    let packageAssembliesFromAssets (assetsJson: string) : PackageAssemblies =
+        try
+            match JsonNode.Parse assetsJson with
+            | null -> Map.empty
+            | root ->
+                match root["targets"] with
+                | :? JsonObject as targets ->
+                    let mutable map = Map.empty
+
+                    for target in targets do
+                        match target.Value with
+                        | :? JsonObject as libraries ->
+                            for library in libraries do
+                                // "<Id>/<Version>" — only the id half matters here.
+                                let packageId = library.Key.Split('/')[0]
+
+                                match library.Value with
+                                | :? JsonObject as sections ->
+                                    for sectionName in [ "compile"; "runtime" ] do
+                                        match sections[sectionName] with
+                                        | :? JsonObject as files ->
+                                            for file in files do
+                                                match simpleNameOfPath file.Key with
+                                                | Some assemblyName -> map <- addAssembly packageId assemblyName map
+                                                | None -> ()
+                                        | _ -> ()
+                                | _ -> ()
+                        | _ -> ()
+
+                    map
+                | _ -> Map.empty
+        with _ ->
+            Map.empty
+
+    /// Roots the NuGet global-packages cache can live under, most specific first.
+    let private globalPackagesRoots () =
+        [ Environment.GetEnvironmentVariable "NUGET_PACKAGES"
+          Path.Combine(Environment.GetFolderPath Environment.SpecialFolder.UserProfile, ".nuget", "packages") ]
+        |> List.filter (String.IsNullOrWhiteSpace >> not)
+        |> List.map (fun root -> root.TrimEnd([| '/'; '\\' |]))
+
+    let private splitSegments (path: string) =
+        path.Split([| '/'; '\\' |], StringSplitOptions.RemoveEmptyEntries)
+
+    /// Fallback for projects whose `project.assets.json` is unavailable (relocated
+    /// MSBuildProjectExtensionsPath, packages.config, unreadable file): derive the same map
+    /// from the `-r:` reference paths, which for NuGet-resolved assemblies live under the
+    /// global packages cache as `<root>/<idLower>/<version>/<...>/<Assembly>.dll`.
+    let packageAssembliesFromReferencePaths (otherOptions: string seq) : PackageAssemblies =
+        let roots = globalPackagesRoots ()
+
+        // A NuGet version directory always starts with a digit ("9.0.0", "1.0.0-rc.2").
+        // Requiring that stops an unrelated "…/packages/…" directory from inventing ids.
+        let looksLikeVersion (segment: string) =
+            segment.Length > 0 && Char.IsDigit segment[0]
+
+        let packageIdOf (path: string) =
+            let segments = splitSegments path
+
+            let idIndex =
+                roots
+                |> List.tryPick (fun root ->
+                    if
+                        path.StartsWith(root + "/", StringComparison.OrdinalIgnoreCase)
+                        || path.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase)
+                    then
+                        Some (splitSegments root).Length
+                    else
+                        None)
+                |> Option.orElseWith (fun () ->
+                    // Not under a known root (RestorePackagesPath, CI cache mount, …) — fall
+                    // back to the layout itself, taking the LAST "packages" segment so a root
+                    // like /home/packages/agent/packages/<id>/… resolves to the inner one.
+                    segments
+                    |> Array.tryFindIndexBack (fun segment ->
+                        String.Equals(segment, "packages", StringComparison.OrdinalIgnoreCase))
+                    |> Option.map (fun index -> index + 1))
+
+            match idIndex with
+            | Some index when index + 1 < segments.Length && looksLikeVersion segments[index + 1] ->
+                Some segments[index]
+            | _ -> None
+
+        otherOptions
+        |> Seq.choose (fun option ->
+            if isNull option then
+                None
+            elif option.StartsWith("-r:", StringComparison.Ordinal) then
+                Some(option.Substring 3)
+            elif option.StartsWith("--reference:", StringComparison.Ordinal) then
+                Some(option.Substring 12)
+            else
+                None)
+        |> Seq.fold
+            (fun map path ->
+                match packageIdOf path, simpleNameOfPath path with
+                | Some packageId, Some assemblyName -> addAssembly packageId assemblyName map
+                | _ -> map)
+            Map.empty
+
+    /// Default assets location. MSBuild can relocate it via MSBuildProjectExtensionsPath, but
+    /// that property is not carried on FSharpProjectOptions — a relocated (or missing) assets
+    /// file falls through to the `-r:` derivation, which needs no file at all.
+    let assetsFilePath (projectFileName: string) =
+        try
+            let directory = Path.GetDirectoryName(Path.GetFullPath projectFileName)
+
+            if String.IsNullOrEmpty directory then
+                ""
+            else
+                Path.Combine(directory, "obj", "project.assets.json")
+        with _ ->
+            ""
+
+    let forProject (projectFileName: string) (otherOptions: string seq) : PackageAssemblies =
+        let fromAssets =
+            try
+                let path = assetsFilePath projectFileName
+
+                if path <> "" && File.Exists path then
+                    packageAssembliesFromAssets (File.ReadAllText path)
+                else
+                    Map.empty
+            with _ ->
+                Map.empty
+
+        if Map.isEmpty fromAssets then
+            packageAssembliesFromReferencePaths otherOptions
+        else
+            fromAssets
+
+    /// An assembly matches `packageId` when its SimpleName IS the packageId (pre-#191
+    /// behaviour, kept — callers who already know the assembly name keep working even when the
+    /// restore graph is unreadable) OR when the restore graph says that package ships that
+    /// assembly. Both arms are exact, case-insensitive comparisons: prefix matching stays
+    /// rejected in both directions.
+    let matches (map: PackageAssemblies) (packageId: string) (assemblySimpleName: string) =
+        if
+            String.IsNullOrWhiteSpace assemblySimpleName
+            || String.IsNullOrWhiteSpace packageId
+        then
+            false
+        elif String.Equals(assemblySimpleName, packageId, StringComparison.OrdinalIgnoreCase) then
+            true
+        else
+            match Map.tryFind (packageId.ToLowerInvariant()) map with
+            | Some names ->
+                names
+                |> Set.exists (fun name -> String.Equals(name, assemblySimpleName, StringComparison.OrdinalIgnoreCase))
+            | None -> false
+
+    /// Packages from the restore graph whose id or shipped assembly names relate to `query` by
+    /// case-insensitive containment in EITHER direction (so both "I passed the assembly name"
+    /// and "I passed the package id" miss modes self-correct), best first, capped at `limit`.
+    let candidates (map: PackageAssemblies) (query: string) (limit: int) : (string * string list) list =
+        let normalized =
+            query
+            |> Option.ofObj
+            |> Option.defaultValue ""
+            |> (fun s -> s.Trim().ToLowerInvariant())
+
+        if normalized = "" || limit <= 0 then
+            []
+        else
+            let unrelated = Int32.MaxValue
+
+            map
+            |> Map.toList
+            |> List.choose (fun (packageId, assemblyNames) ->
+                let idScore =
+                    if packageId = normalized then 0
+                    elif packageId.Contains normalized then 1
+                    elif normalized.Contains packageId then 3
+                    else unrelated
+
+                let assemblyScores =
+                    assemblyNames
+                    |> Set.toList
+                    |> List.map (fun name ->
+                        let lowered = name.ToLowerInvariant()
+
+                        if lowered = normalized then 0
+                        elif lowered.Contains normalized then 2
+                        elif normalized.Contains lowered then 4
+                        else unrelated)
+
+                let score = List.min (idScore :: assemblyScores)
+
+                if score = unrelated then
+                    None
+                else
+                    Some(score, packageId, assemblyNames |> Set.toList |> List.sort))
+            // Shortest id first inside a score bucket: "Orleans.Core" beats
+            // "Orleans.Core.Abstractions.Extras" as the likelier intent.
+            |> List.sortBy (fun (score, packageId, _) -> score, packageId.Length, packageId)
+            |> List.truncate limit
+            |> List.map (fun (_, packageId, assemblyNames) -> packageId, assemblyNames)
+
+    let private candidatesToJson (candidates: (string * string list) list) : JsonNode =
+        candidates
+        |> List.map (fun (packageId, assemblyNames) ->
+            jobj
+                [ "packageId", jstr packageId
+                  "assemblies", JsonArray(assemblyNames |> List.map jstr |> List.toArray) :> JsonNode ]
+            :> JsonNode)
+        |> List.toArray
+        |> JsonArray
+        :> JsonNode
+
+    /// Additive miss payload — emitted ONLY when zero assemblies matched, so the happy-path
+    /// response shape is unchanged. Turns the #100 field failure ("empty result, no idea why")
+    /// into a one-turn self-correction.
+    let missFields (map: PackageAssemblies) (packageId: string) : (string * JsonNode) list =
+        let closest = candidates map packageId 5
+        let restored = Map.containsKey (packageId.ToLowerInvariant()) map
+
+        let hint =
+            if restored then
+                $"'%s{packageId}' is in this project's restore graph, but none of the assemblies it ships are on the compile line — analyzer/build-only/runtime-only packages contribute no compile-time reference. candidatePackages lists what it does ship; fcs_referenced_symbols searches the assemblies that ARE loaded."
+            elif not (List.isEmpty closest) then
+                $"No referenced assembly matches packageId '%s{packageId}'. packageId accepts EITHER the NuGet package id OR the assembly SimpleName it ships, and the two differ for many packages (Microsoft.Orleans.Core.Abstractions ships Orleans.Core.Abstractions.dll). See candidatePackages for the closest entries in this project's restore graph."
+            else
+                $"No referenced assembly matches packageId '%s{packageId}', and nothing similar is in this project's restore graph. Note that a NuGet package id and the assembly SimpleName it ships are often different names (Microsoft.Orleans.Core.Abstractions ships Orleans.Core.Abstractions.dll); packageId accepts either. Confirm the package is referenced by this project, or use fcs_referenced_symbols to search all loaded assemblies by type name."
+
+        [ "hint", jstr hint; "candidatePackages", candidatesToJson closest ]
+
 type internal FcsBridge
     (
         ?projectEvaluationBeforeLoadOverride: (string -> Task),
@@ -2069,24 +2353,22 @@ type internal FcsBridge
         with _ ->
             Seq.empty
 
-    let assemblyMatchesPackageId (asm: FSharpAssembly) (packageId: string) =
-        // Exact SimpleName match only (case-insensitive). We intentionally reject prefix
-        // matching in both directions: "System" must NOT match every System.* assembly,
-        // and "Newtonsoft.Json.Schema" must NOT silently fall back to "Newtonsoft.Json".
-        // If a NuGet package ships multiple assemblies, callers should query each
-        // assembly by its actual SimpleName.
-        let pkgLower = packageId.ToLowerInvariant()
-
+    let assemblySimpleName (asm: FSharpAssembly) =
         try
-            let simple =
-                asm.SimpleName
-                |> Option.ofObj
-                |> Option.map (fun s -> s.ToLowerInvariant())
-                |> Option.defaultValue ""
-
-            simple = pkgLower
+            asm.SimpleName |> Option.ofObj |> Option.defaultValue ""
         with _ ->
-            false
+            ""
+
+    /// Exact matching only (case-insensitive), on the assembly SimpleName OR on the
+    /// packageId→assembly map built from the project's restore graph (#191). We still reject
+    /// prefix matching in both directions: "System" must NOT match every System.* assembly,
+    /// and "Newtonsoft.Json.Schema" must NOT silently fall back to "Newtonsoft.Json".
+    let assemblyMatchesPackageId
+        (packageAssemblies: NugetPackageMap.PackageAssemblies)
+        (asm: FSharpAssembly)
+        (packageId: string)
+        =
+        NugetPackageMap.matches packageAssemblies packageId (assemblySimpleName asm)
 
     let isObsoleteEntity (entity: FSharpEntity) =
         try
@@ -8229,14 +8511,19 @@ type internal FcsBridge
                 with _ ->
                     []
 
+            // #191: the packageId may name a package whose assembly is called something else
+            // (Microsoft.Orleans.Core.Abstractions → Orleans.Core.Abstractions.dll), so match
+            // against the project's own restore graph as well as the assembly SimpleName.
+            let packageAssemblies =
+                NugetPackageMap.forProject options.ProjectFileName options.OtherOptions
+
             let matchingAssemblies =
                 assemblies
-                |> List.filter (fun asm -> assemblyMatchesPackageId asm packageId)
+                |> List.filter (fun asm -> assemblyMatchesPackageId packageAssemblies asm packageId)
 
             let matchedAssemblyNames =
                 matchingAssemblies
-                |> List.map (fun asm ->
-                    try asm.SimpleName |> Option.ofObj |> Option.defaultValue "" with _ -> "")
+                |> List.map assemblySimpleName
                 |> List.filter (fun s -> s <> "")
 
             let passesAccessibility (entity: FSharpEntity) =
@@ -8249,8 +8536,7 @@ type internal FcsBridge
             let allEntities =
                 seq {
                     for asm in matchingAssemblies do
-                        let asmName =
-                            try asm.SimpleName |> Option.ofObj |> Option.defaultValue "" with _ -> ""
+                        let asmName = assemblySimpleName asm
 
                         for entity in allEntitiesFromAssembly asm do
                             if passesAccessibility entity then
@@ -8272,10 +8558,17 @@ type internal FcsBridge
                   "includeNonPublic", jbool includeNonPublic
                   "results", JsonArray(pageEntries) :> JsonNode ]
 
+            // Additive: only present on a total miss, so the ok-path shape is unchanged (#191).
+            let missFields =
+                if List.isEmpty matchingAssemblies then
+                    NugetPackageMap.missFields packageAssemblies packageId
+                else
+                    []
+
             let paginationFields =
                 Cursor.paginationFields "types" allEntities.Length pageOffset pageSize pageEntries.Length
 
-            return jobj (baseFields @ paginationFields) :> JsonNode
+            return jobj (baseFields @ missFields @ paginationFields) :> JsonNode
         }
 
     /// Enumerate members of one specific type from a referenced assembly.
@@ -8331,9 +8624,14 @@ type internal FcsBridge
                 with _ ->
                     []
 
+            // #191: see NugetTypes — packageId may name a package whose assembly is called
+            // something else, so consult the project's restore graph too.
+            let packageAssemblies =
+                NugetPackageMap.forProject options.ProjectFileName options.OtherOptions
+
             let matchingAssemblies =
                 assemblies
-                |> List.filter (fun asm -> assemblyMatchesPackageId asm packageId)
+                |> List.filter (fun asm -> assemblyMatchesPackageId packageAssemblies asm packageId)
 
             // FCS exposes generic types with a CLR arity suffix (e.g. `FSharpOption`1`).
             // Strip a trailing `N so callers can pass the bare compiled name (`FSharpOption`).
@@ -8498,10 +8796,27 @@ type internal FcsBridge
                   "includeNonPublic", jbool includeNonPublic
                   "results", JsonArray(pageEntries) :> JsonNode ]
 
+            // Additive: only present on a miss, so the ok-path shape is unchanged (#191).
+            // Two distinct miss modes — no assembly resolved for the packageId (the #100 field
+            // failure), versus the assembly resolved but carries no such type.
+            let missFields =
+                if List.isEmpty matchingAssemblies then
+                    NugetPackageMap.missFields packageAssemblies packageId
+                elif List.isEmpty matchedEntities then
+                    let assemblyNames =
+                        matchingAssemblies |> List.map assemblySimpleName |> String.concat ", "
+
+                    let hint =
+                        $"packageId '%s{packageId}' resolved to assembly %s{assemblyNames}, but it exports no type named '%s{typeName}'. Run fcs_nuget_types with the same packageId to list the type names it does export, or fcs_referenced_symbols to search every loaded assembly."
+
+                    [ ("hint", jstr hint) ]
+                else
+                    []
+
             let paginationFields =
                 Cursor.paginationFields "members" dedupedMembers.Length pageOffset pageSize pageEntries.Length
 
-            return jobj (baseFields @ paginationFields) :> JsonNode
+            return jobj (baseFields @ missFields @ paginationFields) :> JsonNode
         }
 
     /// Emit the project's OWN public API surface — every public (and, when
