@@ -227,7 +227,9 @@ project, collapsed to a single `verdict`. No path, no project, no flags needed f
    project files, and duplicates are removed, and `file` reads `"snippet"` — so bare
    expression code without a `module` header is valid.
 4. Collapses the diagnostics into one `verdict` (`clean` / `errors` / `unknown`).
-5. Returns `verdict` + `errorCount` + `warningCount` + a `diagnostics` array filtered to `severity`.
+5. Returns `verdict` + `errorCount` + `warningCount` + a `diagnostics` array filtered to `severity`,
+   plus `totalDiagnostics`/`infoCount`/`belowSeverityFloorCount` covering the full severity set (see
+   below).
 
 ### The stale-`{}` problem it solves
 
@@ -243,7 +245,14 @@ the rest of the scope is incomplete.
    options). Establish project context and retry; do not treat it as a pass.
 2. **`severity` filters the array only** — `errorCount`/`warningCount` always reflect the full
    result regardless of the `severity` cutoff applied to the returned `diagnostics`.
-3. **`speed=fast` is coverage-aware but still cached** — inspect `complete`, `expectedFiles`,
+3. **`totalDiagnostics = errorCount + warningCount + infoCount`, always** — `totalDiagnostics`
+   counts the FULL diagnostic set across every severity (including Info/Hidden), so it can be
+   larger than `errorCount + warningCount` alone and larger than the `diagnostics` array length.
+   `infoCount` is a tally of the Info+Hidden diagnostics in that full set. `belowSeverityFloorCount`
+   says how many of those full-set diagnostics were excluded from `diagnostics` by the `severity`
+   floor (never by the 50-item cap — that is `diagnosticsTruncated`'s job); when it is `> 0`,
+   `diagnosticsNote` spells out the gap and points at `severity="all"`.
+4. **`speed=fast` is coverage-aware but still cached** — inspect `complete`, `expectedFiles`,
    `missingFiles`, `staleFiles`, and `sessionGeneration`. Use the default `trusted` when you need a
    fresh type-check of a just-written on-disk edit.
 

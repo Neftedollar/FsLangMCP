@@ -133,6 +133,9 @@ Response shape:
   "speed": "trusted",
   "errorCount": 0,
   "warningCount": 0,
+  "infoCount": 0,
+  "totalDiagnostics": 0,
+  "belowSeverityFloorCount": 0,
   "fresh": true,
   "groundTruth": true,
   "diagnostics": []
@@ -141,7 +144,12 @@ Response shape:
 
 `verdict` is one of `clean | errors | unknown`. `fresh: true` means the check ran
 a new in-process FCS type-check, not a stale cached snapshot. This solution
-produces a clean verdict.
+produces a clean verdict. `totalDiagnostics` always equals
+`errorCount + warningCount + infoCount` — it counts every severity, including
+Info/Hidden, so it can be larger than `errorCount + warningCount` alone or than
+`diagnostics.length`; `belowSeverityFloorCount` (plus a `diagnosticsNote` when
+it's nonzero) explains the gap when the `severity` floor excludes diagnostics
+from the list.
 
 ---
 
