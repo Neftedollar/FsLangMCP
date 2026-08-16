@@ -168,14 +168,25 @@ let private matchedAssemblies (result: JsonNode) =
     | :? JsonArray as arr -> arr |> Seq.cast<JsonNode> |> Seq.map (fun n -> n.GetValue<string>()) |> Seq.toList
     | _ -> []
 
-let private candidateIds (result: JsonNode) =
+/// Both keys of every candidate row. Reading only `packageId` would let a dropped or
+/// misspelled `assemblies` key survive the whole suite (#191 review M2).
+let private candidateRows (result: JsonNode) =
     match result["candidatePackages"] with
     | :? JsonArray as arr ->
         arr
         |> Seq.cast<JsonNode>
-        |> Seq.map (fun entry -> entry["packageId"].GetValue<string>())
+        |> Seq.map (fun entry ->
+            let assemblies =
+                (entry["assemblies"] :?> JsonArray)
+                |> Seq.cast<JsonNode>
+                |> Seq.map (fun name -> name.GetValue<string>())
+                |> Seq.toList
+
+            entry["packageId"].GetValue<string>(), assemblies)
         |> Seq.toList
     | _ -> []
+
+let private candidateIds (result: JsonNode) = candidateRows result |> List.map fst
 
 // ─────────────────────────────────────────────────────────────────────────────────
 
@@ -276,8 +287,9 @@ type NugetClassFieldTests(fx: FieldProbeFixture) =
 
             // The map came off the fixture's own obj/project.assets.json, so the near miss is
             // named and the agent self-corrects in one turn instead of falling back to
-            // MetadataLoadContext (the #100 field failure).
-            Assert.Contains("fsharp.core", candidateIds result)
+            // MetadataLoadContext (the #100 field failure). The row carries the assembly names
+            // too — that pairing is the whole point of the payload.
+            Assert.Contains(("fsharp.core", [ "FSharp.Core" ]), candidateRows result)
         }
 
     [<Fact>]

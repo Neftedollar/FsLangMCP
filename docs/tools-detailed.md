@@ -212,6 +212,11 @@ success shape is unchanged):
 | `hint` | string | Names the package-id-vs-assembly-name distinction, and distinguishes "not in this project's restore graph" from "restored, but no assembly of it is on the compile line" (analyzer / build-only / runtime-only packages) |
 | `candidatePackages` | array | Up to 5 `{ packageId, assemblies }` entries from the restore graph whose id or assembly names relate to the query, so the correct spelling is one turn away |
 
+The map records **every** restored package, including those that ship no referenceable assembly
+at all (`IncludeAssets=analyzers`, build-only, content-only). Those appear with
+`assemblies: []`, and asking for one by id gets the "restored, but contributes no compile-time
+reference" hint rather than the false "not in this project's restore graph".
+
 ### Caveats
 
 1. **Exact matching, never prefix** — `packageId="System"` matches only the `System.dll`

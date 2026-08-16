@@ -111,16 +111,30 @@ let ``packageAssembliesFromAssets unions compile and runtime and folds every tar
     )
 
 [<Fact>]
-let ``packageAssembliesFromAssets ignores build-only packages, _._ placeholders and non-dll payloads`` () =
+let ``packageAssembliesFromAssets records assembly-less packages with an EMPTY set, not as absent`` () =
     let map = NugetPackageMap.packageAssembliesFromAssets orleansAssets
 
-    // A build/analyzer-only package contributes no assembly at all — it must not appear,
-    // because its presence would claim it ships something.
-    Assert.False(map.ContainsKey "microsoft.orleans.analyzers")
+    // An analyzer/build-only package ships nothing referenceable — but it IS restored, and the
+    // miss payload has to be able to say so instead of "nothing similar is in this project's
+    // restore graph" (#191 review I2). Present key, empty set.
+    Assert.True(map.ContainsKey "microsoft.orleans.analyzers")
+    Assert.Equal<Set<string>>(Set.empty, assemblies map "microsoft.orleans.analyzers")
 
-    // `_._` is NuGet's "contributes nothing for this TFM" marker, and a satellite
-    // `*.resources.dll` under `resource` is not a compile reference.
-    Assert.False(map.ContainsKey "someframework.facade")
+    // Same for a package whose only payloads are the `_._` "contributes nothing for this TFM"
+    // marker and a satellite `*.resources.dll` under `resource` — neither is a compile reference.
+    Assert.True(map.ContainsKey "someframework.facade")
+    Assert.Equal<Set<string>>(Set.empty, assemblies map "someframework.facade")
+
+[<Fact>]
+let ``an empty assembly set never matches an assembly`` () =
+    // The empty set must stay inert on the MATCH path — recording the id may not turn into
+    // claiming it ships something.
+    let map = NugetPackageMap.packageAssembliesFromAssets orleansAssets
+
+    Assert.False(NugetPackageMap.matches map "Microsoft.Orleans.Analyzers" "Microsoft.Orleans.Analyzers.dll")
+    Assert.False(NugetPackageMap.matches map "Microsoft.Orleans.Analyzers" "Orleans.Core.Abstractions")
+    // …while the SimpleName arm still works for it, exactly as before.
+    Assert.True(NugetPackageMap.matches map "Microsoft.Orleans.Analyzers" "Microsoft.Orleans.Analyzers")
 
 [<Theory>]
 [<InlineData("")>]
@@ -150,23 +164,33 @@ let ``packageAssembliesFromReferencePaths reads the id from the global-packages 
         assemblies map "microsoft.orleans.core.abstractions"
     )
 
-[<Fact>]
-let ``packageAssembliesFromReferencePaths honours NUGET_PACKAGES and Windows separators`` () =
-    let previous = Environment.GetEnvironmentVariable "NUGET_PACKAGES"
+// NUGET_PACKAGES is process-wide state, so the one test that writes it runs alone — same
+// device the repo already uses for LSP process isolation (LspBridgeTests.fs). Today nothing
+// else reads the variable concurrently, but a future test that exercises the fallback against
+// the real environment would race silently (#191 review M3).
+[<CollectionDefinition("FsLangMcp environment variable isolation", DisableParallelization = true)>]
+type EnvironmentVariableIsolationCollection() = class end
 
-    try
-        Environment.SetEnvironmentVariable("NUGET_PACKAGES", @"D:\ci\pkgs")
+[<Collection("FsLangMcp environment variable isolation")>]
+type NugetPackagesEnvironmentTests() =
 
-        let map =
-            NugetPackageMap.packageAssembliesFromReferencePaths
-                [ @"-r:D:\ci\pkgs\microsoft.orleans.core.abstractions\9.0.0\lib\net8.0\Orleans.Core.Abstractions.dll" ]
+    [<Fact>]
+    member _.``packageAssembliesFromReferencePaths honours NUGET_PACKAGES and Windows separators``() =
+        let previous = Environment.GetEnvironmentVariable "NUGET_PACKAGES"
 
-        Assert.Equal<Set<string>>(
-            Set.ofList [ "Orleans.Core.Abstractions" ],
-            assemblies map "microsoft.orleans.core.abstractions"
-        )
-    finally
-        Environment.SetEnvironmentVariable("NUGET_PACKAGES", previous)
+        try
+            Environment.SetEnvironmentVariable("NUGET_PACKAGES", @"D:\ci\pkgs")
+
+            let map =
+                NugetPackageMap.packageAssembliesFromReferencePaths
+                    [ @"-r:D:\ci\pkgs\microsoft.orleans.core.abstractions\9.0.0\lib\net8.0\Orleans.Core.Abstractions.dll" ]
+
+            Assert.Equal<Set<string>>(
+                Set.ofList [ "Orleans.Core.Abstractions" ],
+                assemblies map "microsoft.orleans.core.abstractions"
+            )
+        finally
+            Environment.SetEnvironmentVariable("NUGET_PACKAGES", previous)
 
 [<Fact>]
 let ``packageAssembliesFromReferencePaths ignores paths that are not package-cache shaped`` () =
@@ -229,14 +253,25 @@ let private hintOf (fields: (string * JsonNode) list) =
             None)
     |> Option.defaultValue ""
 
-let private candidatePackagesOf (fields: (string * JsonNode) list) =
+/// Reads BOTH keys of every candidate row. Reading only `packageId` would let a dropped or
+/// misspelled `assemblies` key pass the whole suite, and the spec requires each candidate to
+/// carry its assembly simple names (#191 review M2).
+let private candidateRowsOf (fields: (string * JsonNode) list) =
     fields
     |> List.tryPick (fun (name, value) -> if name = "candidatePackages" then Some value else None)
     |> Option.map (fun node ->
         (node :?> JsonArray)
-        |> Seq.map (fun entry -> entry["packageId"].GetValue<string>())
+        |> Seq.map (fun entry ->
+            let assemblies =
+                (entry["assemblies"] :?> JsonArray)
+                |> Seq.map (fun name -> name.GetValue<string>())
+                |> Seq.toList
+
+            entry["packageId"].GetValue<string>(), assemblies)
         |> Seq.toList)
     |> Option.defaultValue []
+
+let private candidatePackagesOf (fields: (string * JsonNode) list) = candidateRowsOf fields |> List.map fst
 
 [<Fact>]
 let ``candidates suggests the package whose ASSEMBLY name the caller passed`` () =
@@ -274,7 +309,13 @@ let ``missFields names the id-versus-assembly distinction and lists candidates``
     Assert.Contains("package id", hint)
     Assert.Contains("SimpleName", hint)
     Assert.Contains("candidatePackages", hint)
-    Assert.Equal<string list>([ "microsoft.orleans.core.abstractions" ], candidatePackagesOf fields)
+
+    // Both keys of the row, not just the id: the assembly names are what let an agent see that
+    // the id it guessed and the assembly it knows are two different strings.
+    Assert.Equal<(string * string list) list>(
+        [ "microsoft.orleans.core.abstractions", [ "Orleans.Core.Abstractions" ] ],
+        candidateRowsOf fields
+    )
 
 [<Fact>]
 let ``missFields on a total miss still explains the id-versus-assembly distinction`` () =
@@ -296,6 +337,22 @@ let ``missFields distinguishes restored-but-not-on-the-compile-line from unknown
     let hint = hintOf (NugetPackageMap.missFields map "Split.Refs")
     Assert.Contains("restore graph", hint)
     Assert.Contains("compile line", hint)
+
+[<Fact>]
+let ``missFields tells an analyzer-package caller the package IS restored`` () =
+    // Regression for #191 review I2. Microsoft.Orleans.Analyzers ships no compile/runtime
+    // assembly at all, so it used to be absent from the map, and asking for it produced the
+    // flatly false "nothing similar is in this project's restore graph".
+    let map = NugetPackageMap.packageAssembliesFromAssets orleansAssets
+    let fields = NugetPackageMap.missFields map "Microsoft.Orleans.Analyzers"
+
+    let hint = hintOf fields
+    Assert.Contains("restore graph", hint)
+    Assert.Contains("compile line", hint)
+    Assert.DoesNotContain("nothing similar", hint)
+
+    // …and it is reported as shipping nothing, rather than omitted from the candidate list.
+    Assert.Contains(("microsoft.orleans.analyzers", []), candidateRowsOf fields)
 
 [<Fact>]
 let ``missFields always emits both keys so the response shape is stable`` () =
@@ -336,6 +393,18 @@ let ``the parser handles this repo's REAL project assets file`` () =
     // Multi-assembly package: one id, two shipped assemblies.
     Assert.Contains("FSharp.DependencyManager.Nuget", assemblies map "fsharp.compiler.service")
 
+    // Real analyzer packages this project references with IncludeAssets=analyzers: restored,
+    // present in the map, shipping nothing referenceable (#191 review I2). Asserted on real
+    // data because the synthetic fixture cannot prove NuGet actually emits them this way.
+    for analyzerPackage in [ "fsharp.analyzers.build"; "g-research.fsharp.analyzers"; "ionide.analyzers" ] do
+        Assert.True(map.ContainsKey analyzerPackage, $"{analyzerPackage} must be recorded as restored.")
+        Assert.Equal<Set<string>>(Set.empty, assemblies map analyzerPackage)
+
+    let hint = hintOf (NugetPackageMap.missFields map "Ionide.Analyzers")
+
+    Assert.Contains("restore graph", hint)
+    Assert.DoesNotContain("nothing similar", hint)
+
 [<Fact>]
 let ``this repo's own restore contains a package whose assembly name differs from its id`` () =
     let map = realAssetsMap ()
@@ -347,8 +416,12 @@ let ``this repo's own restore contains a package whose assembly name differs fro
         map
         |> Map.toList
         |> List.filter (fun (packageId, names) ->
-            names
-            |> Set.forall (fun name -> not (String.Equals(name, packageId, StringComparison.OrdinalIgnoreCase))))
+            // `Set.forall` is vacuously true on the empty set, and since #191 review I2 the map
+            // deliberately carries assembly-less packages — exclude them or every analyzer
+            // package would masquerade as a name mismatch and hollow out this invariant.
+            not (Set.isEmpty names)
+            && names
+               |> Set.forall (fun name -> not (String.Equals(name, packageId, StringComparison.OrdinalIgnoreCase))))
         |> List.map fst
 
     Assert.NotEmpty(mismatched)
@@ -371,8 +444,14 @@ let ``the assets parser and the -r: fallback agree on this repo's real reference
     task {
         // Two independent derivations of the same ground truth: one reads the restore graph,
         // the other reads the compile line MSBuild produced from it. Asserting they agree
-        // catches drift in either — and, because CI runs this on Windows too, it exercises the
-        // fallback's backslash/`%USERPROFILE%\.nuget\packages` handling for real.
+        // catches drift in either.
+        //
+        // It is also the only place the fallback meets a REAL package-cache root. ci.yml and
+        // publish.yml run the suite on ubuntu only, so `live-fsac.yml` runs this family — by
+        // name — on its Windows leg specifically to exercise
+        // `%USERPROFILE%\.nuget\packages` and backslash-separated `-r:` options for real. If
+        // that step is ever removed, Windows path handling falls back to being pinned only by
+        // the synthetic string test above (#191 review I1).
         let root = repoRoot ()
         let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
         let bridge = FcsBridge()
@@ -393,6 +472,10 @@ let ``the assets parser and the -r: fallback agree on this repo's real reference
             $"The -r: derivation found only {fromReferencePaths.Count} packages in {otherOptions.Length} compiler options; it is not reading the global-packages layout."
         )
 
+        // Direction checked: everything the compile line yields must be in the restore graph and
+        // agree with it. The reverse does NOT hold by construction — the assets map is a superset
+        // by the packages that ship no referenceable assembly at all (#191 review I2), which on
+        // this repo is exactly the three analyzer packages (55 from -r:, 58 from assets).
         let disagreements =
             fromReferencePaths
             |> Map.toList
@@ -403,7 +486,10 @@ let ``the assets parser and the -r: fallback agree on this repo's real reference
                     Some $"{packageId}: -r: says {Set.toList names}, assets says {Set.toList assetNames}"
                 | None -> Some $"{packageId}: derived from -r: but absent from the assets graph")
 
-        Assert.Equal<string list>([], disagreements)
+        Assert.True(
+            List.isEmpty disagreements,
+            $"{List.length disagreements} of {fromReferencePaths.Count} -r:-derived packages disagree with the {fromAssets.Count}-package assets graph: {disagreements}"
+        )
 
         // The fallback must fix #191 on its own, not only alongside the assets file.
         Assert.True(

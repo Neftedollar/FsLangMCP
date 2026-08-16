@@ -26,9 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Miss payloads on both tools now explain themselves.** When no assembly matches the
   `packageId`, the response additively carries `hint` (which names the
   package-id-vs-assembly-name distinction, and separates "not in this project's restore
-  graph" from "restored, but no assembly of it is on the compile line") and
-  `candidatePackages` (up to 5 `{ packageId, assemblies }` entries from the restore graph
-  whose id or assembly names relate to the query). `fcs_nuget_members` additionally emits a
+  graph" from "restored, but no assembly of it is on the compile line" — including
+  analyzer/build-only packages, which are recorded with an empty assembly list rather than
+  omitted) and `candidatePackages` (up to 5 `{ packageId, assemblies }` entries from the
+  restore graph whose id or assembly names relate to the query). `fcs_nuget_members` additionally emits a
   `hint` when the assembly resolved but exports no such type, naming the assembly searched
   and pointing at `fcs_nuget_types`. Success-path responses are unchanged — the fields are
   absent on a hit.

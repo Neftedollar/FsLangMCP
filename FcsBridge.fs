@@ -1625,7 +1625,10 @@ type private CheckTargetDiscoveryResult =
 module internal NugetPackageMap =
 
     /// packageId (lower-cased — NuGet ids are case-insensitive) → assembly SimpleNames in
-    /// their shipped casing.
+    /// their shipped casing. An EMPTY set is meaningful and distinct from an absent key: the
+    /// package is in the restore graph but ships no compile/runtime assembly (analyzer,
+    /// build-only, content-only). Keeping those ids lets the miss payload say "restored, but
+    /// contributes no reference" instead of the false "not in this project's restore graph".
     type PackageAssemblies = Map<string, Set<string>>
 
     let private fileNameOf (path: string) =
@@ -1646,6 +1649,18 @@ module internal NugetPackageMap =
             Some(fileName.Substring(0, fileName.Length - 4))
         else
             None
+
+    /// Record that the package exists in the restore graph, without claiming it ships anything.
+    let private addPackage (packageId: string) (map: PackageAssemblies) =
+        if String.IsNullOrWhiteSpace packageId then
+            map
+        else
+            let key = packageId.ToLowerInvariant()
+
+            if Map.containsKey key map then
+                map
+            else
+                Map.add key Set.empty map
 
     let private addAssembly (packageId: string) (assemblyName: string) (map: PackageAssemblies) =
         if String.IsNullOrWhiteSpace packageId || String.IsNullOrWhiteSpace assemblyName then
@@ -1668,6 +1683,8 @@ module internal NugetPackageMap =
     /// `type: "project"` entries (ProjectReference, payload `bin/placeholder/<AssemblyName>.dll`)
     /// are kept deliberately: they give the same project-name → assembly-name mapping for a
     /// project whose <AssemblyName> was renamed, and their key is `<Name>/<Version>` too.
+    /// Every well-formed library entry contributes its id, even when it names no `.dll` at all —
+    /// see the `PackageAssemblies` doc for why an empty set is not the same as an absent key.
     let packageAssembliesFromAssets (assetsJson: string) : PackageAssemblies =
         try
             match JsonNode.Parse assetsJson with
@@ -1686,6 +1703,12 @@ module internal NugetPackageMap =
 
                                 match library.Value with
                                 | :? JsonObject as sections ->
+                                    // Register the id first: a package that ships no assembly at
+                                    // all (analyzer, build-only, content-only) is still restored,
+                                    // and the miss payload must be able to say so rather than
+                                    // claim it is absent from the graph (#191 review I2).
+                                    map <- addPackage packageId map
+
                                     for sectionName in [ "compile"; "runtime" ] do
                                         match sections[sectionName] with
                                         | :? JsonObject as files ->
@@ -1886,7 +1909,11 @@ module internal NugetPackageMap =
 
         let hint =
             if restored then
-                $"'%s{packageId}' is in this project's restore graph, but none of the assemblies it ships are on the compile line — analyzer/build-only/runtime-only packages contribute no compile-time reference. candidatePackages lists what it does ship; fcs_referenced_symbols searches the assemblies that ARE loaded."
+                // Reachable for BOTH shapes since #191 review I2: a package that ships assemblies
+                // none of which are on the compile line (runtime-only, ExcludeAssets=compile), and
+                // one that ships none at all (analyzer, build-only) — the latter arrives here with
+                // an empty assembly set, and `candidatePackages` shows it as `assemblies: []`.
+                $"'%s{packageId}' is in this project's restore graph, but none of the assemblies it ships are on the compile line — analyzer/build-only/runtime-only packages contribute no compile-time reference. candidatePackages shows which assemblies it ships, if any; fcs_referenced_symbols searches the assemblies that ARE loaded."
             elif not (List.isEmpty closest) then
                 $"No referenced assembly matches packageId '%s{packageId}'. packageId accepts EITHER the NuGet package id OR the assembly SimpleName it ships, and the two differ for many packages (Microsoft.Orleans.Core.Abstractions ships Orleans.Core.Abstractions.dll). See candidatePackages for the closest entries in this project's restore graph."
             else
