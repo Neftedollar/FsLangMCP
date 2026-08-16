@@ -40,6 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consolidation, not a registered tool — no consumer could have observed this), which was silently
   always `0`: it read the JSON `severity` field as an int, but that field is serialized as text
   (`"Error"`) — the read never matched.
+- `check`'s `scope='workspace'` `perProject` entries now carry `infoCount` too (#205, deferred from
+  #190), so a member project's own `errorCount + warningCount + infoCount` identity holds
+  per-project, not just at the workspace total — the same genuine tally
+  (`countInfoDiagnostics`) used everywhere else, not a `total - error - warning` remainder.
 - `fcs_nuget_types` / `fcs_nuget_members` now resolve a NuGet **package id** whose
   assembly is named something else. Both matched the assembly `SimpleName` alone, so
   `Microsoft.Orleans.Core.Abstractions` (which ships `Orleans.Core.Abstractions.dll`)
