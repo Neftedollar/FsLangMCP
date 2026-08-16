@@ -37,6 +37,11 @@ test:
 
 check: build test
 
+# Drive the built server over real stdio against a project pinning an absent SDK
+# (#192 acceptance criterion). Skips itself when nothing is built yet.
+e2e-sdk-pin: build
+    FSLANGMCP_SERVER_DLL=bin/Debug/net10.0/FsLangMcp.dll python3 -m unittest -v scripts.tests.test_sdk_pin_preflight_e2e
+
 audit-descriptions:
     python3 scripts/audit-tool-descriptions.py
 
