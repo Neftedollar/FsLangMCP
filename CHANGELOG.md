@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.16.0] - 2026-08-16
 
-0.16.0 closes three field-reported gaps where a payload's own numbers didn't explain themselves: `check`'s `totalDiagnostics` now reconciles with `errorCount + warningCount + infoCount` (workspace-wide and per-project), NuGet package-id-to-assembly resolution no longer returns an empty-but-`ok` payload when the assembly ships under a different name, and an unsatisfiable SDK pin now returns a typed `sdk_not_found` error instead of a lost transport connection. `set_project`'s `not_warmed` readiness state and `find`'s new `scopeNote` report sweep/readiness coverage honestly — what wasn't observed, and how many projects a sweep actually covered — instead of guessing or staying silent. `fcs_public_api` and `fcs_file_outline` now close pages on a response-size budget as well as by count, so API-dense types can no longer produce an oversized inline payload. `find` also gains a field-impact mode, classifying record-field sites into five shapes instead of three and annotating each with its current type, so a field-type change can be planned from the tool output alone.
+0.16.0 closes three field-reported gaps where a payload's own numbers didn't explain themselves: `check`'s `totalDiagnostics` now reconciles with `errorCount + warningCount + infoCount` (workspace-wide and per-project), NuGet package-id-to-assembly resolution no longer returns an empty-but-`ok` payload when the assembly ships under a different name, and an unsatisfiable SDK pin now returns a typed `sdk_not_found` error instead of a lost transport connection. `set_project`'s `not_warmed` readiness state and `find`'s new `scopeNote` report sweep/readiness coverage honestly — what wasn't observed, and how many projects a sweep actually covered — instead of guessing or staying silent. `fcs_public_api` and `fcs_file_outline` now close pages on a response-size budget as well as by count, so a page no longer goes oversized merely because `maxResults` still had room by count (a single pathological entity can still exceed the budget by design — at least one entity is always returned). `find` also gains a field-impact mode, classifying record-field sites into five shapes instead of three and annotating each with its current type, so a field-type change can be planned from the tool output alone.
 
 ### Fixed
 
@@ -897,10 +897,14 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
 <!--
   Compare links: only versions that exist as git tags are linked.
   Earlier releases (0.2.0, 0.3.0, 0.3.1, 0.4.0) shipped without tags;
-  backfilling them would point at synthetic refs.
+  backfilling them would point at synthetic refs. 0.14.0 is the same case:
+  it was prepared but never tagged or published (see the 0.15.0 entry
+  above), so it has no link definition either — 0.15.0 compares from the
+  last version that actually was tagged, 0.13.2.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.14.0...HEAD
-[0.14.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.13.2...v0.14.0
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.13.2...v0.15.0
 [0.13.2]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.13.2
 [0.13.1]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.13.1
 [0.13.0]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.13.0

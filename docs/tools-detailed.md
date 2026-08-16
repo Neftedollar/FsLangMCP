@@ -174,7 +174,7 @@ a different edit:
 | `field-pattern` | `\| { Field = binding } ->` | change the pattern / the binding's downstream use |
 | `field-read` | `x.Field` in an expression | the read's result type changes — follow the ripple |
 
-`field-set-mutation` and `field-pattern` are new in this release. Both used to be reported as
+`field-set-mutation` and `field-pattern` are new in v0.16.0. Both used to be reported as
 `field-read`, which for a mutation labelled a **write** as a read. `breakdown` gains the matching
 `fieldSetMutation` / `fieldPattern` counters; the existing counters keep their meaning, and
 `fieldRead` now means only "an expression that reads the field".

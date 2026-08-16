@@ -41,6 +41,11 @@ CURRENT typecheck resolves it at that site, plus a `siteTypes` ledger (`typed + 
 fieldSites`). It never predicts the post-edit type: edit the sites, then run `check`. See
 `docs/tools-detailed.md`.
 
+**Changed in v0.16.0:** `field-set-mutation` (`x.Field <- v`) and `field-pattern`
+(`| { Field = x } ->`) are new kinds — both used to be reported as `field-read`, mislabeling a
+write as a read. `fieldRead` counts in `breakdown` drop accordingly; the new
+`fieldSetMutation` / `fieldPattern` counters make up the difference.
+
 **Absence contract:** inspect `outcome` and `coverage.complete`. A complete miss returns
 `outcome="not_found"` and `resolution.matched=false`. A failed/timed-out project makes absence
 indeterminate (`status="unknown"`, `outcome="indeterminate"`, `matched=null`); positive results
@@ -77,7 +82,8 @@ zero-error snapshot is `unknown`, never `clean`.
 `infoCount` tallies the Info/Hidden diagnostics in the full set, and `belowSeverityFloorCount`
 (plus a `diagnosticsNote` when nonzero) explains how many of them the `severity` floor excluded
 from the `diagnostics` array. `scope='workspace'` carries the same `infoCount` on every
-`perProject[]` entry, not just the workspace total.
+**successfully analyzed** `perProject[]` entry, not just the workspace total — a timed-out,
+unrestored, or errored entry carries no counts at all.
 
 ---
 
