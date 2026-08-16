@@ -38,6 +38,11 @@ let toolResult (work: Task<JsonNode>) : Task<Result<Content list, McpError>> =
             let! payload = work
             return Ok [ Content.text (renderToken payload) ]
         with
+        // #192: an unsatisfiable global.json pin is machine configuration, not a tool
+        // fault. Rendering it here — ahead of every other arm — is what makes every
+        // consumer of EnsureProjectResults report the same typed sdk_not_found
+        // envelope instead of a generic "Unable to load F# project options".
+        | SdkPreflight.SdkPinUnsatisfiable failure -> return Ok [ Content.text (renderToken failure.Envelope) ]
         | :? OperationCanceledException as ex ->
             // TaskCanceledException is a subclass of OperationCanceledException — both caught here
             let err = FcsAborted ex.Message
