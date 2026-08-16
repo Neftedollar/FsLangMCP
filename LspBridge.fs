@@ -492,12 +492,15 @@ module internal LspResponseShape =
             if symbolIndexReady then
                 "ready", null
             elif lspReady && warmupWindowElapsed workspaceReadyAt now warmupWindow then
-                // The window has passed and the index still hasn't produced a
-                // single non-empty result (#194) — "warming" would be a lie at
-                // this point, so say plainly that it stalled and what still works.
+                // The window has passed with no non-empty index result observed
+                // (#194) — "warming" would be a lie at this point. But the FSAC
+                // probe is only sent when find's own FCS sweep comes up empty
+                // (Dispatcher.fs), so absence of a warm signal is not proof the
+                // index failed to warm — a healthy session that never needed the
+                // probe looks identical. Say what was (not) observed, not a verdict.
                 "not_warmed",
                 jstr
-                    $"FSAC's symbol index did not warm within {int warmupWindow.TotalSeconds}s. find and check are unaffected (they use FCS sweeps); only the symbol-index fallback inside position-based LSP tools may be degraded."
+                    $"FSAC's symbol index has not been observed warm within {int warmupWindow.TotalSeconds}s of workspace load. find and check are unaffected (they use FCS sweeps); only the symbol-index fallback inside position-based LSP tools may be degraded."
             elif lspReady then
                 "warming",
                 jstr
@@ -2058,12 +2061,26 @@ type internal FsAutoCompleteBridge
                                 else
                                     "warming"
 
+                            // workspaceReadyAt is a multi-field struct (DateTimeOffset voption),
+                            // unlike its bool neighbours above it isn't read-atomic, and it can be
+                            // written concurrently by another gate-holding SetProject/cleanup call
+                            // (#194 review, M7). Snapshot it under the same gate discipline as
+                            // WorkspaceSymbolForContext's read of the same field, rather than
+                            // reading the mutable field directly after the gate was released above.
+                            do! gate.WaitAsync()
+
+                            let workspaceReadyAtSnapshot =
+                                try
+                                    workspaceReadyAt
+                                finally
+                                    gate.Release() |> ignore
+
                             let readinessNode =
                                 LspResponseShape.setProjectReadiness
                                     ready
                                     symbolIndexEverWarmed
                                     (restartLsp || live)
-                                    workspaceReadyAt
+                                    workspaceReadyAtSnapshot
                                     DateTimeOffset.UtcNow
                                     LspResponseShape.symbolIndexWarmupWindow
 

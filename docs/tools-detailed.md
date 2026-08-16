@@ -27,33 +27,43 @@ to do about it.
 | `symbolIndexState` | Meaning | What still works |
 |---|---|---|
 | `ready` | The FSAC symbol index has produced at least one non-empty `workspace/symbol` result. | Everything, including symbol-index fallback. |
-| `warming` | The LSP is up but the index hasn't warmed yet, and the warm-up window since workspace-ready hasn't elapsed. | `find` and `check` (FCS sweeps, not index-dependent). Wait briefly and retry symbol-index-dependent calls. |
-| `not_warmed` | The LSP is up, but the warm-up window since workspace-ready has already elapsed with no non-empty index result (#194). | `find` and `check` remain unaffected. Only the symbol-index fallback inside position-based LSP tools may be degraded — this is a terminal-for-now state, not "still loading". |
-| `blocked_on_lsp` | A restart was requested but FSAC never reached workspace-ready. | Nothing LSP-dependent. Retry `set_project` with `restartLsp=true`. |
-| `not_started` | The LSP was never started for this session. | Nothing LSP-dependent. Call `set_project` with `restartLsp=true`. |
+| `warming` | The LSP is up but the index hasn't warmed yet, and either the warm-up window since workspace-ready hasn't elapsed, or `workspaceReadyAt` itself isn't known yet (nothing to measure elapsed time from). | `find` and `check` (FCS sweeps, not index-dependent). Wait briefly and retry symbol-index-dependent calls. |
+| `not_warmed` | The LSP is up, and the warm-up window since workspace-ready has elapsed with no non-empty index result **observed** (#194) — this reports absence of evidence, not a diagnosis. See Caveats: a healthy session can sit here indefinitely. | `find` and `check` remain unaffected. Only the symbol-index fallback inside position-based LSP tools may be degraded — this is a terminal-for-now state, not "still loading". |
+| `blocked_on_lsp` | FSAC has a live process tracked, or a restart was explicitly requested, but this call never observed workspace-ready. Covers both a `restartLsp=true` call whose readiness wait timed out and a `restartLsp=false` call reusing an already-live-but-not-yet-ready session. | Nothing LSP-dependent. Retry `set_project` with `restartLsp=true`. |
+| `not_started` | Neither a restart was requested nor is an LSP process currently live. Covers a session that never started the LSP as well as one that started and has since died or been stopped. | Nothing LSP-dependent. Call `set_project` with `restartLsp=true`. |
 
 ### How it works internally
 
-`warming` and `not_warmed` are distinguished by comparing elapsed time since `workspaceReadyAt`
-against a shared warm-up window (`symbolIndexWarmupWindow`, 3 seconds) — the same window and the
-same `workspaceReadyAt` timestamp that `find`-adjacent `workspace_symbol` calls use to decide
-whether an empty result means "still indexing" or "genuinely no matches". `set_project` never
-invents a second timing mechanism; it reuses this one so the two surfaces agree.
+`warming` and `not_warmed` compare elapsed time since `workspaceReadyAt` against a shared warm-up
+window (`symbolIndexWarmupWindow`, 3 seconds) — the same window and the same `workspaceReadyAt`
+timestamp that `find`-adjacent `workspace_symbol` calls use. Sharing the inputs is where the
+agreement ends: past that window, `assessSymbolIndex` (used by `workspace_symbol`) and
+`setProjectReadiness` (used by `set_project`) answer different questions from the same elapsed
+time. `assessSymbolIndex` returns `true` — "an empty result is now trustworthy; stop treating it
+as still-indexing." `setProjectReadiness` returns `not_warmed` — "no warm signal has been
+observed yet." Reusing the window and timestamp gives `set_project` one timing source instead of
+two duplicated `TimeSpan.FromSeconds 3.0` literals; it does not make the two surfaces agree on
+what elapsed time means.
 
 ### Caveats
 
-1. **`not_warmed` is not an error.** `find` and `check` never depend on the FSAC symbol index —
-   they sweep FCS project options directly — so a session stuck at `not_warmed` can still be used
-   normally for the primary tools. Only the symbol-index fallback path inside position-based LSP
-   tools is degraded.
+1. **`not_warmed` is not evidence of a problem.** FSAC's symbol index is queried only as a
+   fallback, when `find`'s own FCS sweep comes up empty. A session where `find` keeps resolving
+   through FCS may never query the index at all, so `not_warmed` can be the expected, indefinite
+   steady state of a perfectly healthy session — not a fault to chase. `find` and `check` never
+   depend on the FSAC symbol index — they sweep FCS project options directly — so a session stuck
+   at `not_warmed` can be used normally for the primary tools regardless. Only the symbol-index
+   fallback path inside position-based LSP tools is degraded.
 2. **The boolean `symbolIndex` field never changes shape.** `symbolIndexState` /
    `symbolIndexHint` are additive; existing integrations reading only the booleans are unaffected.
 
 ### Related tools
 
-- `find` / `check` — unaffected by `symbolIndexState`; safe to use in any state.
+- `find` / `check` — unaffected by `symbolIndexState`; safe to use in any state, including
+  `not_warmed`.
 - `fsharp_runtime_status` — inspect whether the FSAC child process itself is healthy when
-  `symbolIndexState` stays `not_warmed` or `blocked_on_lsp` longer than expected.
+  `symbolIndexState` stays `blocked_on_lsp` longer than expected. `not_warmed` alone is not that
+  signal — see Caveats.
 
 ---
 

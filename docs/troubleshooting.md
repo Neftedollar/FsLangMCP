@@ -76,9 +76,13 @@ with no result yet — see `docs/tools-detailed.md#set_project`), or an LSP that
 
 **What to do:** Start using `find`, `check`, and outline tools normally. They
 trigger on-demand type-checking per file and don't depend on a fully warmed
-global index — this holds for `not_warmed` too, not just `warming`. If
-`symbolIndex` stays `false` for more than a few minutes on a medium-sized
-project, run `project_health` to check for underlying issues.
+global index — this holds for `not_warmed` too, not just `warming`.
+`not_warmed` in particular can be a permanent, healthy state: the FSAC symbol
+index is only queried as a fallback when `find`'s own FCS sweep comes up
+empty, so a session where `find` keeps resolving normally may never warm the
+index at all. Only reach for `project_health` if a symbol-index-dependent
+call has actually failed or `readiness.lsp` itself isn't `true` — `not_warmed`
+by itself is not that signal.
 
 ---
 

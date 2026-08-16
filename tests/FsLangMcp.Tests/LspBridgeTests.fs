@@ -1812,7 +1812,11 @@ let ``setProjectReadiness reports not_warmed once the warmup window has elapsed 
 
     Assert.False(readiness["symbolIndex"].GetValue<bool>())
     Assert.Equal("not_warmed", readiness["symbolIndexState"].GetValue<string>())
-    Assert.Contains("did not warm within 3s", readiness["symbolIndexHint"].GetValue<string>())
+    // Observation-honest wording (#194 review, I1): reports what was not
+    // observed, not a diagnosis — the FSAC probe this depends on is only
+    // sent when find's own FCS sweep comes up empty, so a healthy session
+    // that never needed the probe looks identical to one that "failed".
+    Assert.Contains("has not been observed warm within 3s", readiness["symbolIndexHint"].GetValue<string>())
     Assert.Contains("find and check are unaffected", readiness["symbolIndexHint"].GetValue<string>())
     Assert.Contains("FCS sweeps", readiness["symbolIndexHint"].GetValue<string>())
 
