@@ -709,6 +709,39 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
         }
 
     [<Fact>]
+    member _.``#193 round 2: a single-project sweep with incomplete coverage and no file filter combines both honestly``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // The fourth (coverageComplete, filterPath) combination — round 2's commit
+            // (f68fc51) claimed all four were tested, but this one (single project,
+            // non-file scope, incomplete coverage) was not. Reached via an explicit
+            // .fsproj projectPath with timeoutMs=0: the project times out before
+            // analysis runs, so the note must say "could not fully analyze" rather
+            // than "swept", and — since scope != 'file' — there is no file filter to
+            // name, only the sibling-project blind spot.
+            let! find =
+                bridge.Find(
+                    { findArgs fx.DomainFsproj "TraderRole" with
+                        timeoutMs = Some 0 }
+                )
+
+            Assert.Equal("unknown", gs find "status")
+            Assert.Equal(1, gi find "projectsRequested")
+            Assert.Equal(0, gi find "projectsAnalyzed")
+            Assert.Equal(0, gi find "projectsFailed")
+            Assert.Equal(1, gi find "projectsTimedOut")
+
+            Assert.Equal(
+                "find could not fully analyze this project (0 failed, 1 timed out) — this response is incomplete; see coverage/message before trusting an absence of matches. Cross-project usages in sibling projects are also not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.",
+                gs find "scopeNote"
+            )
+        }
+
+    [<Fact>]
     member _.``find reports matched=false ONLY when the symbol is truly absent everywhere``() : Task =
         task {
             Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")

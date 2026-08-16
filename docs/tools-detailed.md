@@ -20,8 +20,9 @@ The consolidation aliases below were removed in v0.13.1 and are no longer regist
 solution and unions definitions, references, record-field set sites, and member-usage sites.
 Bare `find(query)` suffices; optional `kind`
 (`auto`|`symbol`|`members`|`field`|`definition`|`position`) and `scope` narrow it. Every response
-carries a top-level `scopeNote` naming how many projects were actually swept and how to
-widen/narrow (#193 — see below). Prefer over text search for cross-project refactors.
+that completes a sweep carries a top-level `scopeNote` naming how many projects were actually
+swept and how to widen/narrow (#193 — see below); early validation failures and `kind=position`
+resolution failures do not. Prefer over text search for cross-project refactors.
 
 **Signature:** `query` is the only required argument. `kind` (default `auto`) and `scope` (default
 `auto`) shape the sweep. `exact` (default `true`) toggles exact-vs-substring matching. `member` /
@@ -43,9 +44,12 @@ common case is a single argument.
 Sweep breadth is unchanged by any `scope` value — `auto`/`workspace` always sweep every member
 project the resolved sweep target actually has, exactly as `file`/`project` always narrow to one.
 What's new is that **every response that completes a sweep carries a top-level `scopeNote`**
-(everything except the two `invalid_args` envelopes — `succeeded`, `partial`, and `unknown` all get
-one) reporting the real outcome (driven by `projectsSwept`/`projectsAnalyzed`, not by which `scope`
-string was requested) and the recipe to change it:
+(`succeeded`, `partial`, and `unknown` all get one) reporting the real outcome (driven by
+`projectsSwept`/`projectsAnalyzed`, not by which `scope` string was requested) and the recipe to
+change it. Responses that never reach a sweep carry no `scopeNote` at all: the query-validation and
+zero-projects `invalid_args` envelopes, and — for `kind=position`, which resolves the symbol under
+the cursor before sweeping — its own failure statuses (`aborted`, `invalid_args` on an out-of-range
+line, `no_candidate`, `no_symbol`).
 
 - **One project swept** — however the sweep target arrived (an explicit `.fsproj` `projectPath`, a
   `path`-derived fallback, or a solution/directory that itself has only one member project): the
