@@ -69,20 +69,88 @@ let private appFs =
           "let useRole (role: TraderRole) = role.Propose 1 2"
           "" ]
 
-let private leafProject (sourceFile: string) =
+// ── #207 field-impact sources ──────────────────────────────────────────────────
+// A SECOND record, defined in Domain and consumed only from App, carrying every
+// field-site shape a field-type change has to edit differently: construction literal,
+// copy-and-update, mutation of a `mutable` field, pattern destructuring, and plain
+// expression reads. Deliberately disjoint from TraderRole/Propose (no "role" substring
+// anywhere) so the existing exact/non-exact TraderRole assertions keep their counts.
+
+let private shippingFs =
+    String.concat
+        "\n"
+        [ "namespace Domain.Shipping"
+          ""
+          "/// Two fields of DIFFERENT types, so one query's site rows must carry"
+          "/// different siteType values. `Attempts` is mutable → mutation sites exist."
+          "type Shipment ="
+          "    { Code: string"
+          "      mutable Attempts: int }"
+          ""
+          "/// Generic record: pins the documented limit that siteType reports the type"
+          "/// PARAMETER, not the instantiation at the site (FCS gives no per-use"
+          "/// generic arguments for record fields)."
+          "type Box<'T> = { Value: 'T }"
+          "" ]
+
+let private impactFs =
+    String.concat
+        "\n"
+        [ "module App.Impact"
+          ""
+          "open Domain.Shipping"
+          ""
+          "// I1: record-literal construction — two field-set-literal sites"
+          "let create (code: string) : Shipment = { Code = code; Attempts = 0 }"
+          ""
+          "// I2: copy-and-update — one field-set-update site"
+          "let retitle (s: Shipment) (code: string) = { s with Code = code }"
+          ""
+          "// I3: mutation on the LHS + expression read on the RHS, same line"
+          "let bump (s: Shipment) = s.Attempts <- s.Attempts + 1"
+          ""
+          "// I4: expression read"
+          "let codeLength (s: Shipment) = s.Code.Length"
+          ""
+          "// I5: pattern destructuring"
+          "let codeOf (s: Shipment) ="
+          "    match s with"
+          "    | { Code = c } -> c"
+          ""
+          "// I6: SynExpr.DotSet mutation. FCS reports this symbol use over the WHOLE"
+          "// target expression (`parcels[0].Attempts`), not just the field ident, so the"
+          "// parse-tree lookup only lines up on the END position — the case the"
+          "// FieldSiteForms.MutationEnds fallback exists for."
+          "let parcels = [| create \"a\" |]"
+          "let bumpFirst () = parcels[0].Attempts <- 5"
+          ""
+          "// I7: generic-record literal + read sites"
+          "let intBox: Box<int> = { Value = 1 }"
+          "let textBox: Box<string> = { Value = \"x\" }"
+          "let readInt = intBox.Value"
+          "let readText = textBox.Value"
+          "" ]
+
+let private leafProject (sourceFiles: string list) =
+    let compiles =
+        sourceFiles |> List.map (fun f -> $"<Compile Include=\"{f}\" />") |> String.concat ""
+
     String.concat
         "\n"
         [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
           "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
-          $"  <ItemGroup><Compile Include=\"{sourceFile}\" /></ItemGroup>"
+          $"  <ItemGroup>{compiles}</ItemGroup>"
           "</Project>" ]
 
-let private refProject (sourceFile: string) (refRelative: string) =
+let private refProject (sourceFiles: string list) (refRelative: string) =
+    let compiles =
+        sourceFiles |> List.map (fun f -> $"<Compile Include=\"{f}\" />") |> String.concat ""
+
     String.concat
         "\n"
         [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
           "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
-          $"  <ItemGroup><Compile Include=\"{sourceFile}\" /></ItemGroup>"
+          $"  <ItemGroup>{compiles}</ItemGroup>"
           $"  <ItemGroup><ProjectReference Include=\"{refRelative}\" /></ItemGroup>"
           "</Project>" ]
 
@@ -115,12 +183,18 @@ type FindFixture() =
         File.WriteAllText(full, content)
         full
 
-    let domainFsproj = write "Domain/Domain.fsproj" (leafProject "Domain.fs")
+    let domainFsproj = write "Domain/Domain.fsproj" (leafProject [ "Domain.fs"; "Shipping.fs" ])
     let domainSource = write "Domain/Domain.fs" domainFs
-    do write "Stubs/Stubs.fsproj" (refProject "Stubs.fs" "../Domain/Domain.fsproj") |> ignore
+    do write "Domain/Shipping.fs" shippingFs |> ignore
+    do write "Stubs/Stubs.fsproj" (refProject [ "Stubs.fs" ] "../Domain/Domain.fsproj") |> ignore
     do write "Stubs/Stubs.fs" stubsFs |> ignore
-    do write "App/App.fsproj" (refProject "App.fs" "../Domain/Domain.fsproj") |> ignore
+
+    do
+        write "App/App.fsproj" (refProject [ "App.fs"; "Impact.fs" ] "../Domain/Domain.fsproj")
+        |> ignore
+
     do write "App/App.fs" appFs |> ignore
+    let impactSource = write "App/Impact.fs" impactFs
     // Deliberately malformed project used to prove that a failed member cannot
     // be interpreted as a zero-match project.
     do write "Broken/Broken.fsproj" "<Project><ItemGroup>" |> ignore
@@ -170,6 +244,7 @@ type FindFixture() =
     member _.PartialSlnx = partialSlnxPath
     member _.DomainFsproj = domainFsproj
     member _.DomainFs = domainSource
+    member _.ImpactFs = impactSource
     member _.BuildExitCode = buildExit
     member _.BuildLog = buildLog
     member _.BuildMs = int buildSw.ElapsedMilliseconds
@@ -211,6 +286,7 @@ let private findArgs (projectPath: string) (query: string) : FindArgs =
       includeDeclaration = None
       includeInfo = None
       includePerProject = None
+      includeSiteTypes = None
       projectPath = Some projectPath
       maxResults = Some 500
       timeoutMs = None
@@ -406,6 +482,380 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
             Assert.Equal(0, exactFieldTotal)
         }
 
+    // ── #207: field-impact mode — per-site type context on record-field sites ───────
+    //
+    // The field scenario from #100 batch 5: a record's shape changes and every consumer,
+    // including ones in sibling projects, has to be edited. `find` already LOCATED them;
+    // the agent still had to open each file to decide the edit. These tests pin the two
+    // halves that close that loop from the tool output alone — the type the site consumes
+    // TODAY, and a site classification that distinguishes the four different edits.
+
+    /// Sites of `kind` from a find response, in document order.
+    static member private SitesOfKinds (find: JsonNode) (kinds: string Set) =
+        (find["sites"] :?> JsonArray)
+        |> Seq.filter (fun s -> kinds.Contains(gs s "kind"))
+        |> Seq.toArray
+
+    [<Fact>]
+    member this.``#207: kind=field + includeSiteTypes types every field site and splits literal / copy-update / mutation / pattern``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let! find =
+                bridge.Find(
+                    { findArgs fx.Slnx "Shipment" with
+                        kind = Some "field"
+                        includeSiteTypes = Some true }
+                )
+
+            Assert.Equal("succeeded", gs find "status")
+            let breakdown = find["breakdown"]
+
+            // Domain/Shipping.fs is consumed ONLY from App/Impact.fs — a cross-project
+            // sweep is the only thing that sees these sites at all.
+            // I1 `{ Code = code; Attempts = 0 }`          → 2 literal
+            // I2 `{ s with Code = code }`                  → 1 copy-update
+            // I3 `s.Attempts <- s.Attempts + 1`            → 1 mutation + 1 read
+            // I4 `s.Code.Length`                           → 1 read
+            // I5 `| { Code = c } ->`                       → 1 pattern
+            // I6 `parcels[0].Attempts <- 5`                → 1 mutation (DotSet shape)
+            Assert.Equal(2, gi breakdown "fieldSetLiteral")
+            Assert.Equal(1, gi breakdown "fieldSetUpdate")
+            Assert.Equal(2, gi breakdown "fieldSetMutation")
+            Assert.Equal(1, gi breakdown "fieldPattern")
+            Assert.Equal(2, gi breakdown "fieldRead")
+
+            let fieldKinds =
+                Set.ofList
+                    [ "field-set-literal"
+                      "field-set-update"
+                      "field-set-mutation"
+                      "field-pattern"
+                      "field-read" ]
+
+            let sites = FindTests.SitesOfKinds find fieldKinds
+            Assert.Equal(8, sites.Length)
+
+            // Both mutation SHAPES are reachable: `s.Attempts <- ...` (SynExpr.LongIdentSet,
+            // start positions align) and `parcels[0].Attempts <- ...` (SynExpr.DotSet, only
+            // the end position aligns). A regression in either falls back to "field-read",
+            // i.e. silently reports a WRITE as a read.
+            let mutationLines =
+                sites
+                |> Array.filter (fun s -> gs s "kind" = "field-set-mutation")
+                |> Array.map (fun s -> (gs s "lineText").Trim())
+                |> Array.sort
+
+            Assert.Equal<string array>(
+                [| "let bump (s: Shipment) = s.Attempts <- s.Attempts + 1"
+                   "let bumpFirst () = parcels[0].Attempts <- 5" |],
+                mutationLines
+            )
+
+            // EVERY field row carries the key — never a missing key an agent has to guess at.
+            for site in sites do
+                let where = gs site "file"
+                let startLine = gi site["range"] "startLine"
+
+                Assert.True(
+                    site.AsObject().ContainsKey("siteType"),
+                    $"every field site must carry siteType; missing on {where}:{startLine}"
+                )
+
+            // The payoff: rows of ONE query carry DIFFERENT types, so the agent reads the
+            // "old type" per site instead of cross-referencing the record definition.
+            let typeOfField (fieldName: string) =
+                sites
+                |> Array.filter (fun s -> (gs s "symbolFullName").EndsWith("." + fieldName, StringComparison.Ordinal))
+                |> Array.map (fun s -> gs s "siteType")
+                |> Array.distinct
+
+            Assert.Equal<string array>([| "string" |], typeOfField "Code")
+            Assert.Equal<string array>([| "int" |], typeOfField "Attempts")
+
+            // The ledger must account for every field site.
+            let siteTypes = find["siteTypes"]
+            Assert.True(gb siteTypes "requested")
+            Assert.Equal(8, gi siteTypes "fieldSites")
+            Assert.Equal(8, gi siteTypes "typed")
+            Assert.Equal(0, gi siteTypes "degraded")
+            Assert.Equal(gi siteTypes "fieldSites", gi siteTypes "typed" + gi siteTypes "degraded")
+
+            // The documented boundary: this tool never speculates about the NEW shape.
+            let note = gs find "siteTypesNote"
+            Assert.Contains("check(scope='project')", note)
+            Assert.Contains("does NOT typecheck", note)
+
+            let sitesJson = find["sites"].ToJsonString()
+            output.WriteLine($"#207 typed sites: {sitesJson}")
+        }
+
+    [<Fact>]
+    member _.``#207: without includeSiteTypes the site row and the response envelope are unchanged``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let! find = bridge.Find({ findArgs fx.Slnx "Shipment" with kind = Some "field" })
+
+            Assert.Equal("succeeded", gs find "status")
+            Assert.False(find.AsObject().ContainsKey("siteTypes"), "siteTypes must be opt-in")
+            Assert.False(find.AsObject().ContainsKey("siteTypesNote"), "siteTypesNote must be opt-in")
+
+            for site in (find["sites"] :?> JsonArray) do
+                Assert.False(site.AsObject().ContainsKey("siteType"), "default rows must not carry siteType")
+        }
+
+    [<Fact>]
+    member this.``#207: under kind=auto only field sites are typed — definitions and references stay lean``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let! find =
+                bridge.Find(
+                    { findArgs fx.Slnx "Shipment" with
+                        kind = Some "auto"
+                        includeSiteTypes = Some true }
+                )
+
+            Assert.Equal("succeeded", gs find "status")
+
+            let nonFieldSites =
+                FindTests.SitesOfKinds find (Set.ofList [ "definition"; "reference"; "member-usage" ])
+
+            Assert.True((nonFieldSites.Length > 0), "kind=auto must still produce name sites for Shipment")
+
+            for site in nonFieldSites do
+                let siteKind = gs site "kind"
+
+                Assert.False(
+                    site.AsObject().ContainsKey("siteType"),
+                    $"non-field site {siteKind} must not carry siteType"
+                )
+
+            // The ledger counts field sites only, not every site in the sweep.
+            let siteTypes = find["siteTypes"]
+            Assert.Equal(8, gi siteTypes "fieldSites")
+            Assert.True((gi find "totalSites" > gi siteTypes "fieldSites"))
+        }
+
+    [<Fact>]
+    member _.``#207: includeSiteTypes on a kind that produces no field sites explains the no-op instead of going silent``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let! find =
+                bridge.Find(
+                    { findArgs fx.Slnx "TraderRole" with
+                        kind = Some "definition"
+                        includeSiteTypes = Some true }
+                )
+
+            Assert.Equal("succeeded", gs find "status")
+            Assert.Equal(0, gi find["siteTypes"] "fieldSites")
+            Assert.Equal(0, gi find["siteTypes"] "degraded")
+
+            let note = gs find "siteTypesNote"
+            Assert.Contains("kind='field'", note)
+            Assert.Contains("produced none", note)
+        }
+
+    [<Fact>]
+    member _.``#207: an empty typed result on an incomplete sweep blames coverage, not the caller's kind``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // timeoutMs=0 is an already-exhausted budget, so no project is analyzed and no
+            // field site exists. The note must NOT tell the caller to "use kind='field'" —
+            // they already did; the sweep simply never ran. (Same determinism trick as the
+            // P1-01 exhausted-budget test: no background FCS work is started.)
+            let! find =
+                bridge.Find(
+                    { findArgs fx.Slnx "Shipment" with
+                        kind = Some "field"
+                        includeSiteTypes = Some true
+                        timeoutMs = Some 0 }
+                )
+
+            Assert.Equal("unknown", gs find "status")
+            Assert.Equal(0, gi find["siteTypes"] "fieldSites")
+
+            let note = gs find "siteTypesNote"
+            Assert.Contains("sweep is incomplete", note)
+            Assert.Contains("timeoutMs", note)
+            Assert.DoesNotContain("Use kind='field'", note)
+        }
+
+    [<Fact>]
+    member this.``#207: on a generic record siteType reports the type PARAMETER, the documented limit``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let! find =
+                bridge.Find(
+                    { findArgs fx.Slnx "Box" with
+                        kind = Some "field"
+                        field = Some "Value"
+                        includeSiteTypes = Some true }
+                )
+
+            Assert.Equal("succeeded", gs find "status")
+
+            let sites =
+                FindTests.SitesOfKinds find (Set.ofList [ "field-set-literal"; "field-read" ])
+
+            // `{ Value = 1 }`, `{ Value = "x" }`, `intBox.Value`, `textBox.Value`.
+            Assert.Equal(4, sites.Length)
+
+            // FCS reports no per-use generic arguments for record fields, so every site of
+            // Box.Value renders as 'T rather than int/string. This test PINS that limit: if
+            // a future FCS starts instantiating, it fails and we upgrade the docs with it.
+            let distinct = sites |> Array.map (fun s -> gs s "siteType") |> Array.distinct
+            Assert.Equal<string array>([| "'T" |], distinct)
+            Assert.Contains("type PARAMETER", gs find "siteTypesNote")
+        }
+
+    [<Fact>]
+    member this.``#207: the type column stays inside find's documented page budget``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let baseArgs = { findArgs fx.Slnx "Shipment" with kind = Some "field" }
+            let! lean = bridge.Find(baseArgs)
+            let! fat = bridge.Find({ baseArgs with includeSiteTypes = Some true })
+
+            let leanChars = lean["sites"].ToJsonString().Length
+            let fatChars = fat["sites"].ToJsonString().Length
+            let siteCount = (fat["sites"] :?> JsonArray).Count
+            Assert.True((siteCount > 0), "budget check needs sites to measure")
+
+            let perSiteGrowth = float (fatChars - leanChars) / float siteCount
+
+            // Hard per-site cap: siteTypeMaxChars (200) + the "..." truncation marker.
+            let siteTypeCapChars = 203
+
+            for site in (fat["sites"] :?> JsonArray) do
+                match site["siteType"] with
+                | null -> ()
+                | v ->
+                    let text = v.GetValue<string>()
+
+                    Assert.True(
+                        (text.Length <= siteTypeCapChars),
+                        $"siteType must be capped at {siteTypeCapChars} chars; got {text.Length}"
+                    )
+
+            // The envelope FcsBridge.Find documents for the compact row: ~527 chars per
+            // site, default page 80, MCP ceiling ~72k chars (~25k tokens). Worst case with
+            // the column is a capped type on every row plus its JSON key. Asserted as
+            // arithmetic so raising the cap without re-doing the page math fails HERE.
+            let compactSiteChars = 527
+            let defaultPageSize = 80
+            let mcpCeilingChars = 72_000
+            let jsonKeyOverhead = 15
+            let worstCasePage = defaultPageSize * (compactSiteChars + siteTypeCapChars + jsonKeyOverhead)
+
+            Assert.True(
+                (worstCasePage < mcpCeilingChars),
+                $"a full default page with the type column must stay under the MCP ceiling; worst case {worstCasePage} >= {mcpCeilingChars}"
+            )
+
+            // ...and the real-world growth is far below the worst case, so the default page
+            // size does not need lowering when the flag is on.
+            Assert.True(
+                (perSiteGrowth <= float (siteTypeCapChars + jsonKeyOverhead)),
+                $"measured per-site growth {perSiteGrowth} exceeded the capped worst case"
+            )
+
+            output.WriteLine(
+                $"#207 budget: {siteCount} sites, lean={leanChars} fat={fatChars} chars, +{perSiteGrowth:F1}/site; worst-case 80-site page={worstCasePage}"
+            )
+        }
+
+    [<Fact>]
+    member _.``#207: a swept file with a parse error degrades per site, never the whole call``() : Task =
+        task {
+            // The degraded path the spec asks for. NOTE the finding this test records:
+            // FCS resolves field TYPES through a parse error just fine (verified against
+            // 43.12.400), so what a broken file actually costs is the parse-tree form
+            // classification, not siteType. The contract asserted here is the one that
+            // matters either way — the ledger balances and the call still succeeds.
+            let runId = Guid.NewGuid().ToString("N")
+            let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_207_{runId}")
+            let dir = Path.Combine(root, "Broken207")
+            Directory.CreateDirectory dir |> ignore
+
+            try
+                let source =
+                    String.concat
+                        "\n"
+                        [ "module Broken207.Library"
+                          ""
+                          "type Parcel = { Code: string; Attempts: int }"
+                          ""
+                          "let ok = { Code = \"a\"; Attempts = 1 }"
+                          "let broken (p: Parcel) = p.Code +"
+                          "let after (p: Parcel) = p.Attempts"
+                          "" ]
+
+                File.WriteAllText(Path.Combine(dir, "Library.fs"), source)
+
+                let projectPath = Path.Combine(dir, "Broken207.fsproj")
+                File.WriteAllText(projectPath, leafProject [ "Library.fs" ])
+
+                let bridge = FcsBridge()
+
+                let! find =
+                    bridge.Find(
+                        { findArgs projectPath "Parcel" with
+                            kind = Some "field"
+                            includeSiteTypes = Some true }
+                    )
+
+                // A per-site miss must never become a whole-call failure.
+                Assert.Equal("succeeded", gs find "status")
+
+                let siteTypes = find["siteTypes"]
+                let fieldSites = gi siteTypes "fieldSites"
+                Assert.True((fieldSites > 0), "the broken file must still yield field sites")
+
+                Assert.Equal(fieldSites, gi siteTypes "typed" + gi siteTypes "degraded")
+
+                Assert.Equal(
+                    gi siteTypes "degraded",
+                    gi siteTypes "degradedUnresolved" + gi siteTypes "degradedTimedOut"
+                )
+
+                // Whatever the per-site outcome, the key is present on every field row so a
+                // consumer reads `null` rather than an absent key.
+                for site in (find["sites"] :?> JsonArray) do
+                    Assert.True(site.AsObject().ContainsKey("siteType"))
+
+                let typedCount = gi siteTypes "typed"
+                let degradedCount = gi siteTypes "degraded"
+                let breakdownJson = find["breakdown"].ToJsonString()
+
+                output.WriteLine(
+                    $"#207 parse-error fixture: fieldSites={fieldSites}, typed={typedCount}, degraded={degradedCount}, breakdown={breakdownJson}"
+                )
+            finally
+                if Directory.Exists root then
+                    try
+                        Directory.Delete(root, true)
+                    with _ ->
+                        ()
+        }
+
     [<Fact>]
     member _.``find with empty query returns invalid_args naming query``() : Task =
         task {
@@ -460,7 +910,7 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
 
             try
                 Directory.CreateDirectory(outsideRoot) |> ignore
-                File.WriteAllText(outsideProject, leafProject "Outside.fs")
+                File.WriteAllText(outsideProject, leafProject [ "Outside.fs" ])
                 File.WriteAllText(outsideSource, "module Outside")
                 let bridge = FcsBridge()
 
@@ -488,7 +938,7 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
 
             try
                 Directory.CreateDirectory(outsideRoot) |> ignore
-                File.WriteAllText(outsideProject, leafProject "Linked.fs")
+                File.WriteAllText(outsideProject, leafProject [ "Linked.fs" ])
                 File.WriteAllText(outsideSource, "module Linked")
                 let bridge = FcsBridge()
 
@@ -1333,7 +1783,7 @@ type ConfigFixture() =
         File.WriteAllText(full, content)
         full
 
-    let fsproj = write "ConfigProbe/ConfigProbe.fsproj" (leafProject "ConfigProbe.fs")
+    let fsproj = write "ConfigProbe/ConfigProbe.fsproj" (leafProject [ "ConfigProbe.fs" ])
     let source = write "ConfigProbe/ConfigProbe.fs" configProbeFs
 
     // Build once so Ionide.ProjInfo resolves options. Isolation/retry flags mirror FindFixture.

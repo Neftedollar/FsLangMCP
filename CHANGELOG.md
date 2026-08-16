@@ -10,6 +10,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `find` gains a **field-impact mode** for planning a record-field type change from
+  the tool output alone (#207). Two halves:
+  - **Five-way field-site classification.** `kind=field` sites are now tagged
+    `field-set-literal` | `field-set-update` | `field-set-mutation` |
+    `field-pattern` | `field-read`, with matching `fieldSetMutation` /
+    `fieldPattern` counters in `breakdown`. Each shape needs a different edit
+    when the field's type changes. **Behaviour change:** `x.Field <- v` and
+    `| { Field = x } ->` used to be reported as `field-read` — the first of those
+    labelled a *write* as a read. Existing counters keep their meaning;
+    `fieldRead` now means only "an expression that reads the field".
+  - **`includeSiteTypes` (default `false`).** When true, every record-field site
+    row additionally carries `siteType` — the field's type as the CURRENT
+    typecheck resolves it at that site, rendered with that site's own `open`s —
+    so an agent reads the "old type" per row instead of opening each file. A
+    `siteTypes` ledger (`typed + degraded == fieldSites`, counted over the whole
+    matched set, not just the page) and a `siteTypesNote` accompany it. A site
+    whose type FCS cannot produce, or one reached after the `timeoutMs` budget is
+    exhausted, gets `siteType: null` and is counted as degraded — a per-site miss
+    never fails the call. Annotates field sites only; a `kind` that produces none
+    says so in the note rather than going silently no-op. `siteType` is capped at
+    200 chars, keeping a full default 80-site page under the MCP payload ceiling
+    without lowering `maxResults`.
+  - **Explicit non-goal, stated in the docs and in every response note:**
+    `siteType` is never the type the field would have *after* the edit. That
+    requires compiling the modified code — edit the enumerated sites, then run
+    `check(scope='project')` for the verdict. Known limit: FCS exposes no per-use
+    generic arguments for record fields, so a field on a generic record renders
+    as its type *parameter* (`'T`), not the instantiation at the site.
+
 - `find` now reports a top-level `scopeNote` on every response that completes
   a sweep (`succeeded`, `partial`, and `unknown`), naming how many projects
   were actually swept (`projectsSwept`) and the recipe to change it: pass the

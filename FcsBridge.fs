@@ -55,45 +55,159 @@ let private explicitFsproj (projectPath: string option) : string option =
 
 open FSharp.Compiler.Syntax
 
-/// A (startLine, startColumn) pair used as a dictionary key for field-name ranges.
+/// A (line, column) pair used as a dictionary key for field-name ranges.
 /// FCS range has [<NoComparison>], so it cannot be used directly as a map key.
 type private FieldFormKey = int * int
 
-/// Module that walks a FCS ParsedInput and tags every record-field expression
-/// site as `true` (with-update form) or `false` (literal form).
+/// The syntactic form a record-field use site takes. Each needs a DIFFERENT edit when
+/// the field's type changes, which is why `find` reports them as distinct site kinds
+/// rather than lumping everything that is not a construction site into "read" (#207).
+[<RequireQualifiedAccess>]
+type private FieldSiteForm =
+    /// `{ Field = expr }` — record construction literal.
+    | Literal
+    /// `{ x with Field = expr }` — copy-and-update.
+    | Update
+    /// `x.Field <- expr` — assignment to a mutable field.
+    | Mutation
+    /// `| { Field = binding } ->` — destructuring in a pattern.
+    | Pattern
+
+/// Per-file field-site classification produced by one parse-tree walk.
+[<NoComparison; NoEquality>]
+type private FieldSiteForms =
+    { /// Keyed by the START position of the field identifier, which is what FCS reports
+      /// as the symbol-use range start for record literals, copy-and-updates, patterns,
+      /// and the `x.Field <- v` (SynExpr.LongIdentSet) shape of a mutation.
+      ByStart: System.Collections.Generic.Dictionary<FieldFormKey, FieldSiteForm>
+      /// Mutation sites keyed by the END position of the field identifier.
+      /// SynExpr.DotSet (`arr[0].Field <- v`) breaks start-position alignment: FCS
+      /// reports the symbol use over the WHOLE target expression (verified on
+      /// `arr.[0].Attempts <- 5`: use range col 17-33, DotSet lid range col 25-33),
+      /// so only the end position lines up for every mutation shape. Consulted only
+      /// when the start lookup misses, so it can never override a construction form.
+      MutationEnds: System.Collections.Generic.HashSet<FieldFormKey> }
+
+/// Module that walks a FCS ParsedInput and tags every record-field use site with the
+/// syntactic form it appears in.
 module private FieldFormClassifier =
 
-    let private tagFields
-        (isUpdate: bool)
+    let private tagExprFields
+        (form: FieldSiteForm)
         (fields: SynExprRecordField list)
-        (d: System.Collections.Generic.Dictionary<FieldFormKey, bool>)
+        (d: System.Collections.Generic.Dictionary<FieldFormKey, FieldSiteForm>)
         =
         for field in fields do
             match field with
             | SynExprRecordField((lid, _), _, _, _, _) ->
                 let r = lid.Range
-                d[(r.StartLine, r.StartColumn)] <- isUpdate
+                d[(r.StartLine, r.StartColumn)] <- form
 
     /// Walk the full parse tree using ParsedInput.fold (FCS 43.12+).
     /// ParsedInput.fold is a position-independent full-tree accumulator that visits
     /// every SyntaxNode in the tree, including those inside type member bodies,
     /// for-loops, CE binds, object expressions, and all other expression-containing arms.
-    let classify (input: ParsedInput) : System.Collections.Generic.Dictionary<FieldFormKey, bool> =
+    let classifySites (input: ParsedInput) : FieldSiteForms =
+        let empty () =
+            { ByStart = System.Collections.Generic.Dictionary<FieldFormKey, FieldSiteForm>()
+              MutationEnds = System.Collections.Generic.HashSet<FieldFormKey>() }
+
         // SigFile (.fsi): signature files declare types but contain no expression
         // use-sites — there are no record literals/updates here to classify. Empty
-        // dictionary is the correct return; do not "complete" this arm.
+        // result is the correct return; do not "complete" this arm.
         match input with
-        | ParsedInput.SigFile _ -> System.Collections.Generic.Dictionary<FieldFormKey, bool>()
+        | ParsedInput.SigFile _ -> empty ()
         | ParsedInput.ImplFile _ ->
-            let d = System.Collections.Generic.Dictionary<FieldFormKey, bool>()
+            let acc = empty ()
 
-            (d, input)
-            ||> ParsedInput.fold (fun acc _path node ->
+            (acc, input)
+            ||> ParsedInput.fold (fun state _path node ->
                 match node with
                 | SyntaxNode.SynExpr(SynExpr.Record(_, copyInfo, fields, _)) ->
-                    tagFields copyInfo.IsSome fields acc
-                    acc
-                | _ -> acc)
+                    tagExprFields
+                        (if copyInfo.IsSome then
+                             FieldSiteForm.Update
+                         else
+                             FieldSiteForm.Literal)
+                        fields
+                        state.ByStart
+                | SyntaxNode.SynExpr(SynExpr.LongIdentSet(lid, _, _))
+                | SyntaxNode.SynExpr(SynExpr.DotSet(_, lid, _, _)) ->
+                    let r = lid.Range
+                    state.ByStart[(r.StartLine, r.StartColumn)] <- FieldSiteForm.Mutation
+                    state.MutationEnds.Add((r.EndLine, r.EndColumn)) |> ignore
+                | SyntaxNode.SynPat(SynPat.Record(fieldPats, _)) ->
+                    for fieldPat in fieldPats do
+                        match fieldPat with
+                        | NamePatPairField(fieldName = lid) ->
+                            let r = lid.Range
+                            state.ByStart[(r.StartLine, r.StartColumn)] <- FieldSiteForm.Pattern
+                | _ -> ()
+
+                state)
+
+    /// Back-compat projection for RecordFieldAudit, whose `form` field has always been
+    /// exactly literal / with-update / unknown. Mutation and pattern sites are NOT record
+    /// construction sites, so they are dropped here and fall through to that tool's
+    /// textual fallback — byte-identical to the behaviour before the four-way split.
+    let classify (input: ParsedInput) : System.Collections.Generic.Dictionary<FieldFormKey, bool> =
+        let d = System.Collections.Generic.Dictionary<FieldFormKey, bool>()
+
+        for entry in (classifySites input).ByStart do
+            match entry.Value with
+            | FieldSiteForm.Literal -> d[entry.Key] <- false
+            | FieldSiteForm.Update -> d[entry.Key] <- true
+            | FieldSiteForm.Mutation
+            | FieldSiteForm.Pattern -> ()
+
+        d
+
+
+// ─── find: per-site field type resolution (issue #207) ──────────────────────────
+//
+// `find(kind=field, includeSiteTypes=true)` prints, for every record-field site, the
+// field's type AS THE CURRENT TYPECHECK RESOLVES IT AT THAT SITE — rendered with the
+// site's own FSharpDisplayContext, so it reads the way code at that site would write it
+// (`string`, not `Microsoft.FSharp.Core.string`) and honours the `open`s in scope there.
+// Across a sweep spanning several fields — or several declaring types under exact=false —
+// that string differs per row: it is the "old type" column an agent needs to plan a
+// field-type change without opening every file.
+//
+// Explicit non-goal: this is NEVER the type the field would have AFTER the edit. Knowing
+// that requires compiling the modified code — i.e. `check`, run once the edits land.
+//
+// Established empirically against FCS 43.12.400 while designing this (see the #207 PR):
+//   • FSharpSymbolUse.GenericArguments is EMPTY for record-field uses, so a field on a
+//     generic record renders as its type PARAMETER (`'T`), not the instantiation at the
+//     site. FSharpType.Instantiate therefore buys nothing here; documented as a limit.
+//   • Type resolution survives a parse error elsewhere in the file AND an undefined field
+//     type (FCS recovers the latter to `obj`), so `siteType: null` is a genuine but RARE
+//     defensive outcome rather than a routine one.
+
+/// Longest `siteType` string emitted per site. A pathological generic signature must not
+/// be able to blow `find`'s page budget: a full default page of 80 sites is ~43k chars
+/// today, and this cap bounds the growth to 80 × (cap + ~15 chars of JSON overhead).
+let private siteTypeMaxChars = 200
+
+/// Format a field symbol use's type for the site it occurs at. Returns None when FCS
+/// cannot produce one — the caller degrades that single row to `siteType: null` and
+/// counts it, rather than failing the whole call.
+let private tryFormatFieldSiteType (symbolUse: FSharpSymbolUse) : string option =
+    try
+        match symbolUse.Symbol with
+        | :? FSharpField as field ->
+            let formatted = field.FieldType.Format(symbolUse.DisplayContext)
+
+            if String.IsNullOrWhiteSpace formatted then None
+            elif formatted.Length > siteTypeMaxChars then
+                Some(formatted.Substring(0, siteTypeMaxChars) + "...")
+            else
+                Some formatted
+        | _ -> None
+    with _ ->
+        // FCS throws on synthetic / unresolved field symbols; a per-site miss must never
+        // propagate out of the sweep.
+        None
 
 
 // ─── find: typed FSAC fallback result (issue #168, P1-01) ───────────────────────
@@ -4968,7 +5082,7 @@ type internal FcsBridge
                         [ "status", jstr "invalid_args"
                           "message",
                           jstr
-                              "find requires a non-empty query (symbol, type, or member name). Expected parameters: query (required); kind, scope, exact, member, field, path, line, word, occurrence, character, contextLines, includeDeclaration, includeInfo, includePerProject, projectPath, maxResults, timeoutMs, cursor (optional)." ]
+                              "find requires a non-empty query (symbol, type, or member name). Expected parameters: query (required); kind, scope, exact, member, field, path, line, word, occurrence, character, contextLines, includeDeclaration, includeInfo, includePerProject, includeSiteTypes, projectPath, maxResults, timeoutMs, cursor (optional)." ]
                     :> JsonNode
             | Ok query0 ->
 
@@ -4983,6 +5097,9 @@ type internal FcsBridge
             let includeDeclaration = args.includeDeclaration |> Option.defaultValue true
             let includeInfo = args.includeInfo |> Option.defaultValue false
             let includePerProject = args.includePerProject |> Option.defaultValue true
+            // #207: opt-in per-site field types. Off by default — resolving and formatting
+            // a type for every site is FCS work the common `find` call has no use for.
+            let includeSiteTypes = args.includeSiteTypes |> Option.defaultValue false
             // #100 hang fix: `find` must ALWAYS return. timeoutMs is the overall
             // wall-clock budget for the whole multi-project sweep (default 120s);
             // each project's FCS sweep is cancelled at the remaining budget, and
@@ -5219,7 +5336,13 @@ type internal FcsBridge
                        EndCol: int
                        Kind: string
                        Project: string
-                       FullName: string |}
+                       FullName: string
+                       /// #207: the field's type at this site, or null when the site is
+                       /// not a field site, includeSiteTypes was off, or resolution
+                       /// degraded (see TypeStatus).
+                       SiteType: string
+                       /// "typed" | "unresolved" | "timeout" | null (not applicable).
+                       TypeStatus: string |}
                  >()
 
             let perProject = ResizeArray<JsonNode>()
@@ -5279,10 +5402,7 @@ type internal FcsBridge
                     let parsingOptions, _ = checker.GetParsingOptionsFromProjectOptions(options)
 
                     let formCache =
-                        System.Collections.Generic.Dictionary<
-                            string,
-                            System.Collections.Generic.Dictionary<FieldFormKey, bool> option
-                         >()
+                        System.Collections.Generic.Dictionary<string, FieldSiteForms option>()
 
                     let classifyForms (filePath: string) =
                         match formCache.TryGetValue filePath with
@@ -5293,7 +5413,7 @@ type internal FcsBridge
                                     if File.Exists filePath then
                                         let st = SourceText.ofString (File.ReadAllText filePath)
                                         let p = checker.ParseFile(filePath, st, parsingOptions) |> Async.RunSynchronously
-                                        Some(FieldFormClassifier.classify p.ParseTree)
+                                        Some(FieldFormClassifier.classifySites p.ParseTree)
                                     else
                                         None
                                 with _ ->
@@ -5302,22 +5422,49 @@ type internal FcsBridge
                             formCache[filePath] <- parsed
                             parsed
 
+                    // #207: four-way site classification. `x.Field <- v` used to land in
+                    // field-read, which is not merely imprecise — it labelled a WRITE as a
+                    // read, and a field-type change edits the two differently. Record
+                    // patterns (`| { Field = x } ->`) were likewise indistinguishable from
+                    // an expression read. Both now have their own kind.
                     let fieldKind (symbolUse: FSharpSymbolUse) =
                         let r = symbolUse.Range
 
                         match classifyForms (normalizePath r.FileName) with
-                        | Some d ->
-                            match d.TryGetValue((r.StartLine, r.StartColumn)) with
-                            | true, true -> "field-set-update"
-                            | true, false -> "field-set-literal"
-                            | _ -> "field-read"
+                        | Some forms ->
+                            match forms.ByStart.TryGetValue((r.StartLine, r.StartColumn)) with
+                            | true, FieldSiteForm.Update -> "field-set-update"
+                            | true, FieldSiteForm.Literal -> "field-set-literal"
+                            | true, FieldSiteForm.Mutation -> "field-set-mutation"
+                            | true, FieldSiteForm.Pattern -> "field-pattern"
+                            | _ ->
+                                // SynExpr.DotSet mutations only line up on the END position
+                                // (see FieldSiteForms.MutationEnds).
+                                if forms.MutationEnds.Contains((r.EndLine, r.EndColumn)) then
+                                    "field-set-mutation"
+                                else
+                                    "field-read"
                         | None -> "field-read"
 
                     let mutable nameCount = 0
                     let mutable fieldCount = 0
                     let mutable memberCount = 0
 
-                    let add (symbolUse: FSharpSymbolUse) (siteKind: string) (overwrite: bool) =
+                    // #207: type resolution shares `find`'s ONE wall-clock budget. Past the
+                    // deadline a site is recorded untyped (status "timeout") instead of
+                    // stretching the sweep — the caller still gets every site, just without
+                    // the extra column on the tail of a very large sweep.
+                    let resolveSiteType (symbolUse: FSharpSymbolUse) =
+                        if not includeSiteTypes then
+                            null, null
+                        elif int sweepSw.ElapsedMilliseconds >= sweepBudgetMs then
+                            null, "timeout"
+                        else
+                            match tryFormatFieldSiteType symbolUse with
+                            | Some formatted -> formatted, "typed"
+                            | None -> null, "unresolved"
+
+                    let add (symbolUse: FSharpSymbolUse) (siteKind: string) (overwrite: bool) (siteType: string) (typeStatus: string) =
                         let r = symbolUse.Range
                         let key = locationKey r
 
@@ -5333,7 +5480,9 @@ type internal FcsBridge
                                    FullName =
                                     (match symbolUse.Symbol.FullName with
                                      | null -> null
-                                     | s -> s) |}
+                                     | s -> s)
+                                   SiteType = siteType
+                                   TypeStatus = typeStatus |}
 
                     // Field/member sites first so their richer kind wins over a generic
                     // "reference" tag when a non-exact name-match overlaps the same range.
@@ -5341,13 +5490,14 @@ type internal FcsBridge
                         for u in allUses do
                             if not u.IsFromDefinition && isQueriedField u then
                                 fieldCount <- fieldCount + 1
-                                add u (fieldKind u) true
+                                let siteType, typeStatus = resolveSiteType u
+                                add u (fieldKind u) true siteType typeStatus
 
                     if wantMember then
                         for u in allUses do
                             if not u.IsFromDefinition && isQueriedMember u then
                                 memberCount <- memberCount + 1
-                                add u "member-usage" true
+                                add u "member-usage" true null null
 
                     if wantName then
                         for u in allUses do
@@ -5358,7 +5508,7 @@ type internal FcsBridge
                                 if passDefsOnly && passDecl then
                                     nameCount <- nameCount + 1
                                     let k = if u.IsFromDefinition then "definition" else "reference"
-                                    add u k false
+                                    add u k false null null
 
                     projSw.Stop()
                     projectsAnalyzed <- projectsAnalyzed + 1
@@ -5437,9 +5587,25 @@ type internal FcsBridge
             let refCount = countKind "reference"
             let fLit = countKind "field-set-literal"
             let fUpd = countKind "field-set-update"
+            let fMut = countKind "field-set-mutation"
+            let fPat = countKind "field-pattern"
             let fRead = countKind "field-read"
             let memCount = countKind "member-usage"
             let totalSites = sortedSites.Length
+
+            // #207: counted over the FULL matched set (post scope=file filter), not just the
+            // returned page, so "3 of 40 sites could not be typed" stays true across paging.
+            let fieldSiteCount = fLit + fUpd + fMut + fPat + fRead
+
+            let countTypeStatus (status: string) =
+                sortedSites
+                |> Array.filter (fun s -> String.Equals(s.TypeStatus, status, StringComparison.Ordinal))
+                |> Array.length
+
+            let typedSites = countTypeStatus "typed"
+            let unresolvedSites = countTypeStatus "unresolved"
+            let timedOutTypeSites = countTypeStatus "timeout"
+            let degradedSites = unresolvedSites + timedOutTypeSites
 
             let projectsRequested = projectsToSweep.Length
             let coverageComplete = projectsAnalyzed = projectsRequested
@@ -5525,7 +5691,9 @@ type internal FcsBridge
                                   EndCol: int
                                   Kind: string
                                   Project: string
-                                  FullName: string |}) =
+                                  FullName: string
+                                  SiteType: string
+                                  TypeStatus: string |}) =
                 let ctx = lineContextToJson lineContextCache contextLines s.File s.StartLine
 
                 let rangeNode =
@@ -5546,6 +5714,21 @@ type internal FcsBridge
                     else
                         []
 
+                // #207: present on EVERY field site under includeSiteTypes — explicit null
+                // for a degraded one, so a consumer never has to distinguish "absent key"
+                // from "could not resolve". Absent entirely on non-field sites and when the
+                // flag is off, keeping the default row byte-identical to before.
+                let siteTypeFields =
+                    if includeSiteTypes && not (isNull s.TypeStatus) then
+                        let value =
+                            match s.SiteType with
+                            | null -> null
+                            | v -> jstr v
+
+                        [ ("siteType", value) ]
+                    else
+                        []
+
                 jobj
                     ([ "file", jstr s.File
                        "range", rangeNode
@@ -5556,6 +5739,7 @@ type internal FcsBridge
                         | null -> null
                         | v -> jstr v)
                        "lineText", ctx["lineText"].DeepClone() ]
+                     @ siteTypeFields
                      @ contextFields)
                 :> JsonNode
 
@@ -5626,9 +5810,50 @@ type internal FcsBridge
                       "references", jint refCount
                       "fieldSetLiteral", jint fLit
                       "fieldSetUpdate", jint fUpd
+                      // #207: `x.Field <- v` and `| { Field = x } ->` used to be counted as
+                      // fieldRead. They are separate edit shapes, so they get their own keys
+                      // — fieldRead now means "an expression that reads the field", nothing
+                      // more. Additive: existing keys keep their meaning.
+                      "fieldSetMutation", jint fMut
+                      "fieldPattern", jint fPat
                       "fieldRead", jint fRead
                       "memberUsages", jint memCount ]
                 :> JsonNode
+
+            // #207: the honesty ledger for includeSiteTypes. `typed + degraded` must always
+            // equal `fieldSites`, so a caller can tell "every site carries its type" from
+            // "some rows are blank" without diffing the sites array.
+            let siteTypesFields =
+                if not includeSiteTypes then
+                    []
+                else
+                    let summary =
+                        jobj
+                            [ "requested", jbool true
+                              "fieldSites", jint fieldSiteCount
+                              "typed", jint typedSites
+                              "degraded", jint degradedSites
+                              "degradedUnresolved", jint unresolvedSites
+                              "degradedTimedOut", jint timedOutTypeSites ]
+                        :> JsonNode
+
+                    let note =
+                        if fieldSiteCount = 0 && not coverageComplete then
+                            // Do not blame the caller's `kind` for an empty result the sweep
+                            // never got far enough to produce — coverage is the real story.
+                            $"No field site was typed because the sweep is incomplete: {projectsAnalyzed} of {projectsRequested} project(s) were analyzed ({projectsFailed} failed, {projectsTimedOut} timed out). See coverage/message; re-run with a larger timeoutMs before reading anything into the empty result."
+                        elif fieldSiteCount = 0 then
+                            $"includeSiteTypes annotates record-field sites only, and this sweep produced none (kindResolved='{kindResolved}'). Use kind='field' (optionally with field='Name') or kind='auto' to get field sites, then re-read `siteType` on each row."
+                        else
+                            let degradedClause =
+                                if degradedSites = 0 then
+                                    "Every field site is typed."
+                                else
+                                    $"{degradedSites} of {fieldSiteCount} field sites could not be typed ({unresolvedSites} unresolved, {timedOutTypeSites} past the timeoutMs budget) and carry siteType: null."
+
+                            $"siteType is the field's type as the CURRENT typecheck resolves it at that site, rendered with that site's own opens — the BEFORE half of a field-type change. {degradedClause} find deliberately does NOT typecheck a hypothetical new record shape: edit every site listed here, then run check(scope='project') for the AFTER verdict. On a generic record the type shows as the type PARAMETER (e.g. 'T), not its instantiation at the site."
+
+                    [ ("siteTypes", summary); ("siteTypesNote", jstr note) ]
 
             let paginationFields =
                 Cursor.paginationFields "sites" totalSites pageOffset pageSize pageSites.Length
@@ -5762,6 +5987,7 @@ type internal FcsBridge
                 @ [ "sweepElapsedMs", jint (int sweepSw.ElapsedMilliseconds)
                     "projectDiagnostics", JsonArray(diagNodes) :> JsonNode ]
                 @ hintField
+                @ siteTypesFields
                 @ scopeNoteField
 
             return jobj (baseFields @ paginationFields) :> JsonNode
@@ -10392,6 +10618,9 @@ type internal FcsBridge
                   includeDeclaration = Some true
                   includeInfo = Some false
                   includePerProject = None
+                  // #207: refactor_impact synthesises counts, not per-site rows — a
+                  // per-site type column would be computed and then thrown away.
+                  includeSiteTypes = None
                   projectPath = args.projectPath
                   maxResults = Some 1000
                   timeoutMs = None

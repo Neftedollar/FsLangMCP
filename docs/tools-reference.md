@@ -22,10 +22,18 @@ These two tools replace the legacy search/check entry points removed in v0.13.1.
 - `member` — narrow to a specific member name when `kind=members`
 - `scope` — `auto` | `file` | `project` | `workspace` (default: `auto`); file requires `path`, project requires one member `.fsproj`
 - `contextLines` — non-negative surrounding source-line count (default: `0`)
+- `includeSiteTypes` — add `siteType` (the field's type as resolved TODAY) to every record-field row (default: `false`)
 - `maxResults` — page size from 1 to 1000 (default: `80`)
 - `timeoutMs` — non-negative whole-sweep budget; `0` returns an immediate typed timeout (default: `120000`)
 
 **Use when:** "Where is `X` defined?", "What calls `OrderId`?", "Which files set this record field?"
+
+**Field-impact mode:** `kind=field` classifies each site as `field-set-literal` | `field-set-update`
+| `field-set-mutation` | `field-pattern` | `field-read` — the five shapes a field-type change edits
+differently. Add `includeSiteTypes=true` for a `siteType` column carrying the field's type as the
+CURRENT typecheck resolves it at that site, plus a `siteTypes` ledger (`typed + degraded ==
+fieldSites`). It never predicts the post-edit type: edit the sites, then run `check`. See
+`docs/tools-detailed.md`.
 
 **Absence contract:** inspect `outcome` and `coverage.complete`. A complete miss returns
 `outcome="not_found"` and `resolution.matched=false`. A failed/timed-out project makes absence

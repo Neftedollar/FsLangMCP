@@ -637,7 +637,7 @@ let private mainCore argv =
                 tool (
                     TypedTool.define<FindArgs>
                         "find"
-        "Multi-project F# semantic search: definitions, references, record-field sites, member call-sites (`x.Foo`) across every solution .fsproj. FCS-resolved — beats textual rg, which over-matches `.Member()` and can't cross projects. Bare find(query) gives a compact one-line-per-site list; contextLines adds code. Narrow with kind (symbol|members|field|definition|position)+scope; member call sites = kind=members + member=Name. scopeNote reports projects swept and how to widen/narrow."
+        "Multi-project F# semantic search: definitions, references, record-field sites, member call-sites (`x.Foo`) across every solution .fsproj. FCS-resolved — beats rg, which over-matches `.Member()` and can't cross projects. Bare find(query) gives one compact line per site; contextLines adds code. Narrow with kind (symbol|members|field|definition|position)+scope; member call sites = kind=members + member=Name; kind=field+includeSiteTypes types every field site. scopeNote reports sweep breadth."
                         (fun args (_ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }

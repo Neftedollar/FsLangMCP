@@ -186,6 +186,8 @@ readability; your run will show all sites):
     "references": 5,
     "fieldSetLiteral": 6,
     "fieldSetUpdate": 0,
+    "fieldSetMutation": 0,
+    "fieldPattern": 0,
     "fieldRead": 4,
     "memberUsages": 0
   },
@@ -217,8 +219,13 @@ projects — 8 in `Domain/Order.fs` (definitions, references, field reads) and 9
 
 Each site carries `file`, `range` (1-based startLine/endLine, 0-based
 startColumn/endColumn), `kind` (definition | reference | field-set-literal |
-field-set-update | field-read | member-usage), `project`, `symbolFullName`, and
-`lineText`.
+field-set-update | field-set-mutation | field-pattern | field-read |
+member-usage), `project`, `symbolFullName`, and `lineText`.
+
+Add `"includeSiteTypes": true` to a `kind=field` call and each field-site row also
+carries `siteType` — the field's type as the current typecheck resolves it at that
+site — plus a top-level `siteTypes` ledger. It reports today's type only; after
+editing the sites, run `check` for the post-edit verdict.
 
 ---
 
