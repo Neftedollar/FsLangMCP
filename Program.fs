@@ -79,7 +79,17 @@ let private runProjInfoAsync (path: string) : Task<JsonNode> =
         // #192: the out-of-process proj-info CLI calls the same Init.init and dies the
         // same way (exit 134, unhandled), so it needs the same pre-flight the in-process
         // loader got. Raising lets Tools.toolResult render the shared typed envelope.
-        do! Task.Run(fun () -> SdkPreflight.ensure [ Path.GetDirectoryName(Path.GetFullPath path) ])
+        // Walk from the path itself when it is a directory: starting at its parent
+        // would skip a global.json sitting inside it.
+        let projectDirectory =
+            let full = Path.GetFullPath path
+
+            if Directory.Exists full then
+                full
+            else
+                Path.GetDirectoryName full
+
+        do! Task.Run(fun () -> SdkPreflight.ensure [ projectDirectory ])
 
         try
             let! result =

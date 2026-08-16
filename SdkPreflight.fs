@@ -56,7 +56,9 @@ let internal toEnvelope (pin: SdkPin) (installedSdks: string list) : JsonNode =
           "errorKind", jstr "sdk_not_found"
           "message", jstr (describe pin installedSdks)
           "requestedSdkVersion", jstr pin.Version
-          "rollForward", jstr (pin.RollForward |> Option.defaultValue "disable")
+          // Echoed verbatim rather than defaulted to "disable": only a disable pin can
+          // reach here, and the file's own casing is what the caller will search for.
+          "rollForward", (pin.RollForward |> Option.map jstr |> Option.defaultValue null)
           "globalJsonPath", jstr pin.GlobalJsonPath
           "installedSdks", JsonArray(installedSdks |> List.map jstr |> List.toArray) :> JsonNode
           "remedies",

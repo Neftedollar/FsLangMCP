@@ -39,7 +39,7 @@ The nearest `global.json` above the project pins an SDK version with
 `Ionide.ProjInfo` resolves the SDK by running `dotnet --version` **in the target
 project's directory**, so it inherits the target's `global.json`; with an
 unsatisfiable pin the muxer exits 155. `fsautocomplete` makes the same call during
-its own startup, with nothing to catch the failure — before v0.16 the child died
+its own startup, with nothing to catch the failure — in earlier releases the child died
 before answering `initialize` and the only symptom reaching the agent was
 `TransportError … "The JSON-RPC connection with the remote party was lost"`, which
 named neither the SDK nor the file. FsLangMCP now screens the pin first and tells

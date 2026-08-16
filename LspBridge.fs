@@ -89,6 +89,9 @@ let private releaseOnDispose (semaphore: SemaphoreSlim) =
 
 let rec private classifyRenameInfrastructureError (error: exn) =
     match error with
+    // #192: must precede the InvalidOperationException arm — SdkNotFoundException
+    // derives from it, and an unsatisfiable SDK pin is not a protocol error.
+    | SdkPreflight.SdkPinUnsatisfiable _ -> "sdk_not_found", false
     | :? TimeoutException -> "timeout", true
     | :? System.ComponentModel.Win32Exception -> "executable_missing", false
     | :? IOException
@@ -2117,6 +2120,22 @@ type internal FsAutoCompleteBridge
             let command = fsacCommand ()
             let args = fsacArgs ()
             let workspaceRoot = getWorkspaceRoot ()
+
+            // #192: set_project screens the pin up front, but a pin can be poisoned
+            // AFTER a successful set_project — a branch switch that adds a global.json,
+            // an SDK removed from the machine — and every later lazy start
+            // (EnsureStartedUnsafe) or diagnostic-input restart lands here. Without this,
+            // those paths reproduce the original opaque "connection lost": fsautocomplete
+            // calls Init.init with exactly this working directory and dies before it
+            // answers `initialize`. Raised, not returned: this method owes its caller a
+            // JsonRpc, and every caller funnels the exception into the shared typed
+            // envelope. Nothing has been mutated yet, so the failure is state-neutral.
+            do!
+                Task.Run(fun () ->
+                    SdkPreflight.ensure
+                        [ workspaceRoot
+                          yield! (runtimeProjectPath |> Option.map resolveWorkspaceFromProjectPath |> Option.toList) ])
+
             let generation = Interlocked.Increment(&nextSessionGeneration)
             // Capture before the FSAC process exists: a versionless publication from
             // this generation cannot legitimately describe content older than this

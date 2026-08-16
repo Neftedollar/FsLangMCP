@@ -461,6 +461,53 @@ let ``set_project returns sdk_not_found and never starts fsautocomplete`` () : T
     }
 
 [<Fact>]
+let ``a pin poisoned after set_project is caught on the next lazy FSAC start`` () : Task =
+    task {
+        // The time-shift case: set_project screens a clean workspace, then a branch
+        // switch adds a global.json (or the SDK is removed) and the NEXT LSP tool call
+        // lazily starts FSAC. Without a pre-flight in StartLspUnsafe that start
+        // reproduces the original opaque "connection lost".
+        let root = tempRoot "lazystart"
+        let sourcePath = Path.Combine(root, "Library.fs")
+
+        try
+            let projectPath = writeMinimalProject root
+
+            // A command that cannot exist: if the pre-flight regresses, the spawn
+            // fails with executable_missing instead, and this test fails loudly.
+            use bridge =
+                new FsAutoCompleteBridge(fsacCommandOverride = $"missing-fsac-{Guid.NewGuid():N}")
+
+            let! selected =
+                bridge.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some false }
+                )
+
+            Assert.Equal("ok", selected["status"].GetValue<string>())
+
+            // Poison the workspace only AFTER the context is established.
+            writeGlobalJson root (pin absentVersion (Some "disable"))
+
+            let! result =
+                bridge.RenamePreview(
+                    { path = sourcePath
+                      line = 2
+                      character = 4
+                      newName = "renamed"
+                      text = None }
+                )
+
+            Assert.Equal("infrastructure_error", result["status"].GetValue<string>())
+            Assert.Equal("sdk_not_found", result["errorKind"].GetValue<string>())
+            Assert.Contains(absentVersion, result["message"].GetValue<string>())
+            Assert.True(bridge.FsacProcess.IsNone, "No FSAC process may be spawned into a poisoned workspace.")
+        finally
+            Directory.Delete(root, true)
+    }
+
+[<Fact>]
 let ``a solution member's own poisoned global.json is caught before fsautocomplete starts`` () : Task =
     task {
         // A nested global.json under one member project kills FSAC's startup exactly
