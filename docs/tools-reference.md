@@ -28,12 +28,23 @@ These two tools replace the legacy search/check entry points removed in v0.13.1.
 
 **Use when:** "Where is `X` defined?", "What calls `OrderId`?", "Which files set this record field?"
 
+**Sweep breadth:** every response that completes a sweep carries `resolution.scopeResolved`,
+top-level `projectsSwept`, and a `scopeNote` explaining how many projects were actually swept
+and the exact recipe to widen (`scope='workspace'` with a `.sln`/`.slnx` `projectPath`) or narrow
+(a single `.fsproj` `projectPath`) it — so you don't pay for a whole-workspace sweep just to
+discover which recipe would have been faster. See `docs/tools-detailed.md`.
+
 **Field-impact mode:** `kind=field` classifies each site as `field-set-literal` | `field-set-update`
 | `field-set-mutation` | `field-pattern` | `field-read` — the five shapes a field-type change edits
 differently. Add `includeSiteTypes=true` for a `siteType` column carrying the field's type as the
 CURRENT typecheck resolves it at that site, plus a `siteTypes` ledger (`typed + degraded ==
 fieldSites`). It never predicts the post-edit type: edit the sites, then run `check`. See
 `docs/tools-detailed.md`.
+
+**Changed in v0.16.0:** `field-set-mutation` (`x.Field <- v`) and `field-pattern`
+(`| { Field = x } ->`) are new kinds — both used to be reported as `field-read`, mislabeling a
+write as a read. `fieldRead` counts in `breakdown` drop accordingly; the new
+`fieldSetMutation` / `fieldPattern` counters make up the difference.
 
 **Absence contract:** inspect `outcome` and `coverage.complete`. A complete miss returns
 `outcome="not_found"` and `resolution.matched=false`. A failed/timed-out project makes absence
@@ -67,6 +78,13 @@ In `speed=fast`, inspect `complete`, `expectedFiles`, `missingFiles`, `staleFile
 `sessionGeneration`. Current errors remain actionable with `complete=false`; an incomplete
 zero-error snapshot is `unknown`, never `clean`.
 
+**Diagnostic counts:** `totalDiagnostics = errorCount + warningCount + infoCount`, always —
+`infoCount` tallies the Info/Hidden diagnostics in the full set, and `belowSeverityFloorCount`
+(plus a `diagnosticsNote` when nonzero) explains how many of them the `severity` floor excluded
+from the `diagnostics` array. `scope='workspace'` carries the same `infoCount` on every
+**successfully analyzed** `perProject[]` entry, not just the workspace total — a timed-out,
+unrestored, or errored entry carries no counts at all.
+
 ---
 
 ## Navigate / understand
@@ -80,6 +98,8 @@ zero-error snapshot is `unknown`, never `clean`.
 - `restartLsp` — request an FSAC restart (default `true`)
 
 **Response includes:** `loadedProjects`, `readiness` (`lsp` / `projectOptions` / `symbolIndex` flags plus `symbolIndexState` / `symbolIndexHint`), `lspLifecycleState`, `sessionGeneration`, `lspRestartRequested`, legacy `lspRestarted`, `lspReplacedExistingProcess`, and `fslangmcpVersion`. `lspRestarted` keeps mirroring the request for compatibility; `lspReplacedExistingProcess=true` means a pre-existing FSAC process was actually replaced, so first launch reports `false` there. Switching to a different context with `restartLsp=false` while FSAC is live returns `status="restart_required"` and leaves the active context unchanged.
+
+`symbolIndexState` includes a `not_warmed` state — the warm-up window elapsed with no warm signal *observed*, which is not proof the index failed to warm (`find`/`check` are unaffected either way; see `docs/tools-detailed.md`). On an unsatisfiable `global.json` SDK pin (`rollForward: "disable"` pinning a version not installed), `set_project` instead returns a typed `{status: "infrastructure_error", errorKind: "sdk_not_found", ...}` envelope carrying the requested version, the `global.json` path, and the installed SDK list — not a readiness payload.
 
 **Use when:** Starting a session or switching to a different project. Call once; context persists.
 
@@ -119,6 +139,12 @@ The `evaluation` object identifies the evaluated source and restore state. LSP r
 - `summaryOnly` — `true` (default) for headers+counts; `false` for full name/kind/range/signature entries
 
 **Use when:** Understanding a single file's structure before editing it.
+
+**`downgradedToSummary`:** a `summaryOnly=false` request whose full per-member entries would
+cross the same response-size budget `fcs_public_api` uses is downgraded to the header-only
+shape instead of ever returning the oversized payload, flagged by `downgradedToSummary: true`
+plus a `hint` naming `maxResults` as the narrowing knob. `summaryOnly` in the response always
+echoes what was requested; check `downgradedToSummary` for what was actually returned.
 
 ---
 
@@ -309,6 +335,12 @@ The response includes `evaluation.status`, `evaluation.source`, `evaluation.impo
 - `maxResults` / `cursor` — pagination
 
 **Use when:** API-stability diffs, breaking-change detection, or generating a changelog. Prefer over `fcs_project_outline` for API work.
+
+**Page budget:** a page also closes on a shared response-size budget, not `maxResults` alone —
+API-dense types (long member lists) can cross it before the count cap does. `truncatedByBudget:
+true` flags a budget-close specifically; either close reason adds a `hint` naming
+`namespaceFilter` with real remainder namespaces to narrow the next call. See
+`docs/tools-detailed.md`.
 
 ---
 

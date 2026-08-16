@@ -2,7 +2,7 @@
 
 The MCP description tells you *whether* to call a tool; this file tells you *how it works internally*.
 
-**Start here.** `find` and `check` are the primary entry points in the 35-tool v0.15.0 surface.
+**Start here.** `find` and `check` are the primary entry points in the 35-tool v0.16.0 surface.
 The consolidation aliases below were removed in v0.13.1 and are no longer registered:
 
 | Removed names | Current route |
@@ -174,7 +174,7 @@ a different edit:
 | `field-pattern` | `\| { Field = binding } ->` | change the pattern / the binding's downstream use |
 | `field-read` | `x.Field` in an expression | the read's result type changes — follow the ripple |
 
-`field-set-mutation` and `field-pattern` are new in this release. Both used to be reported as
+`field-set-mutation` and `field-pattern` are new in v0.16.0. Both used to be reported as
 `field-read`, which for a mutation labelled a **write** as a read. `breakdown` gains the matching
 `fieldSetMutation` / `fieldPattern` counters; the existing counters keep their meaning, and
 `fieldRead` now means only "an expression that reads the field".
@@ -331,7 +331,10 @@ the rest of the scope is incomplete.
    `infoCount` is a tally of the Info+Hidden diagnostics in that full set. `belowSeverityFloorCount`
    says how many of those full-set diagnostics were excluded from `diagnostics` by the `severity`
    floor (never by the 50-item cap — that is `diagnosticsTruncated`'s job); when it is `> 0`,
-   `diagnosticsNote` spells out the gap and points at `severity="all"`.
+   `diagnosticsNote` spells out the gap and points at `severity="all"`. At `scope='workspace'`,
+   this identity holds per-project too: every successfully analyzed `perProject[]` entry carries
+   its own `errorCount` / `warningCount` / `infoCount` (#205), the same genuine
+   `countInfoDiagnostics` tally used everywhere else — not a `total - error - warning` remainder.
 4. **`speed=fast` is coverage-aware but still cached** — inspect `complete`, `expectedFiles`,
    `missingFiles`, `staleFiles`, and `sessionGeneration`. Use the default `trusted` when you need a
    fresh type-check of a just-written on-disk edit.

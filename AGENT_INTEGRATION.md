@@ -1,6 +1,6 @@
 # Agent Integration Guide
 
-This document describes a recommended workflow for AI coding agents (Claude Code, Cursor, GitHub Copilot CLI, Codex, etc.) that delegate F# work to subagents and use FsLangMCP as the semantic-query layer. It targets the 35-tool v0.13.2 surface and is opinionated — the patterns here came from real production multi-agent runs and have been refined through ~12 subagent sessions and ~700 tool calls against this server.
+This document describes a recommended workflow for AI coding agents (Claude Code, Cursor, GitHub Copilot CLI, Codex, etc.) that delegate F# work to subagents and use FsLangMCP as the semantic-query layer. It targets the 35-tool v0.16.0 surface and is opinionated — the patterns here came from real production multi-agent runs and have been refined through ~12 subagent sessions and ~700 tool calls against this server.
 
 ## Why this guide exists
 
@@ -170,6 +170,12 @@ done
 ```
 
 Read the log file at session close, include the delta in the routing comment if growth is non-trivial. This is how the asymmetric-per-project growth pattern was discovered (one PID accumulated state, sibling PIDs stayed flat — suggests per-project cache that needs periodic compaction).
+
+## Version drift in long-lived sessions
+
+`fslangmcp` is a long-lived stdio process: your MCP client spawns it once and keeps it running for the life of the session, sometimes longer if the client pools connections across subagents. `dotnet tool update -g FsLangMcp` (or a fresh `dotnet tool install` after a repo checkout) changes what's on disk, not what's already running. A subagent spawned mid-session, or a fresh agent reusing an existing client connection, can silently talk to a stale server for the rest of its run.
+
+Don't assume the on-disk version is the running version. Call `fslangmcp_version` (zero-arg, no project context required) at the start of any version-sensitive task — bug reproduction, regression testing, or confirming a fix landed — and compare it against the version you expect. If they disagree, the fix is a fresh MCP connection (restart the client's server process, or start a new client session), not another `dotnet tool update`.
 
 ## Adapting to non-Claude agents
 

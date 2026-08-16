@@ -8,78 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+## [0.16.0] - 2026-08-16
 
-- `find` gains a **field-impact mode** for planning a record-field type change from
-  the tool output alone (#207). The `includeSiteTypes` half is below; the site
-  reclassification half is a behaviour change, filed under *Changed*.
-  - **`includeSiteTypes` (default `false`).** When true, every record-field site
-    row additionally carries `siteType` — the field's type as the CURRENT
-    typecheck resolves it at that site, rendered with that site's own `open`s —
-    so an agent reads the "old type" per row instead of opening each file. A
-    `siteTypes` ledger (`typed + degraded == fieldSites`, counted over the whole
-    matched set, not just the page) and a `siteTypesNote` accompany it. A site
-    whose type FCS cannot produce, or one reached after the `timeoutMs` budget is
-    exhausted, gets `siteType: null` and is counted as degraded — a per-site miss
-    never fails the call. Annotates field sites only; a `kind` that produces none
-    says so in the note rather than going silently no-op. `siteType` is capped at
-    200 chars, keeping a full default 80-site page under the MCP payload ceiling
-    without lowering `maxResults`.
-  - **Explicit non-goal, stated in the docs and in every response note:**
-    `siteType` is never the type the field would have *after* the edit. That
-    requires compiling the modified code — edit the enumerated sites, then run
-    `check(scope='project')` for the verdict. Known limit: FCS exposes no per-use
-    generic arguments for record fields, so a field on a generic record renders
-    as its type *parameter* (`'T`), not the instantiation at the site.
-
-- `find` now reports a top-level `scopeNote` on every response that completes
-  a sweep (`succeeded`, `partial`, and `unknown`), naming how many projects
-  were actually swept (`projectsSwept`) and the recipe to change it: pass the
-  solution's `.sln`/`.slnx` as `projectPath` (or `set_project` it) with
-  `scope='workspace'` to widen from one project to every member project, or
-  pass a single `.fsproj` as `projectPath` to narrow from a solution sweep to
-  one project. Sweep breadth itself is unchanged — `scope=auto`/`workspace`
-  always sweep every member project the resolved target has, `scope=file`/
-  `project` always narrow to one — this is purely a new response field
-  surfacing that outcome so an agent does not have to pay for a
-  whole-workspace sweep to discover which recipe would have been faster. The
-  note never overstates coverage: when a project timed out or failed before
-  analysis completed, it reports "analyzed K of N" instead of claiming a
-  sweep that didn't happen, and for `scope='file'` it names the additional
-  file-level filter, not just the sibling-project blind spot (#193).
-- `fcs_public_api` now closes a page on a shared 45,000-character response
-  budget in addition to the existing `maxResults` type-count cap, so a
-  handful of API-dense types (long member lists) can no longer produce an
-  over-budget page just because `maxResults` still had "room" by count — the
-  field failure behind this: a 2.5k-line project's default call spilled to a
-  client-side file instead of returning inline. The additive
-  `truncatedByBudget: true` field distinguishes a budget-close from a
-  count-close; either way, whenever a page closes early with entities left
-  over, an additive `hint` names `namespaceFilter` together with 2-3 real
-  namespaces pulled from the remainder, so the next call can narrow instead
-  of re-fetching the same oversized shape. `fcs_file_outline` shares the same
-  budget: a `summaryOnly=false` request whose full per-member entries would
-  cross it now downgrades to the header-only shape `summaryOnly=true`
-  produces, flagged by an additive `downgradedToSummary: true` plus a `hint`
-  naming `maxResults` as the narrowing knob, instead of ever emitting the
-  oversized payload. Both changes are additive-only — a page/outline that
-  already fit the budget is unchanged (#206).
-
-### Changed
-
-- **`find` now reports five distinct record-field site kinds instead of three**
-  (#207). `kind=field` sites are tagged `field-set-literal` |
-  `field-set-update` | `field-set-mutation` | `field-pattern` | `field-read`,
-  with matching `fieldSetMutation` / `fieldPattern` counters added to
-  `breakdown`. Each shape needs a different edit when the field's type changes.
-  **Behaviour change:** `x.Field <- v` and `| { Field = x } ->` used to be
-  reported as `field-read` — the first of those labelled a *write* as a read.
-  Existing `breakdown` keys keep their meaning and the new ones are additive, but
-  `fieldRead` now means only "an expression that reads the field", so a consumer
-  that sums or switches on field kinds will see different numbers. No registered
-  tool couples to the field kinds (`fcs_refactor_impact` compares only against
-  `"definition"`), and `fcs_record_field_audit`'s internal `form` contract
-  (`literal` | `with-update` | `unknown`) is unchanged.
+0.16.0 closes three field-reported gaps where a payload's own numbers didn't explain themselves: `check`'s `totalDiagnostics` now reconciles with `errorCount + warningCount + infoCount` (workspace-wide and per-project), NuGet package-id-to-assembly resolution no longer returns an empty-but-`ok` payload when the assembly ships under a different name, and an unsatisfiable SDK pin now returns a typed `sdk_not_found` error instead of a lost transport connection. `set_project`'s `not_warmed` readiness state and `find`'s new `scopeNote` report sweep/readiness coverage honestly — what wasn't observed, and how many projects a sweep actually covered — instead of guessing or staying silent. `fcs_public_api` and `fcs_file_outline` now close pages on a response-size budget as well as by count, so a page no longer goes oversized merely because `maxResults` still had room by count (a single pathological entity can still exceed the budget by design — at least one entity is always returned). `find` also gains a field-impact mode, classifying record-field sites into five shapes instead of three and annotating each with its current type, so a field-type change can be planned from the tool output alone.
 
 ### Fixed
 
@@ -161,6 +92,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Behaviour change worth noting: `set_project(restartLsp=false)` on such a project
   previously answered `status: "ok"` with `readiness.projectOptions: false`. It now
   answers with the typed error, because the project genuinely cannot be evaluated.
+
+### Changed
+
+- **`find` now reports five distinct record-field site kinds instead of three**
+  (#207). `kind=field` sites are tagged `field-set-literal` |
+  `field-set-update` | `field-set-mutation` | `field-pattern` | `field-read`,
+  with matching `fieldSetMutation` / `fieldPattern` counters added to
+  `breakdown`. Each shape needs a different edit when the field's type changes.
+  **Behaviour change:** `x.Field <- v` and `| { Field = x } ->` used to be
+  reported as `field-read` — the first of those labelled a *write* as a read.
+  Existing `breakdown` keys keep their meaning and the new ones are additive, but
+  `fieldRead` now means only "an expression that reads the field", so a consumer
+  that sums or switches on field kinds will see different numbers. No registered
+  tool couples to the field kinds (`fcs_refactor_impact` compares only against
+  `"definition"`), and `fcs_record_field_audit`'s internal `form` contract
+  (`literal` | `with-update` | `unknown`) is unchanged.
+
+### Added
+
+- `find` gains a **field-impact mode** for planning a record-field type change from
+  the tool output alone (#207). The `includeSiteTypes` half is below; the site
+  reclassification half is a behaviour change, filed under *Changed*.
+  - **`includeSiteTypes` (default `false`).** When true, every record-field site
+    row additionally carries `siteType` — the field's type as the CURRENT
+    typecheck resolves it at that site, rendered with that site's own `open`s —
+    so an agent reads the "old type" per row instead of opening each file. A
+    `siteTypes` ledger (`typed + degraded == fieldSites`, counted over the whole
+    matched set, not just the page) and a `siteTypesNote` accompany it. A site
+    whose type FCS cannot produce, or one reached after the `timeoutMs` budget is
+    exhausted, gets `siteType: null` and is counted as degraded — a per-site miss
+    never fails the call. Annotates field sites only; a `kind` that produces none
+    says so in the note rather than going silently no-op. `siteType` is capped at
+    200 chars, keeping a full default 80-site page under the MCP payload ceiling
+    without lowering `maxResults`.
+  - **Explicit non-goal, stated in the docs and in every response note:**
+    `siteType` is never the type the field would have *after* the edit. That
+    requires compiling the modified code — edit the enumerated sites, then run
+    `check(scope='project')` for the verdict. Known limit: FCS exposes no per-use
+    generic arguments for record fields, so a field on a generic record renders
+    as its type *parameter* (`'T`), not the instantiation at the site.
+
+- `find` now reports a top-level `scopeNote` on every response that completes
+  a sweep (`succeeded`, `partial`, and `unknown`), naming how many projects
+  were actually swept (`projectsSwept`) and the recipe to change it: pass the
+  solution's `.sln`/`.slnx` as `projectPath` (or `set_project` it) with
+  `scope='workspace'` to widen from one project to every member project, or
+  pass a single `.fsproj` as `projectPath` to narrow from a solution sweep to
+  one project. Sweep breadth itself is unchanged — `scope=auto`/`workspace`
+  always sweep every member project the resolved target has, `scope=file`/
+  `project` always narrow to one — this is purely a new response field
+  surfacing that outcome so an agent does not have to pay for a
+  whole-workspace sweep to discover which recipe would have been faster. The
+  note never overstates coverage: when a project timed out or failed before
+  analysis completed, it reports "analyzed K of N" instead of claiming a
+  sweep that didn't happen, and for `scope='file'` it names the additional
+  file-level filter, not just the sibling-project blind spot (#193).
+- `fcs_public_api` now closes a page on a shared 45,000-character response
+  budget in addition to the existing `maxResults` type-count cap, so a
+  handful of API-dense types (long member lists) can no longer produce an
+  over-budget page just because `maxResults` still had "room" by count — the
+  field failure behind this: a 2.5k-line project's default call spilled to a
+  client-side file instead of returning inline. The additive
+  `truncatedByBudget: true` field distinguishes a budget-close from a
+  count-close; either way, whenever a page closes early with entities left
+  over, an additive `hint` names `namespaceFilter` together with 2-3 real
+  namespaces pulled from the remainder, so the next call can narrow instead
+  of re-fetching the same oversized shape. `fcs_file_outline` shares the same
+  budget: a `summaryOnly=false` request whose full per-member entries would
+  cross it now downgrades to the header-only shape `summaryOnly=true`
+  produces, flagged by an additive `downgradedToSummary: true` plus a `hint`
+  naming `maxResults` as the narrowing knob, instead of ever emitting the
+  oversized payload. Both changes are additive-only — a page/outline that
+  already fit the budget is unchanged (#206).
 
 ## [0.15.0] - 2026-08-16
 
@@ -893,10 +897,14 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
 <!--
   Compare links: only versions that exist as git tags are linked.
   Earlier releases (0.2.0, 0.3.0, 0.3.1, 0.4.0) shipped without tags;
-  backfilling them would point at synthetic refs.
+  backfilling them would point at synthetic refs. 0.14.0 is the same case:
+  it was prepared but never tagged or published (see the 0.15.0 entry
+  above), so it has no link definition either — 0.15.0 compares from the
+  last version that actually was tagged, 0.13.2.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.14.0...HEAD
-[0.14.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.13.2...v0.14.0
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.13.2...v0.15.0
 [0.13.2]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.13.2
 [0.13.1]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.13.1
 [0.13.0]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.13.0
