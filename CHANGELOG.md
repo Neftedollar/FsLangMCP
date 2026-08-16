@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `set_project`'s `readiness.symbolIndexState` no longer claims `warming`
+  forever when no warm signal from the FSAC symbol index is ever observed
+  (#194). `assessSymbolIndex` already compared elapsed-since-workspace-ready
+  against a warm-up window for the internal FSAC `workspace/symbol` probe
+  `find` falls back to, but `setProjectReadiness` never saw that signal. It
+  now reuses the same
+  `workspaceReadyAt` timestamp and warm-up window: past the window with no
+  non-empty index result observed yet, the state reads `not_warmed` with a
+  hint that `find`/`check` are unaffected (they use FCS sweeps, not the
+  symbol index) — only the symbol-index fallback inside position-based LSP
+  tools may be degraded. The hint reports what was not observed rather than
+  asserting the index failed to warm, since the underlying FSAC probe is
+  only sent as a fallback and a healthy session may never need it.
+  `warming` still applies within the window; the boolean `symbolIndex` field
+  and the other states are unchanged.
 - An unsatisfiable `global.json` SDK pin no longer reduces `set_project` to an
   opaque transport error (#192). When the nearest `global.json` pins a version
   with `rollForward: "disable"` and that exact SDK is not installed, both
