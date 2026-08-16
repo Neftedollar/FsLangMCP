@@ -593,7 +593,7 @@ let private mainCore argv =
                 tool (
                     TypedTool.define<FcsNugetTypesArgs>
                         "fcs_nuget_types"
-                        "Enumerate all types in one referenced assembly matched by EXACT SimpleName (case-insensitive). Prefer `fcs_referenced_symbols` when you need substring search across assemblies. `Spectre.Console` resolves only to that assembly — not `Spectre.Console.Cli`; call once per assembly. Each entry: displayName, fullName, kind, accessibility, isObsolete. Paginated; default 500, max 2000. Returns `matchedAssemblies=[]` on no match. Mechanics: docs/tools-detailed.md#fcs_nuget_types."
+                        "Enumerate all types in one referenced assembly. `packageId` accepts the NuGet package id OR an assembly SimpleName it ships (exact, case-insensitive, never a prefix); the two often differ, and multi-assembly packages resolve fully. Prefer `fcs_referenced_symbols` for substring search across assemblies. Entry: displayName, fullName, kind, accessibility, isObsolete. Paginated; default 500, max 2000. A miss adds `hint` + `candidatePackages`. Details: docs/tools-detailed.md#fcs_nuget_types."
                         (fun args (_ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -605,7 +605,7 @@ let private mainCore argv =
                 tool (
                     TypedTool.define<FcsNugetMembersArgs>
                         "fcs_nuget_members"
-                        "Enumerate members of one type from a referenced assembly (matched by packageId + typeName). Prefer `fcs_nuget_types` to discover available type names first. Each entry: name, kind, signature, accessibility, isObsolete, xmlDocSummary. Paginated; default 500, max 2000. Returns `matchedTypes=[]` on no type match. Mechanics: docs/tools-detailed.md#fcs_nuget_members."
+                        "Enumerate members of one type from a referenced assembly (packageId + typeName). `packageId` accepts the NuGet package id OR an assembly SimpleName it ships; the two often differ. Prefer `fcs_nuget_types` to discover type names first. Entry: name, kind, signature, accessibility, isObsolete, xmlDocSummary. Paginated; default 500, max 2000. A miss adds `hint`, plus `candidatePackages` when the packageId did not resolve. Details: docs/tools-detailed.md#fcs_nuget_members."
                         (fun args (_ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }

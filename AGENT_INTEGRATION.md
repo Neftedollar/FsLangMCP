@@ -113,9 +113,9 @@ A minimal F# subagent brief skeleton. Embed your task-specific content where ind
   as needed. The removed `workspace_diagnostics`, `workspace_symbol`, and
   `textDocument_references` aliases are not available; use `find` / `check`.
 - `rg` is OK for non-F# files (.fsproj, .md, .json, .yml).
-- For NuGet third-party type enumeration: `fcs_nuget_types` (exact
-  assembly) and `fcs_referenced_symbols` (cross-assembly search), both
-  shipped v0.7.0.
+- For NuGet third-party type enumeration: `fcs_nuget_types` (one package or
+  assembly — `packageId` takes either spelling) and `fcs_referenced_symbols`
+  (cross-assembly search), both shipped v0.7.0.
 - For unresolved-symbol "what `open` do I add?" lookups:
   `fcs_suggest_open` (shipped v0.9.0).
 - For record-construction-site audits (`{ Field = ... }` /
