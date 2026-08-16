@@ -3279,18 +3279,21 @@ type internal FcsBridge
             let status =
                 if checkedResults.IsSome then "succeeded" else "aborted"
 
-            let errorCount =
-                Array.append parseDiagnostics checkDiagnostics
-                |> Array.filter (fun d ->
-                    match d with
-                    | :? JsonObject as obj ->
-                        match obj["severity"] with
-                        | :? JsonValue as sev ->
-                            let mutable code = 0
-                            sev.TryGetValue(&code) && code = 1
-                        | _ -> false
-                    | _ -> false)
-                |> Array.length
+            // #190: errorCount used to be read back off the JSON `severity` field via
+            // JsonValue.TryGetValue<int>, but diagnosticToJson serializes severity as text
+            // (e.g. "Error") — the int read never matched, so errorCount was silently 0
+            // even with real type errors. Count off the raw FCS diagnostics instead, the
+            // same way every other totalDiagnostics emitter in this file does; that also
+            // gets warningCount/infoCount for free (FSharpDiagnosticSeverity has exactly
+            // four cases, so total - error - warning = info + hidden, exactly).
+            let rawDiagnostics =
+                match checkedResults with
+                | Some r -> Array.append parseResults.Diagnostics r.Diagnostics
+                | None -> parseResults.Diagnostics
+
+            let errorCount, warningCount = countDiagnosticsBySeverity rawDiagnostics
+            let totalDiagnosticsCount = rawDiagnostics.Length
+            let infoCount = totalDiagnosticsCount - errorCount - warningCount
 
             return
                 jobj
@@ -3301,7 +3304,9 @@ type internal FcsBridge
                       "parseHadErrors", jbool parseResults.ParseHadErrors
                       "hasFullTypeCheckInfo", jbool hasTypeCheckInfo
                       "errorCount", jint errorCount
-                      "totalDiagnostics", jint (parseDiagnostics.Length + checkDiagnostics.Length)
+                      "warningCount", jint warningCount
+                      "infoCount", jint infoCount
+                      "totalDiagnostics", jint totalDiagnosticsCount
                       "parseDiagnostics", JsonArray(parseDiagnostics) :> JsonNode
                       "checkDiagnostics", JsonArray(checkDiagnostics) :> JsonNode ]
                 :> JsonNode
@@ -3386,6 +3391,11 @@ type internal FcsBridge
                         |> Array.filter (fun d -> d.Severity = FSharpDiagnosticSeverity.Warning)
                         |> Array.length
 
+                    // #190: full-set remainder once errors/warnings are subtracted —
+                    // FSharpDiagnosticSeverity has exactly four cases (Error/Warning/Info/
+                    // Hidden), so this is exact, matching the `check` tool's identity.
+                    let infoCount = allDiagnostics.Length - errorCount - warningCount
+
                     return
                         jobj
                             [ "status", jstr (if checkSucceeded then "succeeded" else "aborted")
@@ -3395,6 +3405,7 @@ type internal FcsBridge
                               "parseHadErrors", jbool parseResults.ParseHadErrors
                               "errorCount", jint errorCount
                               "warningCount", jint warningCount
+                              "infoCount", jint infoCount
                               "totalDiagnostics", jint allDiagnostics.Length
                               "diagnostics", JsonArray(allDiagnostics |> Array.map diagnosticToJson) :> JsonNode ]
                         :> JsonNode
@@ -6303,6 +6314,26 @@ type internal FcsBridge
                 let cappedDiagNodes = diagNodes |> Array.truncate diagnosticsCap
                 let diagnosticsTruncated = diagNodes.Length > diagnosticsCap
 
+                // #190: totalDiagnostics silently disagreed with errorCount+warningCount
+                // whenever the full set held Info/Hidden diagnostics — agents read the gap
+                // as "hidden findings" and burned time hunting for them. Both new numbers
+                // fall out of the parameters every call site already computes, so no call
+                // site needs to change: infoCount is the FULL-set remainder once errors and
+                // warnings are subtracted (FSharpDiagnosticSeverity has exactly four cases —
+                // Error/Warning/Info/Hidden — so this is exact, not an approximation);
+                // belowSeverityFloorCount is the FULL-set count minus what passed the
+                // severity floor into `diagNodes`, measured before the diagnosticsCap
+                // truncation above so the cap and the floor never overlap in what they explain.
+                let infoCount = max 0 (totalDiagnostics - errorCount - warningCount)
+                let belowSeverityFloorCount = max 0 (totalDiagnostics - diagNodes.Length)
+
+                let diagnosticsNote =
+                    if belowSeverityFloorCount > 0 then
+                        jstr
+                            $"%d{belowSeverityFloorCount} diagnostic(s) below the current severity floor are counted in totalDiagnostics but not listed; pass severity=\"all\" to list them."
+                    else
+                        null
+
                 jobj (
                     [ "status", jstr "succeeded"
                       "verdict", jstr verdict
@@ -6322,6 +6353,9 @@ type internal FcsBridge
                       "fresh", jbool (speed = "trusted")
                       "groundTruth", jbool (analyzed && via = "fcs")
                       "totalDiagnostics", jint totalDiagnostics
+                      "infoCount", jint infoCount
+                      "belowSeverityFloorCount", jint belowSeverityFloorCount
+                      "diagnosticsNote", diagnosticsNote
                       "reason", (match reason with Some r -> jstr r | None -> null) ]
                     @ extra
                 )

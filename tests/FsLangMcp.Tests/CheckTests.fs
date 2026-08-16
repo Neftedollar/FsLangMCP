@@ -1938,6 +1938,121 @@ type CheckTests(fx: CheckFixture) =
             Assert.Equal(1, gi atError "totalDiagnostics")
         }
 
+    // ── #190: totalDiagnostics disagreed with errorCount+warningCount whenever the full
+    // set held Info/Hidden diagnostics, and nothing in the payload said why — agents read
+    // the gap as "hidden findings" and burned time hunting for them (field report #100).
+    // infoCount and belowSeverityFloorCount must close that gap on every path.
+    [<Fact>]
+    member _.``speed=fast: infoCount + belowSeverityFloorCount explain a zero errorCount/warningCount but nonzero totalDiagnostics (#190)``
+        ()
+        : Task =
+        task {
+            let bridge = FcsBridge()
+
+            // The exact field-evidence shape from #190: zero errors/warnings, nonzero
+            // totalDiagnostics, because the full set holds one info-severity (LSP code 3)
+            // diagnostic that the default severity floor excludes from the list.
+            let json =
+                "{ \"lspState\": \"ready\", \"mostRecentAnalyzedAt\": \"2026-01-01T00:00:00Z\","
+                + " \"diagnosticsFileCount\": 1, \"result\": { \"/probe/Info.fs\": ["
+                + " { \"severity\": 3, \"message\": \"naming hint\", \"file\": \"/probe/Info.fs\","
+                + " \"range\": { \"startLine\": 1, \"startColumn\": 0, \"endLine\": 1, \"endColumn\": 5 } } ] } }"
+
+            let snap = CheckFsacSnapshot.ofDiagnosticsResponse (JsonNode.Parse json)
+
+            let fastCheck (severity: string option) =
+                bridge.Check(
+                    { bareCheck with
+                        projectPath = Some fx.ProbeFsproj
+                        speed = Some "fast"
+                        scope = Some "project"
+                        severity = severity },
+                    fsacSnapshot = (fun expectation ->
+                        Task.FromResult(bindCompleteSnapshot expectation snap))
+                )
+
+            let! atError = fastCheck None
+            Assert.Equal(0, gi atError "errorCount")
+            Assert.Equal(0, gi atError "warningCount")
+            Assert.Equal(1, gi atError "totalDiagnostics")
+            Assert.Equal(1, gi atError "infoCount")
+
+            Assert.Equal(
+                gi atError "totalDiagnostics",
+                gi atError "errorCount" + gi atError "warningCount" + gi atError "infoCount"
+            )
+
+            Assert.Equal(1, gi atError "belowSeverityFloorCount")
+            Assert.Contains("severity=\"all\"", gs atError "diagnosticsNote")
+
+            // severity=all: the floor no longer excludes anything, so the gap closes and
+            // the note disappears — the 50-item cap (diagnosticsTruncated) must never
+            // leak into belowSeverityFloorCount either.
+            let! atAll = fastCheck (Some "all")
+            Assert.Equal(0, gi atAll "belowSeverityFloorCount")
+            Assert.Null(atAll["diagnosticsNote"])
+        }
+
+    [<Fact>]
+    member _.``speed=trusted: totalDiagnostics = errorCount + warningCount + infoCount on a real in-process check (#190)``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            // A genuine FS0025 incomplete-match warning, zero errors — no mocked FSAC
+            // snapshot; this exercises the identity through a real, fresh FCS check.
+            File.WriteAllText(
+                fx.MainFs,
+                String.concat
+                    "\n"
+                    [ "module Probe.Main"
+                      ""
+                      "let classify (x: int option) ="
+                      "    match x with"
+                      "    | Some v -> v"
+                      "" ]
+            )
+
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        path = Some fx.MainFs
+                        projectPath = Some fx.ProbeFsproj
+                        scope = Some "file"
+                        speed = Some "trusted" }
+                )
+
+            Assert.Equal(0, gi result "errorCount")
+            Assert.True(gi result "warningCount" > 0, "Expected the incomplete-match warning to be counted")
+
+            Assert.Equal(
+                gi result "totalDiagnostics",
+                gi result "errorCount" + gi result "warningCount" + gi result "infoCount"
+            )
+
+            // Default floor (error) excludes the warning from the list, so the gap must
+            // be explained.
+            Assert.True(gi result "belowSeverityFloorCount" > 0)
+            Assert.Contains("severity=\"all\"", gs result "diagnosticsNote")
+
+            // severity=all surfaces it and the gap closes.
+            let! atAll =
+                bridge.Check(
+                    { bareCheck with
+                        path = Some fx.MainFs
+                        projectPath = Some fx.ProbeFsproj
+                        scope = Some "file"
+                        speed = Some "trusted"
+                        severity = Some "all" }
+                )
+
+            Assert.Equal(0, gi atAll "belowSeverityFloorCount")
+            Assert.Null(atAll["diagnosticsNote"])
+        }
+
     [<Fact>]
     member _.``invalid speed is rejected with invalid_args``() : Task =
         task {

@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `check`'s `totalDiagnostics` now explains itself instead of silently disagreeing with
+  `errorCount + warningCount` (#190). `totalDiagnostics` counts the FULL diagnostic set across
+  every severity (including Info/Hidden) — a deliberate #133 fix — but nothing in the payload said
+  so, and agents read a nonzero `totalDiagnostics` alongside `errorCount: 0, warningCount: 0` as
+  hidden findings and burned time hunting for them. Two new fields close the identity:
+  `infoCount` (so `totalDiagnostics = errorCount + warningCount + infoCount`, always) and
+  `belowSeverityFloorCount` (how many of those full-set diagnostics the `severity` floor excluded
+  from the `diagnostics` array — never the 50-item cap, which stays `diagnosticsTruncated`'s job),
+  plus a `diagnosticsNote` pointing at `severity="all"` when the gap is nonzero. Also fixes
+  `fcs_check_file`'s internal `errorCount`, which was silently always `0`: it read the JSON
+  `severity` field as an int, but that field is serialized as text (`"Error"`) — the read never
+  matched.
+
 ## [0.15.0] - 2026-08-16
 
 `0.14.0` was prepared but never tagged or published to NuGet — the last release

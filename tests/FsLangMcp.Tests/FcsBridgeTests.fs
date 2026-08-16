@@ -1424,6 +1424,43 @@ let ``CheckFile totalDiagnostics matches parseDiagnostics + checkDiagnostics`` (
                 Directory.Delete(tempRoot, true)
     }
 
+// #190: errorCount used to be read back off the JSON `severity` field via
+// JsonValue.TryGetValue<int>, but diagnosticToJson serializes severity as text (e.g.
+// "Error") so the int read never matched — errorCount was silently 0 even with a real
+// type error. This test would have failed before the fix.
+[<Fact>]
+let ``CheckFile reports errorCount>0 for a real type error, and totalDiagnostics = errorCount + warningCount + infoCount`` ()
+    : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_checkfile_counts_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let sourcePath, projectPath = writeSimpleProject tempRoot "CheckCounts" "value"
+            File.WriteAllText(sourcePath, "module CheckCounts.Library\n\nlet value: int = \"oops\"\n")
+
+            let! result =
+                bridge.CheckFile(
+                    { path = sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None }
+                )
+
+            Assert.True(result["errorCount"].GetValue<int>() > 0, "Expected the real type error to be counted")
+
+            Assert.Equal(
+                result["totalDiagnostics"].GetValue<int>(),
+                result["errorCount"].GetValue<int>()
+                + result["warningCount"].GetValue<int>()
+                + result["infoCount"].GetValue<int>()
+            )
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
 // ─── fcs_type_at_position fuzzy (#111) ───────────────────────────────────────
 
 [<Fact>]
@@ -1594,6 +1631,14 @@ let ``ValidateSnippet flags a type error in the snippet`` () : Task =
         // with errorCount>0 (parse OK, check populated diagnostics).
         Assert.True(result["errorCount"].GetValue<int>() > 0, "Expected at least one error diagnostic")
         Assert.True(result["totalDiagnostics"].GetValue<int>() > 0)
+
+        // #190: infoCount closes totalDiagnostics = errorCount + warningCount + infoCount.
+        Assert.Equal(
+            result["totalDiagnostics"].GetValue<int>(),
+            result["errorCount"].GetValue<int>()
+            + result["warningCount"].GetValue<int>()
+            + result["infoCount"].GetValue<int>()
+        )
     }
 
 [<Fact>]
