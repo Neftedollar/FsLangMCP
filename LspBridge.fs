@@ -1921,6 +1921,38 @@ type internal FsAutoCompleteBridge
                                   :> JsonNode ]
                             :> JsonNode
                     | WorkspaceSelection.Selected(projectPath, selectionCandidates) ->
+                        // #192: Init.init resolves the SDK from the *target's* global.json,
+                        // and fsautocomplete calls it during its own startup with nothing to
+                        // catch the failure — the child dies before answering `initialize`
+                        // and the only symptom reaching the agent is StreamJsonRpc's
+                        // "The JSON-RPC connection with the remote party was lost". Decide
+                        // the provable case here, before any MSBuild evaluation or FSAC
+                        // process exists, and leave the active context untouched.
+                        // Off the dispatch thread: the (cached, once-per-process) SDK
+                        // enumeration spawns `dotnet --list-sdks`.
+                        // listProjects is pure solution-file parsing (no MSBuild), so it is
+                        // safe to enumerate before the pre-flight; a nested global.json under
+                        // one member project would kill FSAC just as effectively as the root.
+                        let loadedProjects = FsLangMcp.ProjectFiles.SolutionParsing.listProjects projectPath
+
+                        // FSAC calls Init.init with its *process working directory*, which
+                        // StartLspUnsafe sets to the resolved workspace root — so the
+                        // workspace candidates matter as much as the project's own directory.
+                        let preflightDirectories =
+                            [ resolveWorkspaceFromProjectPath projectPath
+                              if Directory.Exists inputPath then
+                                  inputPath
+                              yield! (args.workspacePath |> Option.map Path.GetFullPath |> Option.toList)
+                              for memberProject in loadedProjects do
+                                  resolveWorkspaceFromProjectPath memberProject ]
+
+                        let! sdkVerdict = Task.Run(fun () -> SdkPreflight.check preflightDirectories)
+
+                        match sdkVerdict with
+                        | SdkPreflight.SdkNotFound(pin, installedSdks) ->
+                            return SdkPreflight.toEnvelope pin installedSdks
+                        | SdkPreflight.Proceed ->
+
                         let isSolution =
                             projectPath.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
                             || projectPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
@@ -1939,7 +1971,6 @@ type internal FsAutoCompleteBridge
                                 else
                                     resolveWorkspaceFromProjectPath projectPath)
 
-                        let loadedProjects = FsLangMcp.ProjectFiles.SolutionParsing.listProjects projectPath
                         let! evaluatedSourceFiles = resolveEvaluatedSourceFiles loadedProjects
                         let restartLsp = args.restartLsp |> Option.defaultValue true
                         let mutable lspWasRunning = false
