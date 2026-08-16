@@ -90,7 +90,7 @@ Response shape:
 {
   "status": "ok",
   "result": {
-    "fslangmcpVersion": "0.13.2",
+    "fslangmcpVersion": "0.16.0",
     "lspRestartRequested": true,
     "lspRestarted": true,
     "lspReplacedExistingProcess": false,
@@ -208,7 +208,8 @@ readability; your run will show all sites):
       "symbolFullName": "Domain.Order.Id",
       "lineText": "    [ { Id = 1; Customer = \"Alice\"; Amount = 250.00m }"
     }
-  ]
+  ],
+  "scopeNote": "find swept 2 member projects of '…/Quickstart.slnx'. To narrow to just one project (faster, but misses cross-project usages), pass its .fsproj as projectPath."
 }
 ```
 
@@ -226,6 +227,10 @@ Add `"includeSiteTypes": true` to a `kind=field` call and each field-site row al
 carries `siteType` — the field's type as the current typecheck resolves it at that
 site — plus a top-level `siteTypes` ledger. It reports today's type only; after
 editing the sites, run `check` for the post-edit verdict.
+
+Every response that completes a sweep also carries a top-level `scopeNote` —
+here it names the 2 projects actually swept and the recipe (a single `.fsproj`
+`projectPath`) to narrow to one project next time.
 
 ---
 
@@ -310,6 +315,6 @@ dotnet run --project App/App.fsproj
 
 - **Response field names are exact**: `totalSites`, `breakdown`, `sites[].kind`,
   `sites[].symbolFullName`, `sites[].lineText`, `resolution.projectsSwept` all
-  match the v0.13.2 tool implementation.
+  match the v0.16.0 tool implementation.
 
 - **Time to first success: ~3 minutes** (install + bootstrap + four tool calls).

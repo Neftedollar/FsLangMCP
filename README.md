@@ -144,7 +144,7 @@ Prefer the semantic tools above for free-form agent flows.
 
 ```
 1. set_project  {"projectPath": "/abs/path/MyApp.sln"}
-   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.15.0"
+   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.16.0"
 
 2. check  {}
    → verdict="clean"
@@ -281,6 +281,7 @@ dotnet tool restore
   stuck in-process compiler operation.
 - FCS tools fall back to script-style inference (`GetProjectOptionsFromScript`) only when no `.fsproj` is found. Diagnostics and symbol data can be incomplete for multi-project solutions in this mode.
 - `project_health` is project-focused — it does not inspect whole solutions or resolve ambiguous directories.
+- `dotnet tool update -g FsLangMcp` does not affect an already-running server process — it's long-lived once your MCP client spawns it. Call `fslangmcp_version` to confirm which version is actually running rather than assuming the on-disk one; version-sensitive testing needs a fresh MCP connection. See [`docs/troubleshooting.md`](docs/troubleshooting.md#version-skew-tools-behave-differently-than-expected).
 
 ## About Tool Dependencies
 

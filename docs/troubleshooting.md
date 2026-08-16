@@ -165,6 +165,17 @@ running. To update:
 dotnet tool update -g FsLangMcp
 ```
 
+**A second, easy-to-miss cause: the server is a long-lived process.**
+`dotnet tool update -g FsLangMcp` only changes what's on disk — it does not
+affect a `fslangmcp` process your MCP client already spawned and is still
+running. A subagent started mid-session, or a fresh agent reusing an existing
+client connection, can silently keep talking to the pre-update binary for the
+rest of that session. Don't assume the on-disk version is the running
+version: call `fslangmcp_version` again after updating, and if it still
+reports the old version, the fix is a fresh MCP connection (restart the
+client's server process, or start a new client session) — not a repeated
+`dotnet tool update`.
+
 ---
 
 ## `check` or `find` reports stale results after an edit

@@ -139,7 +139,7 @@ let runToolOnly (serverInfoVersion: string) (config: ServerConfig) : Task<unit> 
                     Implementation(
                         Name = ServerName.value config.Name,
                         // FsMcp.Server normalizes its ServerVersion wrapper through
-                        // System.Version (for example 0.15.0 -> 0.15.0.0). The wire
+                        // System.Version (for example 0.16.0 -> 0.16.0.0). The wire
                         // contract and package verifier need the exact SemVer product
                         // identity, so receive the raw value explicitly.
                         Version = serverInfoVersion
