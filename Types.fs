@@ -539,7 +539,9 @@ type FcsAnalyzerDiagnosticsArgs =
       maxResults: int option }
 
 type FcsNugetTypesArgs =
-    { /// Package id (matched against referenced assembly SimpleName, case-insensitive).
+    { /// NuGet package id OR the assembly SimpleName it ships (case-insensitive, exact —
+      /// never a prefix). The two differ for many packages, and either is accepted:
+      /// "Microsoft.Orleans.Core.Abstractions" and "Orleans.Core.Abstractions" both resolve.
       /// Example: "Spectre.Console", "Newtonsoft.Json", "System.Text.Json".
       packageId: string
       projectPath: string option
@@ -550,8 +552,9 @@ type FcsNugetTypesArgs =
       cursor: string option }
 
 type FcsNugetMembersArgs =
-    { /// Package id matched against assembly SimpleName (case-insensitive, exact match).
-      /// Same matching logic as fcs_nuget_types — "System.Text.Json" resolves only to that assembly.
+    { /// NuGet package id OR the assembly SimpleName it ships (case-insensitive, exact match).
+      /// Same matching logic as fcs_nuget_types — "System.Text.Json" resolves only to that
+      /// assembly, never to "System.Text.Json.Nodes" or any other prefix relative.
       packageId: string
       /// Type to look up within the matched assembly. Matched case-insensitively against
       /// DisplayName and FullName. Example: "String", "FSharpList", "JsonSerializer".

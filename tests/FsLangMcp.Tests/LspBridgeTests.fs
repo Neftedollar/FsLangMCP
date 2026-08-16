@@ -1791,7 +1791,11 @@ let ``mostRecentAnalyzedAt with fileGlob matching zero files is null`` () =
 
 [<Fact>]
 let ``setProjectReadiness explains how to recover while symbol index is warming`` () =
-    let readiness = setProjectReadiness true false true
+    let now = DateTimeOffset.UtcNow
+    let workspaceReadyAt = ValueSome(now.AddSeconds(-1.0)) // within the 3s warmup window
+
+    let readiness =
+        setProjectReadiness true false true workspaceReadyAt now (TimeSpan.FromSeconds 3.0)
 
     Assert.False(readiness["symbolIndex"].GetValue<bool>())
     Assert.Equal("warming", readiness["symbolIndexState"].GetValue<string>())
@@ -1799,9 +1803,56 @@ let ``setProjectReadiness explains how to recover while symbol index is warming`
     Assert.Contains("retry", readiness["symbolIndexHint"].GetValue<string>())
 
 [<Fact>]
-let ``setProjectReadiness explains how to start LSP when it was not requested`` () =
-    let readiness = setProjectReadiness false false false
-    let timedOutReadiness = setProjectReadiness false false true
+let ``setProjectReadiness reports not_warmed once the warmup window has elapsed (#194)`` () =
+    let now = DateTimeOffset.UtcNow
+    let workspaceReadyAt = ValueSome(now.AddSeconds(-10.0)) // past the 3s warmup window
+
+    let readiness =
+        setProjectReadiness true false true workspaceReadyAt now (TimeSpan.FromSeconds 3.0)
+
+    Assert.False(readiness["symbolIndex"].GetValue<bool>())
+    Assert.Equal("not_warmed", readiness["symbolIndexState"].GetValue<string>())
+    // Observation-honest wording (#194 review, I1): reports what was not
+    // observed, not a diagnosis — the FSAC probe this depends on is only
+    // sent when find's own FCS sweep comes up empty, so a healthy session
+    // that never needed the probe looks identical to one that "failed".
+    Assert.Contains("has not been observed warm within 3s", readiness["symbolIndexHint"].GetValue<string>())
+    Assert.Contains("find and check are unaffected", readiness["symbolIndexHint"].GetValue<string>())
+    Assert.Contains("FCS sweeps", readiness["symbolIndexHint"].GetValue<string>())
+
+[<Fact>]
+let ``setProjectReadiness stays warming when workspaceReadyAt is unknown, even long after set_project returned`` () =
+    // No observed workspace-ready timestamp means there's nothing to measure
+    // elapsed time from — stay in "warming" rather than guessing "not_warmed".
+    let now = DateTimeOffset.UtcNow
+    let readiness = setProjectReadiness true false true ValueNone now (TimeSpan.FromSeconds 3.0)
+
+    Assert.Equal("warming", readiness["symbolIndexState"].GetValue<string>())
+
+[<Fact>]
+let ``setProjectReadiness regression: reports ready once the symbol index has warmed`` () =
+    let now = DateTimeOffset.UtcNow
+    let workspaceReadyAt = ValueSome(now.AddSeconds(-10.0)) // past the window, but warmed
+
+    let readiness =
+        setProjectReadiness true true true workspaceReadyAt now (TimeSpan.FromSeconds 3.0)
+
+    Assert.True(readiness["symbolIndex"].GetValue<bool>())
+    Assert.Equal("ready", readiness["symbolIndexState"].GetValue<string>())
+    Assert.Null(readiness["symbolIndexHint"])
+
+[<Fact>]
+let ``setProjectReadiness regression: explains how to start LSP when it was not requested`` () =
+    let now = DateTimeOffset.UtcNow
+    // Past the warmup window — but lspReady=false, so not_warmed must not fire;
+    // not_started/blocked_on_lsp take priority whenever the LSP itself isn't up.
+    let workspaceReadyAt = ValueSome(now.AddSeconds(-10.0))
+
+    let readiness =
+        setProjectReadiness false false false workspaceReadyAt now (TimeSpan.FromSeconds 3.0)
+
+    let timedOutReadiness =
+        setProjectReadiness false false true workspaceReadyAt now (TimeSpan.FromSeconds 3.0)
 
     Assert.Equal("not_started", readiness["symbolIndexState"].GetValue<string>())
     Assert.Contains("unavailable", readiness["symbolIndexHint"].GetValue<string>())

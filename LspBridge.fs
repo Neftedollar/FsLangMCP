@@ -89,6 +89,9 @@ let private releaseOnDispose (semaphore: SemaphoreSlim) =
 
 let rec private classifyRenameInfrastructureError (error: exn) =
     match error with
+    // #192: must precede the InvalidOperationException arm — SdkNotFoundException
+    // derives from it, and an unsatisfiable SDK pin is not a protocol error.
+    | SdkPreflight.SdkPinUnsatisfiable _ -> "sdk_not_found", false
     | :? TimeoutException -> "timeout", true
     | :? System.ComponentModel.Win32Exception -> "executable_missing", false
     | :? IOException
@@ -459,6 +462,24 @@ module internal LspResponseShape =
     let lspRestartOccurred (restartRequested: bool) (lspWasRunning: bool) =
         restartRequested && lspWasRunning
 
+    /// Warm-up grace period after workspace-ready before an empty/never-warmed
+    /// symbol index is treated as stalled rather than "still indexing". Shared
+    /// by assessSymbolIndex (workspace_symbol) and setProjectReadiness
+    /// (set_project) — one timing source, not two (#194).
+    let symbolIndexWarmupWindow = TimeSpan.FromSeconds 3.0
+
+    /// True once `warmupWindow` has elapsed since workspace-ready; false when
+    /// workspace-ready hasn't happened yet (nothing to measure the elapsed
+    /// time from).
+    let private warmupWindowElapsed
+        (workspaceReadyAt: DateTimeOffset voption)
+        (now: DateTimeOffset)
+        (warmupWindow: TimeSpan)
+        : bool =
+        match workspaceReadyAt with
+        | ValueSome readyAt -> now - readyAt > warmupWindow
+        | ValueNone -> false
+
     /// Builds the additive readiness detail returned by set_project. Keep the
     /// original boolean fields stable while giving callers a recovery path when
     /// the symbol index is not ready yet.
@@ -466,10 +487,23 @@ module internal LspResponseShape =
         (lspReady: bool)
         (symbolIndexReady: bool)
         (restartRequested: bool)
+        (workspaceReadyAt: DateTimeOffset voption)
+        (now: DateTimeOffset)
+        (warmupWindow: TimeSpan)
         : JsonNode =
         let symbolIndexState, symbolIndexHint =
             if symbolIndexReady then
                 "ready", null
+            elif lspReady && warmupWindowElapsed workspaceReadyAt now warmupWindow then
+                // The window has passed with no non-empty index result observed
+                // (#194) — "warming" would be a lie at this point. But the FSAC
+                // probe is only sent when find's own FCS sweep comes up empty
+                // (Dispatcher.fs), so absence of a warm signal is not proof the
+                // index failed to warm — a healthy session that never needed the
+                // probe looks identical. Say what was (not) observed, not a verdict.
+                "not_warmed",
+                jstr
+                    $"FSAC's symbol index has not been observed warm within {int warmupWindow.TotalSeconds}s of workspace load. find and check are unaffected (they use FCS sweeps); only the symbol-index fallback inside position-based LSP tools may be degraded."
             elif lspReady then
                 "warming",
                 jstr
@@ -644,10 +678,7 @@ module internal LspResponseShape =
         (warmupWindow: TimeSpan)
         : bool =
         match response with
-        | :? JsonArray as arr when arr.Count = 0 ->
-            match workspaceReadyAt with
-            | ValueSome readyAt -> now - readyAt > warmupWindow
-            | ValueNone -> false
+        | :? JsonArray as arr when arr.Count = 0 -> warmupWindowElapsed workspaceReadyAt now warmupWindow
         | _ -> true
 
     /// Formats a UTC DateTimeOffset as an ISO-8601 "Z"-suffixed string for JSON
@@ -1286,8 +1317,49 @@ type internal FsAutoCompleteBridge
     [<VolatileField>]
     let mutable workspaceReady = false
 
-    [<VolatileField>]
-    let mutable workspaceReadyAt: DateTimeOffset voption = ValueNone
+    // The workspace-ready timestamp has three writers: markWorkspaceReady, called
+    // (a) synchronously under `gate` from StartLspUnsafe's explicit-workspace path,
+    // and (b) from the JSON-RPC dispatch thread with NO lock at all, whenever FSAC's
+    // WorkspaceLoadTarget notification fires; and the reset in StopLspUnsafe, which
+    // is gate-held at every call site except Dispose (Dispose calls StopLspUnsafe
+    // directly, with no gate.WaitAsync, right before disposing `gate` itself). Because
+    // (b) takes no gate — and Dispose's call takes none either — no amount of gate
+    // discipline on the *readers*, or on this writer, closes the race by locking: a
+    // `DateTimeOffset voption` is a multi-field struct with no atomic read/write
+    // guarantee even marked [<VolatileField>], so a reader could observe a torn value
+    // while writer (b) is mid-update (#194 review, M7). Storing UTC ticks as int64
+    // instead sidesteps the problem without needing a lock anywhere, including in
+    // Dispose: this field deliberately carries no [<VolatileField>] attribute and is
+    // instead accessed only through Volatile.Read/Volatile.Write below — unlike
+    // activeSessionGeneration above, which carries both the attribute and every access
+    // going through Volatile.Read/Volatile.Write already (there the attribute is
+    // redundant-but-harmless, not load-bearing — do NOT read this comment as license to
+    // strip it). The attribute alone only orders access; it does not guarantee an
+    // atomic read/write of a 64-bit value on a 32-bit runtime, whereas
+    // Volatile.Read/Volatile.Write<Int64> are documented to be atomic even there — which
+    // is why THIS field's correctness rests entirely on the explicit calls, with no
+    // [<VolatileField>] to fall back on. So every writer — gated (a), ungated (b), or Dispose's
+    // ungated reset — can just Volatile.Write it, and every reader gets a whole,
+    // untorn value with no lock needed anywhere. 0L is the "unknown" sentinel
+    // (ValueNone); UtcNow.UtcTicks is never 0 in practice. Go through
+    // readWorkspaceReadyAt/writeWorkspaceReadyAt below rather than touching the
+    // field directly, so both readers (setProjectReadiness's call site and
+    // WorkspaceSymbolForContext) and both writer call sites share the one place
+    // that knows about the ticks encoding.
+    let mutable workspaceReadyAtTicks: int64 = 0L
+
+    let readWorkspaceReadyAt () : DateTimeOffset voption =
+        match Volatile.Read(&workspaceReadyAtTicks) with
+        | 0L -> ValueNone
+        | ticks -> ValueSome(DateTimeOffset(ticks, TimeSpan.Zero))
+
+    let writeWorkspaceReadyAt (value: DateTimeOffset voption) : unit =
+        let ticks =
+            match value with
+            | ValueNone -> 0L
+            | ValueSome dto -> dto.UtcTicks
+
+        Volatile.Write(&workspaceReadyAtTicks, ticks)
 
     [<VolatileField>]
     let mutable symbolIndexEverWarmed = false
@@ -1662,7 +1734,7 @@ type internal FsAutoCompleteBridge
     let markWorkspaceReady generation () =
         if Volatile.Read(&activeSessionGeneration) = generation then
             workspaceReady <- true
-            workspaceReadyAt <- ValueSome DateTimeOffset.UtcNow
+            writeWorkspaceReadyAt (ValueSome DateTimeOffset.UtcNow)
             lifecycleState <- LspLifecycleState.Ready generation
 
     let isTransportFailure (jsonRpc: JsonRpc) (ex: exn) =
@@ -1725,7 +1797,7 @@ type internal FsAutoCompleteBridge
                     System.Collections.Generic.Dictionary<string, string>(DiagnosticIdentity.pathComparer)
                 diagnosticGenerationContextFingerprint <- None)
             workspaceReady <- false
-            workspaceReadyAt <- ValueNone
+            writeWorkspaceReadyAt ValueNone
             symbolIndexEverWarmed <- false
 
             this.BeginLspCleanupUnsafe(stoppedRpc, stoppedProcess, stoppedContainment, stoppedPump)
@@ -1921,6 +1993,38 @@ type internal FsAutoCompleteBridge
                                   :> JsonNode ]
                             :> JsonNode
                     | WorkspaceSelection.Selected(projectPath, selectionCandidates) ->
+                        // #192: Init.init resolves the SDK from the *target's* global.json,
+                        // and fsautocomplete calls it during its own startup with nothing to
+                        // catch the failure — the child dies before answering `initialize`
+                        // and the only symptom reaching the agent is StreamJsonRpc's
+                        // "The JSON-RPC connection with the remote party was lost". Decide
+                        // the provable case here, before any MSBuild evaluation or FSAC
+                        // process exists, and leave the active context untouched.
+                        // Off the dispatch thread: the (cached, once-per-process) SDK
+                        // enumeration spawns `dotnet --list-sdks`.
+                        // listProjects is pure solution-file parsing (no MSBuild), so it is
+                        // safe to enumerate before the pre-flight; a nested global.json under
+                        // one member project would kill FSAC just as effectively as the root.
+                        let loadedProjects = FsLangMcp.ProjectFiles.SolutionParsing.listProjects projectPath
+
+                        // FSAC calls Init.init with its *process working directory*, which
+                        // StartLspUnsafe sets to the resolved workspace root — so the
+                        // workspace candidates matter as much as the project's own directory.
+                        let preflightDirectories =
+                            [ resolveWorkspaceFromProjectPath projectPath
+                              if Directory.Exists inputPath then
+                                  inputPath
+                              yield! (args.workspacePath |> Option.map Path.GetFullPath |> Option.toList)
+                              for memberProject in loadedProjects do
+                                  resolveWorkspaceFromProjectPath memberProject ]
+
+                        let! sdkVerdict = Task.Run(fun () -> SdkPreflight.check preflightDirectories)
+
+                        match sdkVerdict with
+                        | SdkPreflight.SdkNotFound(pin, installedSdks) ->
+                            return SdkPreflight.toEnvelope pin installedSdks
+                        | SdkPreflight.Proceed ->
+
                         let isSolution =
                             projectPath.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
                             || projectPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
@@ -1939,7 +2043,6 @@ type internal FsAutoCompleteBridge
                                 else
                                     resolveWorkspaceFromProjectPath projectPath)
 
-                        let loadedProjects = FsLangMcp.ProjectFiles.SolutionParsing.listProjects projectPath
                         let! evaluatedSourceFiles = resolveEvaluatedSourceFiles loadedProjects
                         let restartLsp = args.restartLsp |> Option.defaultValue true
                         let mutable lspWasRunning = false
@@ -2033,8 +2136,20 @@ type internal FsAutoCompleteBridge
                                 else
                                     "warming"
 
+                            // readWorkspaceReadyAt() is a plain Volatile.Read — no gate needed
+                            // (or wanted: a second gate.WaitAsync() here would count contended
+                            // wait time into "elapsed since ready", per #194 review N1, and could
+                            // block this call on an unrelated in-flight request for up to
+                            // requestTimeout/startupTimeout for no reason, per N2). `now` is read
+                            // in the same expression so nothing sits between the two.
                             let readinessNode =
-                                LspResponseShape.setProjectReadiness ready symbolIndexEverWarmed (restartLsp || live)
+                                LspResponseShape.setProjectReadiness
+                                    ready
+                                    symbolIndexEverWarmed
+                                    (restartLsp || live)
+                                    (readWorkspaceReadyAt ())
+                                    DateTimeOffset.UtcNow
+                                    LspResponseShape.symbolIndexWarmupWindow
 
                             return
                                 jobj
@@ -2086,6 +2201,28 @@ type internal FsAutoCompleteBridge
             let command = fsacCommand ()
             let args = fsacArgs ()
             let workspaceRoot = getWorkspaceRoot ()
+
+            // #192: set_project screens the pin up front, but a pin can be poisoned
+            // AFTER a successful set_project — a branch switch that adds a global.json,
+            // an SDK removed from the machine — and every later lazy start
+            // (EnsureStartedUnsafe) or diagnostic-input restart lands here. Without this,
+            // those paths reproduce the original opaque "connection lost": fsautocomplete
+            // calls Init.init with exactly this working directory and dies before it
+            // answers `initialize`. Raised, not returned: this method owes its caller a
+            // JsonRpc, and every caller funnels the exception into the shared typed
+            // envelope. Nothing has been mutated yet, so the failure is state-neutral.
+            //
+            // The member projects belong in the candidate list too: `fsharp/workspaceLoad`
+            // hands FSAC the solution, so it loads every member, and a nested global.json
+            // under one of them kills the handshake exactly like a root one. Screening
+            // only workspaceRoot would leave that case reporting `disconnected` again.
+            do!
+                Task.Run(fun () ->
+                    SdkPreflight.ensure
+                        [ workspaceRoot
+                          yield! (runtimeProjectPath |> Option.map resolveWorkspaceFromProjectPath |> Option.toList)
+                          yield! (runtimeLoadedProjects |> Seq.map resolveWorkspaceFromProjectPath) ])
+
             let generation = Interlocked.Increment(&nextSessionGeneration)
             // Capture before the FSAC process exists: a versionless publication from
             // this generation cannot legitimately describe content older than this
@@ -2530,9 +2667,9 @@ type internal FsAutoCompleteBridge
                         let shaped =
                             LspResponseShape.workspaceSymbolResponse
                                 response
-                                workspaceReadyAt
+                                (readWorkspaceReadyAt ())
                                 DateTimeOffset.UtcNow
-                                (TimeSpan.FromSeconds 3.0)
+                                LspResponseShape.symbolIndexWarmupWindow
 
                         match shaped with
                         | :? JsonObject as obj ->

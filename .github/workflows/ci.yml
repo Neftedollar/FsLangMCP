@@ -38,6 +38,14 @@ jobs:
       - name: Build
         run: dotnet build FsLangMcp.slnx --no-restore --configuration Release --warnaserror
 
+      # Needs the built assembly, so it cannot ride the pre-build "release-smoke
+      # contracts" step above — that discovery run skips this module by design.
+      # Guards the #192 acceptance criterion over the real stdio transport.
+      - name: Test SDK-pin pre-flight end to end
+        env:
+          FSLANGMCP_SERVER_DLL: bin/Release/net10.0/FsLangMcp.dll
+        run: python -m unittest -v scripts.tests.test_sdk_pin_preflight_e2e
+
       - name: Test (with coverage)
         # coverlet.msbuild instruments FsLangMcp.dll via the ProjectReference graph (ADR-0001).
         # IncludeTestAssembly is no longer needed — prod and test code are in separate assemblies.

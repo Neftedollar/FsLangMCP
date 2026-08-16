@@ -25,6 +25,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   analysis completed, it reports "analyzed K of N" instead of claiming a
   sweep that didn't happen, and for `scope='file'` it names the additional
   file-level filter, not just the sibling-project blind spot (#193).
+### Fixed
+
+- `fcs_nuget_types` / `fcs_nuget_members` now resolve a NuGet **package id** whose
+  assembly is named something else. Both matched the assembly `SimpleName` alone, so
+  `Microsoft.Orleans.Core.Abstractions` (which ships `Orleans.Core.Abstractions.dll`)
+  resolved to zero assemblies and returned an empty — but `status: "ok"` — payload that
+  reads as "the type does not exist" (#191, reported from the field in #100). `packageId`
+  now accepts either spelling, resolved through a packageId → assembly map built from the
+  project's own restore output: `obj/project.assets.json` when present, otherwise derived
+  from the `-r:` reference paths under the NuGet global-packages cache (honouring
+  `NUGET_PACKAGES`). Prefix matching remains rejected in both directions — `System` still
+  does not match `System.Text.Json`, and `Newtonsoft.Json.Schema` still does not fall back
+  to `Newtonsoft.Json`. Side effect: a package that ships several assemblies (e.g.
+  `TypeShape` → `TypeShape.dll` + `TypeShape.CSharp.dll`) now returns all of them in one
+  call instead of requiring one call per assembly.
+- **Miss payloads on both tools now explain themselves.** When no assembly matches the
+  `packageId`, the response additively carries `hint` (which names the
+  package-id-vs-assembly-name distinction, and separates "not in this project's restore
+  graph" from "restored, but no assembly of it is on the compile line" — including
+  analyzer/build-only packages, which are recorded with an empty assembly list rather than
+  omitted) and `candidatePackages` (up to 5 `{ packageId, assemblies }` entries from the
+  restore graph whose id or assembly names relate to the query). `fcs_nuget_members` additionally emits a
+  `hint` when the assembly resolved but exports no such type, naming the assembly searched
+  and pointing at `fcs_nuget_types`. Success-path responses are unchanged — the fields are
+  absent on a hit.
+- `set_project`'s `readiness.symbolIndexState` no longer claims `warming`
+  forever when no warm signal from the FSAC symbol index is ever observed
+  (#194). `assessSymbolIndex` already compared elapsed-since-workspace-ready
+  against a warm-up window for the internal FSAC `workspace/symbol` probe
+  `find` falls back to, but `setProjectReadiness` never saw that signal. It
+  now reuses the same
+  `workspaceReadyAt` timestamp and warm-up window: past the window with no
+  non-empty index result observed yet, the state reads `not_warmed` with a
+  hint that `find`/`check` are unaffected (they use FCS sweeps, not the
+  symbol index) — only the symbol-index fallback inside position-based LSP
+  tools may be degraded. The hint reports what was not observed rather than
+  asserting the index failed to warm, since the underlying FSAC probe is
+  only sent as a fallback and a healthy session may never need it.
+  `warming` still applies within the window; the boolean `symbolIndex` field
+  and the other states are unchanged.
+- An unsatisfiable `global.json` SDK pin no longer reduces `set_project` to an
+  opaque transport error (#192). When the nearest `global.json` pins a version
+  with `rollForward: "disable"` and that exact SDK is not installed, both
+  `Ionide.ProjInfo`'s `Init.init` (in-process) and `fsautocomplete` (which calls
+  it during its own startup, with nothing to catch the failure) die on the
+  `dotnet --version` exit-155 the muxer returns. The FSAC child died before
+  answering `initialize`, so the only thing reaching the agent was StreamJsonRpc's
+  `"The JSON-RPC connection with the remote party was lost"` — naming neither the
+  SDK nor the file. `set_project` now screens the pin before any MSBuild
+  evaluation or FSAC process exists and returns
+  `{ status: "infrastructure_error", errorKind: "sdk_not_found", … }` carrying the
+  requested version, the `global.json` path, the installed SDK list, and both
+  remedies. The same typed envelope replaces the generic
+  "Unable to load F# project options" for every tool that loads project options.
+
+  The screen is deliberately one-sided: only `rollForward: "disable"` with an
+  exact version confirmed absent from `dotnet --list-sdks` can fail it. Any other
+  policy, an `sdk.paths` redirect, an unreadable `global.json`, or an SDK list we
+  could not obtain proceeds to the normal load path unchanged.
+
+  Behaviour change worth noting: `set_project(restartLsp=false)` on such a project
+  previously answered `status: "ok"` with `readiness.projectOptions: false`. It now
+  answers with the typed error, because the project genuinely cannot be evaluated.
 
 ## [0.15.0] - 2026-08-16
 

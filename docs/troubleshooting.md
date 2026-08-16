@@ -31,6 +31,44 @@ needs longer; ordinary live requests use `FSLANGMCP_LSP_REQUEST_TIMEOUT_MS`.
 
 ---
 
+## `{"status": "infrastructure_error", "errorKind": "sdk_not_found"}` from `set_project`
+
+The nearest `global.json` above the project pins an SDK version with
+`rollForward: "disable"`, and that exact SDK is not installed on this machine.
+
+`Ionide.ProjInfo` resolves the SDK by running `dotnet --version` **in the target
+project's directory**, so it inherits the target's `global.json`; with an
+unsatisfiable pin the muxer exits 155. `fsautocomplete` makes the same call during
+its own startup, with nothing to catch the failure — in earlier releases the child died
+before answering `initialize` and the only symptom reaching the agent was
+`TransportError … "The JSON-RPC connection with the remote party was lost"`, which
+named neither the SDK nor the file. FsLangMCP now screens the pin first and tells
+you which one it is.
+
+The response carries `requestedSdkVersion`, `globalJsonPath`, `installedSdks`, and
+`remedies`.
+
+**Remediation** (either one):
+
+1. Install the requested SDK, then retry `set_project` — no server restart needed:
+   the installed-SDK list is re-probed before any rejection, so a freshly installed
+   SDK is picked up on the next call.
+2. Edit the `globalJsonPath` from the response: pin an installed version, or
+   replace `"rollForward": "disable"` with a policy that allows a newer SDK
+   (for example `"latestMajor"`).
+
+Confirm what the machine actually has with `dotnet --list-sdks`. Note that the
+FsLangMCP server process and your shell can resolve different `dotnet` binaries —
+the pre-flight uses the same order `Ionide.ProjInfo` does (`DOTNET_HOST_PATH`,
+then `DOTNET_ROOT`, then `PATH`), so set `DOTNET_ROOT` in the MCP client's server
+configuration if the two disagree.
+
+The screen only ever fires on this one provable case. `rollForward` policies other
+than `disable`, an `sdk.paths` redirect, an unreadable `global.json`, or a machine
+whose SDK list cannot be enumerated all proceed to the normal load path.
+
+---
+
 ## FCS tools fail with a confusing `FSharp.Core` path error or return empty results
 
 The project hasn't been restored. FCS can't load project options when NuGet
@@ -69,13 +107,20 @@ wait for partial readiness automatically.
 
 `set_project` can report `readiness.symbolIndex=false` immediately after load.
 Read `readiness.symbolIndexState` and `readiness.symbolIndexHint`: they distinguish
-a normally `warming` index from an LSP that is `blocked_on_lsp` or `not_started`,
-and state whether to wait/retry or call `set_project` with `restartLsp=true`.
+a normally `warming` index from one that is `not_warmed` (past the warm-up window
+with no result yet — see `docs/tools-detailed.md#set_project`), or an LSP that is
+`blocked_on_lsp` or `not_started`, and state whether to wait/retry or call
+`set_project` with `restartLsp=true`.
 
 **What to do:** Start using `find`, `check`, and outline tools normally. They
 trigger on-demand type-checking per file and don't depend on a fully warmed
-global index. If `symbolIndex` stays `false` for more than a few minutes on a
-medium-sized project, run `project_health` to check for underlying issues.
+global index — this holds for `not_warmed` too, not just `warming`.
+`not_warmed` in particular can be a permanent, healthy state: the FSAC symbol
+index is only queried as a fallback when `find`'s own FCS sweep comes up
+empty, so a session where `find` keeps resolving normally may never warm the
+index at all. Only reach for `project_health` if a symbol-index-dependent
+call has actually failed or `readiness.lsp` itself isn't `true` — `not_warmed`
+by itself is not that signal.
 
 ---
 

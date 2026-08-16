@@ -18,6 +18,8 @@ on:
       - "scripts/runtime-toolchain.py"
       - "scripts/verify-package-version.py"
       - "scripts/tests/**"
+      # The Windows leg is the only place this family runs (#191) — retrigger when it changes.
+      - "tests/FsLangMcp.Tests/NugetPackageMapTests.fs"
       - ".github/workflows/live-fsac.yml"
   pull_request:
     branches: [main]
@@ -31,6 +33,8 @@ on:
       - "scripts/runtime-toolchain.py"
       - "scripts/verify-package-version.py"
       - "scripts/tests/**"
+      # The Windows leg is the only place this family runs (#191) — retrigger when it changes.
+      - "tests/FsLangMcp.Tests/NugetPackageMapTests.fs"
       - ".github/workflows/live-fsac.yml"
 
 concurrency:
@@ -256,3 +260,21 @@ jobs:
 
       - name: Exercise the installed package through live FSAC and ProjInfo
         run: python scripts/runtime-toolchain.py smoke --tool-path "${{ runner.temp }}/fslangmcp-runtime-tools" --server "${{ env.FSLANGMCP_LIVE_SERVER }}" --project FsLangMcp.fsproj
+
+      # The xunit suite otherwise runs on ubuntu only (ci.yml, publish.yml), so nothing
+      # exercised the NuGet packageId -> assembly map against REAL Windows paths: the
+      # `%USERPROFILE%\.nuget\packages` root and backslash-separated `-r:` options. This runs
+      # only that family — including the invariant test that cross-checks the assets-derived
+      # map against the live compile line — on the Windows leg of this existing matrix, which
+      # already has the pinned SDK and a restored FsLangMcp.fsproj. Last step in the job so a
+      # Debug build of the test project cannot disturb the Release artifacts packed above.
+      # See issue #191.
+      - name: Pin the NuGet package map against real Windows paths (#191)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dotnet restore tests/FsLangMcp.Tests/FsLangMcp.Tests.fsproj --locked-mode
+          dotnet test tests/FsLangMcp.Tests/FsLangMcp.Tests.fsproj `
+            --no-restore `
+            --filter "FullyQualifiedName~NugetPackageMapTests" `
+            -- RunConfiguration.TreatNoTestsAsError=true

@@ -357,13 +357,13 @@ The response includes `evaluation.status`, `evaluation.source`, `evaluation.impo
 
 ### `fcs_nuget_types`
 
-**Purpose:** Enumerate all types in one referenced assembly matched by exact `SimpleName` (case-insensitive). Returns display name, full name, kind, accessibility, and obsolete status.
+**Purpose:** Enumerate all types in one referenced assembly. Returns display name, full name, kind, accessibility, and obsolete status.
 
 **Key args:**
-- `packageId` (required) — matched against the referenced assembly's exact simple name, case-insensitive (e.g. `"Spectre.Console"`)
+- `packageId` (required) — the NuGet package id OR an assembly simple name it ships, matched exactly and case-insensitively (e.g. `"Spectre.Console"`, or `"Microsoft.Orleans.Core.Abstractions"` for the assembly `Orleans.Core.Abstractions`)
 - `maxResults` / `cursor` — pagination (default 500, max 2000)
 
-**Use when:** Discovering what types a specific NuGet package exposes. Note: `Spectre.Console` resolves only to that assembly, not `Spectre.Console.Cli` — call once per assembly.
+**Use when:** Discovering what types a specific NuGet package exposes. A package whose assembly is named differently resolves under either spelling, and a package shipping several assemblies returns all of them in one call (#191). On a miss the response carries `hint` + `candidatePackages`. Prefix matching is still rejected: `Spectre.Console` never resolves to `Spectre.Console.Cli`.
 
 ---
 
@@ -372,7 +372,7 @@ The response includes `evaluation.status`, `evaluation.source`, `evaluation.impo
 **Purpose:** Enumerate members of one type from a referenced assembly. Returns name, kind, signature, accessibility, obsolete status, and XML doc summary.
 
 **Key args:**
-- `packageId` (required) — assembly simple name
+- `packageId` (required) — the NuGet package id OR an assembly simple name it ships (same matching as `fcs_nuget_types`)
 - `typeName` (required) — type name to enumerate
 - `maxResults` / `cursor` — pagination (default 500, max 2000)
 
@@ -389,7 +389,7 @@ The response includes `evaluation.status`, `evaluation.source`, `evaluation.impo
 - `includeNonPublic` — include non-public symbols
 - `maxResults` — default 200, max 1000
 
-**Use when:** "What assemblies define something like `IMemoryCache`?" — cross-assembly search when you don't know the exact assembly. Prefer `fcs_nuget_types` when you already know the assembly name.
+**Use when:** "What assemblies define something like `IMemoryCache`?" — cross-assembly search when you don't know the exact assembly. Prefer `fcs_nuget_types` when you already know the package id or the assembly name.
 
 ---
 
