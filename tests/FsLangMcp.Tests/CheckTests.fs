@@ -2210,18 +2210,42 @@ type CheckTests(fx: CheckFixture) =
 
             Assert.Equal("clean", gs workspace "verdict")
             let perProject = (workspace["perProject"] :?> JsonArray) |> Seq.cast<JsonNode>
-            let betaEntry = perProject |> Seq.find (fun p -> gs p "project" = "Beta")
-            let probeEntry = perProject |> Seq.find (fun p -> gs p "project" = "Probe")
+
+            let findProject (name: string) =
+                perProject
+                |> Seq.tryFind (fun p -> gs p "project" = name)
+                |> Option.defaultWith (fun () ->
+                    let seen = perProject |> Seq.map (fun p -> gs p "project") |> String.concat ", "
+                    failwith $"Expected a perProject entry named '{name}'; observed: [{seen}]")
+
+            let betaEntry = findProject "Beta"
+            let probeEntry = findProject "Probe"
 
             // The reconciliation: Beta's perProject breakdown inside the workspace sweep
             // matches its own standalone scope="project" identity exactly, field for
             // field — not just a nonzero remainder that happens to agree.
+            //
+            // infoCount is exercised only at zero here (betaAlone's own infoCount is 0,
+            // asserted above) — no construct reachable through a real trusted FCS check
+            // was found to produce Info/Hidden severity (probed: FS0025, a
+            // #nowarn-suppressed FS0025, [<Obsolete>] usage, shadowing, an unused open).
+            // The nonzero path is exercised only on the mocked FSAC fast path at :2008,
+            // which cannot reach perProject (speed="fast" never builds it — see the class
+            // comment above this test). So this reconciles wiring/scoping — that Beta's
+            // own countInfoDiagnostics tally survives being embedded in a workspace sweep
+            // instead of leaking or getting overwritten — not that the tally is capable of
+            // being nonzero; a hardcoded `jint 0` at the emitter would also pass this.
             Assert.Equal(gi betaAlone "errorCount", gi betaEntry "errorCount")
             Assert.Equal(gi betaAlone "warningCount", gi betaEntry "warningCount")
             Assert.Equal(gi betaAlone "infoCount", gi betaEntry "infoCount")
 
             // Probe is genuinely clean — its own breakdown is all zeros, not a leak of
-            // Beta's counts or the workspace aggregate.
+            // Beta's counts or the workspace aggregate. This only catches a leak from
+            // scoping the tally over the accumulating allDiags instead of Probe's own
+            // diags because Beta sorts before Probe in the sweep (listProjects sorts
+            // full paths, and "Beta" < "Probe"): Beta's diags land in allDiags first, so
+            // if Probe's entry were built off allDiags instead of its own diags, it would
+            // show Beta's nonzero warningCount here, not agree with it by coincidence.
             Assert.Equal(0, gi probeEntry "errorCount")
             Assert.Equal(0, gi probeEntry "warningCount")
             Assert.Equal(0, gi probeEntry "infoCount")
