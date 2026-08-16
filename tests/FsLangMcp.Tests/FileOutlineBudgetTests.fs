@@ -18,6 +18,7 @@ open System.Threading.Tasks
 open Xunit
 open FsLangMcp.Types
 open FsLangMcp.FcsBridge
+open FsLangMcp.Tools
 
 // ─── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -119,17 +120,71 @@ let ``over-budget file downgrades summaryOnly=false to headers plus a hint`` () 
                 Assert.Contains("budget", hint)
                 Assert.Contains("maxResults", hint)
 
-            // Downgraded entries are header-shaped: no per-member `signature`.
+            // Downgraded entries are header-shaped: no per-member `signature`. The
+            // fixture is 220 free `let` functions inside one module, so `headersOf`'s
+            // containerKinds filter leaves exactly the module header — Assert.NotEmpty
+            // makes sure that one entry is really there (#206 review Min-2: a loop with
+            // no NotEmpty check passes vacuously on an empty array).
             match result["entries"] with
             | :? JsonArray as entries ->
+                Assert.NotEmpty(entries)
+
                 for entry in entries |> Seq.cast<JsonNode> do
                     Assert.Null(entry["signature"])
             | _ -> Assert.Fail("expected entries to be a JsonArray")
 
-            // count/memberCounts still describe the FULL (pre-downgrade) surface —
-            // the default maxResults=200 caps entries, not these totals.
+            // count is the post-truncation length (maxResults=200 caps `entries`, hence
+            // `count`, to 200 even though the fixture declares 221 definitions); only
+            // memberCounts describes the full, untruncated definition set (#206 review
+            // Imp-2 — the original comment here claimed count was also uncapped, which
+            // contradicted the very next assertion).
             Assert.Equal(200, result["count"].GetValue<int>())
             Assert.NotNull(result["memberCounts"])
+
+            // #206 review Min-1: assert the actual SHIPPED (indented) response fits the
+            // ~72k-char MCP ceiling, not just that the internal accumulator believes it
+            // closed under "60k" — this is the assertion that would have caught Imp-1.
+            let rendered = renderToken result
+            Assert.True(
+                rendered.Length <= 72_000,
+                $"downgraded outline rendered to {rendered.Length} chars, over the ~72k MCP ceiling"
+            )
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``lowering maxResults after a downgrade resolves it: the response returns to full entries once small enough`` () : Task =
+    task {
+        // #206 review H5: the implementer flagged this round-trip as an untested but
+        // traced-sound gap. `entries` is truncated to maxResults BEFORE the budget
+        // measurement (FcsBridge.fs), so the measured payload is monotonic in
+        // maxResults — halving it roughly halves the measured size, and `overBudget`
+        // must eventually flip back to false. Pin that mechanism with a real call.
+        let sourcePath, projectPath, root = writeFixture "shrink" (bigOutlineSource 220)
+        let bridge = FcsBridge()
+
+        try
+            let! full = bridge.FileOutline(baseArgs sourcePath projectPath)
+            Assert.Equal(Some true, optBool full "downgradedToSummary")
+
+            let! shrunk =
+                bridge.FileOutline({ baseArgs sourcePath projectPath with maxResults = Some 10 })
+
+            Assert.Equal("succeeded", shrunk["status"].GetValue<string>())
+            Assert.Equal(None, optBool shrunk "downgradedToSummary")
+            Assert.Equal(None, optString shrunk "hint")
+            Assert.Equal(10, shrunk["count"].GetValue<int>())
+
+            // Full per-member entries are back — every returned entry carries a signature.
+            match shrunk["entries"] with
+            | :? JsonArray as entries ->
+                Assert.Equal(10, entries.Count)
+
+                for entry in entries |> Seq.cast<JsonNode> do
+                    Assert.NotNull(entry["signature"])
+            | _ -> Assert.Fail("expected entries to be a JsonArray")
         finally
             if Directory.Exists root then
                 Directory.Delete(root, true)

@@ -3333,7 +3333,31 @@ type internal FcsBridge
     // comfortably under the ~25k-token / ~72k-char ceiling with headroom for the rest
     // of the envelope (status, project, pagination fields, hint) — same reasoning as
     // `Find`'s `pageSize` comment below (80-site page ≈ 43k chars under ~72k).
+    //
+    // MEASURED IN THE SHIPPED SERIALIZATION, not JsonNode.ToJsonString(). Every tool
+    // response goes out via Tools.fs `renderToken` → `JsonSerializer.Serialize(token,
+    // renderOpts)` with `WriteIndented = true` — indented is ~1.46-1.48x the length of
+    // `ToJsonString()`'s compact default across a wide member-density sweep (#206
+    // review, Imp-1), so a budget measured compact ships 78k-89k chars against this
+    // same "60k" cap. `renderedLength` below reproduces `renderOpts` exactly
+    // (`FcsBridge.fs` compiles before `Tools.fs` in `FsLangMcp.fsproj`, so it cannot
+    // reference `Tools.renderOpts` directly — this is a deliberate duplicate, not an
+    // oversight; keep the two in sync if `Tools.fs`'s `JsonSerializerOptions` ever
+    // change).
     let responseCharBudget = 60_000
+
+    let renderedJsonOptions =
+        JsonSerializerOptions(
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+            WriteIndented = true
+        )
+
+    /// Serialized length of `node` in the SAME shape the MCP response ships in
+    /// (`Tools.renderToken`'s `WriteIndented = true`), not `JsonNode.ToJsonString()`'s
+    /// compact default. Both `PublicApi` and `FileOutline` budget checks must use this,
+    /// not `ToJsonString().Length` — see the `responseCharBudget` comment above.
+    let renderedLength (node: JsonNode) : int =
+        JsonSerializer.Serialize(node, renderedJsonOptions).Length
 
     member private _.LoadProjectOptionsFromFsproj
         (fsprojPath: string)
@@ -4030,9 +4054,12 @@ type internal FcsBridge
                 // summaryOnly=true produces, rather than ever emitting an over-budget
                 // outline. Only measured when summaryOnly=false was actually requested —
                 // an explicit summaryOnly=true request is already small by construction.
+                // #206 review Imp-1: measured in the SHIPPED (indented) serialization via
+                // `renderedLength`, not `ToJsonString()`'s compact default — see the
+                // `responseCharBudget` comment for why the two are ~1.47x apart.
                 let overBudget =
                     not summaryOnly
-                    && (entries |> Array.sumBy (fun e -> e.ToJsonString().Length)) > responseCharBudget
+                    && (entries |> Array.sumBy renderedLength) > responseCharBudget
 
                 let downgradedToSummary = overBudget
 
@@ -9328,7 +9355,9 @@ type internal FcsBridge
             let entityNodes =
                 countPageNodes
                 |> Array.takeWhile (fun node ->
-                    let nodeChars = node.ToJsonString().Length
+                    // #206 review Imp-1: SHIPPED (indented) length via `renderedLength`,
+                    // not compact `ToJsonString()` — see `responseCharBudget` comment.
+                    let nodeChars = renderedLength node
 
                     if runningChars > 0 && runningChars + nodeChars > responseCharBudget then
                         budgetClosed <- true

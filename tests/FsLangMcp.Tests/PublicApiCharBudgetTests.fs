@@ -23,6 +23,7 @@ open Xunit
 open FsLangMcp.Types
 open FsLangMcp.FcsBridge
 open FsLangMcp.Cursor
+open FsLangMcp.Tools
 
 // ─── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -162,16 +163,32 @@ let ``budget close: page closes under the char budget, hint names real namespace
 
                 Assert.True(namesRealGroup, $"hint must name a real Wide.* namespace, got: {hint}")
 
+            // #206 review Min-1: the invariant this whole issue exists for is that the
+            // SHIPPED response fits the ~72k-char MCP ceiling — not that the internal
+            // accumulator believes it closed at "60k". Assert the actual rendered bytes
+            // (the same `renderToken` every tool response goes out through), not a proxy.
+            let rendered = renderToken page1
+            Assert.True(
+                rendered.Length <= 72_000,
+                $"budget-closed page rendered to {rendered.Length} chars, over the ~72k MCP ceiling"
+            )
+
             let cursorNode = page1["nextCursor"]
             Assert.NotNull(cursorNode)
 
             // Walk every remaining page via nextCursor; pages must be disjoint and
             // their union must reconstruct the full, unpaginated surface exactly.
+            // Bounded so a cursor-progress regression fails fast instead of hanging
+            // the suite (#206 review Min-4) — 270 entities can never need this many
+            // pages even at the smallest plausible page size.
+            let maxPages = 500
             let mutable acc = entityFullNames page1 |> Set.ofList
             let mutable nextCursor = Some(cursorNode.GetValue<string>())
             let mutable pages = 1
 
             while nextCursor.IsSome do
+                Assert.True(pages < maxPages, $"cursor walk did not terminate within {maxPages} pages")
+
                 let! page = bridge.PublicApi({ baseArgs project with maxResults = Some 1000; cursor = nextCursor })
                 pages <- pages + 1
                 let pageNames = entityFullNames page |> Set.ofList

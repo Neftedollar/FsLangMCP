@@ -591,8 +591,12 @@ signatures in one page. The `summaryOnly` field in the response always echoes wh
 **requested**, not what was actually returned; check the additive `downgradedToSummary: true` flag
 to know the entries shape actually changed. Neither field appears when the full output already
 fits the budget — a small file with `summaryOnly=false` gets the unmodified pre-#206 response.
-`count` and `memberCounts` always describe the full pre-downgrade definition set, unaffected by
-either `maxResults` or the downgrade.
+`count` is the length of the returned `entries` slice — it is capped by `maxResults` exactly like
+`entries` itself (`count = min(definitionsInFile, maxResults)`), and unaffected only by the
+downgrade: lowering `maxResults` shrinks `count` on either shape, downgraded or not.
+`memberCounts` is the one field that is genuinely uncapped — it is computed from the full,
+untruncated definition set regardless of `maxResults` or the downgrade, so it is the field to read
+for "how many of kind X does this file really have," never `count`.
 
 ### Caveats
 
@@ -607,6 +611,8 @@ either `maxResults` or the downgrade.
 
 - `fcs_project_outline` — whole-project structural overview; prefer `fcs_file_outline` for one
   file's structure.
-- `fcs_file_symbols` — raw unfiltered symbols, no summary/budget shaping.
+- `find` (`kind="symbol"`) — raw, unfiltered, cross-file symbol search when this tool's
+  local/noisy-symbol filtering or summary/budget shaping gets in the way.
+- `fcs_symbol_at_word` — a single symbol at an exact position, no whole-file shaping at all.
 - `fcs_public_api` — shares the same response-char-budget mechanism for a project's public
   surface.
