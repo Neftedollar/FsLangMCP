@@ -459,7 +459,7 @@ let private mainCore argv =
                 tool (
                     TypedTool.define<CheckArgs>
                         "check"
-                        "One trustworthy verdict for the active F# context. Bare check() suffices: returns `verdict` (clean|errors|unknown) after a FRESH in-process type-check, so it never reports a stale-`{}` false-clean and you don't fall back to dotnet build. Optional: scope (auto|file|project|workspace|snippet), path, snippet, speed (trusted default | fast = cached FSAC snapshot), severity. totalDiagnostics=errorCount+warningCount+infoCount always. Prefer over raw diagnostics plumbing for a yes/no answer."
+                        "One trustworthy verdict for the active F# context. Bare check() suffices: returns `verdict` (clean|errors|unknown) after a FRESH in-process type-check, so it never reports a stale-`{}` false-clean; no dotnet build fallback. Optional: scope (auto|file|project|workspace|snippet), path, snippet (inline source), speed (trusted default | fast = cached FSAC snapshot), severity. totalDiagnostics=errorCount+warningCount+infoCount always. Prefer over raw diagnostics plumbing for a yes/no answer."
                         (fun args (_ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }

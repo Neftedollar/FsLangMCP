@@ -2028,6 +2028,15 @@ type CheckTests(fx: CheckFixture) =
             Assert.Equal(0, gi result "errorCount")
             Assert.True(gi result "warningCount" > 0, "Expected the incomplete-match warning to be counted")
 
+            // Exact values, not just the identity: the fixture guarantees no Info/Hidden
+            // diagnostics (infoCount = 0, a real tally via countInfoDiagnostics — not a
+            // total-error-warning remainder that would make this assertion tautological),
+            // and the default `error` floor excludes exactly the warning(s) from the list,
+            // so belowSeverityFloorCount must equal warningCount precisely, not merely be
+            // nonzero.
+            Assert.Equal(0, gi result "infoCount")
+            Assert.Equal(gi result "warningCount", gi result "belowSeverityFloorCount")
+
             Assert.Equal(
                 gi result "totalDiagnostics",
                 gi result "errorCount" + gi result "warningCount" + gi result "infoCount"

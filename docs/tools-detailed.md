@@ -160,7 +160,7 @@ the rest of the scope is incomplete.
 3. **`totalDiagnostics = errorCount + warningCount + infoCount`, always** — `totalDiagnostics`
    counts the FULL diagnostic set across every severity (including Info/Hidden), so it can be
    larger than `errorCount + warningCount` alone and larger than the `diagnostics` array length.
-   `infoCount` is the Info+Hidden remainder that closes the identity. `belowSeverityFloorCount`
+   `infoCount` is a tally of the Info+Hidden diagnostics in that full set. `belowSeverityFloorCount`
    says how many of those full-set diagnostics were excluded from `diagnostics` by the `severity`
    floor (never by the 50-item cap — that is `diagnosticsTruncated`'s job); when it is `> 0`,
    `diagnosticsNote` spells out the gap and points at `severity="all"`.

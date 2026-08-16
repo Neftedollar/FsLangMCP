@@ -3005,6 +3005,16 @@ type internal FcsBridge
 
         errors.Length, warnings.Length
 
+    // #190: a genuine tally, not a `total - error - warning` remainder — kept as a
+    // separate counter (like `countDiagnosticsBySeverity` above) so a future call-site
+    // bug that scopes error/warning/total over mismatched arrays produces a mismatching
+    // identity in the tests, instead of being silently absorbed by subtraction.
+    let countInfoDiagnostics (diagnostics: FSharpDiagnostic array) =
+        diagnostics
+        |> Array.filter (fun d ->
+            d.Severity = FSharpDiagnosticSeverity.Info || d.Severity = FSharpDiagnosticSeverity.Hidden)
+        |> Array.length
+
     member private _.LoadProjectOptionsFromFsproj
         (fsprojPath: string)
         : Task<(FSharpProjectOptions * ProjectOptionsFingerprint * EvaluatedProjectSnapshot) option> =
@@ -3283,9 +3293,10 @@ type internal FcsBridge
             // JsonValue.TryGetValue<int>, but diagnosticToJson serializes severity as text
             // (e.g. "Error") — the int read never matched, so errorCount was silently 0
             // even with real type errors. Count off the raw FCS diagnostics instead, the
-            // same way every other totalDiagnostics emitter in this file does; that also
-            // gets warningCount/infoCount for free (FSharpDiagnosticSeverity has exactly
-            // four cases, so total - error - warning = info + hidden, exactly).
+            // same way every other totalDiagnostics emitter in this file does. infoCount is
+            // a genuine tally via countInfoDiagnostics, not a `total - error - warning`
+            // remainder, so a future scoping bug in any one of the three counters shows up
+            // as a broken identity in the tests instead of being silently absorbed.
             let rawDiagnostics =
                 match checkedResults with
                 | Some r -> Array.append parseResults.Diagnostics r.Diagnostics
@@ -3293,8 +3304,12 @@ type internal FcsBridge
 
             let errorCount, warningCount = countDiagnosticsBySeverity rawDiagnostics
             let totalDiagnosticsCount = rawDiagnostics.Length
-            let infoCount = totalDiagnosticsCount - errorCount - warningCount
+            let infoCount = countInfoDiagnostics rawDiagnostics
 
+            // No belowSeverityFloorCount/diagnosticsNote here: this payload has no
+            // severity floor — parseDiagnostics/checkDiagnostics below return every
+            // diagnostic, unfiltered. Emitting a hardcoded belowSeverityFloorCount: 0
+            // would advertise a filtering mechanism this member doesn't have.
             return
                 jobj
                     [ "status", jstr status
@@ -3381,21 +3396,18 @@ type internal FcsBridge
 
                     let allDiagnostics = Array.append parseDiagnostics checkDiagnostics
 
-                    let errorCount =
-                        allDiagnostics
-                        |> Array.filter (fun d -> d.Severity = FSharpDiagnosticSeverity.Error)
-                        |> Array.length
+                    // #190: counted the same way every other totalDiagnostics emitter in
+                    // this file does — countDiagnosticsBySeverity for error/warning,
+                    // countInfoDiagnostics as an independent tally (not a
+                    // `total - error - warning` remainder) so the three counters can
+                    // never silently paper over a future scoping mismatch.
+                    let errorCount, warningCount = countDiagnosticsBySeverity allDiagnostics
+                    let infoCount = countInfoDiagnostics allDiagnostics
 
-                    let warningCount =
-                        allDiagnostics
-                        |> Array.filter (fun d -> d.Severity = FSharpDiagnosticSeverity.Warning)
-                        |> Array.length
-
-                    // #190: full-set remainder once errors/warnings are subtracted —
-                    // FSharpDiagnosticSeverity has exactly four cases (Error/Warning/Info/
-                    // Hidden), so this is exact, matching the `check` tool's identity.
-                    let infoCount = allDiagnostics.Length - errorCount - warningCount
-
+                    // No belowSeverityFloorCount/diagnosticsNote here: this payload has no
+                    // severity floor — `diagnostics` below returns every diagnostic,
+                    // unfiltered. Emitting a hardcoded belowSeverityFloorCount: 0 would
+                    // advertise a filtering mechanism this member doesn't have.
                     return
                         jobj
                             [ "status", jstr (if checkSucceeded then "succeeded" else "aborted")
@@ -6300,6 +6312,7 @@ type internal FcsBridge
                 (escalated: string option)
                 (errorCount: int)
                 (warningCount: int)
+                (infoCount: int)
                 (totalDiagnostics: int)
                 (diagNodes: JsonNode array)
                 (files: string array)
@@ -6316,15 +6329,18 @@ type internal FcsBridge
 
                 // #190: totalDiagnostics silently disagreed with errorCount+warningCount
                 // whenever the full set held Info/Hidden diagnostics — agents read the gap
-                // as "hidden findings" and burned time hunting for them. Both new numbers
-                // fall out of the parameters every call site already computes, so no call
-                // site needs to change: infoCount is the FULL-set remainder once errors and
-                // warnings are subtracted (FSharpDiagnosticSeverity has exactly four cases —
-                // Error/Warning/Info/Hidden — so this is exact, not an approximation);
-                // belowSeverityFloorCount is the FULL-set count minus what passed the
-                // severity floor into `diagNodes`, measured before the diagnosticsCap
-                // truncation above so the cap and the floor never overlap in what they explain.
-                let infoCount = max 0 (totalDiagnostics - errorCount - warningCount)
+                // as "hidden findings" and burned time hunting for them. `infoCount` is a
+                // genuine tally the caller computes (countInfoDiagnostics on the trusted
+                // paths, the >=3 LSP-code filter on the fast path) — deliberately NOT
+                // derived here as `totalDiagnostics - errorCount - warningCount`, so a
+                // future call site that scopes one of the three counters over a different
+                // array produces a mismatching identity the tests can actually catch,
+                // instead of the mismatch being silently absorbed by subtraction.
+                // belowSeverityFloorCount stays a derived count: it IS a property of
+                // `diagNodes` vs. `totalDiagnostics` (what the floor let through vs. the
+                // full set), not an independently-observable quantity, so there is nothing
+                // to tally it against — measured before the diagnosticsCap truncation above
+                // so the cap and the floor never overlap in what they explain.
                 let belowSeverityFloorCount = max 0 (totalDiagnostics - diagNodes.Length)
 
                 let diagnosticsNote =
@@ -6382,6 +6398,7 @@ type internal FcsBridge
                         false
                         (if speed = "fast" then "fsac" else "fcs")
                         None
+                        0
                         0
                         0
                         0
@@ -6454,6 +6471,7 @@ type internal FcsBridge
                                     d.ErrorNumber, d.Severity, d.StartLine, d.StartColumn, d.EndLine, d.EndColumn, d.Message)
 
                             let errorCount, warningCount = countDiagnosticsBySeverity allDiags
+                            let infoCount = countInfoDiagnostics allDiags
 
                             let verdict, analyzed, reason =
                                 if not succeeded then
@@ -6478,6 +6496,7 @@ type internal FcsBridge
                                     None
                                     errorCount
                                     warningCount
+                                    infoCount
                                     allDiags.Length
                                     nodes
                                     [||] // synthetic temp file — no meaningful source path to surface
@@ -6740,6 +6759,20 @@ type internal FcsBridge
                         |> Seq.length
                     | _ -> 0
 
+                // #190: a genuine tally (LSP codes 3=Information/4=Hint), not a
+                // `total - error - warning` remainder — mirrors countInfoDiagnostics on
+                // the trusted paths.
+                let infoSnapshotDiagnostics =
+                    match snap.Diagnostics with
+                    | :? JsonArray as arr ->
+                        arr
+                        |> Seq.filter (fun n ->
+                            match n with
+                            | :? JsonObject as obj -> severityCode obj >= 3
+                            | _ -> false)
+                        |> Seq.length
+                    | _ -> 0
+
                 return
                     build
                         verdict
@@ -6748,6 +6781,7 @@ type internal FcsBridge
                         None
                         snap.ErrorCount
                         snap.WarningCount
+                        infoSnapshotDiagnostics
                         totalSnapshotDiagnostics
                         nodes
                         files
@@ -6807,6 +6841,7 @@ type internal FcsBridge
                         let allDiags = Array.append parseResults.Diagnostics checkDiagnostics
                         let succeeded = checkedResults.IsSome
                         let errorCount, warningCount = countDiagnosticsBySeverity allDiags
+                        let infoCount = countInfoDiagnostics allDiags
 
                         let verdict, analyzed, reason =
                             if not succeeded then
@@ -6826,6 +6861,7 @@ type internal FcsBridge
                                 (Some "fcs-reanalyze")
                                 errorCount
                                 warningCount
+                                infoCount
                                 allDiags.Length
                                 nodes
                                 files
@@ -6866,6 +6902,7 @@ type internal FcsBridge
                                 0
                                 0
                                 0
+                                0
                                 [||]
                                 [||]
                                 (Some overallTimeoutReason)
@@ -6877,6 +6914,7 @@ type internal FcsBridge
                                 false
                                 "fcs"
                                 None
+                                0
                                 0
                                 0
                                 0
@@ -6909,6 +6947,7 @@ type internal FcsBridge
                                     0
                                     0
                                     0
+                                    0
                                     [||]
                                     [||]
                                     (Some overallTimeoutReason)
@@ -6920,6 +6959,7 @@ type internal FcsBridge
                                     false
                                     "fcs"
                                     (Some "fcs-reanalyze")
+                                    0
                                     0
                                     0
                                     0
@@ -6938,6 +6978,7 @@ type internal FcsBridge
                                     false
                                     "fcs"
                                     None
+                                    0
                                     0
                                     0
                                     0
@@ -6968,6 +7009,7 @@ type internal FcsBridge
                                         0
                                         0
                                         0
+                                        0
                                         [||]
                                         [||]
                                         (Some overallTimeoutReason)
@@ -6982,12 +7024,14 @@ type internal FcsBridge
                                         0
                                         0
                                         0
+                                        0
                                         [||]
                                         [||]
                                         (Some $"Project could not be analyzed: {msg}")
                                         [ ("projectsSwept", jint 1) ]
                             | Ok(diags, projFileName, optionsSource) ->
                                 let errorCount, warningCount = countDiagnosticsBySeverity diags
+                                let infoCount = countInfoDiagnostics diags
                                 let verdict = if errorCount > 0 then "errors" else "clean"
                                 let nodes, files = surfaceFcs diags
 
@@ -6999,6 +7043,7 @@ type internal FcsBridge
                                         (Some "fcs-reanalyze")
                                         errorCount
                                         warningCount
+                                        infoCount
                                         diags.Length
                                         nodes
                                         files
@@ -7055,6 +7100,7 @@ type internal FcsBridge
                                 0
                                 0
                                 0
+                                0
                                 [||]
                                 [||]
                                 (Some overallTimeoutReason)
@@ -7066,6 +7112,7 @@ type internal FcsBridge
                                 false
                                 "fcs"
                                 None
+                                0
                                 0
                                 0
                                 0
@@ -7183,6 +7230,7 @@ type internal FcsBridge
 
                         let diags = allDiags.ToArray()
                         let errorCount, warningCount = countDiagnosticsBySeverity diags
+                        let infoCount = countInfoDiagnostics diags
 
                         let verdict, analyzed, reason =
                             if timedOutCount > 0 then
@@ -7210,6 +7258,7 @@ type internal FcsBridge
                                 (Some "fcs-reanalyze")
                                 errorCount
                                 warningCount
+                                infoCount
                                 diags.Length
                                 nodes
                                 files

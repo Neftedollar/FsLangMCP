@@ -19,9 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `belowSeverityFloorCount` (how many of those full-set diagnostics the `severity` floor excluded
   from the `diagnostics` array — never the 50-item cap, which stays `diagnosticsTruncated`'s job),
   plus a `diagnosticsNote` pointing at `severity="all"` when the gap is nonzero. Also fixes
-  `fcs_check_file`'s internal `errorCount`, which was silently always `0`: it read the JSON
-  `severity` field as an int, but that field is serialized as text (`"Error"`) — the read never
-  matched.
+  `fcs_check_file`'s internal `errorCount` (an internal `FcsBridge` member since the 0.11.0 tool
+  consolidation, not a registered tool — no consumer could have observed this), which was silently
+  always `0`: it read the JSON `severity` field as an int, but that field is serialized as text
+  (`"Error"`) — the read never matched.
 
 ## [0.15.0] - 2026-08-16
 
