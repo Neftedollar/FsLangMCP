@@ -236,6 +236,12 @@ type FindArgs =
       /// true, projects with zero matches and no error are omitted to cut token noise;
       /// pass false to drop the array entirely on repeated sweeps.
       includePerProject: bool option
+      /// Add `siteType` — the field's type as the CURRENT typecheck resolves it at that
+      /// site — to every record-field site row, so a field-type change can be planned
+      /// without opening each file. Opt-in (per-site type resolution costs FCS work) and
+      /// scoped to field sites, i.e. kind='field' or kind='auto'. Never speculates about
+      /// the type AFTER an edit: make the edits, then run `check`. Default false. (#207)
+      includeSiteTypes: bool option
       /// .fsproj / .sln / .slnx / directory to sweep. Falls back to active set_project.
       projectPath: string option
       /// Maximum sites returned per page. Default 80; valid range 1..1000. The compact

@@ -142,8 +142,10 @@ Two tools carry most of the load:
   handles every failure mode above: it catches the point-free `List.map
   Order.describe`, the `[<AutoOpen>]` and aliased spellings, the cross-project
   construction in `App/`, and it tags each site with its `kind`
-  (`definition | reference | field-set-literal | field-set-update | field-read |
-  member-usage`) so set-sites and reads are distinguishable. Bare `find(query)`
+  (`definition | reference | field-set-literal | field-set-update |
+  field-set-mutation | field-pattern | field-read | member-usage`) so writes,
+  destructurings, and reads are all distinguishable — and `includeSiteTypes=true`
+  adds each field site's current type to its row. Bare `find(query)`
   returns a compact one-line-per-site list; narrow with `kind` + `scope`, or get
   member call-sites with `kind=members` + `member=Name`.
 
