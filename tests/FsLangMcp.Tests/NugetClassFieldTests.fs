@@ -148,6 +148,46 @@ let private nugetArgs (projectPath: string) (includeNonPublic: bool) : FcsNugetM
       maxResults = Some 500
       cursor = None }
 
+let private typesArgs (projectPath: string) (packageId: string) : FcsNugetTypesArgs =
+    { packageId = packageId
+      projectPath = Some projectPath
+      includeNonPublic = None
+      maxResults = Some 500
+      cursor = None }
+
+let private optionalString (result: JsonNode) (field: string) =
+    match result[field] with
+    | null -> None
+    | value -> Some(value.GetValue<string>())
+
+let private displayNames (result: JsonNode) =
+    entries result |> List.map (fun e -> e["displayName"].GetValue<string>())
+
+let private matchedAssemblies (result: JsonNode) =
+    match result["matchedAssemblies"] with
+    | :? JsonArray as arr -> arr |> Seq.cast<JsonNode> |> Seq.map (fun n -> n.GetValue<string>()) |> Seq.toList
+    | _ -> []
+
+/// Both keys of every candidate row. Reading only `packageId` would let a dropped or
+/// misspelled `assemblies` key survive the whole suite (#191 review M2).
+let private candidateRows (result: JsonNode) =
+    match result["candidatePackages"] with
+    | :? JsonArray as arr ->
+        arr
+        |> Seq.cast<JsonNode>
+        |> Seq.map (fun entry ->
+            let assemblies =
+                (entry["assemblies"] :?> JsonArray)
+                |> Seq.cast<JsonNode>
+                |> Seq.map (fun name -> name.GetValue<string>())
+                |> Seq.toList
+
+            entry["packageId"].GetValue<string>(), assemblies)
+        |> Seq.toList
+    | _ -> []
+
+let private candidateIds (result: JsonNode) = candidateRows result |> List.map fst
+
 // ─────────────────────────────────────────────────────────────────────────────────
 
 type NugetClassFieldTests(fx: FieldProbeFixture) =
@@ -197,4 +237,109 @@ type NugetClassFieldTests(fx: FieldProbeFixture) =
 
             Assert.Contains("PublicCounter", allNames)
             Assert.DoesNotContain(allNames, isBackingFieldName)
+        }
+
+    // ─── Issue #191: miss payload through the real tool path ────────────────────
+    //
+    // These run against the same fixture project, so they exercise the whole chain —
+    // EnsureProjectResults -> NugetPackageMap.forProject reading the fixture's own
+    // obj/project.assets.json -> match -> miss payload — not just the pure functions.
+    //
+    // The candidate assertions deliberately target FSharp.Core (a real PACKAGE in the
+    // fixture's restore graph) rather than the FieldProbe project reference: SDK 10.0.400
+    // emits a `type: "project"` target entry only when `dotnet build` discovers the project
+    // from the working directory, and omits it when the project path is passed explicitly —
+    // which is how this fixture builds. Package entries are always present.
+
+    [<Fact>]
+    member _.``NugetTypes keeps the happy path unchanged and adds no miss fields``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let! result = bridge.NugetTypes(typesArgs fx.ConsumerFsproj "FieldProbe")
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+            Assert.Equal<string list>([ "FieldProbe" ], matchedAssemblies result)
+            Assert.Contains("Widget", displayNames result)
+
+            // hint / candidatePackages are additive and must NOT appear when the id resolved.
+            Assert.Equal(None, optionalString result "hint")
+            Assert.Null(result["candidatePackages"])
+        }
+
+    [<Fact>]
+    member _.``NugetTypes on an unresolvable packageId returns a hint plus candidates from the restore graph``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let! result = bridge.NugetTypes(typesArgs fx.ConsumerFsproj "FSharp.Cor")
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+            Assert.Empty(matchedAssemblies result)
+
+            let hint = optionalString result "hint" |> Option.defaultValue ""
+            Assert.Contains("package id", hint)
+            Assert.Contains("SimpleName", hint)
+
+            // The map came off the fixture's own obj/project.assets.json, so the near miss is
+            // named and the agent self-corrects in one turn instead of falling back to
+            // MetadataLoadContext (the #100 field failure). The row carries the assembly names
+            // too — that pairing is the whole point of the payload.
+            Assert.Contains(("fsharp.core", [ "FSharp.Core" ]), candidateRows result)
+        }
+
+    [<Fact>]
+    member _.``NugetTypes on a packageId with no relative in the restore graph still explains the distinction``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let! result = bridge.NugetTypes(typesArgs fx.ConsumerFsproj "Zzz.Completely.Unrelated")
+
+            Assert.Empty(matchedAssemblies result)
+            Assert.Empty(candidateIds result)
+
+            let hint = optionalString result "hint" |> Option.defaultValue ""
+            Assert.Contains("package id", hint)
+            Assert.Contains("SimpleName", hint)
+            Assert.Contains("Orleans.Core.Abstractions.dll", hint)
+        }
+
+    [<Fact>]
+    member _.``NugetMembers separates a resolved assembly with no such type from an unresolvable packageId``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // Assembly resolves, type does not — the hint must point at fcs_nuget_types, not
+            // repeat the package-id lecture.
+            let! typeMiss =
+                bridge.NugetMembers
+                    { nugetArgs fx.ConsumerFsproj false with
+                        typeName = "NoSuchWidget" }
+
+            Assert.Empty(typeMiss["matchedTypes"] :?> JsonArray)
+            let typeHint = optionalString typeMiss "hint" |> Option.defaultValue ""
+            Assert.Contains("FieldProbe", typeHint)
+            Assert.Contains("fcs_nuget_types", typeHint)
+            Assert.Null(typeMiss["candidatePackages"])
+
+            // Package id does not resolve at all — the #100 failure mode gets the map payload.
+            let! packageMiss =
+                bridge.NugetMembers
+                    { nugetArgs fx.ConsumerFsproj false with
+                        packageId = "FSharp.Cor" }
+
+            Assert.Empty(packageMiss["matchedTypes"] :?> JsonArray)
+            let packageHint = optionalString packageMiss "hint" |> Option.defaultValue ""
+            Assert.Contains("SimpleName", packageHint)
+            Assert.Contains("fsharp.core", candidateIds packageMiss)
         }

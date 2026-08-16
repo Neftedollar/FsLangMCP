@@ -224,33 +224,70 @@ the rest of the scope is incomplete.
 
 ## fcs_nuget_types
 
-**Routing description:** Enumerate all types in one referenced assembly
-matched by EXACT SimpleName (case-insensitive). When a package ships multiple assemblies, call
-once per name. Each entry reports `displayName`, `fullName`, `kind`, `accessibility`, `isObsolete`.
-Paginated; default 500, max 2000. Returns `matchedAssemblies=[]` on no match.
+**Routing description:** Enumerate all types in one referenced assembly.
+`packageId` accepts the NuGet package id OR an assembly SimpleName it ships (exact,
+case-insensitive, never a prefix); the two often differ, and multi-assembly packages resolve
+fully. Each entry reports `displayName`, `fullName`, `kind`, `accessibility`, `isObsolete`.
+Paginated; default 500, max 2000. A miss adds `hint` + `candidatePackages`.
+
+### `packageId` is a package id OR an assembly name
+
+A NuGet package id and the assembly it ships are frequently **different strings**:
+`Microsoft.Orleans.Core.Abstractions` ships `Orleans.Core.Abstractions.dll`;
+`Microsoft.VisualStudio.Threading.Only` ships `Microsoft.VisualStudio.Threading.dll`. This tool
+used to match the assembly SimpleName only, so those packages resolved to zero assemblies and
+returned an empty — but `status: "ok"` — payload (issue #191).
+
+Both spellings now resolve. The mapping comes from the project's own restore output
+(`obj/project.assets.json`, falling back to the `-r:` reference paths under the NuGet
+global-packages cache), so it reflects what this project actually restored — it is not a
+heuristic on the string. Prefix matching is still rejected in both directions: `System` does
+not match `System.Text.Json`, and `Newtonsoft.Json.Schema` does not fall back to
+`Newtonsoft.Json`.
 
 ### How it works internally
 
 1. Loads the project via `FSharpChecker.ParseAndCheckProject` (warm from cache if available).
-2. Iterates over all referenced assemblies in the project options.
-3. Matches assemblies whose `SimpleName` equals `packageId` (case-insensitive, exact match —
-   not a prefix or contains check).
-4. Walks the matched assembly's top-level and nested namespaces to collect `FSharpEntity` entries.
-5. Filters by accessibility (public by default; set `includeNonPublic=true` for internal/private).
-6. Returns a paginated list of type entries.
+2. Builds a packageId → assembly-SimpleName map from `<projectDir>/obj/project.assets.json`
+   (every `targets` entry, `compile` and `runtime` sections). When that file is unavailable,
+   the same map is derived from the `-r:` reference paths.
+3. Iterates over all referenced assemblies in the project options.
+4. Matches an assembly when its `SimpleName` equals `packageId` (case-insensitive, exact) OR
+   when the map says `packageId` ships that assembly.
+5. Walks the matched assembly's top-level and nested namespaces to collect `FSharpEntity` entries.
+6. Filters by accessibility (public by default; set `includeNonPublic=true` for internal/private).
+7. Returns a paginated list of type entries.
+
+### Miss payload
+
+When zero assemblies match, two extra fields are added (they are absent on a hit, so the
+success shape is unchanged):
+
+| Field | Type | Notes |
+|---|---|---|
+| `hint` | string | Names the package-id-vs-assembly-name distinction, and distinguishes "not in this project's restore graph" from "restored, but no assembly of it is on the compile line" (analyzer / build-only / runtime-only packages) |
+| `candidatePackages` | array | Up to 5 `{ packageId, assemblies }` entries from the restore graph whose id or assembly names relate to the query, so the correct spelling is one turn away |
+
+The map records **every** restored package, including those that ship no referenceable assembly
+at all (`IncludeAssets=analyzers`, build-only, content-only). Those appear with
+`assemblies: []`, and asking for one by id gets the "restored, but contributes no compile-time
+reference" hint rather than the false "not in this project's restore graph".
 
 ### Caveats
 
-1. **Exact SimpleName match** — `packageId="System"` matches only the `System.dll` assembly,
-   not `System.Text.Json.dll`, `System.Collections.dll`, etc. To discover which assembly names
-   a package publishes, run `fcs_referenced_symbols` with a partial type-name query first.
-2. **Multi-assembly packages** — packages like Spectre.Console ship `Spectre.Console.dll` and
-   `Spectre.Console.Cli.dll` as separate assemblies. Each requires a separate `fcs_nuget_types`
-   call with the exact assembly name.
-3. **Silent no-match** — when `matchedAssemblies=[]`, the tool did NOT fall back to a
-   fuzzy match. The assembly is not in the project's reference list. Check `fcs_referenced_symbols`
-   to see what is loaded.
-4. **Lazy warm-up** — first call after `set_project` triggers `ParseAndCheckProject`, which may
+1. **Exact matching, never prefix** — `packageId="System"` matches only the `System.dll`
+   assembly, not `System.Text.Json.dll`, `System.Collections.dll`, etc.
+2. **Multi-assembly packages resolve fully** — a package that ships several assemblies (e.g.
+   `TypeShape` → `TypeShape.dll` + `TypeShape.CSharp.dll`) returns the types of all of them in
+   one call, and `matchedAssemblies` lists each. To narrow to one, pass that assembly's
+   SimpleName — but note a name that is *also* a package id (here, `TypeShape`) still resolves
+   as the package, so the narrowing works for `TypeShape.CSharp` and not for `TypeShape`.
+3. **No-match is never a fuzzy fallback** — when `matchedAssemblies=[]`, read `hint` and
+   `candidatePackages`; `fcs_referenced_symbols` searches everything that IS loaded.
+4. **Un-restored projects** — if `obj/project.assets.json` is missing AND the reference paths
+   are not under a NuGet packages cache, only the SimpleName arm is available (i.e. pre-#191
+   behaviour) and the miss payload has no candidates to offer.
+5. **Lazy warm-up** — first call after `set_project` triggers `ParseAndCheckProject`, which may
    take several seconds on a large project.
 
 ### Related tools
@@ -264,14 +301,18 @@ Paginated; default 500, max 2000. Returns `matchedAssemblies=[]` on no match.
 ## fcs_nuget_members
 
 **Routing description:** Enumerate members of one type from a referenced
-assembly (matched by `packageId` + `typeName`). Use after `fcs_nuget_types` to discover type
-names. Each entry: `name`, `kind`, `signature`, `accessibility`, `isObsolete`, `xmlDocSummary`.
-Paginated; default 500, max 2000. Returns `matchedTypes=[]` on no type match.
+assembly (`packageId` + `typeName`). `packageId` accepts the NuGet package id OR an assembly
+SimpleName it ships; the two often differ. Use after `fcs_nuget_types` to discover type names.
+Each entry: `name`, `kind`, `signature`, `accessibility`, `isObsolete`, `xmlDocSummary`.
+Paginated; default 500, max 2000. A miss adds `hint`, plus `candidatePackages` when the
+`packageId` did not resolve.
 
 ### How it works internally
 
 1. Resolves the project via `EnsureProjectResults` (same warm-cache path as `fcs_nuget_types`).
-2. Matches assemblies whose `SimpleName` equals `packageId` (exact, case-insensitive).
+2. Matches assemblies by `SimpleName` OR through the packageId → assembly map built from the
+   project's restore output — identical logic to `fcs_nuget_types`, see that section for why
+   `Microsoft.Orleans.Core.Abstractions` and `Orleans.Core.Abstractions` both resolve (#191).
 3. Walks all entities in the matched assembly via `allEntitiesFromAssembly` and filters those
    whose `DisplayName` equals `typeName` (case-insensitive) OR whose `FullName` equals or ends
    with `.typeName` at a segment boundary.
@@ -300,8 +341,11 @@ Paginated; default 500, max 2000. Returns `matchedTypes=[]` on no type match.
 
 1. **Type matching is case-insensitive** but the matched type must appear in the matched assembly.
    Use `fcs_nuget_types` with the same `packageId` to discover the correct `DisplayName`/`FullName`.
-2. **No type match → empty, not error** — when `matchedTypes=[]`, the tool did NOT fall back to a
-   fuzzy match. Verify `packageId` (exact SimpleName) and `typeName`.
+2. **`matchedTypes=[]` has two distinct causes, and `hint` says which** — either the
+   `packageId` resolved to no assembly at all (then `candidatePackages` lists the closest
+   package ids from this project's restore graph, as documented under `fcs_nuget_types`), or
+   the assembly resolved but exports no such type (then `hint` names the assembly that was
+   searched and points at `fcs_nuget_types`). The tool never falls back to a fuzzy match.
 3. **xmlDocSummary is null for compiled BCL/NuGet types** — XML doc is only available for F# source
    files in the loaded project with `///` comments. For BCL types, use the official documentation.
 4. **Signature formatting** — uses FCS `BasicQualifiedName` for types; generic type parameters may
@@ -354,7 +398,8 @@ accessibility, and `isObsolete`. Set `includeNonPublic=true` for internals. Pagi
 
 ### Related tools
 
-- `fcs_nuget_types` — enumerate all types in a specific assembly by exact SimpleName.
+- `fcs_nuget_types` — enumerate all types in a specific assembly, by NuGet package id or by
+  assembly SimpleName (exact, either spelling).
 - `find` — search project-local symbols with source context.
 
 ---
