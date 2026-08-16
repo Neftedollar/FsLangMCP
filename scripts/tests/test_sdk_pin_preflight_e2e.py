@@ -33,6 +33,26 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
+
+def canonical_path(value: str | Path) -> str:
+    r"""Compare paths, not spellings — apply to BOTH sides of any path equality.
+
+    A Windows CI runner sets TEMP to the 8.3 short form, so `tempfile.mkdtemp()`
+    handed this test `C:\Users\RUNNER~1\AppData\Local\Temp\...\global.json` while
+    the server echoed the same file back expanded, as
+    `C:\Users\runneradmin\...\global.json` — one file, two spellings, red job
+    (PR #200). Which side does the expanding is not worth encoding here: run both
+    through the same funnel and the question stops mattering.
+
+    `realpath` resolves 8.3 short names on Windows (it goes through
+    `nt._getfinalpathname`, i.e. `GetFinalPathNameByHandle`, which returns the
+    canonical long form) and follows the macOS `/var` -> `/private/var` symlink;
+    `normcase` absorbs Windows case and separator differences. Canonicalising only
+    one side would just move the bug.
+    """
+    return os.path.normcase(os.path.realpath(str(value)))
+
+
 # No machine can have this installed, so the poisoned side of the assertion holds
 # regardless of which SDKs the host actually has.
 ABSENT_SDK_VERSION = "999.999.999"
@@ -232,8 +252,11 @@ class SdkPinPreflightEndToEnd(unittest.TestCase):
                 self.assertEqual("infrastructure_error", payload.get("status"))
                 self.assertEqual("sdk_not_found", payload.get("errorKind"))
                 self.assertEqual(ABSENT_SDK_VERSION, payload.get("requestedSdkVersion"))
+                reported_global_json = payload.get("globalJsonPath")
+                self.assertIsNotNone(reported_global_json, f"no globalJsonPath in {payload}")
                 self.assertEqual(
-                    str(self._root / "global.json"), payload.get("globalJsonPath")
+                    canonical_path(self._root / "global.json"),
+                    canonical_path(reported_global_json),
                 )
                 self.assertIsInstance(payload.get("installedSdks"), list)
                 self.assertEqual(2, len(payload.get("remedies", [])))
@@ -252,6 +275,11 @@ class SdkPinPreflightEndToEnd(unittest.TestCase):
 
         self.assertFalse(is_error)
         reason = payload["toolingReadiness"]["fcs"]["reason"]
+        # Substring checks on prose, deliberately NOT routed through canonical_path:
+        # the haystack is a sentence containing a path, so canonicalising the needle
+        # while the haystack keeps the server's spelling would reintroduce the same
+        # mismatch in reverse. A version number and a bare filename are spelling-stable
+        # on every host; the exact path is asserted in the test above.
         self.assertIn(ABSENT_SDK_VERSION, reason)
         self.assertIn("global.json", reason)
         self.assertTrue(self._client.alive)
