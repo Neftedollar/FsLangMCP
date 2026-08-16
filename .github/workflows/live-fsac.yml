@@ -276,4 +276,5 @@ jobs:
           dotnet restore tests/FsLangMcp.Tests/FsLangMcp.Tests.fsproj --locked-mode
           dotnet test tests/FsLangMcp.Tests/FsLangMcp.Tests.fsproj `
             --no-restore `
-            --filter "FullyQualifiedName~NugetPackageMapTests"
+            --filter "FullyQualifiedName~NugetPackageMapTests" `
+            -- RunConfiguration.TreatNoTestsAsError=true
