@@ -76,6 +76,21 @@ let private parseProjInfoOutput (path: string) (exitCode: int) (stdout: string) 
 
 let private runProjInfoAsync (path: string) : Task<JsonNode> =
     task {
+        // #192: the out-of-process proj-info CLI calls the same Init.init and dies the
+        // same way (exit 134, unhandled), so it needs the same pre-flight the in-process
+        // loader got. Raising lets Tools.toolResult render the shared typed envelope.
+        // Walk from the path itself when it is a directory: starting at its parent
+        // would skip a global.json sitting inside it.
+        let projectDirectory =
+            let full = Path.GetFullPath path
+
+            if Directory.Exists full then
+                full
+            else
+                Path.GetDirectoryName full
+
+        do! Task.Run(fun () -> SdkPreflight.ensure [ projectDirectory ])
+
         try
             let! result =
                 ProcessRunner.runAsync
@@ -288,6 +303,31 @@ let private applyCliOverrides (argv: string array) =
 
 // ─── Entry point ───────────────────────────────────────────────────────────────
 
+/// #192 hardening. Deliberately narrow, and the split matters:
+///
+///   * TaskScheduler.UnobservedTaskException is genuinely log-and-survive. Marking
+///     the exception observed keeps a faulted background task from becoming fatal
+///     even if a host ever enables ThrowUnobservedTaskExceptions.
+///   * AppDomain.CurrentDomain.UnhandledException CANNOT rescue the process on
+///     .NET — by then the runtime has already decided to terminate. It only buys a
+///     named cause on stderr instead of an agent seeing a bare "connection lost".
+///
+/// What neither covers: a dependency calling Environment.Exit/FailFast, a stack
+/// overflow, or a child process dying (the actual #192 mechanism — that one is
+/// handled by SdkPreflight, not here).
+let private installHostFaultDiagnostics () =
+    TaskScheduler.UnobservedTaskException.Add(fun args ->
+        args.SetObserved()
+        Console.Error.WriteLine($"[unobserved-task] %s{args.Exception.GetBaseException().Message}"))
+
+    AppDomain.CurrentDomain.UnhandledException.Add(fun args ->
+        let description =
+            match args.ExceptionObject with
+            | :? exn as ex -> $"%s{ex.GetType().Name}: %s{ex.Message}\n%s{ex.StackTrace}"
+            | other -> $"%O{other}"
+
+        Console.Error.WriteLine($"[unhandled] terminating=%b{args.IsTerminating} %s{description}"))
+
 let private mainCore argv =
     match applyCliOverrides argv with
     | BootstrapTools -> if bootstrapTools () then 0 else 1
@@ -301,6 +341,7 @@ let private mainCore argv =
         Console.Error.WriteLine(message)
         1
     | Start startOptions ->
+        installHostFaultDiagnostics ()
         let fcsBridge = new FcsBridge()
         let projInfoTimeout = timeoutFromEnv "FSLANGMCP_PROJ_INFO_TIMEOUT_MS" 120_000
 

@@ -3027,8 +3027,16 @@ type internal FcsBridge
             // caller owns the outer admission slot across this actual completion.
             return!
                 Task.Run(fun () ->
+                    let projectDir = Path.GetDirectoryName(fsprojPath)
+
+                    // #192: outside the try on purpose. Init.init inherits this
+                    // directory's global.json, and an unsatisfiable `rollForward:
+                    // "disable"` pin is not a load failure to degrade into None —
+                    // it is a machine-configuration problem the agent must be told
+                    // about by name. Raising here also keeps MSBuild untouched.
+                    SdkPreflight.ensure [ projectDir ]
+
                     try
-                        let projectDir = Path.GetDirectoryName(fsprojPath)
                         let toolsPath = Init.init (DirectoryInfo(projectDir)) None
                         let loader = WorkspaceLoader.Create(toolsPath, [])
                         Interlocked.Increment(&projectOptionsLoadCount) |> ignore
@@ -5075,7 +5083,18 @@ type internal FcsBridge
                             [ "project", jstr projDisplay
                               "fsproj", jstr (normalizePath fsproj)
                               "status", jstr (if timedOut then "timed_out" else "failed")
-                              "errorKind", jstr (if timedOut then "timeout" else "project_failure")
+                              "errorKind",
+                              // #192: a per-project entry cannot become the whole
+                              // response envelope, but it can still name the real
+                              // cause instead of a generic project_failure.
+                              jstr (
+                                  if timedOut then
+                                      "timeout"
+                                  else
+                                      match ex with
+                                      | SdkPreflight.SdkPinUnsatisfiable _ -> "sdk_not_found"
+                                      | _ -> "project_failure"
+                              )
                               "error", jstr ex.Message
                               "elapsedMs", jint (int projSw.ElapsedMilliseconds) ]
                         :> JsonNode
