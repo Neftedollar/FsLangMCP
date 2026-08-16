@@ -7594,6 +7594,11 @@ type internal FcsBridge
                                     | Some(Ok(diags, _, _)) ->
                                         allDiags.AddRange diags
                                         let e, w = countDiagnosticsBySeverity diags
+                                        // #205: a genuine tally via countInfoDiagnostics on this
+                                        // project's own diags — mirrors the top-level infoCount
+                                        // (#190/#202) so errorCount + warningCount + infoCount
+                                        // reconciles per project, not just at the workspace total.
+                                        let i = countInfoDiagnostics diags
 
                                         perProject.Add(
                                             jobj
@@ -7601,6 +7606,7 @@ type internal FcsBridge
                                                   "fsproj", jstr (normalizePath proj)
                                                   "errorCount", jint e
                                                   "warningCount", jint w
+                                                  "infoCount", jint i
                                                   "analyzed", jbool true ]
                                             :> JsonNode
                                         )
