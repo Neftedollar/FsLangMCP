@@ -1328,10 +1328,14 @@ type internal FsAutoCompleteBridge
     // instead sidesteps the problem without needing a lock anywhere, including in
     // Dispose: this field deliberately carries no [<VolatileField>] attribute and is
     // instead accessed only through Volatile.Read/Volatile.Write below — unlike
-    // activeSessionGeneration above, which carries both — because the attribute alone
-    // only orders access, it does not guarantee an atomic read/write of a 64-bit value
-    // on a 32-bit runtime, whereas Volatile.Read/Volatile.Write<Int64> are documented
-    // to be atomic even there. So every writer — gated (a), ungated (b), or Dispose's
+    // activeSessionGeneration above, which carries both the attribute and every access
+    // going through Volatile.Read/Volatile.Write already (there the attribute is
+    // redundant-but-harmless, not load-bearing — do NOT read this comment as license to
+    // strip it). The attribute alone only orders access; it does not guarantee an
+    // atomic read/write of a 64-bit value on a 32-bit runtime, whereas
+    // Volatile.Read/Volatile.Write<Int64> are documented to be atomic even there — which
+    // is why THIS field's correctness rests entirely on the explicit calls, with no
+    // [<VolatileField>] to fall back on. So every writer — gated (a), ungated (b), or Dispose's
     // ungated reset — can just Volatile.Write it, and every reader gets a whole,
     // untorn value with no lock needed anywhere. 0L is the "unknown" sentinel
     // (ValueNone); UtcNow.UtcTicks is never 0 in practice. Go through
