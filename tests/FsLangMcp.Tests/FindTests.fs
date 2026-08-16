@@ -668,6 +668,79 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
         }
 
     [<Fact>]
+    member this.``#207: past the per-site deadline every field row degrades to JSON null and the ledger says so``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+
+            // The ONE degraded arm that is reachable in production: a solution large enough
+            // that find's wall-clock budget expires between a project's sweep returning and
+            // its site loop finishing. It cannot be reached with timeoutMs alone — timeoutMs=0
+            // is already exhausted BEFORE the sweep, so the project fails and yields no sites
+            // at all (that path is covered separately). The seam supplies the clock verdict so
+            // the branch runs deterministically, with everything else the real code.
+            let bridge = FcsBridge(findSiteTypeDeadlineExpiredOverride = (fun () -> true))
+
+            let! find =
+                bridge.Find(
+                    { findArgs fx.Slnx "Shipment" with
+                        kind = Some "field"
+                        includeSiteTypes = Some true }
+                )
+
+            // 1. A per-site miss NEVER fails the call, and never drops a site.
+            Assert.Equal("succeeded", gs find "status")
+
+            let fieldKinds =
+                Set.ofList
+                    [ "field-set-literal"
+                      "field-set-update"
+                      "field-set-mutation"
+                      "field-pattern"
+                      "field-read" ]
+
+            let sites = FindTests.SitesOfKinds find fieldKinds
+            Assert.Equal(8, sites.Length)
+
+            // 2. The ledger with degraded > 0 — the state no other test reaches, so the
+            //    identity is only actually exercised here.
+            let siteTypes = find["siteTypes"]
+            Assert.Equal(8, gi siteTypes "fieldSites")
+            Assert.Equal(0, gi siteTypes "typed")
+            Assert.Equal(8, gi siteTypes "degraded")
+            Assert.Equal(8, gi siteTypes "degradedTimedOut")
+            Assert.Equal(0, gi siteTypes "degradedUnresolved")
+            Assert.Equal(gi siteTypes "fieldSites", gi siteTypes "typed" + gi siteTypes "degraded")
+
+            Assert.Equal(
+                gi siteTypes "degraded",
+                gi siteTypes "degradedUnresolved" + gi siteTypes "degradedTimedOut"
+            )
+
+            // 3. Every row KEEPS the key and carries JSON null — not a dropped key, and not
+            //    the string "null", which a naive presence check would accept.
+            for site in sites do
+                Assert.True(site.AsObject().ContainsKey("siteType"), "a degraded row must keep the key")
+                Assert.True(isNull site["siteType"], "a degraded row's siteType must be JSON null")
+
+            let sitesJson = find["sites"].ToJsonString()
+            Assert.Contains("\"siteType\":null", sitesJson)
+            Assert.DoesNotContain("\"siteType\":\"null\"", sitesJson)
+
+            // 4. The note names the degradation and its cause instead of claiming success.
+            let note = gs find "siteTypesNote"
+            Assert.Contains("8 of 8 field sites could not be typed", note)
+            Assert.Contains("timeoutMs", note)
+
+            // 5. Site kinds are parse-tree-derived and must survive an exhausted type budget
+            //    untouched — losing the classification too would double the damage.
+            Assert.Equal(2, gi find["breakdown"] "fieldSetLiteral")
+            Assert.Equal(2, gi find["breakdown"] "fieldSetMutation")
+            Assert.Equal(1, gi find["breakdown"] "fieldPattern")
+        }
+
+    [<Fact>]
     member _.``#207: an empty typed result on an incomplete sweep blames coverage, not the caller's kind``() : Task =
         task {
             Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")

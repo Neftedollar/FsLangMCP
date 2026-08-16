@@ -11,15 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `find` gains a **field-impact mode** for planning a record-field type change from
-  the tool output alone (#207). Two halves:
-  - **Five-way field-site classification.** `kind=field` sites are now tagged
-    `field-set-literal` | `field-set-update` | `field-set-mutation` |
-    `field-pattern` | `field-read`, with matching `fieldSetMutation` /
-    `fieldPattern` counters in `breakdown`. Each shape needs a different edit
-    when the field's type changes. **Behaviour change:** `x.Field <- v` and
-    `| { Field = x } ->` used to be reported as `field-read` — the first of those
-    labelled a *write* as a read. Existing counters keep their meaning;
-    `fieldRead` now means only "an expression that reads the field".
+  the tool output alone (#207). The `includeSiteTypes` half is below; the site
+  reclassification half is a behaviour change, filed under *Changed*.
   - **`includeSiteTypes` (default `false`).** When true, every record-field site
     row additionally carries `siteType` — the field's type as the CURRENT
     typecheck resolves it at that site, rendered with that site's own `open`s —
@@ -54,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   analysis completed, it reports "analyzed K of N" instead of claiming a
   sweep that didn't happen, and for `scope='file'` it names the additional
   file-level filter, not just the sibling-project blind spot (#193).
+
+### Changed
+
+- **`find` now reports five distinct record-field site kinds instead of three**
+  (#207). `kind=field` sites are tagged `field-set-literal` |
+  `field-set-update` | `field-set-mutation` | `field-pattern` | `field-read`,
+  with matching `fieldSetMutation` / `fieldPattern` counters added to
+  `breakdown`. Each shape needs a different edit when the field's type changes.
+  **Behaviour change:** `x.Field <- v` and `| { Field = x } ->` used to be
+  reported as `field-read` — the first of those labelled a *write* as a read.
+  Existing `breakdown` keys keep their meaning and the new ones are additive, but
+  `fieldRead` now means only "an expression that reads the field", so a consumer
+  that sums or switches on field kinds will see different numbers. No registered
+  tool couples to the field kinds (`fcs_refactor_impact` compares only against
+  `"definition"`), and `fcs_record_field_audit`'s internal `form` contract
+  (`literal` | `with-update` | `unknown`) is unchanged.
+
 ### Fixed
 
 - `check`'s `totalDiagnostics` now explains itself instead of silently disagreeing with

@@ -180,9 +180,16 @@ module private FieldFormClassifier =
 //   • FSharpSymbolUse.GenericArguments is EMPTY for record-field uses, so a field on a
 //     generic record renders as its type PARAMETER (`'T`), not the instantiation at the
 //     site. FSharpType.Instantiate therefore buys nothing here; documented as a limit.
+//   • FSharpSymbolUse.IsFromPattern is FALSE for the field in `| { Code = c } ->` — it
+//     describes the BINDING (`c`), not the field — which is why `field-pattern` is
+//     classified from the parse tree (SynPat.Record) rather than from the symbol use.
 //   • Type resolution survives a parse error elsewhere in the file AND an undefined field
 //     type (FCS recovers the latter to `obj`), so `siteType: null` is a genuine but RARE
-//     defensive outcome rather than a routine one.
+//     defensive outcome rather than a routine one. Review of this feature independently
+//     re-tested two more candidate degradations (a file excluded from compile order; a
+//     field whose type comes from an unreferenced project) and both collapsed to ABSENCE
+//     of the symbol use rather than degradation. The reachable-in-production degraded arm
+//     is therefore the DEADLINE one — see FieldSiteTypes below for how it is tested.
 
 /// Longest `siteType` string emitted per site. A pathological generic signature must not
 /// be able to blow `find`'s page budget: a full default page of 80 sites is ~43k chars
@@ -208,6 +215,59 @@ let private tryFormatFieldSiteType (symbolUse: FSharpSymbolUse) : string option 
         // FCS throws on synthetic / unresolved field symbols; a per-site miss must never
         // propagate out of the sweep.
         None
+
+/// The per-site (siteType, typeStatus) decision and its JSON projection, factored OUT of
+/// the Find state machine so BOTH halves are unit-testable without an FCS session.
+///
+/// Why they live here: every naturally-occurring field site in every fixture resolves
+/// (`degraded = 0`, including the parse-error fixture and a 3434-site sweep of this repo),
+/// so inline in Find the degraded arms would never execute in a test — and a dropped key,
+/// the STRING `"null"` instead of JSON null, or a wrong status string silently breaking the
+/// `typed + degraded == fieldSites` identity would all pass the whole suite. As free
+/// functions over primitives they are exercised directly. The one degraded arm that is
+/// genuinely reachable in production — the deadline — is additionally driven end-to-end
+/// through `Find` via `findSiteTypeDeadlineExpiredOverride`.
+module internal FieldSiteTypes =
+
+    /// Status recorded on a successfully typed site.
+    [<Literal>]
+    let Typed = "typed"
+
+    /// FCS produced no type for this site; the row carries `siteType: null`.
+    [<Literal>]
+    let Unresolved = "unresolved"
+
+    /// The site was reached after find's wall-clock budget was exhausted; the row carries
+    /// `siteType: null` rather than stretching the sweep.
+    [<Literal>]
+    let TimedOut = "timeout"
+
+    /// Decide one site's (siteType, typeStatus). `tryFormat` is a THUNK on purpose: past
+    /// the deadline it is never invoked, so an exhausted budget costs no further FCS
+    /// formatting work on the tail of a large sweep.
+    let outcome (deadlineExpired: bool) (tryFormat: unit -> string option) : string * string =
+        if deadlineExpired then
+            null, TimedOut
+        else
+            match tryFormat () with
+            | Some formatted -> formatted, Typed
+            | None -> null, Unresolved
+
+    /// Project a site's stored (siteType, typeStatus) into the JSON fields its row carries.
+    /// Present on EVERY field site under includeSiteTypes — an explicit JSON null for a
+    /// degraded one, so a consumer never has to distinguish "absent key" from "could not
+    /// resolve". Absent entirely on non-field sites (typeStatus = null) and when the flag
+    /// is off, keeping the default row byte-identical to before the feature.
+    let rowFields (includeSiteTypes: bool) (siteType: string) (typeStatus: string) : (string * JsonNode) list =
+        if includeSiteTypes && not (isNull typeStatus) then
+            let value =
+                match siteType with
+                | null -> null
+                | v -> jstr v
+
+            [ ("siteType", value) ]
+        else
+            []
 
 
 // ─── find: typed FSAC fallback result (issue #168, P1-01) ───────────────────────
@@ -2046,6 +2106,13 @@ type internal FcsBridge
         ?freshProjectCheckBeforeAdmissionOverride: (unit -> Task),
         ?freshProjectCheckBeforeFcsStartOverride: (unit -> Task),
         ?checkFastSnapshotDeadlineExpiredOverride: (unit -> bool),
+        // #207: test-only seam for find's PER-SITE siteType deadline. The production check
+        // is `sweepSw.ElapsedMilliseconds >= sweepBudgetMs`, which cannot be driven from a
+        // test without a clock: timeoutMs=0 is exhausted BEFORE the sweep, so it fails the
+        // whole project and yields no sites at all. This override makes the reachable
+        // degraded arm (a large solution whose budget expires between a project's sweep
+        // returning and its site loop finishing) deterministically testable.
+        ?findSiteTypeDeadlineExpiredOverride: (unit -> bool),
         ?referenceResolutionProbeOverride: (string array -> int * int),
         ?projectOptionsCacheValidationBeforeComputeOverride: (string -> unit)
     ) =
@@ -5116,6 +5183,21 @@ type internal FcsBridge
             // page at ~37k chars instead of truncating at 40. breakdown + totalSites
             // still report the FULL set, and cursor/nextCursor pages the rest, so a
             // complete refactor list stays reachable past the default.
+            //
+            // #207 re-derivation — READ THIS BEFORE CHANGING EITHER NUMBER. includeSiteTypes
+            // adds one `siteType` string per FIELD row, so the envelope above is no longer
+            // the whole story. The increment is bounded by construction at
+            // `siteTypeMaxChars` (200) + a "..." marker, giving a capped worst case of
+            // 80 × (527 + 203 + ~15 chars of JSON key overhead) ≈ 59.6k chars, still under
+            // the ~72k ceiling — so the default 80 stands with the flag on. Measured real
+            // growth is far smaller: +18.5 chars/site on the field fixture, and a 58-char
+            // longest siteType across a 3434-site sweep of this repo. That arithmetic is
+            // ASSERTED in FindTests ("the type column stays inside find's documented page
+            // budget"), so raising siteTypeMaxChars without redoing this math fails there.
+            // Caveat inherited from this envelope, not introduced by #207: 527 is a measured
+            // AVERAGE, not a bound — `lineText` is emitted uncapped, so a page of
+            // pathologically long source lines can exceed the arithmetic with or without
+            // the column.
             let pageSize = args.maxResults |> Option.defaultValue 80
 
             let invalidArgs message =
@@ -5454,15 +5536,17 @@ type internal FcsBridge
                     // deadline a site is recorded untyped (status "timeout") instead of
                     // stretching the sweep — the caller still gets every site, just without
                     // the extra column on the tail of a very large sweep.
+                    let siteTypeDeadlineExpired () =
+                        match findSiteTypeDeadlineExpiredOverride with
+                        | Some hook -> hook ()
+                        | None -> int sweepSw.ElapsedMilliseconds >= sweepBudgetMs
+
                     let resolveSiteType (symbolUse: FSharpSymbolUse) =
                         if not includeSiteTypes then
                             null, null
-                        elif int sweepSw.ElapsedMilliseconds >= sweepBudgetMs then
-                            null, "timeout"
                         else
-                            match tryFormatFieldSiteType symbolUse with
-                            | Some formatted -> formatted, "typed"
-                            | None -> null, "unresolved"
+                            FieldSiteTypes.outcome (siteTypeDeadlineExpired ()) (fun () ->
+                                tryFormatFieldSiteType symbolUse)
 
                     let add (symbolUse: FSharpSymbolUse) (siteKind: string) (overwrite: bool) (siteType: string) (typeStatus: string) =
                         let r = symbolUse.Range
@@ -5602,9 +5686,9 @@ type internal FcsBridge
                 |> Array.filter (fun s -> String.Equals(s.TypeStatus, status, StringComparison.Ordinal))
                 |> Array.length
 
-            let typedSites = countTypeStatus "typed"
-            let unresolvedSites = countTypeStatus "unresolved"
-            let timedOutTypeSites = countTypeStatus "timeout"
+            let typedSites = countTypeStatus FieldSiteTypes.Typed
+            let unresolvedSites = countTypeStatus FieldSiteTypes.Unresolved
+            let timedOutTypeSites = countTypeStatus FieldSiteTypes.TimedOut
             let degradedSites = unresolvedSites + timedOutTypeSites
 
             let projectsRequested = projectsToSweep.Length
@@ -5714,20 +5798,9 @@ type internal FcsBridge
                     else
                         []
 
-                // #207: present on EVERY field site under includeSiteTypes — explicit null
-                // for a degraded one, so a consumer never has to distinguish "absent key"
-                // from "could not resolve". Absent entirely on non-field sites and when the
-                // flag is off, keeping the default row byte-identical to before.
-                let siteTypeFields =
-                    if includeSiteTypes && not (isNull s.TypeStatus) then
-                        let value =
-                            match s.SiteType with
-                            | null -> null
-                            | v -> jstr v
-
-                        [ ("siteType", value) ]
-                    else
-                        []
+                // #207: see FieldSiteTypes.rowFields — extracted so its degraded (JSON null)
+                // arm is unit-testable, which inline here it was not.
+                let siteTypeFields = FieldSiteTypes.rowFields includeSiteTypes s.SiteType s.TypeStatus
 
                 jobj
                     ([ "file", jstr s.File
@@ -5843,7 +5916,21 @@ type internal FcsBridge
                             // never got far enough to produce — coverage is the real story.
                             $"No field site was typed because the sweep is incomplete: {projectsAnalyzed} of {projectsRequested} project(s) were analyzed ({projectsFailed} failed, {projectsTimedOut} timed out). See coverage/message; re-run with a larger timeoutMs before reading anything into the empty result."
                         elif fieldSiteCount = 0 then
-                            $"includeSiteTypes annotates record-field sites only, and this sweep produced none (kindResolved='{kindResolved}'). Use kind='field' (optionally with field='Name') or kind='auto' to get field sites, then re-read `siteType` on each row."
+                            // Advice must name a NEXT step the caller has not already taken.
+                            // Telling a kind='auto'/'field' caller to "use kind='field' or
+                            // kind='auto'" is circular, and a kind='position' caller sees
+                            // kindResolved='symbol' (position folds into the symbol sweep),
+                            // so each entry point gets the step that actually differs.
+                            let recipe =
+                                match kind, kindResolved with
+                                | "position", _ ->
+                                    "kind='position' resolves the symbol under the cursor and then sweeps it as kind='symbol', which never unions field sites. Re-run with kind='field' and the resolved name as query (echoed above as `query`)."
+                                | _, ("field" | "auto") ->
+                                    $"The query already unioned field sites — '{query}' simply matches no record field here. Check the declaring type name (find matches fields by their DECLARING type, not the field name), drop field='…' if it is over-restricting, or pass exact=false for a substring match on the type."
+                                | _ ->
+                                    "Re-run with kind='field' (optionally with field='Name') or kind='auto', which union record-field sites; this kind does not."
+
+                            $"includeSiteTypes annotates record-field sites only, and this sweep produced none (kindResolved='{kindResolved}'). {recipe}"
                         else
                             let degradedClause =
                                 if degradedSites = 0 then

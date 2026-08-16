@@ -118,8 +118,18 @@ A minimal F# subagent brief skeleton. Embed your task-specific content where ind
   (cross-assembly search), both shipped v0.7.0.
 - For unresolved-symbol "what `open` do I add?" lookups:
   `fcs_suggest_open` (shipped v0.9.0).
-- For record-construction-site audits (`{ Field = ... }` /
-  `{ x with Field = ... }`): `find` with `kind="field"`.
+- For record-field work of any kind: `find` with `kind="field"`. It reports FIVE
+  distinct site kinds — `field-set-literal` (`{ Field = ... }`),
+  `field-set-update` (`{ x with Field = ... }`), `field-set-mutation`
+  (`x.Field <- ...`), `field-pattern` (`| { Field = b } ->`), and `field-read` —
+  because a field-type change edits each of them differently.
+- When you are CHANGING a record field's type, add `includeSiteTypes=true` to
+  that call: every field-site row then carries `siteType`, the field's type as
+  the current typecheck resolves it at that site, so you can plan each edit from
+  the response instead of opening every file. It reports today's type only — it
+  never predicts the post-edit type. The loop is:
+  `find(kind="field", field="Name", includeSiteTypes=true)` → edit every site →
+  `check(scope="project")` for the verdict.
 
 ## End-of-run deliverables
 
