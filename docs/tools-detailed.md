@@ -20,7 +20,9 @@ The consolidation aliases below were removed in v0.13.1 and are no longer regist
 resolves its project against whatever `set_project` last bound. Returns a `readiness` object with
 both the stable boolean flags (`lsp`, `projectOptions`, `symbolIndex`) and a richer
 `symbolIndexState` / `symbolIndexHint` pair that explains *why* `symbolIndex` is `false` and what
-to do about it.
+to do about it. On an unsatisfiable `global.json` SDK pin, `set_project` instead returns a typed
+`{status: "infrastructure_error", errorKind: "sdk_not_found"}` envelope, not a readiness payload
+(#192).
 
 ### symbolIndexState
 

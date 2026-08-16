@@ -1317,20 +1317,28 @@ type internal FsAutoCompleteBridge
     // The workspace-ready timestamp has three writers: markWorkspaceReady, called
     // (a) synchronously under `gate` from StartLspUnsafe's explicit-workspace path,
     // and (b) from the JSON-RPC dispatch thread with NO lock at all, whenever FSAC's
-    // WorkspaceLoadTarget notification fires; and the reset in StopLspUnsafe, also
-    // gate-holding. Because (b) takes no gate, no amount of gate discipline on the
-    // *readers* closes the race — a `DateTimeOffset voption` is a multi-field struct
-    // with no atomic read/write guarantee even marked [<VolatileField>], so a reader
-    // could observe a torn value while writer (b) is mid-update (#194 review, M7).
-    // Storing UTC ticks as int64 instead sidesteps the problem: int64 reads/writes
-    // via Volatile.Read/Volatile.Write are genuinely atomic (same pattern already
-    // used for activeSessionGeneration below), so every writer — gated or not — can
-    // just Volatile.Write it and every reader gets a whole, untorn value with no lock
-    // needed anywhere. 0L is the "unknown" sentinel (ValueNone); UtcNow.UtcTicks is
-    // never 0 in practice. Go through readWorkspaceReadyAt/writeWorkspaceReadyAt
-    // below rather than touching the field directly, so both readers
-    // (setProjectReadiness's call site and WorkspaceSymbolForContext) and both
-    // writer call sites share the one place that knows about the ticks encoding.
+    // WorkspaceLoadTarget notification fires; and the reset in StopLspUnsafe, which
+    // is gate-held at every call site except Dispose (Dispose calls StopLspUnsafe
+    // directly, with no gate.WaitAsync, right before disposing `gate` itself). Because
+    // (b) takes no gate — and Dispose's call takes none either — no amount of gate
+    // discipline on the *readers*, or on this writer, closes the race by locking: a
+    // `DateTimeOffset voption` is a multi-field struct with no atomic read/write
+    // guarantee even marked [<VolatileField>], so a reader could observe a torn value
+    // while writer (b) is mid-update (#194 review, M7). Storing UTC ticks as int64
+    // instead sidesteps the problem without needing a lock anywhere, including in
+    // Dispose: this field deliberately carries no [<VolatileField>] attribute and is
+    // instead accessed only through Volatile.Read/Volatile.Write below — unlike
+    // activeSessionGeneration above, which carries both — because the attribute alone
+    // only orders access, it does not guarantee an atomic read/write of a 64-bit value
+    // on a 32-bit runtime, whereas Volatile.Read/Volatile.Write<Int64> are documented
+    // to be atomic even there. So every writer — gated (a), ungated (b), or Dispose's
+    // ungated reset — can just Volatile.Write it, and every reader gets a whole,
+    // untorn value with no lock needed anywhere. 0L is the "unknown" sentinel
+    // (ValueNone); UtcNow.UtcTicks is never 0 in practice. Go through
+    // readWorkspaceReadyAt/writeWorkspaceReadyAt below rather than touching the
+    // field directly, so both readers (setProjectReadiness's call site and
+    // WorkspaceSymbolForContext) and both writer call sites share the one place
+    // that knows about the ticks encoding.
     let mutable workspaceReadyAtTicks: int64 = 0L
 
     let readWorkspaceReadyAt () : DateTimeOffset voption =
