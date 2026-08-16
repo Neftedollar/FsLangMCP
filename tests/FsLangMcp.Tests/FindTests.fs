@@ -519,6 +519,156 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                     Directory.Delete(outsideRoot, true)
         }
 
+    // ── #193 (post-review design revision): NO narrowing mechanism — sweep breadth
+    // is unchanged everywhere, exactly as at BASE. Review proved SolutionParsing.
+    // listProjects(<.fsproj>) = [itself] already at BASE and at v0.13.1, so an
+    // "auto narrows on an explicit .fsproj" mechanism can never change what gets
+    // swept — it is unreachable dead logic, and worse, a scopeNote telling an agent
+    // to retry with scope='workspace' + the SAME .fsproj projectPath is an inert
+    // escape hatch (it re-sweeps the identical one project). Instead, `find` now
+    // always emits a top-level scopeNote naming the ACTUAL outcome — one project
+    // swept vs. N member projects of a solution — independent of which `scope`
+    // argument produced it, with a widening/narrowing recipe that names the
+    // argument that actually works (projectPath, not scope alone).
+
+    [<Fact>]
+    member _.``#193 a single-project sweep (explicit fsproj, scope=auto) emits the single-project scopeNote``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let! find = bridge.Find(findArgs fx.DomainFsproj "TraderRole")
+
+            Assert.Equal("succeeded", gs find "status")
+            // scope is a pure echo of the request — never resolved/rewritten.
+            Assert.Equal("auto", gs find "scope")
+            Assert.Equal(1, gi find "projectsSwept")
+
+            let perProject = find["perProject"].AsArray()
+            Assert.Single(perProject) |> ignore
+            Assert.Equal(Path.GetFullPath(fx.DomainFsproj), gs perProject[0] "fsproj")
+
+            Assert.True(find.AsObject().ContainsKey("scopeNote"), "every response carries a top-level scopeNote")
+
+            Assert.Equal(
+                "find swept only this one project — cross-project usages in sibling projects are not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.",
+                gs find "scopeNote"
+            )
+        }
+
+    [<Fact>]
+    member _.``#193 a multi-project sweep (explicit solution path, scope=auto) emits the multi-project scopeNote with the swept count``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let! find = bridge.Find(findArgs fx.Slnx "TraderRole")
+
+            Assert.Equal("succeeded", gs find "status")
+            Assert.Equal("auto", gs find "scope")
+            // Unchanged from BASE: an explicit .slnx still sweeps every member project.
+            Assert.Equal(3, gi find "projectsSwept")
+
+            Assert.Equal(
+                $"find swept 3 member projects of '{Path.GetFullPath(fx.Slnx)}'. To narrow to just one project (faster, but misses cross-project usages), pass its .fsproj as projectPath.",
+                gs find "scopeNote"
+            )
+        }
+
+    [<Fact>]
+    member _.``#193 a single-project sweep reached via path-only fallback (no projectPath) gets the identical note — 'however it arrived'``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // No projectPath at all — sweepTarget is resolved purely from `path` via
+            // findNearestFsproj (Domain.fsproj). The note is driven by the OUTCOME
+            // (one project swept), not by how the sweep target arrived, so it must
+            // read identically to the explicit-projectPath case above.
+            let! find =
+                bridge.Find(
+                    { findArgs fx.DomainFsproj "TraderRole" with
+                        projectPath = None
+                        path = Some fx.DomainFs }
+                )
+
+            Assert.Equal("succeeded", gs find "status")
+            Assert.Equal("auto", gs find "scope")
+            Assert.Equal(1, gi find "projectsSwept")
+
+            Assert.Equal(
+                "find swept only this one project — cross-project usages in sibling projects are not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.",
+                gs find "scopeNote"
+            )
+        }
+
+    [<Fact>]
+    member _.``#193 explicit scope=workspace with only a bare fsproj as projectPath still sweeps just that one project``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // `scope='workspace'` alone cannot widen a sweep target that is already a
+            // single .fsproj — SolutionParsing.listProjects(<.fsproj>) = [itself]
+            // regardless of the requested scope, so this call is NOT the escape hatch
+            // it might look like. This is the assertion the review's Important 2
+            // finding named explicitly: projectsSwept must be pinned to 1, not assumed.
+            let! find =
+                bridge.Find(
+                    { findArgs fx.DomainFsproj "TraderRole" with
+                        scope = Some "workspace" }
+                )
+
+            Assert.Equal("succeeded", gs find "status")
+            // scope is a pure echo — "workspace" is reported even though only one
+            // project was actually swept; scopeResolved / projectsSwept carry the truth.
+            Assert.Equal("workspace", gs find "scope")
+            let resolution = find["resolution"]
+            Assert.Equal("project", gs resolution "scopeResolved")
+            Assert.Equal(1, gi find "projectsSwept")
+
+            Assert.Equal(
+                "find swept only this one project — cross-project usages in sibling projects are not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.",
+                gs find "scopeNote"
+            )
+        }
+
+    [<Fact>]
+    member _.``#193 the corrected escape hatch works — scope=workspace with the SOLUTION path as projectPath sweeps every member project``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // The scopeNote's widening recipe names projectPath (the solution path),
+            // not scope alone — this proves that recipe genuinely widens the sweep,
+            // unlike the previous (reverted) design's inert "pass scope='workspace'"
+            // remedy against the SAME .fsproj projectPath.
+            let! find =
+                bridge.Find(
+                    { findArgs fx.Slnx "TraderRole" with
+                        scope = Some "workspace" }
+                )
+
+            Assert.Equal("succeeded", gs find "status")
+            Assert.Equal("workspace", gs find "scope")
+            Assert.Equal(3, gi find "projectsSwept")
+
+            Assert.Equal(
+                $"find swept 3 member projects of '{Path.GetFullPath(fx.Slnx)}'. To narrow to just one project (faster, but misses cross-project usages), pass its .fsproj as projectPath.",
+                gs find "scopeNote"
+            )
+        }
+
     [<Fact>]
     member _.``find reports matched=false ONLY when the symbol is truly absent everywhere``() : Task =
         task {

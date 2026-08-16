@@ -5328,6 +5328,28 @@ type internal FcsBridge
                 |> Option.map (fun message -> [ ("message", jstr message) ])
                 |> Option.defaultValue []
 
+            // #193: a top-level (never buried in perProject) recall-vs-speed guardrail on
+            // every response, naming the ACTUAL sweep outcome rather than the requested
+            // `scope` string. Review of the first cut of this feature established that
+            // SolutionParsing.listProjects on a bare .fsproj is already just [| itself |] at
+            // BASE — so a mechanism that "narrows scope=auto when projectPath is an explicit
+            // .fsproj" is unreachable dead code, and worse, an agent told to retry with
+            // scope='workspace' + the SAME .fsproj projectPath would re-sweep the identical
+            // one project and mistakenly believe it now had cross-project coverage. The only
+            // thing that actually changes what gets swept is what sweepTarget resolves to
+            // (a .fsproj vs. a .sln/.slnx/directory) — so this note reports on projectsRequested
+            // (the real outcome), independent of which `scope` argument led there, and the
+            // widening/narrowing recipe below names the argument that actually works.
+            let scopeNoteField =
+                if projectsRequested <= 1 then
+                    [ ("scopeNote",
+                      jstr
+                          "find swept only this one project — cross-project usages in sibling projects are not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.") ]
+                else
+                    [ ("scopeNote",
+                      jstr
+                          $"find swept {projectsRequested} member projects of '{sweepTarget}'. To narrow to just one project (faster, but misses cross-project usages), pass its .fsproj as projectPath.") ]
+
             let baseFields =
                 [ "status", jstr responseStatus
                   "outcome", jstr outcome
@@ -5352,6 +5374,7 @@ type internal FcsBridge
                 @ [ "sweepElapsedMs", jint (int sweepSw.ElapsedMilliseconds)
                     "projectDiagnostics", JsonArray(diagNodes) :> JsonNode ]
                 @ hintField
+                @ scopeNoteField
 
             return jobj (baseFields @ paginationFields) :> JsonNode
         }

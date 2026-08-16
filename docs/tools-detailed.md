@@ -19,8 +19,9 @@ The consolidation aliases below were removed in v0.13.1 and are no longer regist
 **Routing description:** Multi-project symbol search. Sweeps every member `.fsproj` of the
 solution and unions definitions, references, record-field set sites, and member-usage sites.
 Bare `find(query)` suffices; optional `kind`
-(`auto`|`symbol`|`members`|`field`|`definition`|`position`) and `scope` narrow it. Prefer over
-text search for cross-project refactors.
+(`auto`|`symbol`|`members`|`field`|`definition`|`position`) and `scope` narrow it. Every response
+carries a top-level `scopeNote` naming how many projects were actually swept and how to
+widen/narrow (#193 — see below). Prefer over text search for cross-project refactors.
 
 **Signature:** `query` is the only required argument. `kind` (default `auto`) and `scope` (default
 `auto`) shape the sweep. `exact` (default `true`) toggles exact-vs-substring matching. `member` /
@@ -36,6 +37,28 @@ a `path` that resolves to one member project of the requested solution.
 `find(query)` runs `kind=auto` over `scope=auto` — i.e. it sweeps **every** member project of the
 active solution and unions all four site kinds. No position, no project path, no flags needed; the
 common case is a single argument.
+
+### scopeNote (#193)
+
+Sweep breadth is unchanged by any `scope` value — `auto`/`workspace` always sweep every member
+project the resolved sweep target actually has, exactly as `file`/`project` always narrow to one.
+What's new is that **every successful response now carries a top-level `scopeNote`** reporting the
+real outcome (driven by `projectsSwept`, not by which `scope` string was requested) and the recipe
+to change it:
+
+- **One project swept** — however the sweep target arrived (an explicit `.fsproj` `projectPath`, a
+  `path`-derived fallback, or a solution/directory that itself has only one member project): the
+  note warns that cross-project usages in sibling projects are not visible, and names the actual
+  widening recipe — pass the solution's `.sln`/`.slnx` as `projectPath` (or `set_project` it) with
+  `scope='workspace'`. Requesting `scope='workspace'` alone, against an `.fsproj` `projectPath`,
+  does **not** widen anything: `SolutionParsing.listProjects` on a bare `.fsproj` is always
+  `[itself]`, so once the sweep target is a single project, no `scope` value can grow it — only a
+  different (solution/directory) `projectPath` can.
+- **More than one project swept**: the note reports how many member projects of which solution were
+  swept, and names the narrowing recipe — pass a single `.fsproj` as `projectPath` to sweep just
+  that one project (faster, but misses cross-project usages). This is the discoverability that
+  answers the field report behind #193: a 40 s sweep against a solution/directory target now tells
+  the caller, in the response, how to narrow it next time.
 
 ### kind and scope
 

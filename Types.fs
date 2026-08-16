@@ -204,7 +204,10 @@ type FindArgs =
       /// auto unions definitions + references + record-field sites + member-usage sites.
       kind: string option
       /// Sweep breadth: "auto" (default) | "file" | "project" | "workspace".
-      /// auto/workspace sweep every member project of the active solution.
+      /// auto/workspace sweep every member project of the active solution; the response
+      /// echoes this value verbatim (see resolution.scopeResolved / projectsSwept for what
+      /// actually happened, and the top-level scopeNote for how many projects were swept
+      /// and how to widen/narrow).
       scope: string option
       /// When true (default), match query exactly; false = case-insensitive substring.
       exact: bool option

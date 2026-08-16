@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `find` now reports a top-level `scopeNote` on every successful response,
+  naming how many projects were actually swept (`projectsSwept`) and the
+  recipe to change it: pass the solution's `.sln`/`.slnx` as `projectPath`
+  (or `set_project` it) with `scope='workspace'` to widen from one project to
+  every member project, or pass a single `.fsproj` as `projectPath` to narrow
+  from a solution sweep to one project. Sweep breadth itself is unchanged —
+  `scope=auto`/`workspace` always sweep every member project the resolved
+  target has, `scope=file`/`project` always narrow to one — this is purely a
+  new response field surfacing that outcome so an agent does not have to pay
+  for a whole-workspace sweep to discover which recipe would have been faster
+  (#193).
+
 ## [0.15.0] - 2026-08-16
 
 `0.14.0` was prepared but never tagged or published to NuGet — the last release
