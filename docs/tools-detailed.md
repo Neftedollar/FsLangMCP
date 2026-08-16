@@ -42,9 +42,10 @@ common case is a single argument.
 
 Sweep breadth is unchanged by any `scope` value — `auto`/`workspace` always sweep every member
 project the resolved sweep target actually has, exactly as `file`/`project` always narrow to one.
-What's new is that **every successful response now carries a top-level `scopeNote`** reporting the
-real outcome (driven by `projectsSwept`, not by which `scope` string was requested) and the recipe
-to change it:
+What's new is that **every response that completes a sweep carries a top-level `scopeNote`**
+(everything except the two `invalid_args` envelopes — `succeeded`, `partial`, and `unknown` all get
+one) reporting the real outcome (driven by `projectsSwept`/`projectsAnalyzed`, not by which `scope`
+string was requested) and the recipe to change it:
 
 - **One project swept** — however the sweep target arrived (an explicit `.fsproj` `projectPath`, a
   `path`-derived fallback, or a solution/directory that itself has only one member project): the
@@ -53,12 +54,17 @@ to change it:
   `scope='workspace'`. Requesting `scope='workspace'` alone, against an `.fsproj` `projectPath`,
   does **not** widen anything: `SolutionParsing.listProjects` on a bare `.fsproj` is always
   `[itself]`, so once the sweep target is a single project, no `scope` value can grow it — only a
-  different (solution/directory) `projectPath` can.
+  different (solution/directory) `projectPath` can. For `scope='file'` the note additionally names
+  the file-level filter (sites are kept only for `path`, not just narrowed to one project).
 - **More than one project swept**: the note reports how many member projects of which solution were
   swept, and names the narrowing recipe — pass a single `.fsproj` as `projectPath` to sweep just
   that one project (faster, but misses cross-project usages). This is the discoverability that
   answers the field report behind #193: a 40 s sweep against a solution/directory target now tells
   the caller, in the response, how to narrow it next time.
+- **Coverage is never overstated**: if a project timed out or failed before analysis completed
+  (`status="partial"`/`"unknown"`, `projectsAnalyzed < projectsRequested`), the note says "analyzed
+  K of N" instead of "swept N" and calls out the incompleteness explicitly, instead of claiming a
+  sweep happened that didn't.
 
 ### kind and scope
 

@@ -5340,15 +5340,52 @@ type internal FcsBridge
             // (a .fsproj vs. a .sln/.slnx/directory) — so this note reports on projectsRequested
             // (the real outcome), independent of which `scope` argument led there, and the
             // widening/narrowing recipe below names the argument that actually works.
+            //
+            // Round 2 (post-re-review): the note must never overstate coverage. This same
+            // code path is reached by `partial`/`unknown` responses too (e.g. the
+            // timeoutMs=0 exhausted-budget path), where projectsAnalyzed < projectsRequested
+            // — "find swept N" would be a lie about work that timed out or failed before it
+            // ran. Below, `coverageComplete` (already computed for `resolution`/`coverage`)
+            // gates between the confident "swept" wording and an honest "analyzed K of N"
+            // wording. Separately, scope='file' has a SECOND blind spot beyond siblings:
+            // the one project that IS swept has its sites additionally post-filtered to a
+            // single file (see `allSites` above), so the single-project note names that too.
             let scopeNoteField =
+                let widenRecipe =
+                    "To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'."
+
+                let narrowRecipe =
+                    "To narrow to just one project (faster, but misses cross-project usages), pass its .fsproj as projectPath."
+
                 if projectsRequested <= 1 then
-                    [ ("scopeNote",
-                      jstr
-                          "find swept only this one project — cross-project usages in sibling projects are not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.") ]
+                    let filterPath =
+                        if scope = "file" then
+                            match args.path with
+                            | Some p when not (String.IsNullOrWhiteSpace p) -> Some(normalizePath p)
+                            | _ -> None
+                        else
+                            None
+
+                    let text =
+                        match coverageComplete, filterPath with
+                        | true, None ->
+                            $"find swept only this one project — cross-project usages in sibling projects are not visible. {widenRecipe}"
+                        | true, Some path ->
+                            $"find swept only this one project, and kept only sites in '{path}' — other files in this project, and all sibling projects, are not visible. {widenRecipe}"
+                        | false, None ->
+                            $"find could not fully analyze this project ({projectsFailed} failed, {projectsTimedOut} timed out) — this response is incomplete; see coverage/message before trusting an absence of matches. Cross-project usages in sibling projects are also not visible. {widenRecipe}"
+                        | false, Some path ->
+                            $"find could not fully analyze this project ({projectsFailed} failed, {projectsTimedOut} timed out) — this response is incomplete; see coverage/message before trusting an absence of matches. Sites, where present, are also filtered to '{path}'; other files in this project, and all sibling projects, are not visible. {widenRecipe}"
+
+                    [ ("scopeNote", jstr text) ]
                 else
-                    [ ("scopeNote",
-                      jstr
-                          $"find swept {projectsRequested} member projects of '{sweepTarget}'. To narrow to just one project (faster, but misses cross-project usages), pass its .fsproj as projectPath.") ]
+                    let text =
+                        if coverageComplete then
+                            $"find swept {projectsRequested} member projects of '{sweepTarget}'. {narrowRecipe}"
+                        else
+                            $"find analyzed {projectsAnalyzed} of {projectsRequested} member projects of '{sweepTarget}' ({projectsFailed} failed, {projectsTimedOut} timed out) — this response is incomplete; see coverage/message before trusting an absence of matches. {narrowRecipe}"
+
+                    [ ("scopeNote", jstr text) ]
 
             let baseFields =
                 [ "status", jstr responseStatus

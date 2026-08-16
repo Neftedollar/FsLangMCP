@@ -514,6 +514,15 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                         StringComparison.Ordinal
                     )
                 )
+
+                // #193 round 2: this is scope='file' AND incomplete coverage at once — the
+                // note must combine both honestly: it cannot claim the project was "swept"
+                // (it timed out), and it must still name the file-level filter, not just the
+                // sibling-project blind spot.
+                Assert.Equal(
+                    $"find could not fully analyze this project (0 failed, 1 timed out) — this response is incomplete; see coverage/message before trusting an absence of matches. Sites, where present, are also filtered to '{Path.GetFullPath(outsideSource)}'; other files in this project, and all sibling projects, are not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.",
+                    gs result "scopeNote"
+                )
             finally
                 if Directory.Exists outsideRoot then
                     Directory.Delete(outsideRoot, true)
@@ -670,6 +679,36 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
         }
 
     [<Fact>]
+    member _.``#193 round 2: scope=file names the file-level filter too, not just the sibling-project blind spot``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // scope=file sweeps the one owning project (like scope=project), then
+            // additionally post-filters sites down to args.path (FcsBridge.fs's `allSites`
+            // filter). The single-project note's generic "cross-project usages... not
+            // visible" text is true but understates it — files OTHER than fx.DomainFs in
+            // this SAME project are also invisible here, which the note must say.
+            let! find =
+                bridge.Find(
+                    { findArgs fx.DomainFsproj "TraderRole" with
+                        scope = Some "file"
+                        path = Some fx.DomainFs }
+                )
+
+            Assert.Equal("succeeded", gs find "status")
+            Assert.Equal("file", gs find "scope")
+            Assert.Equal(1, gi find "projectsSwept")
+
+            Assert.Equal(
+                $"find swept only this one project, and kept only sites in '{Path.GetFullPath(fx.DomainFs)}' — other files in this project, and all sibling projects, are not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.",
+                gs find "scopeNote"
+            )
+        }
+
+    [<Fact>]
     member _.``find reports matched=false ONLY when the symbol is truly absent everywhere``() : Task =
         task {
             Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
@@ -790,6 +829,14 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
             for project in perProject do
                 Assert.Equal("timed_out", gs project "status")
                 Assert.Equal("timeout", gs project "errorKind")
+
+            // #193 round 2: this response's coverage is INCOMPLETE (0 of 3 analyzed) —
+            // scopeNote must say so honestly ("analyzed 0 of 3") rather than claiming
+            // "find swept 3 member projects", which would overstate work that never ran.
+            Assert.Equal(
+                $"find analyzed 0 of 3 member projects of '{Path.GetFullPath(fx.Slnx)}' (0 failed, 3 timed out) — this response is incomplete; see coverage/message before trusting an absence of matches. To narrow to just one project (faster, but misses cross-project usages), pass its .fsproj as projectPath.",
+                gs result "scopeNote"
+            )
         }
 
     [<Fact>]
