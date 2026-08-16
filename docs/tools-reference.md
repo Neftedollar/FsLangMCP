@@ -4,6 +4,8 @@ FsLangMCP exposes 35 tools over MCP stdio, grouped below by intent. Start with `
 
 All positions (`line`, `character`) are **0-based**. `projectPath` is optional on most tools after `set_project` — it falls back to the active project.
 
+Arguments are **strictly typed JSON** (since v0.15.0): string-encoded scalars such as `"42"` or `"true"` are not coerced into numeric or boolean fields and fail with a structured invalid-arguments error. Send `42` and `true`, not their quoted forms.
+
 ---
 
 ## Headline tools
@@ -46,6 +48,12 @@ before it can return `clean`.
 - `severity` — filter results by severity level
 
 **Use when:** "Did my edit compile?", "Are there errors in this file?", "Is the workspace clean?"
+
+**Snippet scope:** diagnostics describe the snippet's *content* only. Bare expression code
+without a `module` header is valid — the missing-module FS0222 and source-file-bookkeeping
+FS0225 are wrapper artifacts and are filtered out, along with diagnostics belonging to other
+project files. Each surviving diagnostic reports `file: "snippet"` (the caller sent text, not
+a file), and duplicates are collapsed.
 
 In `speed=fast`, inspect `complete`, `expectedFiles`, `missingFiles`, `staleFiles`, and
 `sessionGeneration`. Current errors remain actionable with `complete=false`; an incomplete
@@ -112,6 +120,10 @@ The `evaluation` object identifies the evaluated source and restore state. LSP r
 
 **Key args:**
 - `projectPath` — optional after `set_project`
+- `includeGeneratedFiles` — include build-generated sources (`*.AssemblyInfo.fs`, the SDK's
+  `*.AssemblyAttributes.fs` stub) in the compile order (default `false`). When excluded, they
+  are counted in `filterSummary.exclusionsByReason` under `assembly_info_file`, so the
+  exclusion names what the file is — and which flag surfaces it.
 
 The response includes `evaluation.status`, `evaluation.source`, `evaluation.imports`, and per-section `evaluationSource` metadata. An evaluation failure is explicit (`evaluation.status = "unavailable"`) instead of silently falling back to an incomplete XML interpretation.
 

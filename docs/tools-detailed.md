@@ -134,8 +134,12 @@ project, collapsed to a single `verdict`. No path, no project, no flags needed f
    `ParseAndCheckProject` for a project/workspace) so the result reflects the current source — never
    a stale cached payload. At `speed=fast`, derives the expected files from evaluated FCS project
    options, then accepts only diagnostics from the matching live FSAC generation.
-3. Collapses the diagnostics into one `verdict` (`clean` / `errors` / `unknown`).
-4. Returns `verdict` + `errorCount` + `warningCount` + a `diagnostics` array filtered to `severity`.
+3. For `scope=snippet`, first scopes diagnostics to the snippet's content: wrapper artifacts
+   (FS0222 missing-module, FS0225 source-file bookkeeping), diagnostics attached to other
+   project files, and duplicates are removed, and `file` reads `"snippet"` — so bare
+   expression code without a `module` header is valid.
+4. Collapses the diagnostics into one `verdict` (`clean` / `errors` / `unknown`).
+5. Returns `verdict` + `errorCount` + `warningCount` + a `diagnostics` array filtered to `severity`.
 
 ### The stale-`{}` problem it solves
 
