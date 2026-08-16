@@ -60,6 +60,25 @@ let private probeProject =
           "  </ItemGroup>"
           "</Project>" ]
 
+// #205: a second, independent leaf project alongside Probe so workspace-scope tests
+// can exercise a genuine multi-project sweep. Beta carries a permanent, deliberate
+// FS0025 incomplete-match warning (never reset by ResetClean) — a stable, real
+// ground truth for the perProject infoCount reconciliation test.
+let private betaWarningSource =
+    String.concat
+        "\n"
+        [ "module Beta.Library"; ""; "let classify (x: int option) ="; "    match x with"; "    | Some v -> v"; "" ]
+
+let private betaProject =
+    String.concat
+        "\n"
+        [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+          "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+          "  <ItemGroup>"
+          "    <Compile Include=\"Library.fs\" />"
+          "  </ItemGroup>"
+          "</Project>" ]
+
 // ── Class fixture: written + built ONCE, shared by every test in the class ───────
 
 type CheckFixture() =
@@ -78,15 +97,21 @@ type CheckFixture() =
     let helpersFs = write "Probe/Helpers.fs" cleanHelpers
     let mainFs = write "Probe/Main.fs" cleanMain
 
-    // dotnet build once so Ionide.ProjInfo can resolve options (restore + design-time
-    // build). After this, FCS re-checks read source files from disk — no rebuild needed
-    // for the cross-file stale test. Isolation/retry flags mirror FindFixture to survive
-    // the parallel-collection MSBuild contention the find author hit.
-    let buildOnce () =
+    // #205: Beta lives beside Probe under the same root so workspace-scope tests get a
+    // genuine second member project to sweep. Its warning is permanent — no ResetClean.
+    let betaFsproj = write "Beta/Beta.fsproj" betaProject
+    let _betaLibraryFs = write "Beta/Library.fs" betaWarningSource
+
+    // dotnet build once per project so Ionide.ProjInfo can resolve options (restore +
+    // design-time build). After this, FCS re-checks read source files from disk — no
+    // rebuild needed for the cross-file stale test. Isolation/retry flags mirror
+    // FindFixture to survive the parallel-collection MSBuild contention the find author
+    // hit.
+    let buildOnce (projectPath: string) =
         let psi =
             ProcessStartInfo(
                 "dotnet",
-                $"build \"{probeFsproj}\" -c Debug -m:1 -nologo --disable-build-servers -nodeReuse:false -p:UseSharedCompilation=false"
+                $"build \"{projectPath}\" -c Debug -m:1 -nologo --disable-build-servers -nodeReuse:false -p:UseSharedCompilation=false"
             )
 
         psi.RedirectStandardOutput <- true
@@ -100,19 +125,21 @@ type CheckFixture() =
         p.WaitForExit()
         p.ExitCode, stdout + stderr
 
-    let rec buildWithRetry attempt =
-        let code, log = buildOnce ()
+    let rec buildWithRetry (projectPath: string) attempt =
+        let code, log = buildOnce projectPath
 
         if code = 0 || attempt >= 3 then
             code, log
         else
             System.Threading.Thread.Sleep(1500)
-            buildWithRetry (attempt + 1)
+            buildWithRetry projectPath (attempt + 1)
 
-    let buildExit, buildLog = buildWithRetry 1
+    let buildExit, buildLog = buildWithRetry probeFsproj 1
+    let betaBuildExit, betaBuildLog = buildWithRetry betaFsproj 1
 
     /// Restore the fixture sources to their clean baseline. Called at the top of every
-    /// test so method ordering cannot leak a previous test's on-disk edit.
+    /// test so method ordering cannot leak a previous test's on-disk edit. Beta is
+    /// intentionally excluded — its warning must stay in place for every test.
     member _.ResetClean() =
         File.WriteAllText(probeFsproj, probeProject)
         File.WriteAllText(helpersFs, cleanHelpers)
@@ -125,6 +152,9 @@ type CheckFixture() =
     member _.MainFs = mainFs
     member _.BuildExitCode = buildExit
     member _.BuildLog = buildLog
+    member _.BetaFsproj = betaFsproj
+    member _.BetaBuildExitCode = betaBuildExit
+    member _.BetaBuildLog = betaBuildLog
 
     interface IDisposable with
         member _.Dispose() =
@@ -2126,4 +2156,108 @@ type CheckTests(fx: CheckFixture) =
             Assert.True(gb result "analyzed", "a restored project must be genuinely analyzed")
             Assert.Null(result["restoreStatus"]) // the unrestored extra must be absent
             Assert.False(gb result "diagnosticsTruncated", "a clean project has nothing to truncate")
+        }
+
+    // ── #205: perProject entries carried only errorCount/warningCount, so the
+    // per-project breakdown couldn't be reconciled against a project's own full-set
+    // count the way the top level already can (#190/#202). infoCount is now a genuine
+    // tally (countInfoDiagnostics) on each perProject entry too — this proves a
+    // workspace sweep's per-project errorCount/warningCount/infoCount for a project
+    // matches EXACTLY what a direct scope="project" check reports for that same
+    // project, and that the workspace totals are the sum of the members' own
+    // breakdowns rather than an independently-computed remainder that merely agrees.
+    [<Fact>]
+    member _.``workspace scope's perProject infoCount reconciles with that member's own scope="project" check (#205)``
+        ()
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Probe fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+
+            Assert.True(
+                (fx.BetaBuildExitCode = 0),
+                $"Beta fixture build failed (exit {fx.BetaBuildExitCode}):\n{fx.BetaBuildLog}"
+            )
+
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            // Ground truth: Beta's own standalone project-scope check. Beta.fs carries a
+            // permanent FS0025 incomplete-match warning — zero errors, one real warning,
+            // zero Info/Hidden diagnostics.
+            let! betaAlone =
+                bridge.Check(
+                    { bareCheck with
+                        projectPath = Some fx.BetaFsproj
+                        scope = Some "project" }
+                )
+
+            Assert.Equal(0, gi betaAlone "errorCount")
+            Assert.True(gi betaAlone "warningCount" > 0, "Expected the incomplete-match warning to be counted")
+            Assert.Equal(0, gi betaAlone "infoCount")
+
+            Assert.Equal(
+                gi betaAlone "totalDiagnostics",
+                gi betaAlone "errorCount" + gi betaAlone "warningCount" + gi betaAlone "infoCount"
+            )
+
+            // A workspace sweep over the fixture root covers Probe (clean) AND Beta.
+            let! workspace =
+                bridge.Check(
+                    { bareCheck with
+                        projectPath = Some fx.Root
+                        scope = Some "workspace" }
+                )
+
+            Assert.Equal("clean", gs workspace "verdict")
+            let perProject = (workspace["perProject"] :?> JsonArray) |> Seq.cast<JsonNode>
+
+            let findProject (name: string) =
+                perProject
+                |> Seq.tryFind (fun p -> gs p "project" = name)
+                |> Option.defaultWith (fun () ->
+                    let seen = perProject |> Seq.map (fun p -> gs p "project") |> String.concat ", "
+                    failwith $"Expected a perProject entry named '{name}'; observed: [{seen}]")
+
+            let betaEntry = findProject "Beta"
+            let probeEntry = findProject "Probe"
+
+            // The reconciliation: Beta's perProject breakdown inside the workspace sweep
+            // matches its own standalone scope="project" identity exactly, field for
+            // field — not just a nonzero remainder that happens to agree.
+            //
+            // infoCount is exercised only at zero here (betaAlone's own infoCount is 0,
+            // asserted above) — no construct reachable through a real trusted FCS check
+            // was found to produce Info/Hidden severity (probed: FS0025, a
+            // #nowarn-suppressed FS0025, [<Obsolete>] usage, shadowing, an unused open).
+            // The nonzero path is exercised only on the mocked FSAC fast path at :2008,
+            // which cannot reach perProject (speed="fast" never builds it — see the class
+            // comment above this test). So this reconciles wiring/scoping — that Beta's
+            // own countInfoDiagnostics tally survives being embedded in a workspace sweep
+            // instead of leaking or getting overwritten — not that the tally is capable of
+            // being nonzero; a hardcoded `jint 0` at the emitter would also pass this.
+            Assert.Equal(gi betaAlone "errorCount", gi betaEntry "errorCount")
+            Assert.Equal(gi betaAlone "warningCount", gi betaEntry "warningCount")
+            Assert.Equal(gi betaAlone "infoCount", gi betaEntry "infoCount")
+
+            // Probe is genuinely clean — its own breakdown is all zeros, not a leak of
+            // Beta's counts or the workspace aggregate. This only catches a leak from
+            // scoping the tally over the accumulating allDiags instead of Probe's own
+            // diags because Beta sorts before Probe in the sweep (listProjects sorts
+            // full paths, and "Beta" < "Probe"): Beta's diags land in allDiags first, so
+            // if Probe's entry were built off allDiags instead of its own diags, it would
+            // show Beta's nonzero warningCount here, not agree with it by coincidence.
+            Assert.Equal(0, gi probeEntry "errorCount")
+            Assert.Equal(0, gi probeEntry "warningCount")
+            Assert.Equal(0, gi probeEntry "infoCount")
+
+            // Workspace-level identity still holds (#190), and is exactly the sum of the
+            // two members' own perProject breakdowns.
+            Assert.Equal(gi betaEntry "errorCount" + gi probeEntry "errorCount", gi workspace "errorCount")
+            Assert.Equal(gi betaEntry "warningCount" + gi probeEntry "warningCount", gi workspace "warningCount")
+            Assert.Equal(gi betaEntry "infoCount" + gi probeEntry "infoCount", gi workspace "infoCount")
+
+            Assert.Equal(
+                gi workspace "totalDiagnostics",
+                gi workspace "errorCount" + gi workspace "warningCount" + gi workspace "infoCount"
+            )
         }

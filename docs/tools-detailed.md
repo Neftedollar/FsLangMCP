@@ -84,7 +84,8 @@ for cross-project refactors.
 `auto`) shape the sweep. `exact` (default `true`) toggles exact-vs-substring matching. `member` /
 `field` restrict the member-usage / record-field unions. `path` + `line` + `word` + `occurrence` +
 `character` anchor `kind=position`. `contextLines` (default 0), `includeDeclaration` (default true),
-`includeInfo` (default false), `projectPath` (falls back to active `set_project`), `maxResults`
+`includeInfo` (default false), `includeSiteTypes` (default false — see *Field-impact mode*),
+`projectPath` (falls back to active `set_project`), `maxResults`
 (default 80, valid range 1..1000), `timeoutMs` (default 120000, non-negative), and `cursor` round
 out the surface. `scope=file` requires `path`; `scope=project` requires a direct `.fsproj` target or
 a `path` that resolves to one member project of the requested solution.
@@ -132,7 +133,7 @@ note-less, because none of them reach the code that builds the note.
 | `auto` (default) | Union of `symbol` + `members` + `field` definitions/references/sites |
 | `symbol` | Grouped definitions + references |
 | `members` | Member-usage sites on a type; pair with `member` |
-| `field` | Record construction/update sites; pair with `field` |
+| `field` | Record field sites — construction, copy-update, mutation, pattern, read; pair with `field` |
 | `definition` | Definition sites only |
 | `position` | Exact-position resolution; needs `path` + `line` + `word`/`character` |
 
@@ -147,12 +148,89 @@ note-less, because none of them reach the code that builds the note.
 1. Resolves the sweep target list — every member `.fsproj` of the active solution via
    `SolutionParsing.listProjects` (or the single active project when `scope=project`/`file`).
 2. For each project, runs FCS name resolution and unions four site kinds: definitions, references,
-   record-field set sites (`{ Field = expr }` and `{ x with Field = expr }`), and member-usage sites.
+   record-field sites (see *Field-impact mode* for the five-way field classification), and
+   member-usage sites.
 3. De-duplicates the union by `(file, range)` and groups by symbol identity.
 4. When FCS finds no sites, probes the project-bound FSAC `workspace/symbol` index without
    treating a warming, disconnected, or mismatched FSAC session as a valid zero.
 5. Returns flat `sites` entries with `file`, `range`, `lineText`, plus scoped
    `projectDiagnostics` and explicit project-coverage counts.
+
+### Field-impact mode: `includeSiteTypes` (#207)
+
+Changing a record field's type is a fan-out edit: every construction site, every copy-and-update,
+every mutation, every destructuring pattern, and every read may need a *different* change, and on a
+solution they are spread across projects. `find(kind='field', field='Name', includeSiteTypes=true)`
+is built for exactly that loop.
+
+**Site kinds.** Field sites are classified from the parse tree into five kinds, each of which needs
+a different edit:
+
+| `kind` | Source shape | The edit it implies |
+|--------|--------------|---------------------|
+| `field-set-literal` | `{ Field = expr }` | change the value expression |
+| `field-set-update` | `{ x with Field = expr }` | change the value expression |
+| `field-set-mutation` | `x.Field <- expr` | change the assigned expression |
+| `field-pattern` | `\| { Field = binding } ->` | change the pattern / the binding's downstream use |
+| `field-read` | `x.Field` in an expression | the read's result type changes — follow the ripple |
+
+`field-set-mutation` and `field-pattern` are new in this release. Both used to be reported as
+`field-read`, which for a mutation labelled a **write** as a read. `breakdown` gains the matching
+`fieldSetMutation` / `fieldPattern` counters; the existing counters keep their meaning, and
+`fieldRead` now means only "an expression that reads the field".
+
+**`siteType`.** With `includeSiteTypes=true`, every field site row additionally carries `siteType`:
+the field's type as the **current** typecheck resolves it at that site, rendered with that site's
+own `open`s (so `string`, not `Microsoft.FSharp.Core.string`). Across one sweep the value differs
+per row whenever the query spans several fields — or, under `exact=false`, several declaring types
+— which is the column that lets an agent plan the edit without opening each file:
+
+```json
+{ "file": "…/App/Impact.fs", "range": { "startLine": 12, "startColumn": 25, … },
+  "kind": "field-set-mutation", "symbolFullName": "Domain.Shipping.Shipment.Attempts",
+  "lineText": "let bump (s: Shipment) = s.Attempts <- s.Attempts + 1", "siteType": "int" }
+```
+
+**The check-after-edit boundary (explicit non-goal).** `siteType` is only ever the type the field
+has **today** — the "before" half. `find` deliberately does **not** typecheck a hypothetical new
+record shape: knowing the "after" type requires compiling the modified code, which is what `check`
+does. The intended loop is therefore:
+
+1. `find(kind='field', field='Name', includeSiteTypes=true)` — enumerate every site with its kind,
+   line text, and today's type;
+2. edit all of them;
+3. `check(scope='project')` — one verdict on the result.
+
+Every response with `includeSiteTypes=true` states this boundary in a top-level `siteTypesNote`.
+
+**Ledger and degradation.** A `siteTypes` object accompanies the note:
+
+```json
+"siteTypes": { "requested": true, "fieldSites": 8, "typed": 8,
+               "degraded": 0, "degradedUnresolved": 0, "degradedTimedOut": 0 }
+```
+
+`typed + degraded` always equals `fieldSites`, counted over the **whole** matched set rather than
+the returned page, so the ledger stays true across pagination. A site whose type FCS cannot produce
+gets `siteType: null` and is counted in `degradedUnresolved`; a site reached after the `timeoutMs`
+budget is exhausted gets `siteType: null` and is counted in `degradedTimedOut`. A per-site miss is
+never allowed to fail the call. The key itself is always present on a field row, so a consumer reads
+an explicit `null` rather than having to distinguish it from an absent key.
+
+**Scope and cost.** `includeSiteTypes` annotates **field sites only** — non-field rows under
+`kind='auto'` stay lean, and a `kind` that produces no field sites at all (`definition`, `symbol`,
+`members`) gets a `siteTypesNote` saying so instead of silently doing nothing. Type resolution runs
+inside `find`'s single `timeoutMs` budget.
+
+**Page budget.** `siteType` is capped at 200 characters (plus a `...` marker) so a pathological
+generic signature cannot blow the page. Measured growth on a real sweep is ≈19 chars per site; the
+worst case is 80 × (527 + 203 + 15) ≈ 59.6k chars, still under the ~72k-char MCP ceiling, so the
+default `maxResults` of 80 does **not** need lowering when the flag is on.
+
+**Known limit — generic records.** FCS reports no per-use generic arguments for record fields, so a
+field on `Box<'T>` renders as the type **parameter** `'T` at every site, not as the instantiation
+(`int`, `string`) at that site. The note repeats this; a regression test pins it, so if a future FCS
+starts instantiating, the docs get updated with it.
 
 ### The cross-project problem it solves
 
@@ -172,6 +250,8 @@ the bare call already swept all of them.
    broad substrings on common names ("Id", "Create") can return large pages.
 3. **`kind=position` needs coordinates** — supply `path` + `line` + (`word` or `character`).
    0-based LSP coordinates apply.
+4. **`siteType` never predicts the post-edit type.** It is the current typecheck's answer only;
+   run `check` after the edits for the "after" verdict (see *Field-impact mode*).
 
 ### Related tools
 
