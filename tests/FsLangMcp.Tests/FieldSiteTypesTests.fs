@@ -132,3 +132,165 @@ let ``rowFields round-trips every outcome the resolver can produce`` () =
         match siteTypeNode fields with
         | None -> Assert.Fail $"outcome status '{status}' produced no siteType key"
         | Some node -> Assert.Equal(isNull siteType, isNull node)
+
+// ── #207 review: one physical site, several projects ────────────────────────────
+//
+// find de-duplicates sites by physical location, so a `.fs` linked into more than one
+// `.fsproj` is swept once per project. Those projects can resolve the same field to
+// different types (different conditional symbols, a different generic instantiation).
+// The row used to be overwritten by whichever project the sweep visited last, and the
+// payload then claimed one type with nothing saying another had been seen.
+
+[<Fact>]
+let ``mergeAlternatives keeps a second project's different type, attributed to that project`` () =
+    Assert.Equal<(string * string) list>(
+        [ ("string", "ProjB") ],
+        FieldSiteTypes.mergeAlternatives "int" "string" "ProjB" []
+    )
+
+[<Fact>]
+let ``mergeAlternatives ignores an identical answer, a degraded answer, and duplicates`` () =
+    // Same type from another project is agreement, not a conflict.
+    Assert.Empty(FieldSiteTypes.mergeAlternatives "int" "int" "ProjB" [])
+    // A project that could not type the site says nothing about the type that IS known.
+    Assert.Empty(FieldSiteTypes.mergeAlternatives "int" null "ProjB" [])
+    // Nor does the very same (type, project) pair arriving twice.
+    Assert.Equal<(string * string) list>(
+        [ ("string", "ProjB") ],
+        FieldSiteTypes.mergeAlternatives "int" "string" "ProjB" [ ("string", "ProjB") ]
+    )
+    // But the SAME type from a DIFFERENT project is a distinct fact: it says ProjC
+    // disagrees with the primary too, which is what "plan per project" needs.
+    Assert.Equal<(string * string) list>(
+        [ ("string", "ProjB"); ("string", "ProjC") ],
+        FieldSiteTypes.mergeAlternatives "int" "string" "ProjC" [ ("string", "ProjB") ]
+    )
+
+[<Fact>]
+let ``mergeAlternatives orders alternatives deterministically, whatever the sweep order`` () =
+    // Sweep order is project enumeration order; the payload must not depend on it.
+    let forward =
+        []
+        |> FieldSiteTypes.mergeAlternatives "int" "string" "ProjC"
+        |> FieldSiteTypes.mergeAlternatives "int" "bool" "ProjB"
+
+    let reverse =
+        []
+        |> FieldSiteTypes.mergeAlternatives "int" "bool" "ProjB"
+        |> FieldSiteTypes.mergeAlternatives "int" "string" "ProjC"
+
+    Assert.Equal<(string * string) list>([ ("bool", "ProjB"); ("string", "ProjC") ], forward)
+    Assert.Equal<(string * string) list>(forward, reverse)
+
+[<Fact>]
+let ``alternativesFields stays absent on the common single-project row`` () =
+    // The row shape for a normal sweep must be byte-identical to before the fix.
+    Assert.Empty(FieldSiteTypes.alternativesFields true true [])
+    Assert.Empty(FieldSiteTypes.alternativesFields false true [ ("string", "ProjB") ])
+
+[<Fact>]
+let ``alternativesFields names each other type WITH the projects that resolved it`` () =
+    let fields =
+        FieldSiteTypes.alternativesFields true true [ ("bool", "ProjD"); ("string", "ProjB"); ("string", "ProjC") ]
+
+    Assert.Equal(1, List.length fields)
+    Assert.Equal("siteTypeAlternatives", fst fields[0])
+
+    // #207 review 2: "plan the site per project" is only actionable when the payload says
+    // WHICH project expects which type — a bare list of type strings cannot answer that.
+    let serialized = (FsLangMcp.Types.jobj fields).ToJsonString()
+
+    Assert.Equal(
+        """{"siteTypeAlternatives":[{"siteType":"bool","projects":["ProjD"]},{"siteType":"string","projects":["ProjB","ProjC"]}]}""",
+        serialized
+    )
+
+// ── #207 review 1: the column is bounded, and says so when it truncates ─────────
+
+[<Fact>]
+let ``alternativeEntries caps distinct types per row and reports how many it dropped`` () =
+    let pairs =
+        [ ("aaa", "P1"); ("bbb", "P2"); ("ccc", "P3"); ("ddd", "P4"); ("eee", "P5") ]
+
+    let entries, typesOmitted = FieldSiteTypes.alternativeEntries pairs
+
+    Assert.Equal(FieldSiteTypes.AlternativeTypesPerSite, List.length entries)
+    Assert.Equal<string list>([ "aaa"; "bbb"; "ccc" ], entries |> List.map (fun (t, _, _) -> t))
+    Assert.Equal(2, typesOmitted)
+
+[<Fact>]
+let ``alternativeEntries caps projects per type and reports the remainder on the entry`` () =
+    let pairs =
+        [ for project in [ "P1"; "P2"; "P3"; "P4"; "P5" ] -> ("string", project) ]
+
+    let entries, typesOmitted = FieldSiteTypes.alternativeEntries pairs
+    let siteType, projects, projectsOmitted = List.exactlyOne entries
+
+    Assert.Equal("string", siteType)
+    Assert.Equal<string list>([ "P1"; "P2"; "P3" ], projects)
+    Assert.Equal(2, projectsOmitted)
+    Assert.Equal(0, typesOmitted)
+
+[<Fact>]
+let ``alternativesFields past the page allowance keeps the COUNT and drops the strings`` () =
+    // The count is what makes the truncation non-silent: the caller still learns the site is
+    // contested and by how many types, and the page cannot blow the response ceiling.
+    let pairs = [ ("bool", "ProjB"); ("string", "ProjC") ]
+    let fields = FieldSiteTypes.alternativesFields true false pairs
+
+    Assert.Equal(1, List.length fields)
+    Assert.Equal("siteTypeAlternativesOmitted", fst fields[0])
+
+    let serialized = (FsLangMcp.Types.jobj fields).ToJsonString()
+    Assert.Equal("""{"siteTypeAlternativesOmitted":2}""", serialized)
+
+[<Fact>]
+let ``a full page of pathological rows stays inside the alternatives allowance`` () =
+    // The bound the per-type 200-char cap does NOT give on its own: alternatives grow with
+    // the number of projects a linked file is compiled by, once per site. Render a full
+    // default page of worst-case rows against the real budget loop and measure.
+    let hugeType index =
+        String.replicate 200 "x" + string index // each already at the siteType cap
+
+    let pairs =
+        [ for typeIndex in 1..10 do
+              for projectIndex in 1..10 -> (hugeType typeIndex, $"AVeryLongProjectName{projectIndex}") ]
+
+    let mutable budget = FieldSiteTypes.AlternativesPageBudgetChars
+    let mutable rendered = 0
+
+    for _ in 1..80 do
+        let fields = FieldSiteTypes.alternativesFields true (budget > 0) pairs
+        let size = (FsLangMcp.Types.jobj fields).ToJsonString().Length
+        rendered <- rendered + size
+
+        for _, node in fields do
+            if not (isNull node) then
+                budget <- budget - node.ToJsonString().Length
+
+    // Allowance, plus the small per-row counters every remaining row still carries.
+    let ceiling = FieldSiteTypes.AlternativesPageBudgetChars + 80 * 64
+
+    Assert.True(
+        rendered <= ceiling,
+        $"80 pathological rows rendered {rendered} chars of alternatives; allowance + counters is {ceiling}"
+    )
+
+[<Fact>]
+let ``alternativesTruncated reports every cap, including the projects-only one`` () =
+    // The ledger counter must not be inferred from the rendered keys: a row whose TYPES all
+    // fit but whose project list was capped renders `siteTypeAlternatives` with no
+    // `siteTypeAlternativesOmitted` key, and sniffing keys would miss it.
+    let manyProjects =
+        [ for project in [ "P1"; "P2"; "P3"; "P4" ] -> ("string", project) ]
+
+    let manyTypes =
+        [ ("aaa", "P1"); ("bbb", "P2"); ("ccc", "P3"); ("ddd", "P4") ]
+
+    Assert.True(FieldSiteTypes.alternativesTruncated true manyProjects, "projects cap must count")
+    Assert.True(FieldSiteTypes.alternativesTruncated true manyTypes, "types cap must count")
+    Assert.True(FieldSiteTypes.alternativesTruncated false [ ("string", "P1") ], "budget exhaustion must count")
+
+    // The ordinary case is not truncation, and neither is an empty column.
+    Assert.False(FieldSiteTypes.alternativesTruncated true [ ("string", "P1") ])
+    Assert.False(FieldSiteTypes.alternativesTruncated false [])

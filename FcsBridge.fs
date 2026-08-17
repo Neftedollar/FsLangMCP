@@ -253,6 +253,139 @@ module internal FieldSiteTypes =
             | Some formatted -> formatted, Typed
             | None -> null, Unresolved
 
+    /// Fold a later project's answer for the SAME physical site into the alternatives set,
+    /// carrying WHICH project produced it.
+    ///
+    /// #207 review: `find` de-duplicates sites by physical location, so a `.fs` linked into
+    /// several `.fsproj` files is swept once per project. Those projects can resolve the same
+    /// field to different types (different conditional symbols, a different generic
+    /// instantiation), and the row used to be overwritten by whichever project the sweep
+    /// visited last — the payload then claimed a single type with no sign that the sweep had
+    /// seen another. The FIRST resolved type stays in `siteType` (with the project that
+    /// produced it); every other (type, project) pair lands here so the disagreement is
+    /// visible, attributable, and independent of sweep order.
+    let mergeAlternatives
+        (keptType: string)
+        (candidateType: string)
+        (candidateProject: string)
+        (alternatives: (string * string) list)
+        : (string * string) list =
+        let pair = (candidateType, candidateProject)
+
+        if
+            isNull candidateType
+            || isNull keptType
+            || String.Equals(candidateType, keptType, StringComparison.Ordinal)
+            || alternatives |> List.contains pair
+        then
+            alternatives
+        else
+            alternatives @ [ pair ]
+            |> List.sortWith (fun (leftType, leftProject) (rightType, rightProject) ->
+                match String.CompareOrdinal(leftType, rightType) with
+                | 0 -> String.CompareOrdinal(leftProject, rightProject)
+                | typeOrder -> typeOrder)
+
+    /// Per-row caps: distinct alternative types, and projects listed under one type. They
+    /// stop a single pathological row from eating the whole page allowance below.
+    [<Literal>]
+    let AlternativeTypesPerSite = 3
+
+    [<Literal>]
+    let AlternativeProjectsPerType = 3
+
+    /// Page-wide allowance for the alternatives column, in rendered characters.
+    ///
+    /// #207 review: the number of alternatives is NOT bounded by the per-type 200-char cap —
+    /// it grows with the number of projects a linked file is compiled by, once per site. The
+    /// documented worst case for a full page is 80 × (527 + 203 + 15) ≈ 59.6k against a ~72k
+    /// ceiling, so the column gets the headroom and no more. Rows past the allowance keep the
+    /// COUNT and drop the strings, which is bounded by construction.
+    [<Literal>]
+    let AlternativesPageBudgetChars = 6000
+
+    /// Group (type, project) pairs into per-type entries under the per-row caps. Returns the
+    /// entries — each as (siteType, projects shown, projects omitted) — plus how many distinct
+    /// types the cap left out. Pure: the page-budget decision belongs to the caller.
+    let alternativeEntries (alternatives: (string * string) list) : (string * string list * int) list * int =
+        let byType =
+            alternatives
+            |> List.groupBy fst
+            |> List.sortWith (fun (left, _) (right, _) -> String.CompareOrdinal(left, right))
+
+        let entries =
+            byType
+            |> List.truncate AlternativeTypesPerSite
+            |> List.map (fun (siteType, pairs) ->
+                let projects =
+                    pairs
+                    |> List.map snd
+                    |> List.distinct
+                    |> List.sortWith (fun left right -> String.CompareOrdinal(left, right))
+
+                siteType,
+                List.truncate AlternativeProjectsPerType projects,
+                max 0 (projects.Length - AlternativeProjectsPerType))
+
+        entries, max 0 (byType.Length - AlternativeTypesPerSite)
+
+    /// True when this row's alternatives were capped in ANY way — distinct types dropped,
+    /// projects under a type dropped, or the whole list replaced by a count past the page
+    /// allowance. Drives the `alternativesTruncatedRows` ledger entry, which would otherwise
+    /// have to be inferred by sniffing the rendered JSON and would miss the projects-only case.
+    let alternativesTruncated (withinPageBudget: bool) (alternatives: (string * string) list) : bool =
+        if List.isEmpty alternatives then
+            false
+        elif not withinPageBudget then
+            true
+        else
+            let entries, typesOmitted = alternativeEntries alternatives
+
+            typesOmitted > 0
+            || entries |> List.exists (fun (_, _, projectsOmitted) -> projectsOmitted > 0)
+
+    /// The `siteTypeAlternatives` row fields — emitted ONLY when another swept project
+    /// resolved the same physical site to a different type, so the common row shape is
+    /// byte-identical to a single-project sweep. `withinPageBudget=false` keeps the count and
+    /// drops the strings: an agent still learns the site is contested, and the page stays
+    /// inside the response ceiling. Nothing is ever dropped silently — every omission is a
+    /// number in the row.
+    let alternativesFields
+        (includeSiteTypes: bool)
+        (withinPageBudget: bool)
+        (alternatives: (string * string) list)
+        : (string * JsonNode) list =
+        if not includeSiteTypes || List.isEmpty alternatives then
+            []
+        else
+            let entries, typesOmitted = alternativeEntries alternatives
+
+            if not withinPageBudget then
+                [ ("siteTypeAlternativesOmitted", jint (entries.Length + typesOmitted)) ]
+            else
+                let entryNodes =
+                    entries
+                    |> List.map (fun (siteType, projects, projectsOmitted) ->
+                        jobj (
+                            [ "siteType", jstr siteType
+                              "projects", JsonArray(projects |> List.map jstr |> List.toArray) :> JsonNode ]
+                            // Parenthesised on purpose: a one-element list of an
+                            // UNparenthesised tuple raises FS3536 ("did you mean ';'?"), and
+                            // FcsBridgeTests type-checks this very file expecting zero
+                            // diagnostics at every severity — informational included.
+                            @ (if projectsOmitted > 0 then
+                                   [ ("projectsOmitted", jint projectsOmitted) ]
+                               else
+                                   [])
+                        )
+                        :> JsonNode)
+
+                [ ("siteTypeAlternatives", JsonArray(entryNodes |> List.toArray) :> JsonNode) ]
+                @ (if typesOmitted > 0 then
+                       [ ("siteTypeAlternativesOmitted", jint typesOmitted) ]
+                   else
+                       [])
+
     /// Project a site's stored (siteType, typeStatus) into the JSON fields its row carries.
     /// Present on EVERY field site under includeSiteTypes — an explicit JSON null for a
     /// degraded one, so a consumer never has to distinguish "absent key" from "could not
@@ -1979,6 +2112,39 @@ module internal NugetPackageMap =
         with _ ->
             ""
 
+    /// #191 review: `project.assets.json` describes EVERY target the project restores, but
+    /// `EnsureProjectResults` evaluates exactly ONE. A package referenced only under another
+    /// TFM would otherwise keep claiming the assemblies it ships there — and when one of those
+    /// SimpleNames reaches the evaluated compile line through a DIFFERENT package,
+    /// `fcs_nuget_types`/`fcs_nuget_members` would answer for the wrong package entirely.
+    ///
+    /// So an assets entry keeps an assembly only while the evaluated compile line does not
+    /// attribute that assembly to some OTHER package. An assembly the compile line cannot
+    /// attribute at all (shared-framework ref pack, ProjectReference output, a restore layout
+    /// `packageIdOf` cannot parse) is kept: framework unification legitimately serves a
+    /// package's assembly from a non-package path, and dropping it would lose a real answer.
+    ///
+    /// Package IDS survive either way — an id mapped to an empty set is exactly the
+    /// "restored, but contributes no compile reference here" signal the miss payload reads.
+    let internal restrictToCompileLine (fromPaths: PackageAssemblies) (fromAssets: PackageAssemblies) : PackageAssemblies =
+        let owners =
+            fromPaths
+            |> Map.toSeq
+            |> Seq.collect (fun (packageId, names) ->
+                names |> Seq.map (fun name -> name.ToLowerInvariant(), packageId))
+            |> Seq.fold (fun map (name, packageId) -> Map.add name packageId map) Map.empty
+
+        if Map.isEmpty owners then
+            fromAssets
+        else
+            fromAssets
+            |> Map.map (fun packageId names ->
+                names
+                |> Set.filter (fun name ->
+                    match Map.tryFind (name.ToLowerInvariant()) owners with
+                    | Some owner -> String.Equals(owner, packageId, StringComparison.Ordinal)
+                    | None -> true))
+
     let forProject (projectFileName: string) (otherOptions: string seq) : PackageAssemblies =
         let fromAssets =
             try
@@ -1991,10 +2157,12 @@ module internal NugetPackageMap =
             with _ ->
                 Map.empty
 
+        let fromPaths = packageAssembliesFromReferencePaths otherOptions
+
         if Map.isEmpty fromAssets then
-            packageAssembliesFromReferencePaths otherOptions
+            fromPaths
         else
-            fromAssets
+            restrictToCompileLine fromPaths fromAssets
 
     /// An assembly matches `packageId` when its SimpleName IS the packageId (pre-#191
     /// behaviour, kept — callers who already know the assembly name keep working even when the
@@ -2087,7 +2255,7 @@ module internal NugetPackageMap =
                 // none of which are on the compile line (runtime-only, ExcludeAssets=compile), and
                 // one that ships none at all (analyzer, build-only) — the latter arrives here with
                 // an empty assembly set, and `candidatePackages` shows it as `assemblies: []`.
-                $"'%s{packageId}' is in this project's restore graph, but none of the assemblies it ships are on the compile line — analyzer/build-only/runtime-only packages contribute no compile-time reference. candidatePackages shows which assemblies it ships, if any; fcs_referenced_symbols searches the assemblies that ARE loaded."
+                $"'%s{packageId}' is in this project's restore graph, but none of the assemblies it ships are on the compile line of the target framework that was evaluated — analyzer/build-only/runtime-only packages contribute no compile-time reference, and on a multi-targeted project the package may be referenced only under a DIFFERENT target. candidatePackages shows which assemblies it ships here, if any; fcs_referenced_symbols searches the assemblies that ARE loaded."
             elif not (List.isEmpty closest) then
                 $"No referenced assembly matches packageId '%s{packageId}'. packageId accepts EITHER the NuGet package id OR the assembly SimpleName it ships, and the two differ for many packages (Microsoft.Orleans.Core.Abstractions ships Orleans.Core.Abstractions.dll). See candidatePackages for the closest entries in this project's restore graph."
             else
@@ -5485,7 +5653,11 @@ type internal FcsBridge
                        /// degraded (see TypeStatus).
                        SiteType: string
                        /// "typed" | "unresolved" | "timeout" | null (not applicable).
-                       TypeStatus: string |}
+                       TypeStatus: string
+                       /// #207 review: (type, project) pairs for every OTHER answer swept
+                       /// projects gave this same physical site (a linked .fs compiled by
+                       /// more than one .fsproj). Empty in the common single-project case.
+                       TypeAlternatives: (string * string) list |}
                  >()
 
             let perProject = ResizeArray<JsonNode>()
@@ -5614,6 +5786,33 @@ type internal FcsBridge
                         let key = locationKey r
 
                         if overwrite || not (siteByKey.ContainsKey key) then
+                            // #207 review: kind precedence still lets a later pass overwrite the
+                            // row, but a TYPE another project already resolved for this same
+                            // physical site is never silently replaced — a linked .fs swept by
+                            // several projects can resolve the field differently in each. The
+                            // first resolved type keeps the `siteType` column AND the project
+                            // label that produced it (otherwise the row would report one
+                            // project's name beside another project's type); the rest are kept
+                            // as alternatives. Without includeSiteTypes every SiteType is null,
+                            // so this reduces exactly to the previous last-writer-wins behaviour.
+                            // `typeStatus` is non-null ONLY on a field-pass row under
+                            // includeSiteTypes, so the merge is confined to field-vs-field
+                            // across projects. A member pass overwriting the same range still
+                            // nulls the type exactly as before — otherwise a member-usage row
+                            // could carry a type and break `typed + degraded = fieldSites`.
+                            let keptType, keptStatus, keptProject, alternatives =
+                                match siteByKey.TryGetValue key with
+                                | true, prior when not (isNull prior.SiteType) && not (isNull typeStatus) ->
+                                    prior.SiteType,
+                                    prior.TypeStatus,
+                                    prior.Project,
+                                    FieldSiteTypes.mergeAlternatives
+                                        prior.SiteType
+                                        siteType
+                                        projDisplay
+                                        prior.TypeAlternatives
+                                | _ -> siteType, typeStatus, projDisplay, []
+
                             siteByKey[key] <-
                                 {| File = normalizePath r.FileName
                                    StartLine = r.StartLine
@@ -5621,13 +5820,14 @@ type internal FcsBridge
                                    EndLine = r.EndLine
                                    EndCol = r.EndColumn
                                    Kind = siteKind
-                                   Project = projDisplay
+                                   Project = keptProject
                                    FullName =
                                     (match symbolUse.Symbol.FullName with
                                      | null -> null
                                      | s -> s)
-                                   SiteType = siteType
-                                   TypeStatus = typeStatus |}
+                                   SiteType = keptType
+                                   TypeStatus = keptStatus
+                                   TypeAlternatives = alternatives |}
 
                     // Field/member sites first so their richer kind wins over a generic
                     // "reference" tag when a non-exact name-match overlaps the same range.
@@ -5752,6 +5952,15 @@ type internal FcsBridge
             let timedOutTypeSites = countTypeStatus FieldSiteTypes.TimedOut
             let degradedSites = unresolvedSites + timedOutTypeSites
 
+            // #207 review: a SUBSET of `typed`, not a third bucket — the identity
+            // `typed + degraded = fieldSites` still holds. These rows carry a type; what
+            // they also carry is another project's different answer for the same physical
+            // site, in `siteTypeAlternatives`.
+            let multiTypedSites =
+                sortedSites
+                |> Array.filter (fun s -> not (List.isEmpty s.TypeAlternatives))
+                |> Array.length
+
             let projectsRequested = projectsToSweep.Length
             let coverageComplete = projectsAnalyzed = projectsRequested
 
@@ -5829,6 +6038,15 @@ type internal FcsBridge
 
             let lineContextCache = System.Collections.Generic.Dictionary<string, string array>()
 
+            // #207 review: the alternatives column is the one part of a row whose size is not
+            // bounded by a per-value cap — it grows with the number of projects a linked file
+            // is compiled by. Spend a fixed page allowance in row order (siteToJson runs
+            // sequentially over pageSites, so this is deterministic); once it is gone, rows
+            // keep the count and drop the strings. Charged against what was actually rendered,
+            // not an estimate.
+            let mutable alternativesBudget = FieldSiteTypes.AlternativesPageBudgetChars
+            let mutable alternativesTruncatedRows = 0
+
             let siteToJson (s: {| File: string
                                   StartLine: int
                                   StartCol: int
@@ -5838,7 +6056,8 @@ type internal FcsBridge
                                   Project: string
                                   FullName: string
                                   SiteType: string
-                                  TypeStatus: string |}) =
+                                  TypeStatus: string
+                                  TypeAlternatives: (string * string) list |}) =
                 let ctx = lineContextToJson lineContextCache contextLines s.File s.StartLine
 
                 let rangeNode =
@@ -5861,7 +6080,24 @@ type internal FcsBridge
 
                 // #207: see FieldSiteTypes.rowFields — extracted so its degraded (JSON null)
                 // arm is unit-testable, which inline here it was not.
-                let siteTypeFields = FieldSiteTypes.rowFields includeSiteTypes s.SiteType s.TypeStatus
+                let withinAlternativesBudget = alternativesBudget > 0
+
+                let alternativeFields =
+                    FieldSiteTypes.alternativesFields includeSiteTypes withinAlternativesBudget s.TypeAlternatives
+
+                for _, node in alternativeFields do
+                    if not (isNull node) then
+                        alternativesBudget <- alternativesBudget - node.ToJsonString().Length
+
+                if
+                    includeSiteTypes
+                    && FieldSiteTypes.alternativesTruncated withinAlternativesBudget s.TypeAlternatives
+                then
+                    alternativesTruncatedRows <- alternativesTruncatedRows + 1
+
+                let siteTypeFields =
+                    FieldSiteTypes.rowFields includeSiteTypes s.SiteType s.TypeStatus
+                    @ alternativeFields
 
                 jobj
                     ([ "file", jstr s.File
@@ -5968,7 +6204,13 @@ type internal FcsBridge
                               "typed", jint typedSites
                               "degraded", jint degradedSites
                               "degradedUnresolved", jint unresolvedSites
-                              "degradedTimedOut", jint timedOutTypeSites ]
+                              "degradedTimedOut", jint timedOutTypeSites
+                              // Subset of `typed`; see multiTypedSites.
+                              "typedDifferentlyByAnotherProject", jint multiTypedSites
+                              // Rows on THIS page where the alternatives column hit a cap or
+                              // the page allowance and rendered a count instead of the
+                              // strings — a truncation the caller can see, not infer.
+                              "alternativesTruncatedRows", jint alternativesTruncatedRows ]
                         :> JsonNode
 
                     let note =
@@ -5999,7 +6241,19 @@ type internal FcsBridge
                                 else
                                     $"{degradedSites} of {fieldSiteCount} field sites could not be typed ({unresolvedSites} unresolved, {timedOutTypeSites} past the timeoutMs budget) and carry siteType: null."
 
-                            $"siteType is the field's type as the CURRENT typecheck resolves it at that site, rendered with that site's own opens — the BEFORE half of a field-type change. {degradedClause} find deliberately does NOT typecheck a hypothetical new record shape: edit every site listed here, then run check(scope='project') for the AFTER verdict. On a generic record the type shows as the type PARAMETER (e.g. 'T), not its instantiation at the site."
+                            let multiClause =
+                                if multiTypedSites = 0 then
+                                    ""
+                                else
+                                    let truncationClause =
+                                        if alternativesTruncatedRows = 0 then
+                                            ""
+                                        else
+                                            $" On {alternativesTruncatedRows} row(s) the column hit its per-row cap or this page's size allowance and carries siteTypeAlternativesOmitted (a count) instead of the full list — narrow with scope/projectPath, or page through, to see them."
+
+                                    $" {multiTypedSites} site(s) are compiled by more than one swept project and resolved to DIFFERENT types: siteType/project report the first project's answer and siteTypeAlternatives names each other type with the project(s) that resolved it — plan those sites per project, not from one type.{truncationClause}"
+
+                            $"siteType is the field's type as the CURRENT typecheck resolves it at that site, rendered with that site's own opens — the BEFORE half of a field-type change. {degradedClause}{multiClause} find deliberately does NOT typecheck a hypothetical new record shape: edit every site listed here, then run check(scope='project') for the AFTER verdict. On a generic record the type shows as the type PARAMETER (e.g. 'T), not its instantiation at the site."
 
                     [ ("siteTypes", summary); ("siteTypesNote", jstr note) ]
 

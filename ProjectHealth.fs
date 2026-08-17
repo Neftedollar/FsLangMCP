@@ -353,6 +353,20 @@ let private testProjectInfo (snapshot: EvaluatedProjectSnapshot) : JsonNode =
           "binaryOutputPath", binaryOutputPath
           "configuration", configuration ]
 
+/// Outcome of the reverse test-project sweep. `Unevaluated` is the honesty half (#171
+/// review): a candidate .fsproj whose evaluation FAILED is not evidence that no test
+/// project references this one. MSBuild evaluation is admitted one at a time
+/// (`ProjectEvaluationAdmission`, capacity 1) while the host serves concurrent FCS
+/// handlers, so a sibling `project_health` in flight is enough to make every candidate
+/// come back `ProjectEvaluationBusyException` — and silently dropping those turned a
+/// transient failure into the semantic claim "no_test_projects_found".
+/// NoComparison: JsonNode is not structurally comparable, and warnings-as-errors turns
+/// the auto-derived constraint into a build failure.
+[<NoComparison>]
+type private TestProjectDiscovery =
+    { Projects: JsonNode array
+      Unevaluated: (string * string) list }
+
 let private discoverTestProjects
     (workspaceRoot: string)
     (currentProjectPath: string)
@@ -360,7 +374,7 @@ let private discoverTestProjects
     =
     async {
         if not (Directory.Exists workspaceRoot) then
-            return [||]
+            return { Projects = [||]; Unevaluated = [] }
         else
             let separator: string = string Path.DirectorySeparatorChar
             let binSegment = $"%s{separator}bin%s{separator}"
@@ -384,8 +398,18 @@ let private discoverTestProjects
                 let! result = evaluatedProjectProvider projectPath
                 evaluated.Add result
 
-            return
-                Array.zip projectPaths (evaluated.ToArray())
+            let pairs = Array.zip projectPaths (evaluated.ToArray())
+
+            let unevaluated =
+                pairs
+                |> Array.choose (fun (projectPath, result) ->
+                    match result with
+                    | Error reason -> Some(projectPath, reason)
+                    | Ok _ -> None)
+                |> Array.toList
+
+            let discovered =
+                pairs
                 |> Array.choose (fun (projectPath, result) ->
                     match result with
                     | Error _ -> None
@@ -414,6 +438,10 @@ let private discoverTestProjects
                             )
                         else
                             None)
+
+            return
+                { Projects = discovered
+                  Unevaluated = unevaluated }
     }
 
 /// Walk up from `startDir` to the filesystem root, returning the first existing path among
@@ -871,16 +899,57 @@ let internal createReport
                               "configurationFiles",
                               JsonArray(analyzerConfigFiles |> List.map jstr |> List.toArray) :> JsonNode ]
 
-                let! testProjects =
+                let! testDiscovery =
                     discoverTestProjects workspaceRoot projectPath evaluatedProjectProvider
 
                 let testHealth =
-                    if testProjects.Length = 0 then
-                        jobj [ "status", jstr "no_test_projects_found"; "projects", JsonArray() :> JsonNode ]
-                    else
-                        jobj
-                            [ "status", jstr "test_projects_found"
-                              "projects", JsonArray(testProjects) :> JsonNode ]
+                    let testProjects = testDiscovery.Projects
+                    let unevaluated = testDiscovery.Unevaluated
+                    let discoveryComplete = List.isEmpty unevaluated
+
+                    // Absence is only conclusive when every candidate was actually read.
+                    // A failed candidate keeps its own reason so the caller can tell a
+                    // transient "evaluation busy" from a genuinely broken sibling project.
+                    let status =
+                        if testProjects.Length > 0 then "test_projects_found"
+                        elif discoveryComplete then "no_test_projects_found"
+                        else "test_discovery_incomplete"
+
+                    // A workspace-wide sweep can fail on many candidates at once; cap the
+                    // listing but never the count, and say when the list was capped so the
+                    // payload cannot read as "these were all of them".
+                    let unevaluatedListLimit = 20
+                    let unevaluatedCount = List.length unevaluated
+
+                    let unevaluatedNodes =
+                        unevaluated
+                        |> List.truncate unevaluatedListLimit
+                        |> List.map (fun (candidatePath, reason) ->
+                            jobj [ "projectPath", jstr candidatePath; "reason", jstr reason ] :> JsonNode)
+                        |> List.toArray
+
+                    let listingClause =
+                        if unevaluatedCount > unevaluatedListLimit then
+                            $" unevaluatedProjects lists the first %d{unevaluatedListLimit} of them."
+                        else
+                            ""
+
+                    let incompleteFields =
+                        if discoveryComplete then
+                            []
+                        else
+                            [ "unevaluatedProjectCount", jint unevaluatedCount
+                              "unevaluatedProjects", JsonArray(unevaluatedNodes) :> JsonNode
+                              "note",
+                              jstr
+                                  $"%d{unevaluatedCount} candidate project(s) could not be evaluated, so this list is not exhaustive: a test project that references this one may be among them.%s{listingClause} MSBuild evaluation is admitted one at a time, so a concurrent request is the common cause — retry project_health once it completes." ]
+
+                    jobj (
+                        [ "status", jstr status
+                          "projects", JsonArray(testProjects) :> JsonNode
+                          "discoveryComplete", jbool discoveryComplete ]
+                        @ incompleteFields
+                    )
 
                 return
                     jobj

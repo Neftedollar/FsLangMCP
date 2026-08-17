@@ -1817,8 +1817,13 @@ let ``setProjectReadiness reports not_warmed once the warmup window has elapsed 
     // sent when find's own FCS sweep comes up empty, so a healthy session
     // that never needed the probe looks identical to one that "failed".
     Assert.Contains("has not been observed warm within 3s", readiness["symbolIndexHint"].GetValue<string>())
-    Assert.Contains("find and check are unaffected", readiness["symbolIndexHint"].GetValue<string>())
-    Assert.Contains("FCS sweeps", readiness["symbolIndexHint"].GetValue<string>())
+    // #194 review: the hint used to promise "find and check are unaffected". find is the
+    // one consumer of the index fallback (Dispatcher → FcsBridge via="fsac-symbol-index"),
+    // so the assurance is scoped to FCS-derived results and the fallback is named.
+    Assert.Contains("FCS-derived results are unaffected", readiness["symbolIndexHint"].GetValue<string>())
+    Assert.Contains("fsac-symbol-index", readiness["symbolIndexHint"].GetValue<string>())
+    Assert.Contains("fsacFallbackState", readiness["symbolIndexHint"].GetValue<string>())
+    Assert.DoesNotContain("find and check are unaffected", readiness["symbolIndexHint"].GetValue<string>())
 
 [<Fact>]
 let ``setProjectReadiness stays warming when workspaceReadyAt is unknown, even long after set_project returned`` () =

@@ -8,6 +8,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `project_health` no longer reports `tests.status="no_test_projects_found"` when reverse test
+  discovery actually FAILED (review finding on #171). Discovery evaluates every candidate
+  `.fsproj` under the workspace root, and MSBuild evaluation is admitted one project at a time
+  (`ProjectEvaluationAdmission`, capacity 1) while the host serves concurrent FCS handlers — so a
+  sibling request in flight was enough to make every candidate come back
+  `ProjectEvaluationBusyException`, and each of those failures was silently dropped into "no test
+  project exists". The payload now separates the two: `tests.discoveryComplete` is always present,
+  a candidate that could not be evaluated is listed in `tests.unevaluatedProjects` with its own
+  reason plus `tests.unevaluatedProjectCount`, and a sweep that found nothing while some candidate
+  failed reports the new status `test_discovery_incomplete` instead of claiming absence.
+  `no_test_projects_found` now means what it says: every candidate was read, and none of them
+  referenced this project.
+- `set_project`'s `not_warmed`/`warming` readiness hints no longer promise that "find and check are
+  unaffected" by the FSAC symbol index (review finding on #201). `check` never consults the index,
+  and neither does any `find` site the FCS sweep produced — but `find` is precisely the consumer of
+  the index fallback: on a sweep with zero hits it probes `workspace/symbol` and reports the match
+  as `via="fsac-symbol-index"`. While the index is cold that confirmation is unavailable, so a
+  zero-hit `find` can read as `not_found`. The hints now scope the assurance to FCS-derived results,
+  name `find`'s zero-hit fallback as the affected path, and point at the `fsacFallbackState` /
+  `fsacFallbackReason` fields `find` already returns. Docs corrected to match — `docs/tools-detailed.md`
+  described the fallback and then claimed `find` never depends on it.
+- An SDK removed while the MCP host stays alive is now noticed at the next `set_project`
+  (review finding on #200). The SDK-preflight list is cached for the life of the process and the
+  cache is one-sided by design — it can pass a project but never reject one — which made
+  *installing* the pinned SDK self-healing and *uninstalling* it invisible: the gate kept passing
+  from a stale list and `fsautocomplete` died with the opaque connection-loss error the pre-flight
+  exists to replace. `set_project` now drops the cached list before its check, one
+  `dotnet --list-sdks` next to the FSAC restart and workspace load it precedes. Lazy per-project
+  starts keep using the cache.
+- `find`'s `includeSiteTypes` no longer lets one project's answer silently overwrite another's for
+  the same physical site (review finding on #211). Sites are de-duplicated by source location, so a
+  `.fs` linked into several `.fsproj` files is swept once per project — and those projects can
+  resolve the same field to different types. The last project visited used to win the row outright.
+  The first resolved type now keeps `siteType` *and* the `project` label that produced it, every
+  other answer is listed in the new per-row `siteTypeAlternatives` — each entry naming the type and
+  the projects that resolved it, so a contested site can be planned per project — and
+  `siteTypes.typedDifferentlyByAnotherProject` counts those rows (a subset of `typed` — the
+  `typed + degraded = fieldSites` identity is unchanged). The column is bounded so it cannot blow
+  `find`'s response ceiling on a file linked into many projects: at most 3 types per row and 3
+  projects per type, plus a page-wide 6000-character allowance, with every omission reported as
+  `siteTypeAlternativesOmitted` / `projectsOmitted` / `siteTypes.alternativesTruncatedRows`.
+  Single-project sweeps are byte-identical to before.
+- `fcs_nuget_types` / `fcs_nuget_members` no longer answer for a package that is only referenced
+  under a different target framework (review finding on #203). `project.assets.json` describes every
+  target the project restores while `EnsureProjectResults` evaluates exactly one, and the map folded
+  all of them — so when an assembly reached the evaluated compile line through a *different*
+  package, the query returned that unrelated assembly's types under the wrong package id. The
+  assets-derived map is now intersected with the evaluated compile line: an assembly the compile
+  line attributes to another package is dropped from the entry, while an assembly it cannot
+  attribute at all (shared-framework ref pack, ProjectReference output) is kept, so framework
+  unification still resolves. Package ids survive with an empty set, keeping the miss payload's
+  "restored, but contributes no reference here" signal — now also naming the other-target case.
+
 ## [0.16.0] - 2026-08-16
 
 0.16.0 closes three field-reported gaps where a payload's own numbers didn't explain themselves: `check`'s `totalDiagnostics` now reconciles with `errorCount + warningCount + infoCount` (workspace-wide and per-project), NuGet package-id-to-assembly resolution no longer returns an empty-but-`ok` payload when the assembly ships under a different name, and an unsatisfiable SDK pin now returns a typed `sdk_not_found` error instead of a lost transport connection. `set_project`'s `not_warmed` readiness state and `find`'s new `scopeNote` report sweep/readiness coverage honestly — what wasn't observed, and how many projects a sweep actually covered — instead of guessing or staying silent. `fcs_public_api` and `fcs_file_outline` now close pages on a response-size budget as well as by count, so a page no longer goes oversized merely because `maxResults` still had room by count (a single pathological entity can still exceed the budget by design — at least one entity is always returned). `find` also gains a field-impact mode, classifying record-field sites into five shapes instead of three and annotating each with its current type, so a field-type change can be planned from the tool output alone.

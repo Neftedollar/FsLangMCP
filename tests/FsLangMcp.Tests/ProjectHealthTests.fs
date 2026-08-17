@@ -1396,6 +1396,69 @@ let ``project_health serializes evaluated project loads during reverse discovery
     finally
         if Directory.Exists root then Directory.Delete(root, true)
 
+// ─── #194 review: a failed candidate is not "no test projects" ─────────────────
+//
+// Evaluation is admitted one project at a time while the host serves concurrent FCS
+// handlers, so a sibling request in flight makes every candidate come back
+// ProjectEvaluationBusyException. Those failures used to be dropped, and the payload
+// then asserted the semantic claim "no_test_projects_found" from a transient failure.
+
+[<Fact>]
+let ``project_health reports incomplete test discovery when a candidate cannot be evaluated`` () =
+    let runId = Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_discovery_%s{runId}")
+
+    try
+        let currentProject = writeNonTestProject (Path.Combine(root, "Current"))
+        let sibling = writeNonTestProject (Path.Combine(root, "Sibling"))
+
+        let provider path =
+            async {
+                if String.Equals(path, sibling, StringComparison.OrdinalIgnoreCase) then
+                    return
+                        Error "project evaluation busy: another Ionide/MSBuild evaluation is active; retry after it completes."
+                else
+                    return testEvaluatedSnapshot 0 0 path
+            }
+
+        let result =
+            createReport (healthArgs currentProject (Some root)) (readySnapshot currentProject root) provider
+            |> Async.RunSynchronously
+
+        let tests = result["tests"]
+
+        Assert.Equal("ok", result["status"].GetValue<string>())
+        // The load-bearing assertion: absence must not be claimed from a failure.
+        Assert.Equal("test_discovery_incomplete", tests["status"].GetValue<string>())
+        Assert.False(tests["discoveryComplete"].GetValue<bool>())
+        Assert.Equal(1, tests["unevaluatedProjectCount"].GetValue<int>())
+
+        let unevaluated = tests["unevaluatedProjects"].AsArray()
+        Assert.Single(unevaluated) |> ignore
+        Assert.Equal(sibling, (unevaluated[0]["projectPath"]).GetValue<string>())
+        Assert.Contains("busy", (unevaluated[0]["reason"]).GetValue<string>())
+        Assert.Contains("not exhaustive", tests["note"].GetValue<string>())
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
+[<Fact>]
+let ``project_health marks test discovery complete when every candidate evaluates`` () =
+    let runId = Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_discovery_ok_%s{runId}")
+
+    try
+        let currentProject = writeNonTestProject (Path.Combine(root, "Current"))
+        writeNonTestProject (Path.Combine(root, "Sibling")) |> ignore
+
+        let result = report (healthArgs currentProject (Some root)) (readySnapshot currentProject root)
+        let tests = result["tests"]
+
+        Assert.Equal("no_test_projects_found", tests["status"].GetValue<string>())
+        Assert.True(tests["discoveryComplete"].GetValue<bool>())
+        Assert.Null(tests["unevaluatedProjects"])
+    finally
+        if Directory.Exists root then Directory.Delete(root, true)
+
 [<Fact>]
 let ``analyzer config discovery walks ancestors independently and nearest files shadow parents`` () =
     let runId = System.Guid.NewGuid().ToString("N")

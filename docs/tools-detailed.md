@@ -29,8 +29,8 @@ to do about it. On an unsatisfiable `global.json` SDK pin, `set_project` instead
 | `symbolIndexState` | Meaning | What still works |
 |---|---|---|
 | `ready` | The FSAC symbol index has produced at least one non-empty `workspace/symbol` result. | Everything, including symbol-index fallback. |
-| `warming` | The LSP is up but the index hasn't warmed yet, and either the warm-up window since workspace-ready hasn't elapsed, or `workspaceReadyAt` itself isn't known yet (nothing to measure elapsed time from). | `find` and `check` (FCS sweeps, not index-dependent). Wait briefly and retry symbol-index-dependent calls. |
-| `not_warmed` | The LSP is up, and the warm-up window since workspace-ready has elapsed with no non-empty index result **observed** (#194) — this reports absence of evidence, not a diagnosis. See Caveats: a healthy session can sit here indefinitely. | `find` and `check` remain unaffected. Only the symbol-index fallback inside position-based LSP tools may be degraded — this is a terminal-for-now state, not "still loading". |
+| `warming` | The LSP is up but the index hasn't warmed yet, and either the warm-up window since workspace-ready hasn't elapsed, or `workspaceReadyAt` itself isn't known yet (nothing to measure elapsed time from). | `check`, and every `find` site the FCS sweep produced. `find`'s zero-hit index fallback can be incomplete — read its `fsacFallbackState`. Wait briefly and retry symbol-index-dependent calls. |
+| `not_warmed` | The LSP is up, and the warm-up window since workspace-ready has elapsed with no non-empty index result **observed** (#194) — this reports absence of evidence, not a diagnosis. See Caveats: a healthy session can sit here indefinitely. | FCS-derived results are unaffected: `check`, and every `find` site the sweep produced. `find`'s **zero-hit fallback** is the index (`via="fsac-symbol-index"`), so a cold index costs that one confirmation — a zero-hit `find` reads as `not_found` without it. This is a terminal-for-now state, not "still loading". |
 | `blocked_on_lsp` | FSAC has a live process tracked, or a restart was explicitly requested, but this call never observed workspace-ready. Covers both a `restartLsp=true` call whose readiness wait timed out and a `restartLsp=false` call reusing an already-live-but-not-yet-ready session. | Nothing LSP-dependent. Retry `set_project` with `restartLsp=true`. |
 | `not_started` | Neither a restart was requested nor is an LSP process currently live. Covers a session that never started the LSP as well as one that started and has since died or been stopped. | Nothing LSP-dependent. Call `set_project` with `restartLsp=true`. |
 
@@ -53,17 +53,25 @@ elapsed time means.
 1. **`not_warmed` is not evidence of a problem.** FSAC's symbol index is queried only as a
    fallback, when `find`'s own FCS sweep comes up empty. A session where `find` keeps resolving
    through FCS may never query the index at all, so `not_warmed` can be the expected, indefinite
-   steady state of a perfectly healthy session — not a fault to chase. `find` and `check` never
-   depend on the FSAC symbol index — they sweep FCS project options directly — so a session stuck
-   at `not_warmed` can be used normally for the primary tools regardless. Only the symbol-index
-   fallback path inside position-based LSP tools is degraded.
-2. **The boolean `symbolIndex` field never changes shape.** `symbolIndexState` /
+   steady state of a perfectly healthy session — not a fault to chase.
+2. **What a cold index actually costs `find`.** `check` never touches the symbol index, and
+   neither does any `find` result the FCS sweep produced — those sweep FCS project options
+   directly. But `find` *is* the consumer of the fallback (#194 review): on a sweep with zero
+   hits it probes `workspace/symbol` and, when the index answers, reports the match with
+   `via="fsac-symbol-index"`. While the index is cold that confirmation is unavailable, so a
+   zero-hit `find` reports `not_found` where a warm index might have matched. `find` says so in
+   its own payload — `fsacFallbackState` (`not_ready` / `unavailable` / `failed` /
+   `context_mismatch`) and `fsacFallbackReason` — so read those before treating a zero-hit
+   `find` as proof of absence. Position-based LSP tools that lean on the index are degraded the
+   same way.
+3. **The boolean `symbolIndex` field never changes shape.** `symbolIndexState` /
    `symbolIndexHint` are additive; existing integrations reading only the booleans are unaffected.
 
 ### Related tools
 
-- `find` / `check` — unaffected by `symbolIndexState`; safe to use in any state, including
-  `not_warmed`.
+- `check` — never consults the symbol index; safe to use in any state, including `not_warmed`.
+- `find` — its FCS sweep is safe in any state, but its zero-hit fallback is the symbol index.
+  Safe to run; read `fsacFallbackState` before reading a zero-hit result as absence.
 - `fsharp_runtime_status` — inspect whether the FSAC child process itself is healthy when
   `symbolIndexState` stays `blocked_on_lsp` longer than expected. `not_warmed` alone is not that
   signal — see Caveats.
@@ -207,7 +215,8 @@ Every response with `includeSiteTypes=true` states this boundary in a top-level 
 
 ```json
 "siteTypes": { "requested": true, "fieldSites": 8, "typed": 8,
-               "degraded": 0, "degradedUnresolved": 0, "degradedTimedOut": 0 }
+               "degraded": 0, "degradedUnresolved": 0, "degradedTimedOut": 0,
+               "typedDifferentlyByAnotherProject": 0, "alternativesTruncatedRows": 0 }
 ```
 
 `typed + degraded` always equals `fieldSites`, counted over the **whole** matched set rather than
@@ -216,6 +225,33 @@ gets `siteType: null` and is counted in `degradedUnresolved`; a site reached aft
 budget is exhausted gets `siteType: null` and is counted in `degradedTimedOut`. A per-site miss is
 never allowed to fail the call. The key itself is always present on a field row, so a consumer reads
 an explicit `null` rather than having to distinguish it from an absent key.
+
+**One site, several projects.** Sites are de-duplicated by physical source location, so a `.fs`
+linked into more than one `.fsproj` is swept once per project — and those projects can resolve the
+same field to different types (different conditional symbols, a different generic instantiation).
+The FIRST project to resolve it keeps both the `siteType` value and the row's `project` label; every
+other answer appears in a per-row `siteTypeAlternatives` array, each entry naming the type **and the
+projects that resolved it**, so the site can be planned per project:
+
+```json
+"siteType": "int", "project": "ProjA",
+"siteTypeAlternatives": [ { "siteType": "bool",   "projects": ["ProjC"] },
+                          { "siteType": "string", "projects": ["ProjB"] } ]
+```
+
+`typedDifferentlyByAnotherProject` counts those rows. It is a **subset of `typed`**, not a third
+bucket, so the `typed + degraded = fieldSites` identity is unchanged. Both the field and the counter
+are absent/zero on a normal single-project sweep.
+
+**Why it is bounded.** Unlike `siteType`, whose 200-character cap bounds it per row, the
+alternatives column grows with the number of projects a linked file is compiled by. Three limits
+keep a full page inside the response ceiling, and each one is *reported*, never silent: at most 3
+distinct types per row and 3 projects per type (the remainder becomes `siteTypeAlternativesOmitted`
+on the row and `projectsOmitted` on the entry), and a page-wide 6000-character allowance spent in
+row order — rows past it carry only `siteTypeAlternativesOmitted`, the count of other types, with no
+strings. `siteTypes.alternativesTruncatedRows` counts the rows on this page that hit any of the
+three, and the `siteTypesNote` says so. Narrow with `scope`/`projectPath` to see the full picture
+for a contested file.
 
 **Scope and cost.** `includeSiteTypes` annotates **field sites only** — non-field rows under
 `kind='auto'` stay lean, and a `kind` that produces no field sites at all (`definition`, `symbol`,
