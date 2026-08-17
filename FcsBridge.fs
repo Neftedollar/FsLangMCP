@@ -253,7 +253,8 @@ module internal FieldSiteTypes =
             | Some formatted -> formatted, Typed
             | None -> null, Unresolved
 
-    /// Fold a later project's answer for the SAME physical site into the alternatives set.
+    /// Fold a later project's answer for the SAME physical site into the alternatives set,
+    /// carrying WHICH project produced it.
     ///
     /// #207 review: `find` de-duplicates sites by physical location, so a `.fs` linked into
     /// several `.fsproj` files is swept once per project. Those projects can resolve the same
@@ -261,28 +262,125 @@ module internal FieldSiteTypes =
     /// instantiation), and the row used to be overwritten by whichever project the sweep
     /// visited last — the payload then claimed a single type with no sign that the sweep had
     /// seen another. The FIRST resolved type stays in `siteType` (with the project that
-    /// produced it); every other distinct type lands here so the disagreement is visible
-    /// instead of being decided by sweep order.
-    let mergeAlternatives (keptType: string) (candidateType: string) (alternatives: string list) : string list =
+    /// produced it); every other (type, project) pair lands here so the disagreement is
+    /// visible, attributable, and independent of sweep order.
+    let mergeAlternatives
+        (keptType: string)
+        (candidateType: string)
+        (candidateProject: string)
+        (alternatives: (string * string) list)
+        : (string * string) list =
+        let pair = (candidateType, candidateProject)
+
         if
             isNull candidateType
             || isNull keptType
             || String.Equals(candidateType, keptType, StringComparison.Ordinal)
-            || alternatives |> List.exists (fun existing -> String.Equals(existing, candidateType, StringComparison.Ordinal))
+            || alternatives |> List.contains pair
         then
             alternatives
         else
-            alternatives @ [ candidateType ] |> List.sortWith (fun left right -> String.CompareOrdinal(left, right))
+            alternatives @ [ pair ]
+            |> List.sortWith (fun (leftType, leftProject) (rightType, rightProject) ->
+                match String.CompareOrdinal(leftType, rightType) with
+                | 0 -> String.CompareOrdinal(leftProject, rightProject)
+                | typeOrder -> typeOrder)
 
-    /// The `siteTypeAlternatives` row field — emitted ONLY when another swept project
-    /// resolved the same physical site to a different type, so the common row shape is
-    /// byte-identical to a single-project sweep.
-    let alternativesFields (includeSiteTypes: bool) (alternatives: string list) : (string * JsonNode) list =
-        if includeSiteTypes && not (List.isEmpty alternatives) then
-            [ ("siteTypeAlternatives",
-               JsonArray(alternatives |> List.map jstr |> List.toArray) :> JsonNode) ]
+    /// Per-row caps: distinct alternative types, and projects listed under one type. They
+    /// stop a single pathological row from eating the whole page allowance below.
+    [<Literal>]
+    let AlternativeTypesPerSite = 3
+
+    [<Literal>]
+    let AlternativeProjectsPerType = 3
+
+    /// Page-wide allowance for the alternatives column, in rendered characters.
+    ///
+    /// #207 review: the number of alternatives is NOT bounded by the per-type 200-char cap —
+    /// it grows with the number of projects a linked file is compiled by, once per site. The
+    /// documented worst case for a full page is 80 × (527 + 203 + 15) ≈ 59.6k against a ~72k
+    /// ceiling, so the column gets the headroom and no more. Rows past the allowance keep the
+    /// COUNT and drop the strings, which is bounded by construction.
+    [<Literal>]
+    let AlternativesPageBudgetChars = 6000
+
+    /// Group (type, project) pairs into per-type entries under the per-row caps. Returns the
+    /// entries — each as (siteType, projects shown, projects omitted) — plus how many distinct
+    /// types the cap left out. Pure: the page-budget decision belongs to the caller.
+    let alternativeEntries (alternatives: (string * string) list) : (string * string list * int) list * int =
+        let byType =
+            alternatives
+            |> List.groupBy fst
+            |> List.sortWith (fun (left, _) (right, _) -> String.CompareOrdinal(left, right))
+
+        let entries =
+            byType
+            |> List.truncate AlternativeTypesPerSite
+            |> List.map (fun (siteType, pairs) ->
+                let projects =
+                    pairs
+                    |> List.map snd
+                    |> List.distinct
+                    |> List.sortWith (fun left right -> String.CompareOrdinal(left, right))
+
+                siteType,
+                List.truncate AlternativeProjectsPerType projects,
+                max 0 (projects.Length - AlternativeProjectsPerType))
+
+        entries, max 0 (byType.Length - AlternativeTypesPerSite)
+
+    /// True when this row's alternatives were capped in ANY way — distinct types dropped,
+    /// projects under a type dropped, or the whole list replaced by a count past the page
+    /// allowance. Drives the `alternativesTruncatedRows` ledger entry, which would otherwise
+    /// have to be inferred by sniffing the rendered JSON and would miss the projects-only case.
+    let alternativesTruncated (withinPageBudget: bool) (alternatives: (string * string) list) : bool =
+        if List.isEmpty alternatives then
+            false
+        elif not withinPageBudget then
+            true
         else
+            let entries, typesOmitted = alternativeEntries alternatives
+
+            typesOmitted > 0
+            || entries |> List.exists (fun (_, _, projectsOmitted) -> projectsOmitted > 0)
+
+    /// The `siteTypeAlternatives` row fields — emitted ONLY when another swept project
+    /// resolved the same physical site to a different type, so the common row shape is
+    /// byte-identical to a single-project sweep. `withinPageBudget=false` keeps the count and
+    /// drops the strings: an agent still learns the site is contested, and the page stays
+    /// inside the response ceiling. Nothing is ever dropped silently — every omission is a
+    /// number in the row.
+    let alternativesFields
+        (includeSiteTypes: bool)
+        (withinPageBudget: bool)
+        (alternatives: (string * string) list)
+        : (string * JsonNode) list =
+        if not includeSiteTypes || List.isEmpty alternatives then
             []
+        else
+            let entries, typesOmitted = alternativeEntries alternatives
+
+            if not withinPageBudget then
+                [ ("siteTypeAlternativesOmitted", jint (entries.Length + typesOmitted)) ]
+            else
+                let entryNodes =
+                    entries
+                    |> List.map (fun (siteType, projects, projectsOmitted) ->
+                        jobj (
+                            [ "siteType", jstr siteType
+                              "projects", JsonArray(projects |> List.map jstr |> List.toArray) :> JsonNode ]
+                            @ (if projectsOmitted > 0 then
+                                   [ "projectsOmitted", jint projectsOmitted ]
+                               else
+                                   [])
+                        )
+                        :> JsonNode)
+
+                [ ("siteTypeAlternatives", JsonArray(entryNodes |> List.toArray) :> JsonNode) ]
+                @ (if typesOmitted > 0 then
+                       [ ("siteTypeAlternativesOmitted", jint typesOmitted) ]
+                   else
+                       [])
 
     /// Project a site's stored (siteType, typeStatus) into the JSON fields its row carries.
     /// Present on EVERY field site under includeSiteTypes — an explicit JSON null for a
@@ -5552,10 +5650,10 @@ type internal FcsBridge
                        SiteType: string
                        /// "typed" | "unresolved" | "timeout" | null (not applicable).
                        TypeStatus: string
-                       /// #207 review: other distinct types that OTHER swept projects
-                       /// resolved for this same physical site (a linked .fs compiled by
+                       /// #207 review: (type, project) pairs for every OTHER answer swept
+                       /// projects gave this same physical site (a linked .fs compiled by
                        /// more than one .fsproj). Empty in the common single-project case.
-                       TypeAlternatives: string list |}
+                       TypeAlternatives: (string * string) list |}
                  >()
 
             let perProject = ResizeArray<JsonNode>()
@@ -5704,7 +5802,11 @@ type internal FcsBridge
                                     prior.SiteType,
                                     prior.TypeStatus,
                                     prior.Project,
-                                    FieldSiteTypes.mergeAlternatives prior.SiteType siteType prior.TypeAlternatives
+                                    FieldSiteTypes.mergeAlternatives
+                                        prior.SiteType
+                                        siteType
+                                        projDisplay
+                                        prior.TypeAlternatives
                                 | _ -> siteType, typeStatus, projDisplay, []
 
                             siteByKey[key] <-
@@ -5932,6 +6034,15 @@ type internal FcsBridge
 
             let lineContextCache = System.Collections.Generic.Dictionary<string, string array>()
 
+            // #207 review: the alternatives column is the one part of a row whose size is not
+            // bounded by a per-value cap — it grows with the number of projects a linked file
+            // is compiled by. Spend a fixed page allowance in row order (siteToJson runs
+            // sequentially over pageSites, so this is deterministic); once it is gone, rows
+            // keep the count and drop the strings. Charged against what was actually rendered,
+            // not an estimate.
+            let mutable alternativesBudget = FieldSiteTypes.AlternativesPageBudgetChars
+            let mutable alternativesTruncatedRows = 0
+
             let siteToJson (s: {| File: string
                                   StartLine: int
                                   StartCol: int
@@ -5942,7 +6053,7 @@ type internal FcsBridge
                                   FullName: string
                                   SiteType: string
                                   TypeStatus: string
-                                  TypeAlternatives: string list |}) =
+                                  TypeAlternatives: (string * string) list |}) =
                 let ctx = lineContextToJson lineContextCache contextLines s.File s.StartLine
 
                 let rangeNode =
@@ -5965,9 +6076,24 @@ type internal FcsBridge
 
                 // #207: see FieldSiteTypes.rowFields — extracted so its degraded (JSON null)
                 // arm is unit-testable, which inline here it was not.
+                let withinAlternativesBudget = alternativesBudget > 0
+
+                let alternativeFields =
+                    FieldSiteTypes.alternativesFields includeSiteTypes withinAlternativesBudget s.TypeAlternatives
+
+                for _, node in alternativeFields do
+                    if not (isNull node) then
+                        alternativesBudget <- alternativesBudget - node.ToJsonString().Length
+
+                if
+                    includeSiteTypes
+                    && FieldSiteTypes.alternativesTruncated withinAlternativesBudget s.TypeAlternatives
+                then
+                    alternativesTruncatedRows <- alternativesTruncatedRows + 1
+
                 let siteTypeFields =
                     FieldSiteTypes.rowFields includeSiteTypes s.SiteType s.TypeStatus
-                    @ FieldSiteTypes.alternativesFields includeSiteTypes s.TypeAlternatives
+                    @ alternativeFields
 
                 jobj
                     ([ "file", jstr s.File
@@ -6076,7 +6202,11 @@ type internal FcsBridge
                               "degradedUnresolved", jint unresolvedSites
                               "degradedTimedOut", jint timedOutTypeSites
                               // Subset of `typed`; see multiTypedSites.
-                              "typedDifferentlyByAnotherProject", jint multiTypedSites ]
+                              "typedDifferentlyByAnotherProject", jint multiTypedSites
+                              // Rows on THIS page where the alternatives column hit a cap or
+                              // the page allowance and rendered a count instead of the
+                              // strings — a truncation the caller can see, not infer.
+                              "alternativesTruncatedRows", jint alternativesTruncatedRows ]
                         :> JsonNode
 
                     let note =
@@ -6111,7 +6241,13 @@ type internal FcsBridge
                                 if multiTypedSites = 0 then
                                     ""
                                 else
-                                    $" {multiTypedSites} site(s) are compiled by more than one swept project and resolved to DIFFERENT types: siteType/project report the first project's answer and siteTypeAlternatives lists the rest — plan those sites per project, not from one type."
+                                    let truncationClause =
+                                        if alternativesTruncatedRows = 0 then
+                                            ""
+                                        else
+                                            $" On {alternativesTruncatedRows} row(s) the column hit its per-row cap or this page's size allowance and carries siteTypeAlternativesOmitted (a count) instead of the full list — narrow with scope/projectPath, or page through, to see them."
+
+                                    $" {multiTypedSites} site(s) are compiled by more than one swept project and resolved to DIFFERENT types: siteType/project report the first project's answer and siteTypeAlternatives names each other type with the project(s) that resolved it — plan those sites per project, not from one type.{truncationClause}"
 
                             $"siteType is the field's type as the CURRENT typecheck resolves it at that site, rendered with that site's own opens — the BEFORE half of a field-type change. {degradedClause}{multiClause} find deliberately does NOT typecheck a hypothetical new record shape: edit every site listed here, then run check(scope='project') for the AFTER verdict. On a generic record the type shows as the type PARAMETER (e.g. 'T), not its instantiation at the site."
 

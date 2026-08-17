@@ -44,10 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.fs` linked into several `.fsproj` files is swept once per project — and those projects can
   resolve the same field to different types. The last project visited used to win the row outright.
   The first resolved type now keeps `siteType` *and* the `project` label that produced it, every
-  other distinct type is listed in the new per-row `siteTypeAlternatives`, and
+  other answer is listed in the new per-row `siteTypeAlternatives` — each entry naming the type and
+  the projects that resolved it, so a contested site can be planned per project — and
   `siteTypes.typedDifferentlyByAnotherProject` counts those rows (a subset of `typed` — the
-  `typed + degraded = fieldSites` identity is unchanged). Single-project sweeps are byte-identical
-  to before.
+  `typed + degraded = fieldSites` identity is unchanged). The column is bounded so it cannot blow
+  `find`'s response ceiling on a file linked into many projects: at most 3 types per row and 3
+  projects per type, plus a page-wide 6000-character allowance, with every omission reported as
+  `siteTypeAlternativesOmitted` / `projectsOmitted` / `siteTypes.alternativesTruncatedRows`.
+  Single-project sweeps are byte-identical to before.
 - `fcs_nuget_types` / `fcs_nuget_members` no longer answer for a package that is only referenced
   under a different target framework (review finding on #203). `project.assets.json` describes every
   target the project restores while `EnsureProjectResults` evaluates exactly one, and the map folded

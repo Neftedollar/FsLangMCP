@@ -40,8 +40,11 @@ differently. Add `includeSiteTypes=true` for a `siteType` column carrying the fi
 CURRENT typecheck resolves it at that site, plus a `siteTypes` ledger (`typed + degraded ==
 fieldSites`). It never predicts the post-edit type: edit the sites, then run `check`. A site
 compiled by several swept projects that resolve it differently keeps the first project's answer in
-`siteType` and lists the rest in `siteTypeAlternatives` (counted by
-`siteTypes.typedDifferentlyByAnotherProject`, a subset of `typed`). See `docs/tools-detailed.md`.
+`siteType`/`project` and lists the rest in `siteTypeAlternatives`, each entry naming the type and the
+projects that resolved it (counted by `siteTypes.typedDifferentlyByAnotherProject`, a subset of
+`typed`). That column is capped per row and per page; anything left out is reported as
+`siteTypeAlternativesOmitted` / `projectsOmitted` / `siteTypes.alternativesTruncatedRows`, never
+dropped silently. See `docs/tools-detailed.md`.
 
 **Changed in v0.16.0:** `field-set-mutation` (`x.Field <- v`) and `field-pattern`
 (`| { Field = x } ->`) are new kinds — both used to be reported as `field-read`, mislabeling a

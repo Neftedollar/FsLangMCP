@@ -216,7 +216,7 @@ Every response with `includeSiteTypes=true` states this boundary in a top-level 
 ```json
 "siteTypes": { "requested": true, "fieldSites": 8, "typed": 8,
                "degraded": 0, "degradedUnresolved": 0, "degradedTimedOut": 0,
-               "typedDifferentlyByAnotherProject": 0 }
+               "typedDifferentlyByAnotherProject": 0, "alternativesTruncatedRows": 0 }
 ```
 
 `typed + degraded` always equals `fieldSites`, counted over the **whole** matched set rather than
@@ -230,11 +230,28 @@ an explicit `null` rather than having to distinguish it from an absent key.
 linked into more than one `.fsproj` is swept once per project — and those projects can resolve the
 same field to different types (different conditional symbols, a different generic instantiation).
 The FIRST project to resolve it keeps both the `siteType` value and the row's `project` label; every
-other distinct type appears in a per-row `siteTypeAlternatives` array, and
+other answer appears in a per-row `siteTypeAlternatives` array, each entry naming the type **and the
+projects that resolved it**, so the site can be planned per project:
+
+```json
+"siteType": "int", "project": "ProjA",
+"siteTypeAlternatives": [ { "siteType": "bool",   "projects": ["ProjC"] },
+                          { "siteType": "string", "projects": ["ProjB"] } ]
+```
+
 `typedDifferentlyByAnotherProject` counts those rows. It is a **subset of `typed`**, not a third
 bucket, so the `typed + degraded = fieldSites` identity is unchanged. Both the field and the counter
-are absent/zero on a normal single-project sweep. When it is nonzero, plan those sites per project:
-one type is not the whole answer.
+are absent/zero on a normal single-project sweep.
+
+**Why it is bounded.** Unlike `siteType`, whose 200-character cap bounds it per row, the
+alternatives column grows with the number of projects a linked file is compiled by. Three limits
+keep a full page inside the response ceiling, and each one is *reported*, never silent: at most 3
+distinct types per row and 3 projects per type (the remainder becomes `siteTypeAlternativesOmitted`
+on the row and `projectsOmitted` on the entry), and a page-wide 6000-character allowance spent in
+row order — rows past it carry only `siteTypeAlternativesOmitted`, the count of other types, with no
+strings. `siteTypes.alternativesTruncatedRows` counts the rows on this page that hit any of the
+three, and the `siteTypesNote` says so. Narrow with `scope`/`projectPath` to see the full picture
+for a contested file.
 
 **Scope and cost.** `includeSiteTypes` annotates **field sites only** — non-field rows under
 `kind='auto'` stay lean, and a `kind` that produces no field sites at all (`definition`, `symbol`,

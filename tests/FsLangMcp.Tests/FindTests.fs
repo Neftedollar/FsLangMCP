@@ -2074,12 +2074,19 @@ type FindLinkedSourceTests(fx: LinkedSourceFixture) =
             Assert.Equal("ProjA", gs site "project")
             Assert.Equal("int", gs site "siteType")
 
-            let alternatives =
-                (site["siteTypeAlternatives"] :?> JsonArray)
+            // #207 review 2: each alternative names the project that resolved it, so
+            // "plan the site per project" is something the caller can actually do.
+            let alternatives = site["siteTypeAlternatives"] :?> JsonArray
+            let alternative = Assert.Single(alternatives)
+            Assert.Equal("string", gs alternative "siteType")
+
+            let alternativeProjects =
+                (alternative["projects"] :?> JsonArray)
                 |> Seq.map (fun value -> value.GetValue<string>())
                 |> Seq.toList
 
-            Assert.Equal<string list>([ "string" ], alternatives)
+            Assert.Equal<string list>([ "ProjB" ], alternativeProjects)
+            Assert.False(site.AsObject().ContainsKey("siteTypeAlternativesOmitted"))
 
             // Ledger: the row is still `typed` — the identity typed + degraded = fieldSites
             // must not move — and the disagreement gets its own subset counter plus a note.
