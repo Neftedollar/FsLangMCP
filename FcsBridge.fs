@@ -369,8 +369,12 @@ module internal FieldSiteTypes =
                         jobj (
                             [ "siteType", jstr siteType
                               "projects", JsonArray(projects |> List.map jstr |> List.toArray) :> JsonNode ]
+                            // Parenthesised on purpose: a one-element list of an
+                            // UNparenthesised tuple raises FS3536 ("did you mean ';'?"), and
+                            // FcsBridgeTests type-checks this very file expecting zero
+                            // diagnostics at every severity — informational included.
                             @ (if projectsOmitted > 0 then
-                                   [ "projectsOmitted", jint projectsOmitted ]
+                                   [ ("projectsOmitted", jint projectsOmitted) ]
                                else
                                    [])
                         )
