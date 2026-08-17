@@ -503,19 +503,19 @@ module internal LspResponseShape =
                 // probe looks identical. Say what was (not) observed, not a verdict.
                 "not_warmed",
                 jstr
-                    $"FSAC's symbol index has not been observed warm within {int warmupWindow.TotalSeconds}s of workspace load. find and check are unaffected (they use FCS sweeps); only the symbol-index fallback inside position-based LSP tools may be degraded."
+                    $"FSAC's symbol index has not been observed warm within {int warmupWindow.TotalSeconds}s of workspace load. FCS-derived results are unaffected: check, and every find site the FCS sweep produced. find is itself the consumer of the index fallback (#194 review) — on a sweep with zero hits it probes the index and reports via=\"fsac-symbol-index\" when the index answers, so while the index is cold that confirmation is missing and a zero-hit find can read as not_found. Check find's own fsacFallbackState/fsacFallbackReason before treating absence as conclusive."
             elif lspReady then
                 "warming",
                 jstr
-                    "The FSAC symbol index is still warming, so symbol-index fallback results may be incomplete. Wait briefly, then retry the symbol-dependent request; find and check remain available."
+                    "The FSAC symbol index is still warming, so symbol-index fallback results may be incomplete. Wait briefly, then retry the symbol-dependent request; check and find's FCS sweep remain available, but find's zero-hit index fallback can be incomplete until the index warms — read its fsacFallbackState."
             elif restartRequested then
                 "blocked_on_lsp",
                 jstr
-                    "FSAC did not become ready, so position-based LSP tools and symbol-index fallback are unavailable. Retry set_project with restartLsp=true."
+                    "FSAC did not become ready, so position-based LSP tools and symbol-index fallback are unavailable — including find's zero-hit fallback, which reports fsacFallbackState instead of a hit count. find's own FCS sweep and check are unaffected. Retry set_project with restartLsp=true."
             else
                 "not_started",
                 jstr
-                    "The LSP was not started, so position-based LSP tools and symbol-index fallback are unavailable. Call set_project with restartLsp=true."
+                    "The LSP was not started, so position-based LSP tools and symbol-index fallback are unavailable — including find's zero-hit fallback, which reports fsacFallbackState instead of a hit count. find's own FCS sweep and check are unaffected. Call set_project with restartLsp=true."
 
         jobj
             [ "lsp", jbool lspReady
@@ -2018,7 +2018,18 @@ type internal FsAutoCompleteBridge
                               for memberProject in loadedProjects do
                                   resolveWorkspaceFromProjectPath memberProject ]
 
-                        let! sdkVerdict = Task.Run(fun () -> SdkPreflight.check preflightDirectories)
+                        // #192 review: the SDK list is cached for the life of the host, and the
+                        // cache is one-sided — it can pass a project but never reject one. That
+                        // makes "SDK installed mid-session" self-healing and "SDK REMOVED
+                        // mid-session" invisible: the gate keeps passing from a stale list and
+                        // FSAC dies with the opaque connection-loss error again. set_project is
+                        // the one boundary where a re-probe is free next to the FSAC restart and
+                        // workspace load it precedes, so drop the cache here (lazy per-project
+                        // starts keep using it).
+                        let! sdkVerdict =
+                            Task.Run(fun () ->
+                                SdkPreflight.invalidateCache ()
+                                SdkPreflight.check preflightDirectories)
 
                         match sdkVerdict with
                         | SdkPreflight.SdkNotFound(pin, installedSdks) ->

@@ -205,6 +205,62 @@ let ``packageAssembliesFromReferencePaths ignores paths that are not package-cac
 
     Assert.Empty(map)
 
+// ── Restricting the assets map to the evaluated target (#191 review) ────────────
+//
+// The assets file describes every target the project restores; EnsureProjectResults
+// evaluates one. A package referenced only under another TFM kept claiming the assemblies
+// it ships there, so an assembly that reaches the evaluated compile line through a
+// DIFFERENT package made fcs_nuget_types answer for the wrong package.
+
+[<Fact>]
+let ``restrictToCompileLine drops an assembly the compile line attributes to another package`` () =
+    let fromAssets =
+        Map.ofList
+            [ "legacy.json", Set.ofList [ "Fancy.Json" ] // restored only for another TFM
+              "fancy.json", Set.ofList [ "Fancy.Json" ] ] // the package on THIS target
+
+    let fromPaths =
+        NugetPackageMap.packageAssembliesFromReferencePaths
+            [ "-r:/home/agent/.nuget/packages/fancy.json/3.0.0/lib/net10.0/Fancy.Json.dll" ]
+
+    let restricted = NugetPackageMap.restrictToCompileLine fromPaths fromAssets
+
+    Assert.Equal<Set<string>>(Set.ofList [ "Fancy.Json" ], assemblies restricted "fancy.json")
+    // The key survives — an empty set is the "restored, contributes nothing here" signal
+    // the miss payload reads — but the assembly no longer answers for the wrong package.
+    Assert.True(restricted.ContainsKey "legacy.json")
+    Assert.Empty(assemblies restricted "legacy.json")
+    Assert.False(NugetPackageMap.matches restricted "Legacy.Json" "Fancy.Json")
+    Assert.True(NugetPackageMap.matches restricted "Fancy.Json" "Fancy.Json")
+
+[<Fact>]
+let ``restrictToCompileLine keeps assemblies the compile line cannot attribute to any package`` () =
+    // Framework unification: the package is referenced, but restore serves its assembly
+    // from the shared-framework ref pack, whose path names no package. Dropping it would
+    // lose a real answer, so an unattributable assembly stays with its package.
+    let fromAssets = Map.ofList [ "system.text.json", Set.ofList [ "System.Text.Json" ] ]
+
+    let fromPaths =
+        NugetPackageMap.packageAssembliesFromReferencePaths
+            [ "-r:/usr/share/dotnet/packs/Microsoft.NETCore.App.Ref/10.0.0/ref/net10.0/System.Text.Json.dll"
+              "-r:/home/agent/.nuget/packages/newtonsoft.json/13.0.3/lib/net6.0/Newtonsoft.Json.dll" ]
+
+    let restricted = NugetPackageMap.restrictToCompileLine fromPaths fromAssets
+
+    Assert.True(NugetPackageMap.matches restricted "System.Text.Json" "System.Text.Json")
+
+[<Fact>]
+let ``restrictToCompileLine is a no-op when the compile line attributes nothing`` () =
+    // packages.config, a relocated packages root packageIdOf cannot parse, or an options
+    // set with no `-r:` at all: with no attribution to compare against, the assets map is
+    // still the best answer available and must not be emptied.
+    let fromAssets = NugetPackageMap.packageAssembliesFromAssets orleansAssets
+
+    Assert.Equal<NugetPackageMap.PackageAssemblies>(
+        fromAssets,
+        NugetPackageMap.restrictToCompileLine Map.empty fromAssets
+    )
+
 // ── Matching ────────────────────────────────────────────────────────────────────
 
 [<Fact>]

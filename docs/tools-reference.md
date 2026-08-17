@@ -38,8 +38,10 @@ discover which recipe would have been faster. See `docs/tools-detailed.md`.
 | `field-set-mutation` | `field-pattern` | `field-read` — the five shapes a field-type change edits
 differently. Add `includeSiteTypes=true` for a `siteType` column carrying the field's type as the
 CURRENT typecheck resolves it at that site, plus a `siteTypes` ledger (`typed + degraded ==
-fieldSites`). It never predicts the post-edit type: edit the sites, then run `check`. See
-`docs/tools-detailed.md`.
+fieldSites`). It never predicts the post-edit type: edit the sites, then run `check`. A site
+compiled by several swept projects that resolve it differently keeps the first project's answer in
+`siteType` and lists the rest in `siteTypeAlternatives` (counted by
+`siteTypes.typedDifferentlyByAnotherProject`, a subset of `typed`). See `docs/tools-detailed.md`.
 
 **Changed in v0.16.0:** `field-set-mutation` (`x.Field <- v`) and `field-pattern`
 (`| { Field = x } ->`) are new kinds — both used to be reported as `field-read`, mislabeling a
@@ -99,7 +101,7 @@ unrestored, or errored entry carries no counts at all.
 
 **Response includes:** `loadedProjects`, `readiness` (`lsp` / `projectOptions` / `symbolIndex` flags plus `symbolIndexState` / `symbolIndexHint`), `lspLifecycleState`, `sessionGeneration`, `lspRestartRequested`, legacy `lspRestarted`, `lspReplacedExistingProcess`, and `fslangmcpVersion`. `lspRestarted` keeps mirroring the request for compatibility; `lspReplacedExistingProcess=true` means a pre-existing FSAC process was actually replaced, so first launch reports `false` there. Switching to a different context with `restartLsp=false` while FSAC is live returns `status="restart_required"` and leaves the active context unchanged.
 
-`symbolIndexState` includes a `not_warmed` state — the warm-up window elapsed with no warm signal *observed*, which is not proof the index failed to warm (`find`/`check` are unaffected either way; see `docs/tools-detailed.md`). On an unsatisfiable `global.json` SDK pin (`rollForward: "disable"` pinning a version not installed), `set_project` instead returns a typed `{status: "infrastructure_error", errorKind: "sdk_not_found", ...}` envelope carrying the requested version, the `global.json` path, and the installed SDK list — not a readiness payload.
+`symbolIndexState` includes a `not_warmed` state — the warm-up window elapsed with no warm signal *observed*, which is not proof the index failed to warm (`check` and every FCS-derived `find` site are unaffected either way; `find`'s zero-hit fallback IS the symbol index, so read its `fsacFallbackState` before reading a zero-hit `find` as absence — see `docs/tools-detailed.md`). On an unsatisfiable `global.json` SDK pin (`rollForward: "disable"` pinning a version not installed), `set_project` instead returns a typed `{status: "infrastructure_error", errorKind: "sdk_not_found", ...}` envelope carrying the requested version, the `global.json` path, and the installed SDK list — not a readiness payload.
 
 **Use when:** Starting a session or switching to a different project. Call once; context persists.
 
@@ -113,6 +115,8 @@ unrestored, or errored entry carries no counts at all.
 - `projectPath` — optional after `set_project`
 
 The `evaluation` object identifies the evaluated source and restore state. LSP readiness is context-bound: a live, ready session for project A is not reported as ready while inspecting unrelated project B; use `workspace.lspContextMatched` and `workspace.lspLoadedProjects` to diagnose that case.
+
+**Test-discovery honesty:** reverse test discovery evaluates every candidate `.fsproj` under the workspace root, and a candidate that fails to evaluate (commonly `project evaluation busy` — MSBuild evaluation is admitted one project at a time) is no longer dropped. `tests.discoveryComplete` says whether every candidate was read; failures are listed in `tests.unevaluatedProjects` (with `tests.unevaluatedProjectCount`), and a sweep that found nothing while some candidate failed reports `tests.status="test_discovery_incomplete"` rather than `no_test_projects_found`. Read `no_test_projects_found` as conclusive only with `discoveryComplete: true`.
 
 **Use when:** Diagnosing why FCS tools return incomplete data, or before starting a long agent run.
 

@@ -1963,3 +1963,154 @@ type FindPositionTests(fx: ConfigFixture) =
             Assert.Contains("ConfigProbe.Alpha.Config", plainNames)
             Assert.Contains("ConfigProbe.Beta.Config", plainNames)
         }
+
+// ── #207 review: one linked file, two projects, two different types ─────────────
+//
+// find de-duplicates sites by physical source location, so a `.fs` linked into two
+// `.fsproj` files is swept once per project — and `#if` (or any other per-project type
+// context) can make the SAME range resolve to different field types. Before the fix the
+// last project swept overwrote the row outright: the payload reported ProjB's `string`,
+// counted the site as `typed`, and said nothing about ProjA's `int`.
+//
+// The fixture needs no `dotnet build`: neither project references anything, so ProjInfo
+// resolves options on its own and the whole sweep is a couple of seconds.
+
+let private linkedSharedFs =
+    String.concat
+        "\n"
+        [ "module Shared"
+          ""
+          "type Parcel ="
+          "    { Weight:"
+          "#if ALT"
+          "        string"
+          "#else"
+          "        int"
+          "#endif"
+          "    }"
+          ""
+          "// ONE physical site, compiled by BOTH projects — `int` in ProjA, `string` in ProjB."
+          "let create w = { Weight = w }"
+          "" ]
+
+let private linkedProject (defineConstants: string option) =
+    let defines =
+        match defineConstants with
+        | Some value -> $"<DefineConstants>{value}</DefineConstants>"
+        | None -> ""
+
+    String.concat
+        "\n"
+        [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+          $"  <PropertyGroup><TargetFramework>net10.0</TargetFramework>{defines}</PropertyGroup>"
+          "  <ItemGroup><Compile Include=\"../Shared/Shared.fs\" Link=\"Shared.fs\" /></ItemGroup>"
+          "</Project>" ]
+
+type LinkedSourceFixture() =
+    let runId = Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_findlinked_{runId}")
+
+    let write (rel: string) (content: string) =
+        let full = Path.Combine(root, rel)
+        Directory.CreateDirectory(Path.GetDirectoryName full) |> ignore
+        File.WriteAllText(full, content)
+        full
+
+    let sharedSource = write "Shared/Shared.fs" linkedSharedFs
+    do write "ProjA/ProjA.fsproj" (linkedProject None) |> ignore
+    do write "ProjB/ProjB.fsproj" (linkedProject (Some "ALT")) |> ignore
+
+    let slnxPath =
+        write
+            "Linked.slnx"
+            (String.concat
+                "\n"
+                [ "<Solution>"
+                  "  <Project Path=\"ProjA/ProjA.fsproj\" />"
+                  "  <Project Path=\"ProjB/ProjB.fsproj\" />"
+                  "</Solution>" ])
+
+    member _.Slnx = slnxPath
+    member _.SharedSource = sharedSource
+
+    interface IDisposable with
+        member _.Dispose() =
+            if Directory.Exists root then
+                try
+                    Directory.Delete(root, true)
+                with _ ->
+                    ()
+
+type FindLinkedSourceTests(fx: LinkedSourceFixture) =
+    interface IClassFixture<LinkedSourceFixture>
+
+    [<Fact>]
+    member _.``#207 review: a site two projects type differently keeps the first type and lists the other``
+        ()
+        : Task =
+        task {
+            let bridge = FcsBridge()
+
+            let! find =
+                bridge.Find(
+                    { findArgs fx.Slnx "Parcel" with
+                        kind = Some "field"
+                        includeSiteTypes = Some true }
+                )
+
+            Assert.Equal("succeeded", gs find "status")
+            Assert.Equal(2, gi find "projectsAnalyzed")
+
+            // De-duplication by physical location is intact: ONE row, not one per project.
+            let sites = find["sites"] :?> JsonArray
+            Assert.Equal(1, sites.Count)
+            let site = sites[0]
+
+            Assert.Equal("field-set-literal", gs site "kind")
+            Assert.Equal(fx.SharedSource, gs site "file")
+
+            // The FIRST project to resolve the site owns both the type and the label; the
+            // other project's answer is preserved instead of overwriting it.
+            Assert.Equal("ProjA", gs site "project")
+            Assert.Equal("int", gs site "siteType")
+
+            let alternatives =
+                (site["siteTypeAlternatives"] :?> JsonArray)
+                |> Seq.map (fun value -> value.GetValue<string>())
+                |> Seq.toList
+
+            Assert.Equal<string list>([ "string" ], alternatives)
+
+            // Ledger: the row is still `typed` — the identity typed + degraded = fieldSites
+            // must not move — and the disagreement gets its own subset counter plus a note.
+            let ledger = find["siteTypes"]
+            Assert.Equal(1, gi ledger "fieldSites")
+            Assert.Equal(1, gi ledger "typed")
+            Assert.Equal(0, gi ledger "degraded")
+            Assert.Equal(1, gi ledger "typedDifferentlyByAnotherProject")
+            Assert.Contains("resolved to DIFFERENT types", gs find "siteTypesNote")
+        }
+
+    [<Fact>]
+    member _.``#207 review: a single-project sweep carries no alternatives and no disagreement count``() : Task =
+        task {
+            // The control: the same query narrowed to ONE project must produce the row shape
+            // that shipped before the fix — no siteTypeAlternatives key at all.
+            let bridge = FcsBridge()
+            let projA = Path.Combine(Path.GetDirectoryName fx.Slnx, "ProjA", "ProjA.fsproj")
+
+            let! find =
+                bridge.Find(
+                    { findArgs projA "Parcel" with
+                        kind = Some "field"
+                        includeSiteTypes = Some true }
+                )
+
+            Assert.Equal("succeeded", gs find "status")
+            Assert.Equal(1, gi find "projectsAnalyzed")
+
+            let site = (find["sites"] :?> JsonArray)[0]
+            Assert.Equal("int", gs site "siteType")
+            Assert.False(site.AsObject().ContainsKey("siteTypeAlternatives"))
+            Assert.Equal(0, gi find["siteTypes"] "typedDifferentlyByAnotherProject")
+        }

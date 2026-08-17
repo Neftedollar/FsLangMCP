@@ -118,7 +118,11 @@ global index — this holds for `not_warmed` too, not just `warming`.
 `not_warmed` in particular can be a permanent, healthy state: the FSAC symbol
 index is only queried as a fallback when `find`'s own FCS sweep comes up
 empty, so a session where `find` keeps resolving normally may never warm the
-index at all. Only reach for `project_health` if a symbol-index-dependent
+index at all. The one thing a cold index does cost: that same zero-hit
+fallback. A `find` whose sweep found nothing cannot get the
+`via="fsac-symbol-index"` confirmation while the index is cold, so check
+`fsacFallbackState` / `fsacFallbackReason` in the `find` payload before
+reading its zero hits as proof the symbol does not exist. Only reach for `project_health` if a symbol-index-dependent
 call has actually failed or `readiness.lsp` itself isn't `true` — `not_warmed`
 by itself is not that signal.
 

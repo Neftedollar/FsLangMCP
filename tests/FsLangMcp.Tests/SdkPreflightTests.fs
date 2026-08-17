@@ -262,6 +262,38 @@ let ``a confirmed-absent SDK still rejects after the refresh`` () =
     finally
         Directory.Delete(root, true)
 
+[<Fact>]
+let ``the SDK list cache probes once, and again only after it is invalidated`` () =
+    // #192 review: the one-sided cache makes "SDK installed mid-session" self-healing
+    // and "SDK removed mid-session" invisible — the gate would keep passing from a list
+    // that was true when it was taken. set_project invalidates, so the removal is seen
+    // without restarting the host; every other path keeps paying the probe at most once.
+    let mutable probes = 0
+    let mutable installed = [ "10.0.400" ]
+
+    let cache =
+        SdkPreflight.SdkListCache(fun () ->
+            probes <- probes + 1
+            Some installed)
+
+    Assert.Equal<string list option>(Some [ "10.0.400" ], cache.Cached())
+    Assert.Equal<string list option>(Some [ "10.0.400" ], cache.Cached())
+    Assert.Equal(1, probes)
+
+    // The SDK is uninstalled while the host stays alive: the cache still answers stale.
+    installed <- [ "9.0.100" ]
+    Assert.Equal<string list option>(Some [ "10.0.400" ], cache.Cached())
+    Assert.Equal(1, probes)
+
+    cache.Invalidate()
+    Assert.Equal<string list option>(Some [ "9.0.100" ], cache.Cached())
+    Assert.Equal(2, probes)
+
+    // Refreshed() keeps probing unconditionally — the rejection path is never cached.
+    installed <- [ "10.0.400" ]
+    Assert.Equal<string list option>(Some [ "10.0.400" ], cache.Refreshed())
+    Assert.Equal(3, probes)
+
 // ─── SDK enumeration ──────────────────────────────────────────────────────────
 
 [<Fact>]

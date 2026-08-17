@@ -132,3 +132,56 @@ let ``rowFields round-trips every outcome the resolver can produce`` () =
         match siteTypeNode fields with
         | None -> Assert.Fail $"outcome status '{status}' produced no siteType key"
         | Some node -> Assert.Equal(isNull siteType, isNull node)
+
+// ── #207 review: one physical site, several projects ────────────────────────────
+//
+// find de-duplicates sites by physical location, so a `.fs` linked into more than one
+// `.fsproj` is swept once per project. Those projects can resolve the same field to
+// different types (different conditional symbols, a different generic instantiation).
+// The row used to be overwritten by whichever project the sweep visited last, and the
+// payload then claimed one type with nothing saying another had been seen.
+
+[<Fact>]
+let ``mergeAlternatives keeps a second project's different type instead of dropping it`` () =
+    Assert.Equal<string list>([ "string" ], FieldSiteTypes.mergeAlternatives "int" "string" [])
+
+[<Fact>]
+let ``mergeAlternatives ignores an identical answer, a degraded answer, and duplicates`` () =
+    // Same type from another project is agreement, not a conflict.
+    Assert.Empty(FieldSiteTypes.mergeAlternatives "int" "int" [])
+    // A project that could not type the site says nothing about the type that IS known.
+    Assert.Empty(FieldSiteTypes.mergeAlternatives "int" null [])
+    // Nor does an alternative already recorded by an earlier project.
+    Assert.Equal<string list>([ "string" ], FieldSiteTypes.mergeAlternatives "int" "string" [ "string" ])
+
+[<Fact>]
+let ``mergeAlternatives orders alternatives deterministically, whatever the sweep order`` () =
+    // Sweep order is project enumeration order; the payload must not depend on it.
+    let forward =
+        []
+        |> FieldSiteTypes.mergeAlternatives "int" "string"
+        |> FieldSiteTypes.mergeAlternatives "int" "bool"
+
+    let reverse =
+        []
+        |> FieldSiteTypes.mergeAlternatives "int" "bool"
+        |> FieldSiteTypes.mergeAlternatives "int" "string"
+
+    Assert.Equal<string list>([ "bool"; "string" ], forward)
+    Assert.Equal<string list>(forward, reverse)
+
+[<Fact>]
+let ``alternativesFields stays absent on the common single-project row`` () =
+    // The row shape for a normal sweep must be byte-identical to before the fix.
+    Assert.Empty(FieldSiteTypes.alternativesFields true [])
+    Assert.Empty(FieldSiteTypes.alternativesFields false [ "string" ])
+
+[<Fact>]
+let ``alternativesFields renders the other projects' types as a JSON array`` () =
+    let fields = FieldSiteTypes.alternativesFields true [ "bool"; "string" ]
+
+    Assert.Equal(1, List.length fields)
+    Assert.Equal("siteTypeAlternatives", fst fields[0])
+
+    let serialized = (FsLangMcp.Types.jobj fields).ToJsonString()
+    Assert.Equal("""{"siteTypeAlternatives":["bool","string"]}""", serialized)

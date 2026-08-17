@@ -251,23 +251,48 @@ let internal verdictFor (listInstalledSdks: unit -> string list option) (directo
 
 // The probe costs a child process, so the happy path pays for it at most once per
 // host process. ValueNone = never probed; ValueSome None = probed, undeterminable.
-let private sdkListGate = obj ()
-let mutable private cachedSdkList: string list option voption = ValueNone
+type internal SdkListCache(enumerate: unit -> string list option) =
+    let gate = obj ()
+    let mutable cached: string list option voption = ValueNone
 
-let private cachedInstalledSdks () =
-    lock sdkListGate (fun () ->
-        match cachedSdkList with
-        | ValueSome cached -> cached
-        | ValueNone ->
-            let fresh = enumerateInstalledSdks ()
-            cachedSdkList <- ValueSome fresh
+    /// Whatever the last probe found; probes once if it never has.
+    member _.Cached() =
+        lock gate (fun () ->
+            match cached with
+            | ValueSome value -> value
+            | ValueNone ->
+                let fresh = enumerate ()
+                cached <- ValueSome fresh
+                fresh)
+
+    /// Probe now and keep the answer.
+    member _.Refreshed() =
+        lock gate (fun () ->
+            let fresh = enumerate ()
+            cached <- ValueSome fresh
             fresh)
 
-let private refreshInstalledSdks () =
-    lock sdkListGate (fun () ->
-        let fresh = enumerateInstalledSdks ()
-        cachedSdkList <- ValueSome fresh
-        fresh)
+    /// Forget the answer so the next `Cached()` probes again.
+    member _.Invalidate() = lock gate (fun () -> cached <- ValueNone)
+
+let private sdkList = SdkListCache(enumerateInstalledSdks)
+
+let private cachedInstalledSdks () = sdkList.Cached()
+
+let private refreshInstalledSdks () = sdkList.Refreshed()
+
+/// Drop the cached SDK list so the next check re-probes.
+///
+/// The cache is asymmetric on purpose (see `checkWith`): it can let a project through
+/// but never reject one, so *installing* the missing SDK is noticed immediately. The
+/// reverse — an SDK REMOVED while the host stays alive — is not: the gate keeps
+/// passing from a list that was true when it was taken, and the caller is back to the
+/// opaque connection-loss error this module exists to replace (#192 review).
+///
+/// `set_project` is the session boundary where re-probing is affordable — one
+/// `dotnet --list-sdks` next to the FSAC restart and MSBuild workspace load it is
+/// about to pay for. The lazy per-project load paths keep using the cache.
+let internal invalidateCache () = sdkList.Invalidate()
 
 /// Cache-then-confirm: a cached list is enough to let a project through, but never
 /// enough to reject one. Someone who installs the missing SDK and retries would
