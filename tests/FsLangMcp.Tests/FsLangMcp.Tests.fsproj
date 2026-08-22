@@ -83,7 +83,7 @@
       <IncludeAssets>build; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="FsCheck.Xunit" Version="[3.3.4]" />
+    <PackageReference Include="FsCheck.Xunit" Version="[3.4.0]" />
     <PackageReference Include="Verify.Xunit" Version="[31.12.5]" />
   </ItemGroup>
 
