@@ -16,6 +16,7 @@ open System.Text.Json
 open System.Text.Json.Nodes
 open FsLangMcp.ProjectFiles
 open FsLangMcp.Cursor
+open FsLangMcp.MetadataAccessibility
 open Ionide.ProjInfo
 open Ionide.ProjInfo.Types
 
@@ -2333,6 +2334,7 @@ type internal FcsBridge
     let projectEvaluationAdmission = ProjectEvaluationAdmission(1)
 
     let mutable projectOptionsLoadCount = 0L
+    let mutable projectOptionsStaleReloadCount = 0L
     let mutable projectOptionsCacheValidationCount = 0L
     let mutable projectTypeCheckStartCount = 0L
     let mutable freshProjectCheckInvalidationCount = 0L
@@ -2551,6 +2553,27 @@ type internal FcsBridge
         typ.BasicQualifiedName
         |> Option.defaultWith (fun () -> typ.Format(FSharpDisplayContext.Empty))
 
+    /// FSharpAccessibility's predicates overlap for imported IL. In particular,
+    /// an assembly-internal member can also satisfy IsPrivate, so testing private
+    /// first turns `internal` into a lie. Preserve the externally meaningful CLR
+    /// combinations before falling back to the narrower predicates (#223).
+    let fsharpAccessibilityString (accessibility: FSharpAccessibility) : string =
+        try
+            let isPublic = accessibility.IsPublic
+            let isProtected = accessibility.IsProtected
+            let isInternal = accessibility.IsInternal
+            let isPrivate = accessibility.IsPrivate
+
+            if isPublic then "public"
+            elif isProtected && isInternal then "protected internal"
+            elif isProtected && isPrivate then "private protected"
+            elif isProtected then "protected"
+            elif isInternal then "internal"
+            elif isPrivate then "private"
+            else "unknown"
+        with _ ->
+            "unknown"
+
     let shortenFSharpTypeNames (formatted: string) =
         fsharpTypeNameRegex.Replace(
             formatted,
@@ -2595,12 +2618,7 @@ type internal FcsBridge
 
     let accessibilityString (symbol: FSharpSymbol) : string =
         try
-            let acc = symbol.Accessibility
-
-            if acc.IsPrivate then "private"
-            elif acc.IsInternal then "internal"
-            elif acc.IsPublic then "public"
-            else "unknown"
+            fsharpAccessibilityString symbol.Accessibility
         with _ ->
             // FCS can throw on synthetic symbols; treat as unknown rather than crash.
             "unknown"
@@ -2763,12 +2781,7 @@ type internal FcsBridge
 
     let entityAccessibilityString (entity: FSharpEntity) : string =
         try
-            let acc = entity.Accessibility
-
-            if acc.IsPrivate then "private"
-            elif acc.IsInternal then "internal"
-            elif acc.IsPublic then "public"
-            else "unknown"
+            fsharpAccessibilityString entity.Accessibility
         with _ ->
             "unknown"
 
@@ -2812,12 +2825,7 @@ type internal FcsBridge
 
     let memberAccessibilityString (m: FSharpMemberOrFunctionOrValue) : string =
         try
-            let acc = m.Accessibility
-
-            if acc.IsPrivate then "private"
-            elif acc.IsInternal then "internal"
-            elif acc.IsPublic then "public"
-            else "unknown"
+            fsharpAccessibilityString m.Accessibility
         with _ ->
             "unknown"
 
@@ -2835,6 +2843,95 @@ type internal FcsBridge
                     false)
         with _ ->
             false
+
+    let genericParameterName (parameter: FSharpGenericParameter) =
+        try
+            parameter.Name.TrimStart('\'', '^')
+        with _ ->
+            "T"
+
+    let genericParameterConstraintsWith
+        (formatType: FSharpType -> string)
+        (parameter: FSharpGenericParameter)
+        : string array =
+        try
+            let constraints = parameter.Constraints |> Seq.toArray
+
+            let has predicate =
+                constraints
+                |> Array.exists (fun genericConstraint ->
+                    try predicate genericConstraint with _ -> false)
+
+            let isUnmanaged = has (fun genericConstraint -> genericConstraint.IsUnmanagedConstraint)
+            let isStruct = has (fun genericConstraint -> genericConstraint.IsNonNullableValueTypeConstraint)
+            let isClass = has (fun genericConstraint -> genericConstraint.IsReferenceTypeConstraint)
+
+            [| if isUnmanaged then
+                   yield "unmanaged"
+               elif isStruct then
+                   yield "struct"
+               elif isClass then
+                   yield "class"
+
+               if not isUnmanaged && not isStruct && not isClass then
+                   if has (fun genericConstraint -> genericConstraint.IsNotSupportsNullConstraint) then
+                       yield "notnull"
+                   elif has (fun genericConstraint -> genericConstraint.IsSupportsNullConstraint) then
+                       yield "null"
+
+               for genericConstraint in constraints do
+                   try
+                       if genericConstraint.IsCoercesToConstraint then
+                           yield formatType genericConstraint.CoercesToTarget
+                       elif genericConstraint.IsEnumConstraint then
+                           yield $"enum<{formatType genericConstraint.EnumConstraintTarget}>"
+                       elif genericConstraint.IsDelegateConstraint then
+                           let delegateData = genericConstraint.DelegateConstraintData
+
+                           yield
+                               $"delegate<{formatType delegateData.DelegateTupledArgumentType}, {formatType delegateData.DelegateReturnType}>"
+                       elif genericConstraint.IsSimpleChoiceConstraint then
+                           let choices =
+                               genericConstraint.SimpleChoices
+                               |> Seq.map formatType
+                               |> String.concat " | "
+
+                           if not (String.IsNullOrWhiteSpace choices) then
+                               yield $"choice<{choices}>"
+                   with _ ->
+                       ()
+
+               if has (fun genericConstraint -> genericConstraint.IsEqualityConstraint) then
+                   yield "equality"
+
+               if has (fun genericConstraint -> genericConstraint.IsComparisonConstraint) then
+                   yield "comparison"
+
+               if has (fun genericConstraint -> genericConstraint.IsRequiresDefaultConstructorConstraint) then
+                   yield "new()"
+
+               if has (fun genericConstraint -> genericConstraint.IsAllowsRefStructConstraint) then
+                   yield "allows ref struct" |]
+            |> Array.distinct
+        with _ ->
+            [||]
+
+    let memberGenericParametersWith
+        (formatType: FSharpType -> string)
+        (m: FSharpMemberOrFunctionOrValue)
+        =
+        try
+            m.GenericParameters
+            |> Seq.map (fun parameter ->
+                let constraints = genericParameterConstraintsWith formatType parameter
+
+                jobj
+                    [ "name", jstr (genericParameterName parameter)
+                      "constraints", JsonArray(constraints |> Array.map jstr) :> JsonNode ]
+                :> JsonNode)
+            |> Seq.toArray
+        with _ ->
+            [||]
 
     let memberSignatureWith (formatType: FSharpType -> string) (m: FSharpMemberOrFunctionOrValue) : string =
         try
@@ -2855,7 +2952,25 @@ type internal FcsBridge
                 with _ ->
                     "?"
 
-            $"{m.DisplayName}({paramStr}) -> {returnType}"
+            let constraintsSuffix =
+                try
+                    m.GenericParameters
+                    |> Seq.choose (fun parameter ->
+                        let constraints = genericParameterConstraintsWith formatType parameter
+
+                        if constraints.Length = 0 then
+                            None
+                        else
+                            let renderedConstraints = String.concat ", " constraints
+                            Some $"where {genericParameterName parameter} : {renderedConstraints}")
+                    |> String.concat " "
+                    |> function
+                        | "" -> ""
+                        | constraints -> $" {constraints}"
+                with _ ->
+                    ""
+
+            $"{m.DisplayName}({paramStr}) -> {returnType}{constraintsSuffix}"
         with _ ->
             try
                 m.DisplayName
@@ -2895,27 +3010,35 @@ type internal FcsBridge
         with _ ->
             null
 
-    let referencedMemberToJson (m: FSharpMemberOrFunctionOrValue) : JsonNode =
+    let referencedMemberToJson
+        (metadata: MemberMetadata option)
+        (m: FSharpMemberOrFunctionOrValue)
+        : JsonNode =
         let xmlDocNode : JsonNode =
             try tryExtractXmlSummary m.XmlDoc with _ -> null
+
+        let genericParameters = memberGenericParametersWith typeName m
+
+        let isAbstract =
+            metadata
+            |> Option.map _.IsAbstract
+            |> Option.defaultWith (fun () -> try m.IsDispatchSlot with _ -> false)
 
         jobj
             [ "name", jstr (try m.DisplayName with _ -> "<unknown>")
               "kind", jstr (memberKindString m)
               "signature", jstr (memberSignature m)
-              "accessibility", jstr (memberAccessibilityString m)
+              "accessibility",
+              jstr (metadata |> Option.map _.Accessibility |> Option.defaultWith (fun () -> memberAccessibilityString m))
+              "isAbstract", jbool isAbstract
+              "genericParameters", JsonArray(genericParameters) :> JsonNode
               "isObsolete", jbool (isObsoleteMember m)
               "xmlDocSummary", xmlDocNode ]
         :> JsonNode
 
     let fieldAccessibilityString (f: FSharpField) : string =
         try
-            let acc = f.Accessibility
-
-            if acc.IsPrivate then "private"
-            elif acc.IsInternal then "internal"
-            elif acc.IsPublic then "public"
-            else "unknown"
+            fsharpAccessibilityString f.Accessibility
         with _ ->
             "unknown"
 
@@ -2967,12 +3090,7 @@ type internal FcsBridge
 
         let accessibility =
             try
-                let acc = uc.Accessibility
-
-                if acc.IsPrivate then "private"
-                elif acc.IsInternal then "internal"
-                elif acc.IsPublic then "public"
-                else "unknown"
+                fsharpAccessibilityString uc.Accessibility
             with _ ->
                 "unknown"
 
@@ -3010,6 +3128,52 @@ type internal FcsBridge
         || String.IsNullOrWhiteSpace(symbolUse.Symbol.FullName)
         || String.Equals(kind, "FSharpMemberOrFunctionOrValue", StringComparison.Ordinal)
         || String.Equals(kind, "field", StringComparison.Ordinal)
+
+    let attributesOfSymbol (symbol: FSharpSymbol) : FSharpAttribute array =
+        try
+            match symbol with
+            | :? FSharpEntity as entity -> entity.Attributes |> Seq.toArray
+            | :? FSharpMemberOrFunctionOrValue as memberOrValue ->
+                memberOrValue.Attributes |> Seq.toArray
+            | :? FSharpField as field -> field.Attributes |> Seq.toArray
+            | :? FSharpUnionCase as unionCase -> unionCase.Attributes |> Seq.toArray
+            | _ -> [||]
+        with _ ->
+            [||]
+
+    let attributeFullName (attribute: FSharpAttribute) =
+        try
+            let fullName = attribute.AttributeType.FullName
+
+            if String.IsNullOrWhiteSpace fullName then
+                attribute.AttributeType.DisplayName
+            else
+                fullName
+        with _ ->
+            "<unresolved-attribute>"
+
+    let attributesToJson (attributes: FSharpAttribute array) : JsonNode =
+        attributes
+        |> Array.map (attributeFullName >> jstr)
+        |> JsonArray
+        :> JsonNode
+
+    let isCustomOperationAttribute (attribute: FSharpAttribute) =
+        let fullName = attributeFullName attribute
+
+        String.Equals(fullName, "Microsoft.FSharp.Core.CustomOperationAttribute", StringComparison.Ordinal)
+        || String.Equals(fullName, "CustomOperationAttribute", StringComparison.Ordinal)
+
+    let customOperationName (attribute: FSharpAttribute) =
+        try
+            attribute.ConstructorArguments
+            |> Seq.tryPick (fun (_, value) ->
+                match value with
+                | :? string as operationName when not (String.IsNullOrWhiteSpace operationName) ->
+                    Some operationName
+                | _ -> None)
+        with _ ->
+            None
 
     let sourceLines (source: string) =
         source.Split('\n') |> Array.map (fun line -> line.TrimEnd('\r'))
@@ -3701,6 +3865,36 @@ type internal FcsBridge
     // comment below applies to its own (already-shipped-measured) budget.
     let responseCharBudget = 45_000
 
+    // FileOutline has several independently variable arrays (entries, custom operations,
+    // parse diagnostics, and check diagnostics). `responseCharBudget` is the conservative
+    // allocation for their standalone nodes; this second ceiling is checked against the
+    // fully assembled JSON using the exact serializer used on the wire. The exact guard
+    // closes the remaining indentation/envelope gap and makes diagnostic-heavy malformed
+    // files safe too (#216 follow-up review).
+    let outlineShippedResponseCharBudget = 60_000
+
+    let takeWithinRenderedBudget
+        (budget: int)
+        (alreadyUsed: int)
+        (nodes: JsonNode array)
+        : JsonNode array * int * bool =
+        let accepted = ResizeArray<JsonNode>()
+        let mutable renderedCharsUsed = alreadyUsed
+        let mutable index = 0
+        let mutable truncated = false
+
+        while index < nodes.Length && not truncated do
+            let nodeChars = renderedLength nodes[index]
+
+            if renderedCharsUsed + nodeChars > budget then
+                truncated <- true
+            else
+                accepted.Add(nodes[index])
+                renderedCharsUsed <- renderedCharsUsed + nodeChars
+                index <- index + 1
+
+        accepted.ToArray(), renderedCharsUsed, truncated
+
     member private _.LoadProjectOptionsFromFsproj
         (fsprojPath: string)
         : Task<(FSharpProjectOptions * ProjectOptionsFingerprint * EvaluatedProjectSnapshot) option> =
@@ -3721,6 +3915,7 @@ type internal FcsBridge
                     // it is a machine-configuration problem the agent must be told
                     // about by name. Raising here also keeps MSBuild untouched.
                     SdkPreflight.ensure [ projectDir ]
+                    InstallationHealth.ensureCurrent ()
 
                     try
                         let toolsPath = Init.init (DirectoryInfo(projectDir)) None
@@ -3790,6 +3985,17 @@ type internal FcsBridge
                                                                 if projectOptionsCacheEntryIsCurrent entry then
                                                                     Some entry
                                                                 else
+                                                                    // A precise reload signal: this key had a
+                                                                    // cached ProjInfo result, its full input
+                                                                    // fingerprint changed, and the single-flight
+                                                                    // owner will evaluate it again below. Cold
+                                                                    // first loads and bounded-cache evictions are
+                                                                    // deliberately not mislabeled as reloads.
+                                                                    Interlocked.Increment(
+                                                                        &projectOptionsStaleReloadCount
+                                                                    )
+                                                                    |> ignore
+
                                                                     None
                                                             | None -> None)
 
@@ -4299,16 +4505,62 @@ type internal FcsBridge
 
             match checkedResults with
             | None ->
-                return
+                let parseDiagnosticsAll =
+                    parseResults.Diagnostics |> Array.map diagnosticToJson
+
+                let parseDiagnostics, _, parseDiagnosticsTruncatedByBudget =
+                    takeWithinRenderedBudget responseCharBudget 0 parseDiagnosticsAll
+
+                let parseDiagnosticsArray = JsonArray(parseDiagnostics)
+
+                let response =
                     jobj
                         [ "status", jstr "aborted"
                           "file", jstr path
                           "optionsSource", jstr optionsSource
                           "parseHadErrors", jbool parseResults.ParseHadErrors
                           "message", jstr "Type checking was aborted. Outline is unavailable."
-                          "parseDiagnostics",
-                          JsonArray(parseResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ]
-                    :> JsonNode
+                          "parseDiagnosticCount", jint parseDiagnosticsAll.Length
+                          "parseDiagnostics", parseDiagnosticsArray :> JsonNode
+                          "parseDiagnosticsTruncated", jbool parseDiagnosticsTruncatedByBudget
+                          "responseTruncatedByBudget", jbool parseDiagnosticsTruncatedByBudget
+                          "responseBudgetChars", jint outlineShippedResponseCharBudget
+                          "responseSizeHint", null ]
+
+                let updateAbortedBudgetMetadata () =
+                    let truncated = parseDiagnosticsArray.Count < parseDiagnosticsAll.Length
+                    response["parseDiagnosticsTruncated"] <- jbool truncated
+                    response["responseTruncatedByBudget"] <- jbool truncated
+
+                    response["responseSizeHint"] <-
+                        if truncated then
+                            jstr
+                                $"Returned %d{parseDiagnosticsArray.Count} of %d{parseDiagnosticsAll.Length} parse diagnostics to keep the complete response within %d{outlineShippedResponseCharBudget} serialized characters. Use check(scope=\"file\") for a diagnostic-focused result."
+                        else
+                            null
+
+                updateAbortedBudgetMetadata ()
+
+                while
+                    renderedLength response > outlineShippedResponseCharBudget
+                    && parseDiagnosticsArray.Count > 0
+                    do
+                    parseDiagnosticsArray.RemoveAt(parseDiagnosticsArray.Count - 1)
+                    updateAbortedBudgetMetadata ()
+
+                if renderedLength response > outlineShippedResponseCharBudget then
+                    return
+                        jobj
+                            [ "status", jstr "aborted"
+                              "errorCode", jstr "outline_response_budget_exceeded"
+                              "message",
+                              jstr
+                                  "The fixed outline response metadata exceeded its serialized-size ceiling after all variable arrays were removed."
+                              "responseTruncatedByBudget", jbool true
+                              "responseBudgetChars", jint outlineShippedResponseCharBudget ]
+                        :> JsonNode
+                else
+                    return response :> JsonNode
             | Some checkResults ->
                 let includeLocal = args.includeLocal |> Option.defaultValue false
                 let includePrivate = args.includePrivate |> Option.defaultValue true
@@ -4353,20 +4605,47 @@ type internal FcsBridge
                     allUses
                     |> Array.truncate maxResults
                     |> Array.map (fun symbolUse ->
+                        let attributes = attributesOfSymbol symbolUse.Symbol
+
                         jobj
                             [ "name", jstr symbolUse.Symbol.DisplayName
                               "fullName", jstrOrNull symbolUse.Symbol.FullName
                               "kind", jstr (symbolKind symbolUse.Symbol)
                               "accessibility", symbolAccessibility symbolUse.Symbol
+                              "attributes", attributesToJson attributes
                               "range", rangeToJson symbolUse.Range
                               "signature", jstr (symbolTypeString symbolUse.Symbol)
                               "declarationRange", tryDeclarationRange symbolUse.Symbol ]
                         :> JsonNode)
 
+                // Computation-expression operation names live in
+                // CustomOperationAttribute constructor arguments and are not implied by
+                // the CLR/F# member name. Keep this compact index in BOTH summary modes,
+                // so agents can answer "which operations does this builder declare?"
+                // without requesting every signature from a large file.
+                let customOperationsAll =
+                    allUses
+                    |> Array.choose (fun symbolUse ->
+                        let customOperation =
+                            attributesOfSymbol symbolUse.Symbol
+                            |> Array.tryFind isCustomOperationAttribute
+
+                        customOperation
+                        |> Option.map (fun attribute ->
+                            jobj
+                                [ "operationName",
+                                  customOperationName attribute
+                                  |> Option.map jstr
+                                  |> Option.defaultValue null
+                                  "memberName", jstr symbolUse.Symbol.DisplayName
+                                  "fullName", jstrOrNull symbolUse.Symbol.FullName
+                                  "range", rangeToJson symbolUse.Range ]
+                            :> JsonNode))
+
                 let containerKinds =
                     [| "module"; "record"; "union"; "class"; "interface"; "enum"; "delegate"; "namespace" |]
 
-                let headersOf (fullEntries: JsonNode array) : JsonNode =
+                let headersOf (fullEntries: JsonNode array) : JsonNode array =
                     fullEntries
                     |> Array.filter (fun e ->
                         match e["kind"] with
@@ -4380,12 +4659,21 @@ type internal FcsBridge
                               (match e["fullName"] with
                                | null -> null
                                | fn -> fn.DeepClone())
+                              "attributes", e["attributes"].DeepClone()
                               "range",
                               (match e["range"] with
                                | null -> null
                                | r -> r.DeepClone()) ]
                         :> JsonNode)
-                    |> fun headers -> JsonArray(headers) :> JsonNode
+                let headerEntries = headersOf entries
+
+                // The compact index is derived from the full symbol set so its total is
+                // truthful, but the surfaced rows obey BOTH maxResults and the same
+                // rendered-size budget as outline entries. Without this bound, a file
+                // with hundreds of CustomOperation attributes could make summary mode
+                // larger than the full outline guard was designed to permit.
+                let requestedCustomOperations =
+                    customOperationsAll |> Array.truncate maxResults
 
                 // #206: summaryOnly=false asked for full per-member signatures, but a
                 // large file's full outline can still cross the shared response-char
@@ -4401,18 +4689,54 @@ type internal FcsBridge
                 // `responseCharBudget`'s comment describes, and it stops serializing
                 // further entries the moment the budget is already crossed rather than
                 // summing every one of `entries` (up to `maxResults`) regardless.
-                let overBudget = not summaryOnly && isOverRenderedBudget responseCharBudget entries
+                let overBudget =
+                    not summaryOnly
+                    && isOverRenderedBudget
+                        responseCharBudget
+                        (Seq.append entries requestedCustomOperations)
 
                 let downgradedToSummary = overBudget
 
                 // summaryOnly (default) OR a budget downgrade: module/type headers with
                 // name/kind/fullName/range only (no per-member signatures). Otherwise the
                 // full per-member output requested.
-                let outEntries: JsonNode =
-                    if summaryOnly || downgradedToSummary then
-                        headersOf entries
-                    else
-                        JsonArray(entries) :> JsonNode
+                let surfacedEntryNodesAll =
+                    if summaryOnly || downgradedToSummary then headerEntries else entries
+
+                // Allocate one shared node budget across every variable-size array.
+                // Diagnostics used to sit outside this accounting, so a malformed file
+                // with thousands of errors could exceed one megabyte even in summary mode.
+                let surfacedEntryNodes, renderedAfterEntries, entriesTruncatedByBudget =
+                    takeWithinRenderedBudget responseCharBudget 0 surfacedEntryNodesAll
+
+                let customOperations, renderedAfterOperations, customOperationsTruncatedByBudgetInitial =
+                    takeWithinRenderedBudget responseCharBudget renderedAfterEntries requestedCustomOperations
+
+                let parseDiagnosticsAll =
+                    parseResults.Diagnostics |> Array.map diagnosticToJson
+
+                let parseDiagnostics, renderedAfterParseDiagnostics, parseDiagnosticsTruncatedByBudgetInitial =
+                    takeWithinRenderedBudget responseCharBudget renderedAfterOperations parseDiagnosticsAll
+
+                let checkDiagnosticsAll =
+                    checkResults.Diagnostics |> Array.map diagnosticToJson
+
+                let checkDiagnostics, _, checkDiagnosticsTruncatedByBudgetInitial =
+                    takeWithinRenderedBudget responseCharBudget renderedAfterParseDiagnostics checkDiagnosticsAll
+
+                let outEntriesArray = JsonArray(surfacedEntryNodes)
+                let customOperationsArray = JsonArray(customOperations)
+                let parseDiagnosticsArray = JsonArray(parseDiagnostics)
+                let checkDiagnosticsArray = JsonArray(checkDiagnostics)
+
+                let mutable customOperationsTruncatedByBudget =
+                    customOperationsTruncatedByBudgetInitial
+
+                let mutable parseDiagnosticsTruncatedByBudget =
+                    parseDiagnosticsTruncatedByBudgetInitial
+
+                let mutable checkDiagnosticsTruncatedByBudget =
+                    checkDiagnosticsTruncatedByBudgetInitial
 
                 // Additive-only (#206): present exactly when the requested summaryOnly=false
                 // was downgraded to headers because the full outline exceeded the budget —
@@ -4421,13 +4745,13 @@ type internal FcsBridge
                 let downgradeFields =
                     if downgradedToSummary then
                         let hint =
-                            $"Full outline for this file exceeds the ~%d{responseCharBudget}-char response budget; returning summary-level headers (name/kind/fullName/range, no signatures) instead. Narrow with a smaller maxResults (currently %d{maxResults}) so the full per-member signatures for that slice fit within budget."
+                            $"Full outline for this file exceeds the ~%d{responseCharBudget}-char response budget; returning summary-level headers (name/kind/fullName/attributes/range, no signatures) instead. Narrow with a smaller maxResults (currently %d{maxResults}) so the full per-member signatures for that slice fit within budget."
 
                         [ "downgradedToSummary", jbool true; "hint", jstr hint ]
                     else
                         []
 
-                return
+                let response =
                     jobj
                         ([ "status", jstr "succeeded"
                            "file", jstr path
@@ -4436,14 +4760,114 @@ type internal FcsBridge
                            "includeLocal", jbool includeLocal
                            "summaryOnly", jbool summaryOnly
                            "count", jint entries.Length
+                           "returnedEntryCount", jint outEntriesArray.Count
+                           "entriesTruncatedByBudget", jbool entriesTruncatedByBudget
                            "memberCounts", memberCounts
-                           "entries", outEntries ]
+                           "entries", outEntriesArray :> JsonNode
+                           "customOperationCount", jint customOperationsAll.Length
+                           "customOperations", customOperationsArray :> JsonNode
+                           "customOperationsTruncated", jbool false
+                           "customOperationsTruncatedByBudget", jbool false
+                           "customOperationsHint", null ]
                          @ downgradeFields
-                         @ [ "parseDiagnostics",
-                             JsonArray(parseResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode
-                             "checkDiagnostics",
-                             JsonArray(checkResults.Diagnostics |> Array.map diagnosticToJson) :> JsonNode ])
-                    :> JsonNode
+                         @ [ "parseDiagnosticCount", jint parseDiagnosticsAll.Length
+                             "parseDiagnostics", parseDiagnosticsArray :> JsonNode
+                             "parseDiagnosticsTruncated", jbool false
+                             "checkDiagnosticCount", jint checkDiagnosticsAll.Length
+                             "checkDiagnostics", checkDiagnosticsArray :> JsonNode
+                             "checkDiagnosticsTruncated", jbool false
+                             "diagnosticsHint", null
+                             "responseTruncatedByBudget", jbool false
+                             "responseBudgetChars", jint outlineShippedResponseCharBudget
+                             "responseSizeHint", null ])
+
+                let updateBudgetMetadata () =
+                    let entriesWereTruncated = outEntriesArray.Count < surfacedEntryNodesAll.Length
+                    let customOperationsTruncated = customOperationsArray.Count < customOperationsAll.Length
+                    let parseDiagnosticsTruncated = parseDiagnosticsArray.Count < parseDiagnosticsAll.Length
+                    let checkDiagnosticsTruncated = checkDiagnosticsArray.Count < checkDiagnosticsAll.Length
+
+                    response["returnedEntryCount"] <- jint outEntriesArray.Count
+                    response["entriesTruncatedByBudget"] <- jbool entriesWereTruncated
+                    response["customOperationsTruncated"] <- jbool customOperationsTruncated
+                    response["customOperationsTruncatedByBudget"] <- jbool customOperationsTruncatedByBudget
+                    response["parseDiagnosticsTruncated"] <- jbool parseDiagnosticsTruncated
+                    response["checkDiagnosticsTruncated"] <- jbool checkDiagnosticsTruncated
+
+                    response["customOperationsHint"] <-
+                        if customOperationsTruncated then
+                            jstr
+                                $"Returned %d{customOperationsArray.Count} of %d{customOperationsAll.Length} CustomOperation rows, bounded by maxResults=%d{maxResults} and the shared outline response budget."
+                        else
+                            null
+
+                    response["diagnosticsHint"] <-
+                        if parseDiagnosticsTruncated || checkDiagnosticsTruncated then
+                            jstr
+                                $"Returned %d{parseDiagnosticsArray.Count} of %d{parseDiagnosticsAll.Length} parse diagnostics and %d{checkDiagnosticsArray.Count} of %d{checkDiagnosticsAll.Length} check diagnostics. Use check(scope=\"file\") for a diagnostic-focused result."
+                        else
+                            null
+
+                    let responseTruncated =
+                        entriesWereTruncated
+                        || customOperationsTruncatedByBudget
+                        || parseDiagnosticsTruncatedByBudget
+                        || checkDiagnosticsTruncatedByBudget
+
+                    response["responseTruncatedByBudget"] <- jbool responseTruncated
+
+                    response["responseSizeHint"] <-
+                        if responseTruncated then
+                            jstr
+                                $"Variable-size outline arrays were truncated to keep the complete serialized response within %d{outlineShippedResponseCharBudget} characters. Full counts remain available in memberCounts, customOperationCount, parseDiagnosticCount, and checkDiagnosticCount."
+                        else
+                            null
+
+                updateBudgetMetadata ()
+
+                // The conservative per-node budget above avoids almost all retries. This
+                // exact final check measures the assembled root with its real indentation
+                // and metadata. Trim diagnostics first, then the auxiliary operation index,
+                // and only then structural entries. An impossible fixed-envelope overflow
+                // is still bounded by the compact typed fallback below.
+                let tryTrimOneArrayItem () =
+                    if checkDiagnosticsArray.Count > 0 then
+                        checkDiagnosticsArray.RemoveAt(checkDiagnosticsArray.Count - 1)
+                        checkDiagnosticsTruncatedByBudget <- true
+                        true
+                    elif parseDiagnosticsArray.Count > 0 then
+                        parseDiagnosticsArray.RemoveAt(parseDiagnosticsArray.Count - 1)
+                        parseDiagnosticsTruncatedByBudget <- true
+                        true
+                    elif customOperationsArray.Count > 0 then
+                        customOperationsArray.RemoveAt(customOperationsArray.Count - 1)
+                        customOperationsTruncatedByBudget <- true
+                        true
+                    elif outEntriesArray.Count > 0 then
+                        outEntriesArray.RemoveAt(outEntriesArray.Count - 1)
+                        true
+                    else
+                        false
+
+                let mutable canTrim = true
+
+                while renderedLength response > outlineShippedResponseCharBudget && canTrim do
+                    canTrim <- tryTrimOneArrayItem ()
+                    updateBudgetMetadata ()
+
+                if renderedLength response > outlineShippedResponseCharBudget then
+                    return
+                        jobj
+                            [ "status", jstr "aborted"
+                              "errorCode", jstr "outline_response_budget_exceeded"
+                              "message",
+                              jstr
+                                  "The fixed outline response metadata exceeded its serialized-size ceiling after all variable arrays were removed."
+                              "responseTruncatedByBudget", jbool true
+                              "responseBudgetChars", jint outlineShippedResponseCharBudget ]
+                        :> JsonNode
+                else
+                    return response :> JsonNode
         }
 
     member this.ProjectSymbolUses(args: FcsProjectSymbolUsesArgs) : Task<JsonNode> =
@@ -5617,10 +6041,29 @@ type internal FcsBridge
                             | Some mn -> String.Equals(m.DisplayName, mn, StringComparison.Ordinal)
                             | None -> true
 
-                        nameOk
-                        && (match m.DeclaringEntity with
+                        let memberMatchesQuery =
+                            if exact then
+                                String.Equals(m.DisplayName, query, StringComparison.Ordinal)
+                                || fullNameBoundaryMatch m.FullName
+                            else
+                                (not (isNull m.DisplayName)
+                                 && m.DisplayName.Contains(query, StringComparison.OrdinalIgnoreCase))
+                                || (not (isNull m.FullName)
+                                    && m.FullName.Contains(query, StringComparison.OrdinalIgnoreCase))
+
+                        let declaringEntityMatchesQuery =
+                            match m.DeclaringEntity with
                             | Some e -> entityMatchesQuery e
-                            | None -> false)
+                            | None -> false
+
+                        // `query` is documented as a symbol, TYPE, or MEMBER name.
+                        // Keep the original type-qualified form
+                        //   query="GrainContract", member="Resolve"
+                        // and also accept the documented member-name form
+                        //   query="Resolve", member="Resolve".
+                        // The previous entity-only predicate made the latter return
+                        // not_found even though FCS supplied all internal-member uses.
+                        nameOk && (memberMatchesQuery || declaringEntityMatchesQuery)
                     with _ ->
                         false
                 | _ -> false
@@ -7318,6 +7761,22 @@ type internal FcsBridge
                   FailureReason = Some reason
                   FileGlob = if resolvedScope = "workspace" then args.fileGlob else None }
 
+            // A project verdict is intentionally narrow: FCS checks the selected
+            // project, not projects that reference it. Make that coverage boundary
+            // impossible to mistake for a workspace-wide clean result. Do not discover
+            // or evaluate downstream projects here: doing so would make the cheap,
+            // bounded project path perform another ProjInfo/MSBuild sweep and would
+            // compound the retained-node problem tracked in #150.
+            let narrowCoverageFields =
+                if resolvedScope = "project" then
+                    [ "downstreamProjectsChecked", jbool false
+                      "coverageNote",
+                      jstr
+                          "Only the selected project was analyzed. Projects that reference it (for example apps or test projects) were not checked; use scope=\"workspace\" with a solution or directory projectPath to cover downstream consumers."
+                      "recommendedScope", jstr "workspace" ]
+                else
+                    []
+
             // Single response builder — keeps the actionable header (verdict/analyzed/
             // counts) identical across every scope and speed, then folds in the legacy
             // superset + per-scope extras so migrating callers lose nothing.
@@ -7389,6 +7848,7 @@ type internal FcsBridge
                       "belowSeverityFloorCount", jint belowSeverityFloorCount
                       "diagnosticsNote", diagnosticsNote
                       "reason", (match reason with Some r -> jstr r | None -> null) ]
+                    @ narrowCoverageFields
                     @ extra
                 )
                 :> JsonNode
@@ -8076,6 +8536,10 @@ type internal FcsBridge
                     return
                         invalid
                             "check needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first."
+                | Some target when target.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) ->
+                    return
+                        invalid
+                            "scope=\"workspace\" requires projectPath to be a solution (.sln/.slnx) or directory. A single .fsproj cannot prove that downstream consumers are clean; use scope=\"project\" for that project or pass the containing solution/directory."
                 | Some target ->
                     let! boundedProjects =
                         awaitWithinOverallBudget (fun () ->
@@ -9499,19 +9963,155 @@ type internal FcsBridge
                 }
                 |> Seq.toList
 
+            // FCS reports imported F# `internal` members as private and models CLR
+            // `protected internal` through F# source visibility as protected. Read the
+            // assembly's ECMA-335 method flags for an exact answer when metadata is
+            // available, without loading or executing the target assembly (#223).
+            let referencePathByAssemblyName =
+                let projectDirectory = Path.GetDirectoryName(options.ProjectFileName)
+
+                let tryOptionReferencePath (optionText: string) =
+                    let rawPath =
+                        if optionText.StartsWith("-r:", StringComparison.Ordinal) then
+                            Some(optionText.Substring 3)
+                        elif optionText.StartsWith("--reference:", StringComparison.Ordinal) then
+                            Some(optionText.Substring 12)
+                        else
+                            None
+
+                    rawPath
+                    |> Option.bind (fun path ->
+                        try
+                            let candidate = path.Trim().Trim('"')
+
+                            if Path.IsPathFullyQualified candidate then
+                                Some(Path.GetFullPath candidate)
+                            else
+                                Some(Path.GetFullPath(Path.Combine(projectDirectory, candidate)))
+                        with _ ->
+                            None)
+
+                let binaryReferences =
+                    options.OtherOptions
+                    |> Array.choose tryOptionReferencePath
+
+                let projectReferences =
+                    options.ReferencedProjects
+                    |> Array.choose (fun referencedProject ->
+                        try
+                            let path = referencedProject.OutputFile
+                            if String.IsNullOrWhiteSpace path then None else Some path
+                        with _ ->
+                            None)
+
+                Array.append binaryReferences projectReferences
+                |> Array.map (fun path ->
+                    if Path.IsPathFullyQualified path then
+                        Path.GetFullPath path
+                    else
+                        Path.GetFullPath(Path.Combine(projectDirectory, path)))
+                |> Array.filter File.Exists
+                |> Array.choose (fun path ->
+                    let simpleName = Path.GetFileNameWithoutExtension path
+
+                    if String.IsNullOrWhiteSpace simpleName then
+                        None
+                    else
+                        Some(simpleName, path))
+                |> Map.ofArray
+
+            let metadataResolvers =
+                System.Collections.Generic.Dictionary<
+                    string,
+                    (string -> string -> MemberMetadata option) option
+                 >(
+                    if OperatingSystem.IsWindows() then
+                        StringComparer.OrdinalIgnoreCase
+                    else
+                        StringComparer.Ordinal
+                )
+
+            let exactMemberMetadata (m: FSharpMemberOrFunctionOrValue) =
+                try
+                    let assemblyPath =
+                        match m.Assembly.FileName with
+                        | Some path when File.Exists path -> Some path
+                        | _ ->
+                            let simpleName =
+                                try m.Assembly.SimpleName with _ -> ""
+
+                            referencePathByAssemblyName
+                            |> Map.tryFind simpleName
+
+                    match assemblyPath with
+                    | None -> None
+                    | Some assemblyPath ->
+                        let declaringTypeNames =
+                            [ try
+                                  match m.DeclaringEntity with
+                                  | Some entity when not (String.IsNullOrWhiteSpace entity.FullName) ->
+                                      yield entity.FullName
+                                  | _ -> ()
+                              with _ ->
+                                  ()
+
+                              try
+                                  match m.ApparentEnclosingEntity with
+                                  | Some entity when not (String.IsNullOrWhiteSpace entity.FullName) ->
+                                      yield entity.FullName
+                                  | _ -> ()
+                              with _ ->
+                                  () ]
+                            |> List.distinct
+
+                        let memberNames =
+                            [ try yield m.CompiledName with _ -> ()
+                              try yield m.DisplayName with _ -> ()
+                              try
+                                  if m.IsConstructor then
+                                      yield ".ctor"
+                              with _ ->
+                                  () ]
+                            |> List.filter (String.IsNullOrWhiteSpace >> not)
+                            |> List.distinct
+
+                        candidateAssemblyPaths assemblyPath
+                        |> Array.tryPick (fun candidatePath ->
+                            let resolver =
+                                match metadataResolvers.TryGetValue candidatePath with
+                                | true, cached -> cached
+                                | false, _ ->
+                                    let created = tryCreateMemberResolver candidatePath
+                                    metadataResolvers.Add(candidatePath, created)
+                                    created
+
+                            resolver
+                            |> Option.bind (fun resolve ->
+                                declaringTypeNames
+                                |> List.tryPick (fun typeName ->
+                                    memberNames |> List.tryPick (resolve typeName))))
+                with _ ->
+                    None
+
             let passesMemberAccessibility (m: FSharpMemberOrFunctionOrValue) =
                 if includeNonPublic then
                     true
                 else
                     let acc = memberAccessibilityString m
-                    acc = "public" || acc = "unknown"
+                    acc = "public"
+                    || acc = "protected"
+                    || acc = "protected internal"
+                    || acc = "unknown"
 
             let passesFieldAccessibility (f: FSharpField) =
                 if includeNonPublic then
                     true
                 else
                     let acc = fieldAccessibilityString f
-                    acc = "public" || acc = "unknown"
+                    acc = "public"
+                    || acc = "protected"
+                    || acc = "protected internal"
+                    || acc = "unknown"
 
             let passesUnionCaseAccessibility (uc: FSharpUnionCase) =
                 if includeNonPublic then
@@ -9543,7 +10143,7 @@ type internal FcsBridge
                                     false
 
                             if passesMemberAccessibility m && not isAccessor then
-                                yield referencedMemberToJson m
+                                yield referencedMemberToJson (exactMemberMetadata m) m
 
                         // Record / struct / class fields. Public fields and consts on a
                         // reference-type CLASS (C# class fields, F# `val`) are exposed ONLY
@@ -10315,6 +10915,7 @@ type internal FcsBridge
     /// Number of actual Ionide/MSBuild project loads attempted by this bridge. Cache hits
     /// do not increment it; exposed for deterministic project-options cache tests.
     member _.ProjectOptionsLoadCount = Volatile.Read(&projectOptionsLoadCount)
+    member _.ProjectOptionsStaleReloadCount = Volatile.Read(&projectOptionsStaleReloadCount)
     member _.ProjectOptionsCacheValidationCount = Volatile.Read(&projectOptionsCacheValidationCount)
 
     /// Admission/load counters exposed internally for deterministic containment tests.

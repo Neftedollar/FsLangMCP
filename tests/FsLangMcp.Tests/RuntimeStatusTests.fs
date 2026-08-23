@@ -84,6 +84,9 @@ let private getStr (parent: JsonNode) (key: string) : string =
 let private getIntAt (parent: JsonNode) (key: string) : int =
     parent[key].GetValue<int>()
 
+let private getInt64At (parent: JsonNode) (key: string) : int64 =
+    parent[key].GetValue<int64>()
+
 let private getBoolAt (parent: JsonNode) (key: string) : bool =
     parent[key].GetValue<bool>()
 
@@ -170,6 +173,54 @@ let ``buildSnapshot exposes non-negative thread diagnostics`` () =
     Assert.True(getIntAt threads "threadPool" >= 0)
     Assert.True(threads["pendingWorkItems"].GetValue<int64>() >= 0L)
     Assert.True(threads["completedWorkItems"].GetValue<int64>() >= 0L)
+
+[<Fact>]
+let ``thread health warns at the conservative threshold without claiming proof of cause`` () =
+    let telemetry =
+        { LoadAttempts = 14L
+          StaleReloads = 3L
+          CacheValidations = 40L
+          InFlight = 0 }
+
+    let health = threadHealthJson (Some highThreadWarningThreshold) telemetry
+
+    Assert.Equal("warning", getStr health "status")
+    Assert.True(getBoolAt health "restartRecommended")
+    Assert.Contains("does not prove attribution", getStr health "warning")
+    Assert.Contains("14 project-options load(s)", getStr health "warning")
+    Assert.Contains("3 stale-cache reload(s)", getStr health "warning")
+    Assert.Contains("fslangmcp MCP server process", getStr health "recommendation")
+    Assert.Contains("only fsautocomplete", getStr health "recommendation")
+
+[<Fact>]
+let ``thread health stays ok immediately below the warning threshold`` () =
+    let telemetry =
+        { LoadAttempts = 99L
+          StaleReloads = 50L
+          CacheValidations = 100L
+          InFlight = 0 }
+
+    let health = threadHealthJson (Some(highThreadWarningThreshold - 1)) telemetry
+
+    Assert.Equal("ok", getStr health "status")
+    Assert.False(getBoolAt health "restartRecommended")
+    Assert.Null(node health "warning")
+
+[<Fact>]
+let ``runtime status exposes actual project-options load and stale-reload counters`` () =
+    let telemetry =
+        { LoadAttempts = 7L
+          StaleReloads = 2L
+          CacheValidations = 31L
+          InFlight = 1 }
+
+    let result = buildSnapshotWithTelemetry defaultArgs defaultConfig None telemetry
+    let projectOptions = result["fcs"]["projectOptions"]
+
+    Assert.Equal(7L, getInt64At projectOptions "loadAttempts")
+    Assert.Equal(2L, getInt64At projectOptions "staleReloads")
+    Assert.Equal(31L, getInt64At projectOptions "cacheValidations")
+    Assert.Equal(1, getIntAt projectOptions "inFlight")
 
 [<Fact>]
 let ``buildSnapshot assemblies loaded count is positive`` () =

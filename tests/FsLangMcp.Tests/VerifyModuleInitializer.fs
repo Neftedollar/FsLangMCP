@@ -94,6 +94,27 @@ let init () : unit =
             // runner level. Scrub to keep snapshots portable across CI / dev.
             addRegexScrubber "\"isServerGc\": (true|false)" "\"isServerGc\": <bool>"
 
+            // ── Thread-health classification ────────────────────────────────
+            // The production threshold is deliberately observational. A heavily
+            // loaded test host can legitimately cross it, so snapshot the shape
+            // rather than whichever side of 128 the runner happened to be on.
+            // Dedicated pure tests below the snapshot layer pin both branches.
+            addRegexScrubber
+                "\"status\": \"(ok|warning|unknown)\"(?=\\s*,\\s*\"warningThreshold\")"
+                "\"status\": \"<thread-health>\""
+
+            addRegexScrubber
+                "\"restartRecommended\": (true|false)"
+                "\"restartRecommended\": <bool>"
+
+            addRegexScrubber
+                "\"warning\": (null|\"[^\"]*\")"
+                "\"warning\": <thread-warning>"
+
+            addRegexScrubber
+                "\"recommendation\": (null|\"[^\"]*\")"
+                "\"recommendation\": <thread-recommendation>"
+
             // ── fslangmcpVersion ────────────────────────────────────────────
             // Read from AssemblyInformationalVersion — changes every release.
             // Snapshots stay portable across bumps; non-emptiness is asserted by

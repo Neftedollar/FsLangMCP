@@ -86,9 +86,10 @@ section telling the subagent to:
 
 When a subagent returns with a concrete feature request, missing-tool
 observation, or behaviour bug for `fslangmcp` in its UX report, **post it
-as a follow-up comment on the open FsLangMCP tracking issue** within the
-same turn it surfaced. Do not batch across sessions — the maintainer
-loses context and we lose the feedback signal.
+as one dedicated bounded issue** within the same turn it surfaced. If an
+open issue already tracks that exact behaviour, add the new reproduction
+there instead. Do not batch unrelated observations — the maintainer loses
+the behavior boundary and we lose the feedback signal.
 ```
 
 The exact wording is replaceable; the structure (Tool discipline + UX report + routing) is what matters.
@@ -141,15 +142,18 @@ A minimal F# subagent brief skeleton. Embed your task-specific content where ind
 
 ## Feedback routing — the standing rule
 
-When a subagent surfaces a feature request or bug for FsLangMCP, **post it as a comment on the project's open tracking issue immediately, in the same turn**. The catch-all tracking issue is currently:
-
-> [Neftedollar/FsLangMCP#100 — UX feedback from multi-agent F# codebase](https://github.com/Neftedollar/FsLangMCP/issues/100)
-
-If a future tracking issue replaces #100, that issue's URL goes in this guide and in the agent's CLAUDE.md.
+When a subagent surfaces a reproducible feature request or bug for FsLangMCP,
+**open one dedicated bounded issue immediately, in the same turn**. If the exact
+behavior already has an open issue, comment there with the new version/repro instead.
+Do not route new reports to a numbered catch-all.
 
 **Why immediately:** by the next session, the orchestrator has lost the surrounding context that made the feedback meaningful. The maintainer also benefits from a continuous discussion thread instead of stale issue snapshots opened months apart.
 
-**Why one tracking issue, not one issue per request:** maintainer thread fatigue is real. A single well-organized thread with grouped follow-up comments is easier to triage than 15 separate issues with overlapping themes.
+**Why one behavior per issue:** a bounded tracker can carry a repro, acceptance criteria,
+implementation, and closure state. A mixed thread cannot be closed honestly: one item gets fixed
+while unrelated observations remain, and later agents keep appending to a stale destination.
+Low-signal positive/non-actionable notes stay in the originating task report until they become a
+concrete behavior; they do not need an issue merely to prove a report was written.
 
 ## Memory-growth observation pattern
 
@@ -186,7 +190,10 @@ Don't assume the on-disk version is the running version. Call `fslangmcp_version
 
 ## Reference — what real subagent runs looked like
 
-The patterns in this guide were not invented in a vacuum. The orchestration log lives at [Neftedollar/FsLangMCP#100](https://github.com/Neftedollar/FsLangMCP/issues/100) — the original issue body documents the first six subagent runs, and follow-up comments compound additional observations from subsequent sessions. Worth a read before adopting the patterns to see what kinds of feedback the workflow generates.
+The patterns in this guide were not invented in a vacuum. The archived historical orchestration
+log lives at [Neftedollar/FsLangMCP#100](https://github.com/Neftedollar/FsLangMCP/issues/100) — it
+documents the first multi-agent runs and remains useful as history, but it is not a destination for
+new reports.
 
 ## What this guide is NOT
 

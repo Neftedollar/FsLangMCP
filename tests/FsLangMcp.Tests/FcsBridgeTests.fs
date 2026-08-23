@@ -4012,4 +4012,176 @@ let ``fcs_file_outline summaryOnly=false restores full per-member entries with s
         finally
             if Directory.Exists tempRoot then
                 Directory.Delete(tempRoot, true)
+        }
+
+[<Fact>]
+let ``fcs_file_outline surfaces type attributes and CustomOperation names in both summary modes`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_outline_attributes_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let source =
+                String.concat
+                    "\n"
+                    [ "module OutlineAttributes.Library"
+                      ""
+                      "open System.Diagnostics"
+                      ""
+                      "[<DebuggerDisplay(\"Builder\")>]"
+                      "type WorkflowBuilder() ="
+                      "    [<CustomOperation(\"handleQuery\")>]"
+                      "    member _.HandleQuery(state: int, handler: int -> int) = handler state" ]
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "OutlineAttributes" source
+
+            let args summaryOnly =
+                { path = sourcePath
+                  text = None
+                  projectPath = Some projectPath
+                  projectOptions = None
+                  includePrivate = None
+                  includeLocal = None
+                  summaryOnly = Some summaryOnly
+                  maxResults = None }
+
+            let! summary = bridge.FileOutline(args true)
+            let! full = bridge.FileOutline(args false)
+
+            for result in [ summary; full ] do
+                Assert.Equal("succeeded", result["status"].GetValue<string>())
+                Assert.Equal(1, result["customOperationCount"].GetValue<int>())
+                Assert.False(result["customOperationsTruncated"].GetValue<bool>())
+                Assert.False(result["customOperationsTruncatedByBudget"].GetValue<bool>())
+
+                let operation = (result["customOperations"] :?> JsonArray)[0]
+                Assert.Equal("handleQuery", operation["operationName"].GetValue<string>())
+                Assert.Equal("HandleQuery", operation["memberName"].GetValue<string>())
+
+            let summaryType =
+                (summary["entries"] :?> JsonArray)
+                |> Seq.find (fun entry -> entry["name"].GetValue<string>() = "WorkflowBuilder")
+
+            let summaryAttributes =
+                summaryType["attributes"].AsArray()
+                |> Seq.map _.GetValue<string>()
+                |> Seq.toArray
+
+            Assert.Contains("System.Diagnostics.DebuggerDisplayAttribute", summaryAttributes)
+
+            let fullMember =
+                (full["entries"] :?> JsonArray)
+                |> Seq.find (fun entry -> entry["name"].GetValue<string>() = "HandleQuery")
+
+            let memberAttributes =
+                fullMember["attributes"].AsArray()
+                |> Seq.map _.GetValue<string>()
+                |> Seq.toArray
+
+            Assert.Contains("Microsoft.FSharp.Core.CustomOperationAttribute", memberAttributes)
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``fcs_file_outline bounds a large CustomOperation index in summary mode`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_outline_operation_budget_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let longOperationName index =
+                $"operation{index}_" + String.replicate 520 "x"
+
+            let operationMembers =
+                [ 1..120 ]
+                |> List.collect (fun index ->
+                    [ $"    [<CustomOperation(\"{longOperationName index}\")>]"
+                      $"    member _.Step{index}(state: int, value: int) = state + value" ])
+
+            let source =
+                String.concat
+                    "\n"
+                    ([ "module OutlineOperationBudget.Library"
+                       ""
+                       "type WorkflowBuilder() =" ]
+                     @ operationMembers)
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "OutlineOperationBudget" source
+
+            let! result =
+                bridge.FileOutline(
+                    { path = sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      includePrivate = None
+                      includeLocal = None
+                      summaryOnly = Some true
+                      maxResults = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.Equal(120, result["customOperationCount"].GetValue<int>())
+            Assert.True(result["customOperationsTruncated"].GetValue<bool>())
+            Assert.True(result["customOperationsTruncatedByBudget"].GetValue<bool>())
+            Assert.True((result["customOperations"] :?> JsonArray).Count < 120)
+
+            // responseCharBudget is 45k at depth zero; the 60k shipped-response
+            // assertion includes the containing JSON's indentation/field overhead.
+            Assert.True(renderedLength result <= 60_000, $"Outline response was {renderedLength result} chars.")
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``fcs_file_outline bounds diagnostic-heavy malformed files by the complete response size`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_outline_diagnostic_budget_%s{runId}")
+        let bridge = FcsBridge()
+
+        try
+            let brokenBindings =
+                [ 1..1000 ]
+                |> List.map (fun index -> $"let value%d{index} : int = \"not an int\"")
+
+            let source =
+                String.concat "\n" ([ "module OutlineDiagnosticBudget.Library"; "" ] @ brokenBindings)
+
+            let sourcePath, projectPath = writeProjectWithSource tempRoot "OutlineDiagnosticBudget" source
+
+            let! result =
+                bridge.FileOutline(
+                    { path = sourcePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      includePrivate = None
+                      includeLocal = None
+                      summaryOnly = Some true
+                      maxResults = None }
+                )
+
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.Equal(60_000, result["responseBudgetChars"].GetValue<int>())
+
+            let returnedCheckDiagnostics = (result["checkDiagnostics"] :?> JsonArray).Count
+            let fullCheckDiagnosticCount = result["checkDiagnosticCount"].GetValue<int>()
+
+            Assert.True(fullCheckDiagnosticCount >= 1000, $"Expected 1000 type errors, got %d{fullCheckDiagnosticCount}.")
+            Assert.True(returnedCheckDiagnostics < fullCheckDiagnosticCount)
+            Assert.True(result["checkDiagnosticsTruncated"].GetValue<bool>())
+            Assert.True(result["responseTruncatedByBudget"].GetValue<bool>())
+            Assert.NotNull(result["diagnosticsHint"])
+
+            let shippedLength = renderedLength result
+            Assert.True(shippedLength <= 60_000, $"Outline response was %d{shippedLength} chars.")
+        finally
+            if Directory.Exists tempRoot then
+                Directory.Delete(tempRoot, true)
     }

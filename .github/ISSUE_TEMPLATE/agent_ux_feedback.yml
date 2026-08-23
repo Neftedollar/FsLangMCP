@@ -1,12 +1,13 @@
-name: 🤖 Agent UX feedback
-description: How did FsLangMCP feel to an AI agent on a real task? (friction, surprises, what worked)
+name: 🤖 Agent UX behavior
+description: Report one reproducible agent-facing behavior from a real task
 labels: ["ux-feedback"]
 body:
   - type: markdown
     attributes:
       value: |
-        This project lives or dies on whether agents reach for it **instead of `grep`**. Honest field reports from real
-        agent runs are the single most valuable signal we get — including "didn't need it for this task." Thank you.
+        This project lives or dies on whether agents reach for it **instead of `grep`**. Please keep this issue bounded
+        to **one reproducible behavior**. File unrelated bugs/requests separately; add evidence to an existing issue when
+        it already tracks this exact behavior. Positive/non-actionable notes can stay in the originating task report.
   - type: input
     id: version
     attributes:
@@ -25,12 +26,19 @@ body:
   - type: textarea
     id: friction
     attributes:
-      label: Friction / surprises
-      description: Where did the agent fall back to `rg`/`grep`/build? Confusing response? Missing tool? Empty result that should have matched?
+      label: One observed behavior
+      description: Include the request payload, observed response/timing, and where the agent fell back to rg/build. Do not combine unrelated observations.
     validations:
       required: true
   - type: textarea
-    id: worked
+    id: expected
     attributes:
-      label: What worked well
-      description: Which tools/calls were high-value? (So we don't regress them.)
+      label: Expected behavior
+      description: What concrete response, latency, or capability would close this issue?
+    validations:
+      required: true
+  - type: textarea
+    id: guardrails
+    attributes:
+      label: Relevant non-regressions
+      description: Optional — what nearby behavior already worked and must not regress while fixing this issue?

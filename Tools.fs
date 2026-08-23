@@ -33,12 +33,24 @@ let toolErrorToJson (err: ToolError) : string =
 let renderToken (token: JsonNode) =
     JsonSerializer.Serialize(token, mcpRenderOptions)
 
-let toolResult (work: Task<JsonNode>) : Task<Result<Content list, McpError>> =
+let internal toolResultWithHealthCheck
+    (healthCheck: unit -> unit)
+    (work: unit -> Task<JsonNode>)
+    : Task<Result<Content list, McpError>> =
     task {
         try
-            let! payload = work
+            // A dotnet-tool update can remove this running process's versioned
+            // installation directory without stopping the process. Detect that
+            // before a lazy dependency load turns it into a misleading missing-DLL
+            // transport error. The project-load path repeats the guard so work that
+            // started synchronously while this wrapper was being constructed cannot
+            // enter Ionide/MSBuild either.
+            healthCheck ()
+            let! payload = work ()
             return Ok [ Content.text (renderToken payload) ]
         with
+        | InstallationHealth.StaleToolProcessException failure ->
+            return Ok [ Content.text (renderToken (InstallationHealth.envelope failure)) ]
         // #192: an unsatisfiable global.json pin is machine configuration, not a tool
         // fault. Rendering it here — ahead of every other arm — is what makes every
         // consumer of EnsureProjectResults report the same typed sdk_not_found
@@ -67,3 +79,10 @@ let toolResult (work: Task<JsonNode>) : Task<Result<Content list, McpError>> =
             let err = InfraFailure ex
             return Error(McpError.TransportError(toolErrorToJson err))
     }
+
+/// Accept a thunk, not an already-created Task: F# task expressions are hot and
+/// can execute synchronously during argument evaluation. The installation guard
+/// must run before the handler starts, including before any future lazy loader a
+/// new tool might introduce.
+let toolResult (work: unit -> Task<JsonNode>) : Task<Result<Content list, McpError>> =
+    toolResultWithHealthCheck InstallationHealth.ensureCurrent work

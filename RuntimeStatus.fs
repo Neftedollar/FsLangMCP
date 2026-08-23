@@ -18,6 +18,24 @@ type ChildProcessInfo =
       Pid: int
       RssBytes: int64 }
 
+type ProjectOptionsTelemetry =
+    { LoadAttempts: int64
+      StaleReloads: int64
+      CacheValidations: int64
+      InFlight: int }
+
+let private emptyProjectOptionsTelemetry =
+    { LoadAttempts = 0L
+      StaleReloads = 0L
+      CacheValidations = 0L
+      InFlight = 0 }
+
+/// Conservative heuristic: healthy control processes stayed below 35 threads,
+/// while the retained in-proc MSBuild-node cases measured 177-188. Keep enough
+/// headroom for large legitimate thread pools and label the result as a warning,
+/// never a diagnosis.
+let internal highThreadWarningThreshold = 128
+
 // ─── Pure heap-JSON helper (also used by tests for the int64 round-trip) ──────
 
 /// Input record for heapJson. All byte fields are int64 to avoid truncation on
@@ -141,21 +159,83 @@ let private assemblyCountJson () : JsonNode =
 /// suspend threads, or attach diagnostics. The process count is the OS-visible total;
 /// ThreadPool counters help distinguish worker growth from dedicated/native threads.
 /// The OS count is null only when the platform refuses process-thread inspection.
-let private threadInfoJson (proc: Process) : JsonNode =
+let internal threadHealthJson
+    (processThreadCount: int option)
+    (projectOptions: ProjectOptionsTelemetry)
+    : JsonNode =
+
+    match processThreadCount with
+    | None ->
+        jobj
+            [ "status", jstr "unknown"
+              "warningThreshold", jint highThreadWarningThreshold
+              "restartRecommended", jbool false
+              "warning", null
+              "recommendation", null ]
+        :> JsonNode
+    | Some count when count >= highThreadWarningThreshold ->
+        jobj
+            [ "status", jstr "warning"
+              "warningThreshold", jint highThreadWarningThreshold
+              "restartRecommended", jbool true
+              "warning",
+              jstr
+                  $"FsLangMCP has %d{count} OS-visible threads. Retained in-process Ionide.ProjInfo/MSBuild nodes are one known cause in long-lived sessions, but this count alone does not prove attribution. This process has attempted %d{projectOptions.LoadAttempts} project-options load(s), including %d{projectOptions.StaleReloads} stale-cache reload(s)."
+              "recommendation",
+              jstr
+                  "Restart the fslangmcp MCP server process to reclaim retained MSBuild threads. `set_project(restartLsp=true)` restarts only fsautocomplete." ]
+        :> JsonNode
+    | Some _ ->
+        jobj
+            [ "status", jstr "ok"
+              "warningThreshold", jint highThreadWarningThreshold
+              "restartRecommended", jbool false
+              "warning", null
+              "recommendation", null ]
+        :> JsonNode
+
+let private tryProcessThreadCount (proc: Process) =
+    try
+        Some proc.Threads.Count
+    with _ ->
+        None
+
+let private threadInfoJson (proc: Process) (projectOptions: ProjectOptionsTelemetry) : JsonNode =
+    let processThreadCount = tryProcessThreadCount proc
+
     let processThreads: JsonNode =
-        try
-            jint proc.Threads.Count
-        with _ ->
-            null
+        match processThreadCount with
+        | Some count -> jint count
+        | None -> null
 
     jobj
         [ "process", processThreads
           "threadPool", jint ThreadPool.ThreadCount
           "pendingWorkItems", jint64 ThreadPool.PendingWorkItemCount
-          "completedWorkItems", jint64 ThreadPool.CompletedWorkItemCount ]
+          "completedWorkItems", jint64 ThreadPool.CompletedWorkItemCount
+          "health", threadHealthJson processThreadCount projectOptions ]
     :> JsonNode
 
-let private fcsStatusJson (config: FcsCheckerConfig) : JsonNode =
+let currentThreadWarning (projectOptions: ProjectOptionsTelemetry) : JsonNode option =
+    use proc = Process.GetCurrentProcess()
+
+    match tryProcessThreadCount proc with
+    | Some count when count >= highThreadWarningThreshold ->
+        Some(threadHealthJson (Some count) projectOptions)
+    | _ -> None
+
+let private projectOptionsJson (telemetry: ProjectOptionsTelemetry) : JsonNode =
+    jobj
+        [ "loadAttempts", jint64 telemetry.LoadAttempts
+          "staleReloads", jint64 telemetry.StaleReloads
+          "cacheValidations", jint64 telemetry.CacheValidations
+          "inFlight", jint telemetry.InFlight
+          "note",
+          jstr
+              "loadAttempts counts actual Ionide.ProjInfo/MSBuild evaluations; cache hits are excluded. staleReloads counts cached entries invalidated by a changed project-options input fingerprint." ]
+    :> JsonNode
+
+let private fcsStatusJson (config: FcsCheckerConfig) (projectOptions: ProjectOptionsTelemetry) : JsonNode =
     // IncrementalBuilder count is not exposed by the public FCS API on net10.0.
     // Count is null because FSharpChecker does not expose live builder count on net10.0.
     // approximateBytes is null for the same reason.
@@ -166,6 +246,7 @@ let private fcsStatusJson (config: FcsCheckerConfig) : JsonNode =
                 "approximateBytes", null ]
           :> JsonNode
           "projectCacheSize", jint config.ProjectCacheSize
+          "projectOptions", projectOptionsJson projectOptions
           "checker",
           jobj
               [ "keepAssemblyContents", jbool config.KeepAssemblyContents
@@ -197,10 +278,11 @@ let private childProcessJson (proc: Process) : JsonNode =
 
 // ─── Public entry point ────────────────────────────────────────────────────────
 
-let buildSnapshot
+let buildSnapshotWithTelemetry
     (args: RuntimeStatusArgs)
     (config: FcsCheckerConfig)
     (fsacProcess: Process option)
+    (projectOptions: ProjectOptionsTelemetry)
     : JsonNode =
 
     let includeFcs = args.includeFcsCacheStats |> Option.defaultValue true
@@ -218,7 +300,7 @@ let buildSnapshot
         [ yield "uptimeSeconds", jint uptimeSeconds
           yield "managedHeap", managedHeapJson ()
           yield "gcInfo", gcInfoJson ()
-          yield "threads", threadInfoJson proc
+          yield "threads", threadInfoJson proc projectOptions
 
           if includeAssemblies then
               yield "assemblies", assemblyCountJson ()
@@ -251,9 +333,19 @@ let buildSnapshot
           yield "process", processPart
 
           if includeFcs then
-              yield "fcs", fcsStatusJson config
+              yield "fcs", fcsStatusJson config projectOptions
 
           if includeChildren then
               yield "children", children ]
 
     jobj topFields
+
+/// Compatibility entry point used by callers that do not own project-options
+/// instrumentation. The MCP composition root uses buildSnapshotWithTelemetry.
+let buildSnapshot
+    (args: RuntimeStatusArgs)
+    (config: FcsCheckerConfig)
+    (fsacProcess: Process option)
+    : JsonNode =
+
+    buildSnapshotWithTelemetry args config fsacProcess emptyProjectOptionsTelemetry

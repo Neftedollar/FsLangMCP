@@ -154,6 +154,29 @@ dotnet tool update -g FsLangMcp
 The fix pins `Microsoft.VisualStudio.Threading.Only 17.14.15` as a direct
 PackageReference and adds `rollForward: LatestMajor` to the runtimeconfig.
 
+If the installed package is newer but a long-running MCP process still reports a
+missing ProjInfo/VS.Threading dependency, see `stale_tool_process` below: the on-disk
+package may be complete while the running process points at a version directory that
+`dotnet tool update` has already replaced.
+
+---
+
+## `{"status":"infrastructure_error","errorKind":"stale_tool_process"}`
+
+`dotnet tool update` replaces the global tool's versioned installation directory but
+cannot replace a process an MCP client already started. If that old process lazily loads
+ProjInfo/MSBuild later, its dependency directory may no longer exist and the symptom looks
+like a partial NuGet package even though a clean installation is complete.
+
+FsLangMCP now validates its own installation directory before entering semantic/project-load
+paths. The response includes the running version, installation directory, missing files,
+`restartRequired: true`, and a restart recommendation.
+
+**Remediation:** restart the parent MCP client/server connection (or start a new client
+session) so it spawns the currently installed binary. Re-running `dotnet tool update` does
+not repair the already-running process. If a fresh process returns the same envelope, attach
+the full payload to a dedicated issue because that is a genuine packaging/install failure.
+
 ---
 
 ## Version skew: tools behave differently than expected
@@ -196,6 +219,25 @@ it after the replacement generation warms if latency matters. If `unknown`
 persists, call `set_project` again and inspect the coverage fields. FsLangMCP
 retains MSBuild project options only while their project, imports, restore
 outputs, source contents, and source-directory inputs are unchanged.
+
+`fsharp_runtime_status.fcs.projectOptions` exposes `loadAttempts`, `staleReloads`,
+`cacheValidations`, and `inFlight`. `staleReloads` increments only when an existing
+cached fingerprint became stale and was re-evaluated; cold loads and explicit evictions
+do not inflate it.
+
+---
+
+## `fsharp_runtime_status` recommends restarting because of high thread count
+
+At 128 or more OS-visible threads, `process.threads.health.status` becomes `warning`,
+`restartRecommended` becomes true, and the response recommends restarting the parent MCP
+process. Retained in-process ProjInfo/MSBuild nodes are one known cause; the thread count
+alone is not proof of ownership or a leak.
+
+Use `fcs.projectOptions.staleReloads` alongside the thread count to see whether repeated
+project-option re-evaluation correlates with growth. Restarting only the FSAC child cannot
+reclaim threads owned by the parent `fslangmcp` process. The warning is observational: the
+server never terminates itself or forces a restart.
 
 ---
 

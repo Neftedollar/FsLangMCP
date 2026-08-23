@@ -357,7 +357,7 @@ let ``toolResult renders SdkNotFoundException as the typed envelope rather than 
               SdkPreflight.SdkPin.RollForward = Some "disable"
               SdkPreflight.SdkPin.GlobalJsonPath = "/repo/global.json" }
 
-        let work =
+        let work () =
             task {
                 raise (SdkPreflight.SdkNotFoundException(pinned, [ "10.0.400" ]))
                 return (null: JsonNode)
@@ -393,7 +393,7 @@ let ``a wrapped SdkNotFoundException is still recognised and rendered`` () : Tas
         | SdkPreflight.SdkPinUnsatisfiable failure -> Assert.Equal(absentVersion, failure.Pin.Version)
         | _ -> Assert.Fail("Expected the wrapper chain to be unwrapped.")
 
-        let work =
+        let work () =
             task {
                 raise wrapped
                 return (null: JsonNode)

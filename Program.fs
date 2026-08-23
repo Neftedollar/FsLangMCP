@@ -76,6 +76,8 @@ let private parseProjInfoOutput (path: string) (exitCode: int) (stdout: string) 
 
 let private runProjInfoAsync (path: string) : Task<JsonNode> =
     task {
+        InstallationHealth.ensureCurrent ()
+
         // #192: the out-of-process proj-info CLI calls the same Init.init and dies the
         // same way (exit 134, unhandled), so it needs the same pre-flight the in-process
         // loader got. Raising lets Tools.toolResult render the shared typed envelope.
@@ -345,6 +347,12 @@ let private mainCore argv =
         let fcsBridge = new FcsBridge()
         let projInfoTimeout = timeoutFromEnv "FSLANGMCP_PROJ_INFO_TIMEOUT_MS" 120_000
 
+        let projectOptionsTelemetry () : ProjectOptionsTelemetry =
+            { LoadAttempts = fcsBridge.ProjectOptionsLoadCount
+              StaleReloads = fcsBridge.ProjectOptionsStaleReloadCount
+              CacheValidations = fcsBridge.ProjectOptionsCacheValidationCount
+              InFlight = fcsBridge.ProjectOptionsInFlightCount }
+
         let waitForProjInfo operationName projectPath (work: Task<Result<'T, string>>) =
             task {
                 try
@@ -385,6 +393,7 @@ let private mainCore argv =
 
         let setProjectAndRefresh (args: SetProjectArgs) : Task<JsonNode> =
             task {
+                InstallationHealth.ensureCurrent ()
                 let! result = bridge.SetProject args
 
                 let succeeded =
@@ -440,6 +449,10 @@ let private mainCore argv =
                                     readinessObj["projectOptionsError"] <- jstr error
                             | _ -> ()
                         | None -> ()
+
+                        match currentThreadWarning (projectOptionsTelemetry ()) with
+                        | Some warning -> resultObj["runtimeWarning"] <- warning
+                        | None -> ()
                     | _ -> ()
 
                 return result
@@ -474,15 +487,14 @@ let private mainCore argv =
                 invalidOp $"--project preload failed: {preload.ToJsonString()}"
         | None -> ()
 
-        let versionResponse: Task<JsonNode> =
-            task {
-                return
-                    jobj
-                        [ "status", jstr "ok"
-                          "fslangmcpVersion", jstr FsLangMcp.Version.current
-                          "productName", jstr FsLangMcp.Version.productName ]
-                    :> JsonNode
-            }
+        let versionResponse () : Task<JsonNode> =
+            Task.FromResult(
+                jobj
+                    [ "status", jstr "ok"
+                      "fslangmcpVersion", jstr FsLangMcp.Version.current
+                      "productName", jstr FsLangMcp.Version.productName ]
+                :> JsonNode
+            )
 
         let server =
             mcpServer {
@@ -493,19 +505,20 @@ let private mainCore argv =
                     TypedTool.define<CompletionArgs>
                         "textDocument_completion"
                         "Raw LSP proxy to fsautocomplete textDocument/completion. Exact-position IDE primitive; requires set_project first. line/character are 0-based. Pass 'text' for unsaved content. Avoid for free-form agent flows — completion is exact-position editor IO; for symbol semantics use fcs_symbol_at_word or find(kind=position) instead."
-                        (fun args (_ct: CancellationToken) -> toolResult (runLimited lspGate (fun () -> bridge.Completion args)))
+                        (fun args (_ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited lspGate (fun () -> bridge.Completion args)))
                     |> unwrapResult
                 )
 
                 tool (
                     TypedTool.define<CheckArgs>
                         "check"
-                        "One trustworthy verdict for the active F# context. Bare check() suffices: returns `verdict` (clean|errors|unknown) after a FRESH in-process type-check, so it never reports a stale-`{}` false-clean; no dotnet build fallback. Optional: scope (auto|file|project|workspace|snippet), path, snippet (inline source), speed (trusted default | fast = cached FSAC snapshot), severity. totalDiagnostics=errorCount+warningCount+infoCount always. Prefer over raw diagnostics plumbing for a yes/no answer."
+                        "Fresh F# verdict for the active context. Bare check() returns clean|errors|unknown from an in-process type-check. Optional: scope, path, snippet, speed, severity. trusted (default) is fresh; fast uses cached FSAC. Counts reconcile: totalDiagnostics=errors+warnings+info. Project scope marks downstream consumers unchecked; workspace requires a solution or directory. Prefer for yes/no validation."
                         (fun args (_ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (
+                            toolResult (fun () ->
                                 runLimited fcsGate (fun () ->
                                     Dispatcher.CheckDispatch.run fcsBridge bridge (Dispatcher.Check args))))
                     |> unwrapResult
@@ -516,9 +529,8 @@ let private mainCore argv =
                         "set_project"
                         "Initialize or switch the FSAC/LSP project context. Required before raw LSP proxies. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load and clears stale FCS analysis while retaining validated MSBuild project options. Response includes loadedProjects, readiness, restart intent, and whether a running FSAC process was actually replaced."
                         (fun args (_ct: CancellationToken) ->
-                            toolResult (
-                                runLimited lspGate (fun () -> setProjectAndRefresh args)
-                            ))
+                            toolResult (fun () ->
+                                runLimited lspGate (fun () -> setProjectAndRefresh args)))
                     |> unwrapResult
                 )
 
@@ -541,10 +553,9 @@ let private mainCore argv =
                             let evaluatedProject path =
                                 getEvaluatedProjectSnapshot path |> Async.AwaitTask
 
-                            toolResult (
+                            toolResult (fun () ->
                                 runLimited fcsGate (fun () ->
-                                    createReport args snapshot evaluatedProject |> Async.StartAsTask)
-                            ))
+                                    createReport args snapshot evaluatedProject |> Async.StartAsTask)))
                     |> unwrapResult
                 )
 
@@ -559,10 +570,9 @@ let private mainCore argv =
                             let evaluatedProject path =
                                 getEvaluatedProjectSnapshot path |> Async.AwaitTask
 
-                            toolResult (
+                            toolResult (fun () ->
                                 runLimited fcsGate (fun () ->
-                                    inspectProject args evaluatedProject |> Async.StartAsTask)
-                            ))
+                                    inspectProject args evaluatedProject |> Async.StartAsTask)))
                     |> unwrapResult
                 )
 
@@ -574,7 +584,7 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.ReferencedSymbols args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.ReferencedSymbols args)))
                     |> unwrapResult
                 )
 
@@ -586,7 +596,7 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.SuggestOpen args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.SuggestOpen args)))
                     |> unwrapResult
                 )
 
@@ -598,27 +608,28 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.NugetTypes args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.NugetTypes args)))
                     |> unwrapResult
                 )
 
                 tool (
                     TypedTool.define<FcsNugetMembersArgs>
                         "fcs_nuget_members"
-                        "Enumerate members of one type from a referenced assembly (packageId + typeName). `packageId` accepts the NuGet package id OR an assembly SimpleName it ships; the two often differ. Prefer `fcs_nuget_types` to discover type names first. Entry: name, kind, signature, accessibility, isObsolete, xmlDocSummary. Paginated; default 500, max 2000. A miss adds `hint`, plus `candidatePackages` when the packageId did not resolve. Details: docs/tools-detailed.md#fcs_nuget_members."
+                        "Members of one type from a referenced assembly. packageId accepts a NuGet package id or assembly SimpleName; use fcs_nuget_types to discover names. Rows include signature and constraints, exact CLR accessibility when metadata is available, isAbstract, genericParameters, obsolete/XML docs. Protected API is included by default; includeNonPublic widens. Paginated (500 default, 2000 max); misses include routing hints. Details: docs/tools-detailed.md#fcs_nuget_members."
                         (fun args (_ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.NugetMembers args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.NugetMembers args)))
                     |> unwrapResult
                 )
 
                 tool (
                     TypedTool.define<FcsFileOutlineArgs>
                         "fcs_file_outline"
-                        "Agent-friendly compact F# outline for one file. Defaults to summaryOnly=true: module/type headers + per-kind memberCounts only (no per-member signatures), so large files never overflow the token ceiling. Set summaryOnly=false for full name/kind/range/signature/accessibility entries. Filters local/noisy symbols by default. Prefer fcs_project_outline for a whole-project overview; find(kind=\"symbol\") for raw unfiltered symbols."
-                        (fun args (_ct: CancellationToken) -> toolResult (runLimited fcsGate (fun () -> fcsBridge.FileOutline args)))
+                        "Compact outline for one F# file. Start with summaryOnly=true (default): container headers and attributes, member counts, CustomOperation index, and parse/check diagnostics. Those diagnostics are a per-file signal, not a project verdict. summaryOnly=false adds signatures/accessibility/attributes; oversized output downgrades to summary. Filters locals/noise by default. Use fcs_project_outline for a project or find(kind=\"symbol\") for search."
+                        (fun args (_ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.FileOutline args)))
                     |> unwrapResult
                 )
 
@@ -630,19 +641,19 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.MakeInternalVisible args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.MakeInternalVisible args)))
                     |> unwrapResult
                 )
 
                 tool (
                     TypedTool.define<FindArgs>
                         "find"
-        "Multi-project F# semantic search: definitions, references, record-field sites, member call-sites (`x.Foo`) across every solution .fsproj. FCS-resolved — beats rg, which over-matches `.Member()` and can't cross projects. Bare find(query) gives one compact line per site; contextLines adds code. Narrow with kind (symbol|members|field|definition|position)+scope; member call sites = kind=members + member=Name; kind=field+includeSiteTypes types every field site. scopeNote reports sweep breadth."
+        "F# semantic search across solution projects: definitions/references, field sites, and member calls. Bare find(query) returns compact sites; contextLines adds code. Narrow with kind (symbol|members|field|definition|position), scope, path, or projectPath. Member calls: kind=members + member=Name; query may be the member or declaring type. Field impact: kind=field + includeSiteTypes. FCS-resolved; scopeNote reports breadth."
                         (fun args (_ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (
+                            toolResult (fun () ->
                                 runLimited fcsGate (fun () ->
                                     Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.Find args))))
                     |> unwrapResult
@@ -652,7 +663,8 @@ let private mainCore argv =
                     TypedTool.define<FcsSymbolAtWordArgs>
                         "fcs_symbol_at_word"
                         "Tolerant FCS symbol lookup for agent workflows. Accepts a line plus word/occurrence, finds the candidate span, and returns symbol identity, kind, type string, definition range, and optional documentation. Prefer over exact-position hover/type queries."
-                        (fun args (_ct: CancellationToken) -> toolResult (runLimited fcsGate (fun () -> fcsBridge.SymbolAtWord args)))
+                        (fun args (_ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.SymbolAtWord args)))
                     |> unwrapResult
                 )
 
@@ -664,7 +676,7 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.ProjectOutline args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.ProjectOutline args)))
                     |> unwrapResult
                 )
 
@@ -672,7 +684,8 @@ let private mainCore argv =
                     TypedTool.define<FcsSignatureHelpArgs>
                         "fcs_signature_help"
                         "Low-level exact-position FCS signature help. Returns overloads/parameters around a call site. line/character are 0-based. Pass projectPath/projectOptions and 'text' when available."
-                        (fun args (_ct: CancellationToken) -> toolResult (runLimited fcsGate (fun () -> fcsBridge.SignatureHelp args)))
+                        (fun args (_ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.SignatureHelp args)))
                     |> unwrapResult
                 )
 
@@ -680,7 +693,8 @@ let private mainCore argv =
                     TypedTool.define<PositionArgs>
                         "fsharp_signature_data"
                         "Structured FSAC signature help via fsharp/signatureData. Requires set_project and an exact call-site position. Use this when FCS fallback is insufficient or when validating FSAC's current workspace view."
-                        (fun args (_ct: CancellationToken) -> toolResult (runLimited lspGate (fun () -> bridge.SignatureData args)))
+                        (fun args (_ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited lspGate (fun () -> bridge.SignatureData args)))
                     |> unwrapResult
                 )
 
@@ -688,7 +702,8 @@ let private mainCore argv =
                     TypedTool.define<FormattingArgs>
                         "textDocument_formatting"
                         "Raw LSP formatting proxy via fsautocomplete/Fantomas. Requires set_project first. Returns formatted text and edits; it does not write to disk. Pass 'text' for unsaved content."
-                        (fun args (_ct: CancellationToken) -> toolResult (runLimited lspGate (fun () -> bridge.Formatting args)))
+                        (fun args (_ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited lspGate (fun () -> bridge.Formatting args)))
                     |> unwrapResult
                 )
 
@@ -696,7 +711,8 @@ let private mainCore argv =
                     TypedTool.define<CodeActionArgs>
                         "textDocument_codeAction"
                         "Raw LSP codeAction proxy at an exact position with empty diagnostic context. Requires set_project first. Useful for debugging FSAC; prefer future diagnostics-to-fix workflows for agent repairs. Pass 'text' for unsaved content."
-                        (fun args (_ct: CancellationToken) -> toolResult (runLimited lspGate (fun () -> bridge.CodeAction args)))
+                        (fun args (_ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited lspGate (fun () -> bridge.CodeAction args)))
                     |> unwrapResult
                 )
 
@@ -704,7 +720,8 @@ let private mainCore argv =
                     TypedTool.define<RenameArgs>
                         "textDocument_rename"
                         "Raw LSP semantic rename at an exact position. Requires `set_project` first. Prefer over textual rename — handles shadowing and aliased opens safely. Returns raw WorkspaceEdit; needs a precise target. Pass `text` for unsaved content."
-                        (fun args (_ct: CancellationToken) -> toolResult (runLimited lspGate (fun () -> bridge.Rename args)))
+                        (fun args (_ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited lspGate (fun () -> bridge.Rename args)))
                     |> unwrapResult
                 )
 
@@ -720,13 +737,13 @@ let private mainCore argv =
 
                             match resolved with
                             | None ->
-                                toolResult (
+                                toolResult (fun () ->
                                     Task.FromException<JsonNode>(
                                         ArgumentException
                                             "projectPath is required. Either pass it explicitly or call set_project first to establish a default."
-                                    )
-                                )
-                            | Some path -> toolResult (runLimited fcsGate (fun () -> runProjInfoAsync path)))
+                                    ))
+                            | Some path ->
+                                toolResult (fun () -> runLimited fcsGate (fun () -> runProjInfoAsync path)))
                     |> unwrapResult
                 )
 
@@ -738,7 +755,7 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.CheckCompileOrder args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.CheckCompileOrder args)))
                     |> unwrapResult
                 )
 
@@ -754,23 +771,24 @@ let private mainCore argv =
                     TypedTool.define<DiagnosticFixesArgs>
                         "fcs_diagnostic_fixes"
                         "Fetch a file's diagnostics, then request code-action fixes for each and group them per diagnostic: range, severity, code, message, fixes [{title, kind, editSummary}], plus diagnosticCount/fixCount. Agent-friendly wrapper over raw textDocument_codeAction: supplies the diagnostic context the raw proxy leaves empty and groups the fixes. Requires set_project first. Pass line(+character) to narrow to one position, else all; pass text for unsaved content."
-                        (fun args (_ct: CancellationToken) -> toolResult (runLimited lspGate (fun () -> bridge.DiagnosticFixes args)))
+                        (fun args (_ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited lspGate (fun () -> bridge.DiagnosticFixes args)))
                     |> unwrapResult
                 )
 
                 tool (
                     TypedTool.define<RuntimeStatusArgs>
                         "fsharp_runtime_status"
-                        "Read-only observational snapshot of FsLangMCP: managed-heap and GC counters, OS-visible and thread-pool thread counts, assembly count, FCS checker/cache state, and FSAC child working set. Use during long sessions to distinguish thread growth from managed-memory growth. Never triggers GC, walks the heap, suspends threads, or attaches diagnostics."
+                        "Read-only observational snapshot of FsLangMCP: managed-heap and GC counters, OS-visible and thread-pool thread counts, project-options load/reload counters, FCS checker/cache state, and FSAC child working set. At an anomalous OS thread count it emits a heuristic warning and parent-process restart recommendation. Never triggers GC, walks the heap, suspends threads, or attaches diagnostics."
                         (fun args (_ct: CancellationToken) ->
-                            toolResult (
+                            toolResult (fun () ->
                                 Task.FromResult(
-                                    buildSnapshot
+                                    buildSnapshotWithTelemetry
                                         args
                                         fcsBridge.CheckerConfig
                                         bridge.FsacProcess
-                                )
-                            ))
+                                        (projectOptionsTelemetry ())
+                                )))
                     |> unwrapResult
                 )
 
@@ -782,7 +800,7 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.ExplainDiagnostic args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.ExplainDiagnostic args)))
                     |> unwrapResult
                 )
 
@@ -794,7 +812,7 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.TestsForSymbol args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.TestsForSymbol args)))
                     |> unwrapResult
                 )
 
@@ -802,7 +820,8 @@ let private mainCore argv =
                     TypedTool.define<RenamePreviewArgs>
                         "fcs_rename_preview"
                         "Preview a semantic rename's full impact WITHOUT applying it — non-destructive, writes nothing. Runs the same FSAC machinery as `textDocument_rename` but returns edits grouped by file, each with originalLineText and previewLineText, plus totalEdits, fileCount, and a crossProject flag. Use it to inspect blast radius before `textDocument_rename` applies the change. Requires `set_project`. Returns `no_symbol` when the position has no renamable symbol. Pass `text` for unsaved buffers."
-                        (fun args (_ct: CancellationToken) -> toolResult (runLimited lspGate (fun () -> bridge.RenamePreview args)))
+                        (fun args (_ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited lspGate (fun () -> bridge.RenamePreview args)))
                     |> unwrapResult
                 )
 
@@ -814,7 +833,7 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.PublicApi args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.PublicApi args)))
                     |> unwrapResult
                 )
 
@@ -826,7 +845,7 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (
+                            toolResult (fun () ->
                                 runLimited fcsGate (fun () ->
                                     fcsBridge.RefactorImpact(args, (fun rp -> bridge.RenamePreview rp)))))
                     |> unwrapResult
@@ -840,7 +859,7 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.SignatureStatus args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.SignatureStatus args)))
                     |> unwrapResult
                 )
 
@@ -852,7 +871,7 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.ReviewScan args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.ReviewScan args)))
                     |> unwrapResult
                 )
 
@@ -864,7 +883,7 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.DeadCode args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.DeadCode args)))
                     |> unwrapResult
                 )
 
@@ -876,7 +895,7 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.CreateFilePlan args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.CreateFilePlan args)))
                     |> unwrapResult
                 )
 
@@ -888,7 +907,7 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.AnalyzerDiagnostics args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.AnalyzerDiagnostics args)))
                     |> unwrapResult
                 )
 
@@ -900,7 +919,7 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (runLimited fcsGate (fun () -> fcsBridge.AnalyzerSetupPreview args)))
+                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.AnalyzerSetupPreview args)))
                     |> unwrapResult
                 )
 

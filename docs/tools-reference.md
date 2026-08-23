@@ -83,6 +83,14 @@ In `speed=fast`, inspect `complete`, `expectedFiles`, `missingFiles`, `staleFile
 `sessionGeneration`. Current errors remain actionable with `complete=false`; an incomplete
 zero-error snapshot is `unknown`, never `clean`.
 
+**Project-scope coverage boundary:** a resolved `scope=project` response always includes
+`downstreamProjectsChecked: false`, `recommendedScope: "workspace"`, and `coverageNote`.
+A clean project verdict says only that the selected project is clean; apps/tests that reference
+it were not analyzed. Use `scope=workspace` with a solution or directory `projectPath` to cover
+those consumers. `scope=workspace` with a single `.fsproj` is rejected rather than returning a
+misleading one-project workspace verdict. The tool deliberately does not start another MSBuild
+sweep merely to count downstream projects.
+
 **Diagnostic counts:** `totalDiagnostics = errorCount + warningCount + infoCount`, always —
 `infoCount` tallies the Info/Hidden diagnostics in the full set, and `belowSeverityFloorCount`
 (plus a `diagnosticsNote` when nonzero) explains how many of them the `severity` floor excluded
@@ -139,11 +147,11 @@ The `evaluation` object identifies the evaluated source and restore state. LSP r
 
 ### `fcs_file_outline`
 
-**Purpose:** Compact F# outline for one file. `summaryOnly=true` (default) returns module/type headers and per-kind member counts, keeping token cost low.
+**Purpose:** Compact F# outline for one file. `summaryOnly=true` (default) returns module/type headers, attributes, per-kind member counts, a bounded CustomOperation index, and bounded parse/check diagnostics while keeping token cost low. Full counts and explicit array/budget truncation fields distinguish complete from partial output; the fully serialized response is capped at 60,000 characters.
 
 **Key args:**
 - `path` (required) — absolute path to `.fs` file
-- `summaryOnly` — `true` (default) for headers+counts; `false` for full name/kind/range/signature entries
+- `summaryOnly` — `true` (default) for headers+counts+attributes; `false` for full name/kind/range/signature/accessibility/attributes entries
 
 **Use when:** Understanding a single file's structure before editing it.
 
@@ -151,7 +159,9 @@ The `evaluation` object identifies the evaluated source and restore state. LSP r
 cross the same response-size budget `fcs_public_api` uses is downgraded to the header-only
 shape instead of ever returning the oversized payload, flagged by `downgradedToSummary: true`
 plus a `hint` naming `maxResults` as the narrowing knob. `summaryOnly` in the response always
-echoes what was requested; check `downgradedToSummary` for what was actually returned.
+echoes what was requested; check `downgradedToSummary` for what was actually returned. The final
+size guard also accounts for CustomOperation rows, parse/check diagnostics, and the response
+envelope; `responseTruncatedByBudget` plus per-array fields report any additional cuts.
 
 ---
 
@@ -416,7 +426,7 @@ true` flags a budget-close specifically; either close reason adds a `hint` namin
 
 ### `fcs_nuget_members`
 
-**Purpose:** Enumerate members of one type from a referenced assembly. Returns name, kind, signature, accessibility, obsolete status, and XML doc summary.
+**Purpose:** Enumerate members of one type from a referenced assembly. Returns name, kind, signature (including generic constraints), exact metadata accessibility when available, abstractness, structured generic parameters, obsolete status, and XML doc summary.
 
 **Key args:**
 - `packageId` (required) — the NuGet package id OR an assembly simple name it ships (same matching as `fcs_nuget_types`)
@@ -424,6 +434,14 @@ true` flags a budget-close specifically; either close reason adds a `hint` namin
 - `maxResults` / `cursor` — pagination (default 500, max 2000)
 
 **Use when:** Inspecting a specific type's API after `fcs_nuget_types` identified it.
+
+Protected members remain in the default externally visible surface. Set
+`includeNonPublic=true` for internal/private rows. Each method row includes
+`isAbstract` and `genericParameters: [{ name, constraints }]`; the same constraints
+are appended to `signature` (for example `where T : class, new()`). Metadata is read
+without loading or executing the target assembly; exact accessibility and abstractness
+come from ECMA-335 when the row is unambiguous. Otherwise they fall back to FCS's
+source-language/dispatch-slot view.
 
 ---
 
@@ -520,6 +538,12 @@ above for free-form agent flows.
 
 ### `fsharp_runtime_status`
 
-**Purpose:** Read-only snapshot of the FsLangMCP process runtime state: managed-heap sizes by generation/LOH/POH, GC collection counts, `isServerGC` flag, assembly load count, FCS checker configuration flags and project-results cache size, FSAC child-process working set, and `process.threads` (OS process/ThreadPool counts plus pending/completed work items).
+**Purpose:** Read-only snapshot of the FsLangMCP process runtime state: managed-heap sizes by generation/LOH/POH, GC collection counts, `isServerGC` flag, assembly load count, FCS checker/cache state, project-options load/reload telemetry, FSAC child-process working set, and `process.threads` (OS process/ThreadPool counts plus pending/completed work items).
 
-**Use when:** Memory growth monitoring during long multi-agent sessions. Never triggers a GC collection or walks the heap.
+`fcs.projectOptions` distinguishes all load attempts from true stale-cache reloads,
+cache validations, and in-flight evaluations. At an OS-visible thread count of 128 or
+more, `process.threads.health` becomes `warning` and recommends restarting the parent
+MCP process. This is a safety signal, not proof of a leak: retained ProjInfo/MSBuild
+nodes are one known cause, but thread count alone cannot identify ownership.
+
+**Use when:** Memory/thread growth monitoring during long multi-agent sessions. Never triggers a GC collection, walks the heap, suspends threads, or forces a restart.

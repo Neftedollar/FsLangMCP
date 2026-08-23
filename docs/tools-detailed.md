@@ -347,6 +347,22 @@ project, collapsed to a single `verdict`. No path, no project, no flags needed f
    plus `totalDiagnostics`/`infoCount`/`belowSeverityFloorCount` covering the full severity set (see
    below).
 
+### Project-scope coverage boundary (#222)
+
+`scope=project` checks exactly one project. A library can therefore be `clean` while an app or
+test project that references it has an error caused by the same edit. Every resolved project-scope
+response makes that boundary machine-readable:
+
+- `downstreamProjectsChecked: false`
+- `recommendedScope: "workspace"`
+- `coverageNote` explaining that downstream consumers were not analyzed
+
+Use `scope=workspace` with a solution or directory `projectPath` when the verdict must include
+consumers. The project path does **not** evaluate or scan downstream projects merely to produce a
+count: that would make the narrow check unexpectedly expensive and add more ProjInfo/MSBuild work.
+An explicit workspace check against a single `.fsproj` is rejected as `invalid_args`, because it
+would still cover only that project while presenting itself as workspace evidence.
+
 ### The stale-`{}` problem it solves
 
 Right after an `Edit`/`Write`, a cached FSAC diagnostics snapshot can be an empty `{}` while the
@@ -374,6 +390,8 @@ the rest of the scope is incomplete.
 4. **`speed=fast` is coverage-aware but still cached** — inspect `complete`, `expectedFiles`,
    `missingFiles`, `staleFiles`, and `sessionGeneration`. Use the default `trusted` when you need a
    fresh type-check of a just-written on-disk edit.
+5. **Project scope is not a workspace verdict** — read `downstreamProjectsChecked` and follow
+   `recommendedScope` before treating a clean library check as evidence about tests/apps.
 
 ### Related tools
 
@@ -463,7 +481,8 @@ reference" hint rather than the false "not in this project's restore graph".
 **Routing description:** Enumerate members of one type from a referenced
 assembly (`packageId` + `typeName`). `packageId` accepts the NuGet package id OR an assembly
 SimpleName it ships; the two often differ. Use after `fcs_nuget_types` to discover type names.
-Each entry: `name`, `kind`, `signature`, `accessibility`, `isObsolete`, `xmlDocSummary`.
+Each entry: `name`, `kind`, `signature`, `accessibility`, `isAbstract`, `genericParameters`,
+`isObsolete`, `xmlDocSummary`.
 Paginated; default 500, max 2000. A miss adds `hint`, plus `candidatePackages` when the
 `packageId` did not resolve.
 
@@ -482,9 +501,15 @@ Paginated; default 500, max 2000. A miss adds `hint`, plus `candidatePackages` w
      compiler-generated backing fields (`Name@`, `<Prop>k__BackingField`) filtered out so an
      auto-property is not duplicated by its hidden field
    - `UnionCases` — F# union cases (only for union types)
-5. Overloaded methods appear as separate entries with distinct `signature` strings.
-6. Filters by accessibility (public-only by default; `includeNonPublic=true` for private/internal).
-7. Returns a paginated list with cursor mechanics identical to `fcs_nuget_types`.
+5. Reads method accessibility from ECMA-335 metadata when possible, without loading/executing the
+   assembly. Project-system `obj/.../ref` assemblies are paired with their implementation under
+   `bin/...`; NuGet `ref/<tfm>` assemblies are paired with `lib/<tfm>` when shipped. Ambiguous or
+   unavailable metadata falls back to FCS.
+6. Renders each `FSharpGenericParameter.Constraints` collection both structurally and as a
+   `where T : ...` suffix in the signature.
+7. Overloaded methods appear as separate entries with distinct `signature` strings.
+8. Filters by accessibility (public/protected by default; `includeNonPublic=true` for private/internal).
+9. Returns a paginated list with cursor mechanics identical to `fcs_nuget_types`.
 
 ### Response shape per entry
 
@@ -492,8 +517,10 @@ Paginated; default 500, max 2000. A miss adds `hint`, plus `candidatePackages` w
 |---|---|---|
 | `name` | string | `DisplayName` of the member |
 | `kind` | string | `"method"`, `"property"`, `"constructor"`, `"event"`, `"field"`, `"union-case"`, `"function"` |
-| `signature` | string | Formatted as `Name(param: Type, …) -> ReturnType` for methods; `Name: Type` for fields |
-| `accessibility` | string | `"public"`, `"internal"`, `"private"`, `"unknown"` |
+| `signature` | string | `Name(param: Type, …) -> ReturnType`, plus `where T : class, new()`-style constraints; `Name: Type` for fields |
+| `accessibility` | string | `"public"`, `"protected"`, `"protected internal"`, `"internal"`, `"private protected"`, `"private"`, `"unknown"` |
+| `isAbstract` | bool | Exact ECMA-335 abstract flag when metadata resolves unambiguously; otherwise the FCS dispatch-slot fallback |
+| `genericParameters` | array | `{ name, constraints[] }` rows; empty for non-generic members |
 | `isObsolete` | bool | `true` if `[<Obsolete>]` attribute is present |
 | `xmlDocSummary` | string\|null | `<summary>` content from `///` XML doc, if available in-source; null for compiled-only assemblies |
 
@@ -508,8 +535,9 @@ Paginated; default 500, max 2000. A miss adds `hint`, plus `candidatePackages` w
    searched and points at `fcs_nuget_types`). The tool never falls back to a fuzzy match.
 3. **xmlDocSummary is null for compiled BCL/NuGet types** — XML doc is only available for F# source
    files in the loaded project with `///` comments. For BCL types, use the official documentation.
-4. **Signature formatting** — uses FCS `BasicQualifiedName` for types; generic type parameters may
-   appear as `'T` or fully-qualified names depending on the FCS representation.
+4. **Signature type naming** — uses FCS `BasicQualifiedName` for parameter/return types; generic
+   constraints are now present, but BCL types can still appear under F# spellings such as
+   `Microsoft.FSharp.Core.string` or `unit`. CLR-oriented naming is tracked separately.
 5. **Class fields: F# `val` yes, imported C#/IL fields no** — public `val` fields on a reference-type
    class ARE now enumerated (they live only in `FSharpFields`, not `MembersFunctionsAndValues`), and
    compiler-generated backing fields are filtered. However, FCS returns an empty `FSharpFields` for
@@ -697,38 +725,58 @@ oversized type is never dropped into an empty page just because it alone exceeds
 ## fcs_file_outline
 
 **Routing description:** Agent-friendly compact F# outline for one file. `summaryOnly=true`
-(default) returns module/type headers plus per-kind `memberCounts` only — no per-member
-signatures — which keeps the response small on large files by construction. `summaryOnly=false`
-restores full per-member `name`/`kind`/`range`/`signature`/`accessibility` entries.
+(default) returns module/type headers, attributes, per-kind `memberCounts`, a bounded
+CustomOperation index, and parse/check diagnostics — no per-member signatures.
+`summaryOnly=false` restores full per-member
+`name`/`kind`/`range`/`signature`/`accessibility`/`attributes` entries.
+
+`attributes` is a compact array of attribute full names. Top-level `customOperationCount` is the
+full count; `customOperations` decodes the operation-name constructor argument into bounded rows
+with `operationName`, `memberName`, `fullName`, and source range. The rows obey `maxResults` and the
+shared response-size budget. `customOperationsTruncated`,
+`customOperationsTruncatedByBudget`, and `customOperationsHint` make incomplete indexes explicit.
+These fields are available in summary mode, so the common lookup does not require full signatures.
+
+Entries, CustomOperation rows, parse diagnostics, and check diagnostics share one conservative
+45,000-character node budget. The fully assembled JSON is then measured with the exact serializer
+used on the wire and trimmed to a hard 60,000-character ceiling. `returnedEntryCount`,
+`parseDiagnosticCount`, and `checkDiagnosticCount` distinguish surfaced rows from full totals;
+`entriesTruncatedByBudget`, `parseDiagnosticsTruncated`, `checkDiagnosticsTruncated`,
+`responseTruncatedByBudget`, and the accompanying hints make every size cut explicit. For a file
+with a very large diagnostic set, use `check(scope="file")` for the diagnostic-focused view.
 
 ### `downgradedToSummary` size guard (#206)
 
 `summaryOnly=false` has no count-based ceiling of its own beyond `maxResults` (default 200), and a
 file with many signature-heavy top-level bindings can still serialize past the shared 45,000-
 character `responseCharBudget` within that count — two field-observed outlines hit 54KB and 65KB.
-Rather than ever return that oversized payload, a `summaryOnly=false` request whose full
-entries would cross the budget is downgraded to the same header-only shape `summaryOnly=true`
+Before assembling the final response, a `summaryOnly=false` request whose full entries would cross
+the conservative node budget is downgraded to the same header-only shape `summaryOnly=true`
 produces (name/kind/fullName/range, no signatures), plus an additive `hint` explaining the
 downgrade and naming `maxResults` — the narrowing knob available today — as the way to fit full
-signatures in one page. The `summaryOnly` field in the response always echoes what was
+signatures in one page. The final assembled response guard also accounts for diagnostics and JSON
+envelope/indentation, rather than assuming summary mode is always small. The `summaryOnly` field
+in the response always echoes what was
 **requested**, not what was actually returned; check the additive `downgradedToSummary: true` flag
 to know the entries shape actually changed. Neither field appears when the full output already
 fits the budget — a small file with `summaryOnly=false` gets the unmodified pre-#206 response.
-`count` is the length of the returned `entries` slice — it is capped by `maxResults` exactly like
-`entries` itself (`count = min(definitionsInFile, maxResults)`), and unaffected only by the
-downgrade: lowering `maxResults` shrinks `count` on either shape, downgraded or not.
+`count` is the pre-budget definition slice capped by `maxResults`
+(`count = min(definitionsInFile, maxResults)`). `returnedEntryCount` is the actual length of the
+surfaced `entries` array after summary shaping and response-budget trimming; use it when consuming
+the array. Lowering `maxResults` shrinks `count` on either shape, downgraded or not.
 `memberCounts` is the one field that is genuinely uncapped — it is computed from the full,
 untruncated definition set regardless of `maxResults` or the downgrade, so it is the field to read
 for "how many of kind X does this file really have," never `count`.
 
 ### Caveats
 
-1. **`downgradedToSummary` only fires for an explicit `summaryOnly=false` request.**
-   `summaryOnly=true` is already small by construction and is never measured against the budget.
+1. **`downgradedToSummary` only fires for an explicit `summaryOnly=false` request.** A summary
+   request can still set the array-level truncation fields when attributes, CustomOperation rows,
+   or diagnostics consume the shared budget; both modes receive the exact final size check.
 2. **A future per-type narrowing parameter (tracked separately, #157) is not implemented here.**
    Until it lands, `maxResults` is the only narrowing knob the downgrade hint can point to.
-3. **The MCP client may still spill an oversized response to a side file, with a client-defined
-   shape** — same caveat as `fcs_public_api` above.
+3. **The 60,000-character ceiling applies to this tool's serialized JSON response.** It is not a
+   token-count promise: tokenization and any outer MCP/client envelope are client-defined.
 
 ### Related tools
 

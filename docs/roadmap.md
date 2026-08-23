@@ -10,13 +10,13 @@ A living document. **Not a delivery contract** — priorities shift with real us
 
 These conditions need to be true before cutting `1.0.0`:
 
-- **No open blocker-grade UX issues** on the catch-all tracking issue [`#100`](https://github.com/Neftedollar/FsLangMCP/issues/100).
+- **No open blocker-grade UX issues** across the repository's bounded UX/bug trackers.
 - **Tool surface stable across 3 consecutive minor releases** with no renames or removals — a soak period proving the contract holds.
 - **`///` doc-comments surface in the MCP JSON schema's `properties[x].description`.** Today they don't (see v0.8.6 CHANGELOG). Needs either an FsMcp.Server-side change or a local schema-generation pass that picks up XML doc.
 - **VS.Threading bind race in subagent context fully closed.** v0.8.2 #121 fix held in most cases but residual reports surfaced across v0.8.4–v0.9.0 subagent sessions. Needs deeper `RuntimeFrameworkVersion` or binding-redirect investigation.
 - **Performance baselines documented and met**: warm-cache `set_project` ≤ 2s on a 10-project solution; cold-cache `find(kind="field")` ≤ 5s on a 50k-LOC project. (Today both are unmeasured.)
 - **Documentation in lockstep with the surface**: README, `CONTRIBUTING.md`, `docs/architecture.md`, and `AGENT_INTEGRATION.md` all reflect the shipped tool set.
-- **At least one third-party adoption signal**: someone other than the maintainer running FsLangMcp in a non-toy project and reporting stable usage in `#100` or a dedicated issue.
+- **At least one third-party adoption signal**: someone other than the maintainer running FsLangMcp in a non-toy project and reporting stable usage in a dedicated issue/discussion.
 
 ## Deferred items / planned work
 
@@ -46,4 +46,7 @@ Triage order, highest first:
 5. **Polish** — error-message wording, tool descriptions, doc edits.
 6. **Content** — blog posts, demos, conference talks.
 
-Issues filed against [`#100`](https://github.com/Neftedollar/FsLangMCP/issues/100) (UX feedback) get triaged into dedicated issues within ~24 hours when actionable. Non-actionable noise stays on the thread until it accumulates a pattern.
+Every reproducible UX behavior is filed directly as one bounded issue with version, request,
+observed result, expected result, and acceptance criteria. New evidence for the exact same behavior
+is added to that issue; unrelated observations are never batched into a numbered catch-all.
+Positive/non-actionable notes stay in the originating report until they form a concrete request.
