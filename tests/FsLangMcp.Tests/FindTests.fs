@@ -36,6 +36,17 @@ let private domainFs =
           "/// Hexagonal port modelled as a record-of-functions."
           "type TraderRole ="
           "    { Propose: int -> int -> int }"
+          ""
+          "/// Regression fixture: internal members are still valid FCS call-site targets."
+          "type GrainContract<'T>() ="
+          "    member internal _.Resolve(value: 'T) = value"
+          ""
+          "module InternalMemberCalls ="
+          "    let private contract = GrainContract<int>()"
+          "    let first = contract.Resolve 1"
+          "    let second = contract.Resolve 2"
+          "    let third = contract.Resolve 3"
+          "    let fourth = contract.Resolve 4"
           "" ]
 
 let private stubsFs =
@@ -432,6 +443,40 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
             Assert.Equal(0, gi breakdown "references")
             Assert.Equal(5, gi breakdown "fieldSetLiteral" + gi breakdown "fieldSetUpdate" + gi breakdown "fieldRead")
             Assert.Equal("field", gs find "kindResolved")
+        }
+
+    [<Fact>]
+    member _.``find kind=members accepts the member name as query and finds internal call sites``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let! byMemberName =
+                bridge.Find(
+                    { findArgs fx.Slnx "Resolve" with
+                        kind = Some "members"
+                        ``member`` = Some "Resolve" }
+                )
+
+            Assert.Equal("succeeded", gs byMemberName "status")
+            Assert.Equal(4, gi byMemberName["breakdown"] "memberUsages")
+
+            let memberSites: JsonNode array =
+                FindTests.SitesOfKinds byMemberName (Set.singleton "member-usage")
+
+            Assert.Equal(4, memberSites.Length)
+
+            // Preserve the older type-qualified form while fixing the documented
+            // query=member form used by the tool description and getting-started guide.
+            let! byDeclaringType =
+                bridge.Find(
+                    { findArgs fx.Slnx "GrainContract" with
+                        kind = Some "members"
+                        ``member`` = Some "Resolve" }
+                )
+
+            Assert.Equal("succeeded", gs byDeclaringType "status")
+            Assert.Equal(4, gi byDeclaringType["breakdown"] "memberUsages")
         }
 
     [<Fact>]

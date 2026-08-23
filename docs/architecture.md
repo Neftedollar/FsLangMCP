@@ -34,20 +34,27 @@ MCP transport is provided by `FsMcp.Server` (a transitive package dependency).
 
 Sources live at the repo root (single-project layout). Listed in `<Compile Include>` order from `FsLangMcp.fsproj`:
 
-| File | LOC | Purpose |
-|------|----:|---------|
-| `BoundedCache.fs` | 57 | Generic thread-safe FIFO-eviction cache (`BoundedCache<'K,'V>`). Used in `FcsBridge` for project-options/symbol-use caches (size 50) and the project-results cache (size 3). |
-| `Types.fs` | 761 | All MCP arg records (`CompletionArgs`, `PositionArgs`, `FindArgs`, ...) with `///` field doc-comments. Also hosts `ToolError` DU, JSON helpers (`jobj`, `jstr`, `jint`, `jbool`), and the `ArgsValidation.requireNonBlank` helper that standardises required-string envelope responses. |
-| `Version.fs` | 48 | Reads the assembly's `AssemblyInformationalVersion` (set by SDK from `<Version>` in the fsproj) and exposes it as a string. Used by `set_project`, `fsharp_runtime_status`, and the `fslangmcp_version` tool. |
-| `ProjectFiles.fs` | 367 | Parses `.sln` / `.slnx` / `.fsproj` files. Includes the internal `SolutionParsing` module. |
-| `Cursor.fs` | 88 | Opaque pagination cursor encoding / decoding for paginated tool responses (e.g. `fcs_project_outline`). |
-| `ProjectInspection.fs` | 146 | Implements `fsharp_project_inspect` — read-only `.fsproj` inspection (compile order, references, source summary, sig/impl pairing). |
-| `ProjectHealth.fs` | 1140 | Implements `project_health` — preflight checks including test-framework detection, test-count regex (uses `\b` word boundary so `[<TestFixture>]` isn't double-counted, see v0.8.1 #119 follow-up), and last-build-artifact discovery. |
-| `LspBridge.fs` | 2102 | fsautocomplete child-process lifecycle + LSP JSON-RPC client. Hosts the internal `DiagnosticsTarget` (the `publishDiagnostics` callback target), the internal `WorkspaceSelection` module (chooses a project when multiple match), and the internal `LspResponseShape` module (pure response builders kept separate for unit-testing without spinning up FSAC). |
-| `FcsBridge.fs` | 8662 | The heavyweight. Hosts a single `FSharpChecker` instance, the bounded caches, and the semantic tool implementations. Also defines the parse-tree walker used by `find(kind="field")` to classify record construction/update sites. |
-| `Tools.fs` | 63 | Error-envelope helpers (`toolResult`, error→envelope translation). Thin layer used by every tool registration in `Program.fs`. |
-| `RuntimeStatus.fs` | 259 | Builds the `fsharp_runtime_status` JSON payload (managed-heap sizes, GC counts, thread counters, FCS cache sizes, FSAC child working set). Pure builder — instrumentation reads come from the caller. |
-| `Program.fs` | 667 | CLI parsing, MCP server boot, every `TypedTool.define` registration, semaphore-based concurrency gates (`fcsGate`, `lspGate`). The composition root. |
+| File | Purpose |
+|------|---------|
+| `BoundedCache.fs` | Generic thread-safe FIFO-eviction cache used by the semantic caches. |
+| `ProcessRunner.fs` | Bounded external-process execution, output capture, cancellation, and process-tree cleanup. |
+| `Types.fs` | MCP argument records, error types, render-budget settings, and JSON helpers. |
+| `SdkPreflight.fs` | Detects unsatisfied `global.json` SDK pins before ProjInfo/FSAC fail opaquely. |
+| `Version.fs` | Exposes the running product version from assembly metadata. |
+| `InstallationHealth.fs` | Detects a stale long-lived global-tool process whose version directory/dependencies were replaced on disk. |
+| `ProjectFiles.fs` | Shared project/solution discovery, filtering, and evaluated-project data model. |
+| `Cursor.fs` | Opaque pagination cursor encoding/decoding. |
+| `ProjectInspection.fs` | Implements read-only evaluated `.fsproj` inspection. |
+| `ProjectHealth.fs` | Implements project readiness and reverse test-project discovery. |
+| `AnalyzerDiagnostics.fs` | Analyzer SARIF ingestion and analyzer-setup previews. |
+| `LspBridge.fs` | fsautocomplete child-process lifecycle, LSP JSON-RPC client, diagnostics generations, and readiness state. |
+| `MetadataAccessibility.fs` | Reads ECMA-335 method accessibility without loading/executing referenced assemblies. |
+| `FcsBridge.fs` | `FSharpChecker`, project-options/results caches, semantic queries, and FCS-backed tool implementations. |
+| `Tools.fs` | Shared tool error envelopes, including stale-installation handling. |
+| `RuntimeStatus.fs` | Pure builder for heap/GC/thread/process/FCS telemetry and high-thread warnings. |
+| `Dispatcher.fs` | Maps consolidated `find`/`check` requests to their FCS/FSAC execution paths. |
+| `McpHost.fs` | MCP host configuration and typed-tool schema adaptation. |
+| `Program.fs` | CLI/MCP composition root, tool registration, concurrency gates, and active-context wiring. |
 
 ## Key design choices
 

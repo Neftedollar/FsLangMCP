@@ -101,6 +101,10 @@ type CheckFixture() =
     // genuine second member project to sweep. Its warning is permanent — no ResetClean.
     let betaFsproj = write "Beta/Beta.fsproj" betaProject
     let _betaLibraryFs = write "Beta/Library.fs" betaWarningSource
+    let probeSlnx =
+        write
+            "ProbeOnly.slnx"
+            "<Solution>\n  <Project Path=\"Probe/Probe.fsproj\" />\n</Solution>\n"
 
     // dotnet build once per project so Ionide.ProjInfo can resolve options (restore +
     // design-time build). After this, FCS re-checks read source files from disk — no
@@ -147,6 +151,7 @@ type CheckFixture() =
 
     member _.Root = root
     member _.ProbeFsproj = probeFsproj
+    member _.ProbeSlnx = probeSlnx
     member _.StandaloneFsi = standaloneFsi
     member _.HelpersFs = helpersFs
     member _.MainFs = mainFs
@@ -1761,7 +1766,7 @@ type CheckTests(fx: CheckFixture) =
             let! result =
                 bridge.Check(
                     { bareCheck with
-                        projectPath = Some fx.ProbeFsproj
+                        projectPath = Some fx.ProbeSlnx
                         scope = Some "workspace"
                         fileGlob = Some "src/DoesNotExist/*.fs"
                         speed = Some "fast" },
@@ -2156,6 +2161,51 @@ type CheckTests(fx: CheckFixture) =
             Assert.True(gb result "analyzed", "a restored project must be genuinely analyzed")
             Assert.Null(result["restoreStatus"]) // the unrestored extra must be absent
             Assert.False(gb result "diagnosticsTruncated", "a clean project has nothing to truncate")
+        }
+
+    [<Fact>]
+    member _.``project scope makes its downstream coverage boundary explicit``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            let! projectOnly =
+                bridge.Check(
+                    { bareCheck with
+                        scope = Some "project"
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            Assert.Equal("clean", gs projectOnly "verdict")
+            Assert.False(gb projectOnly "downstreamProjectsChecked")
+            Assert.Equal("workspace", gs projectOnly "recommendedScope")
+
+            let note = gs projectOnly "coverageNote"
+            Assert.Contains("not checked", note)
+            Assert.Contains("scope=\"workspace\"", note)
+
+            let! ambiguousWorkspace =
+                bridge.Check(
+                    { bareCheck with
+                        scope = Some "workspace"
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            Assert.Equal("invalid_args", gs ambiguousWorkspace "status")
+            Assert.Contains("solution", gs ambiguousWorkspace "message")
+            Assert.Contains("downstream consumers", gs ambiguousWorkspace "message")
+
+            let! workspace =
+                bridge.Check(
+                    { bareCheck with
+                        scope = Some "workspace"
+                        projectPath = Some fx.Root }
+                )
+
+            Assert.Null(workspace["downstreamProjectsChecked"])
+            Assert.Null(workspace["coverageNote"])
+            Assert.Null(workspace["recommendedScope"])
         }
 
     // ── #205: perProject entries carried only errorCount/warningCount, so the

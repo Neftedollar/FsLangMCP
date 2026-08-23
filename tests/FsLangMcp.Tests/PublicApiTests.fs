@@ -352,6 +352,55 @@ type PublicApiTests(fx: SurfaceFixture) =
         }
 
     [<Fact>]
+    member _.``project options reload when a wildcard gains a file in a new sibling directory (#163)``
+        ()
+        : Task =
+        task {
+            let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_wildcard_%O{Guid.NewGuid()}")
+            let project = Path.Combine(root, "Wildcard.fsproj")
+            let existing = Path.Combine(root, "src", "Existing", "Existing.fs")
+            let added = Path.Combine(root, "src", "NewSibling", "Added.fs")
+
+            try
+                Directory.CreateDirectory(Path.GetDirectoryName existing) |> ignore
+
+                File.WriteAllText(
+                    project,
+                    String.concat
+                        Environment.NewLine
+                        [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+                          "  <PropertyGroup>"
+                          "    <TargetFramework>net10.0</TargetFramework>"
+                          "    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>"
+                          "  </PropertyGroup>"
+                          "  <ItemGroup><Compile Include=\"src/**/*.fs\" /></ItemGroup>"
+                          "</Project>" ]
+                )
+
+                File.WriteAllText(existing, "module Wildcard.Existing\n\ntype Existing = { Value: int }\n")
+
+                let bridge = FcsBridge()
+                let! before = bridge.PublicApi(baseArgs project)
+                Assert.Contains("Wildcard.Existing.Existing", entityFullNames before)
+                Assert.DoesNotContain("Wildcard.Added.Added", entityFullNames before)
+                let loadsBefore = bridge.ProjectOptionsLoadCount
+                let reloadsBefore = bridge.ProjectOptionsStaleReloadCount
+
+                // Do not touch the project file. Only a brand-new sibling directory
+                // and source file appear beneath the wildcard search root.
+                Directory.CreateDirectory(Path.GetDirectoryName added) |> ignore
+                File.WriteAllText(added, "module Wildcard.Added\n\ntype Added = { Value: string }\n")
+
+                let! after = bridge.PublicApi(baseArgs project)
+                Assert.Contains("Wildcard.Added.Added", entityFullNames after)
+                Assert.Equal(loadsBefore + 1L, bridge.ProjectOptionsLoadCount)
+                Assert.Equal(reloadsBefore + 1L, bridge.ProjectOptionsStaleReloadCount)
+            finally
+                if Directory.Exists root then
+                    Directory.Delete(root, true)
+        }
+
+    [<Fact>]
     member _.``project options stay warm across analysis clears and coalesce an input refresh`` () : Task =
         task {
             let bridge = FcsBridge()
@@ -364,11 +413,13 @@ type PublicApiTests(fx: SurfaceFixture) =
 
             try
                 let before = bridge.ProjectOptionsLoadCount
+                let reloadsBefore = bridge.ProjectOptionsStaleReloadCount
                 let! first = bridge.ProbeProjectOptions(fx.Project)
                 assertLoaded first
 
                 let afterFirst = bridge.ProjectOptionsLoadCount
                 Assert.Equal(before + 1L, afterFirst)
+                Assert.Equal(reloadsBefore, bridge.ProjectOptionsStaleReloadCount)
 
                 // set_project uses this lighter clear: unchanged MSBuild inputs must not
                 // invoke Ionide again (each real invocation owns MSBuild node threads).
@@ -378,6 +429,7 @@ type PublicApiTests(fx: SurfaceFixture) =
                     assertLoaded warm
 
                 Assert.Equal(afterFirst, bridge.ProjectOptionsLoadCount)
+                Assert.Equal(reloadsBefore, bridge.ProjectOptionsStaleReloadCount)
 
                 // A previously-missing ancestor import is part of the fingerprint. All
                 // concurrent stale callers must share one refresh, then remain warm.
@@ -392,6 +444,7 @@ type PublicApiTests(fx: SurfaceFixture) =
 
                 let afterRefresh = bridge.ProjectOptionsLoadCount
                 Assert.Equal(afterFirst + 1L, afterRefresh)
+                Assert.Equal(reloadsBefore + 1L, bridge.ProjectOptionsStaleReloadCount)
 
                 // Fresh file checks invalidate semantic results, not project options.
                 let checkArgs: FcsParseAndCheckArgs =
@@ -405,6 +458,7 @@ type PublicApiTests(fx: SurfaceFixture) =
                 Assert.Equal("succeeded", firstCheck["status"].GetValue<string>())
                 Assert.Equal("succeeded", secondCheck["status"].GetValue<string>())
                 Assert.Equal(afterRefresh, bridge.ProjectOptionsLoadCount)
+                Assert.Equal(reloadsBefore + 1L, bridge.ProjectOptionsStaleReloadCount)
             finally
                 if File.Exists directoryBuildProps then
                     File.Delete directoryBuildProps

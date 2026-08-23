@@ -36,6 +36,7 @@ let private widgetFs =
           "type Widget(initial: int) ="
           "    [<DefaultValue>] val mutable PublicCounter : int"
           "    member val Name : string = \"\" with get, set"
+          "    member internal _.InternalOnly () = ()"
           "    member _.Compute () = initial + 1"
           "" ]
 
@@ -47,17 +48,47 @@ let private fieldProbeFsproj =
           "  <ItemGroup><Compile Include=\"Widget.fs\" /></ItemGroup>"
           "</Project>" ]
 
+let private csharpProbeCs =
+    String.concat
+        "\n"
+        [ "namespace MetadataProbe;"
+          "public abstract class Api"
+          "{"
+          "    internal void InternalOnly() { }"
+          "    protected abstract void ProtectedAbstract();"
+          "    protected internal virtual void ProtectedInternal() { }"
+          "    private protected void PrivateProtected() { }"
+          "    public T Echo<T>(T value) where T : class, new() => value;"
+          "}"
+          "" ]
+
+let private csharpProbeCsproj =
+    String.concat
+        "\n"
+        [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+          "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+          "</Project>" ]
+
 let private consumerFsproj =
     String.concat
         "\n"
         [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
           "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
           "  <ItemGroup><Compile Include=\"Consumer.fs\" /></ItemGroup>"
-          "  <ItemGroup><ProjectReference Include=\"../FieldProbe/FieldProbe.fsproj\" /></ItemGroup>"
+          "  <ItemGroup>"
+          "    <ProjectReference Include=\"../FieldProbe/FieldProbe.fsproj\" />"
+          "    <ProjectReference Include=\"../CSharpProbe/CSharpProbe.csproj\" />"
+          "  </ItemGroup>"
           "</Project>" ]
 
 let private consumerFs =
-    String.concat "\n" [ "module Consumer.Main"; ""; "let private _widget = FieldProbe.Widget(0)"; "" ]
+    String.concat
+        "\n"
+        [ "module Consumer.Main"
+          ""
+          "let private _widget = FieldProbe.Widget(0)"
+          "let private _metadataApi = typeof<MetadataProbe.Api>"
+          "" ]
 
 // ── Class fixture: written + built ONCE ──────────────────────────────────────────
 
@@ -73,6 +104,8 @@ type FieldProbeFixture() =
 
     do write "FieldProbe/FieldProbe.fsproj" fieldProbeFsproj |> ignore
     do write "FieldProbe/Widget.fs" widgetFs |> ignore
+    do write "CSharpProbe/CSharpProbe.csproj" csharpProbeCsproj |> ignore
+    do write "CSharpProbe/Api.cs" csharpProbeCs |> ignore
     let consumer = write "Consumer/Consumer.fsproj" consumerFsproj
     do write "Consumer/Consumer.fs" consumerFs |> ignore
 
@@ -148,6 +181,14 @@ let private nugetArgs (projectPath: string) (includeNonPublic: bool) : FcsNugetM
       maxResults = Some 500
       cursor = None }
 
+let private metadataArgs (projectPath: string) (includeNonPublic: bool) : FcsNugetMembersArgs =
+    { packageId = "CSharpProbe"
+      typeName = "MetadataProbe.Api"
+      projectPath = Some projectPath
+      includeNonPublic = Some includeNonPublic
+      maxResults = Some 500
+      cursor = None }
+
 let private typesArgs (projectPath: string) (packageId: string) : FcsNugetTypesArgs =
     { packageId = packageId
       projectPath = Some projectPath
@@ -159,6 +200,11 @@ let private optionalString (result: JsonNode) (field: string) =
     match result[field] with
     | null -> None
     | value -> Some(value.GetValue<string>())
+
+let private entryNamed (result: JsonNode) (name: string) =
+    entries result
+    |> List.tryFind (fun entry -> entry["name"].GetValue<string>() = name)
+    |> Option.defaultWith (fun () -> failwith $"Expected member row '{name}'.")
 
 let private displayNames (result: JsonNode) =
     entries result |> List.map (fun e -> e["displayName"].GetValue<string>())
@@ -237,6 +283,48 @@ type NugetClassFieldTests(fx: FieldProbeFixture) =
 
             Assert.Contains("PublicCounter", allNames)
             Assert.DoesNotContain(allNames, isBackingFieldName)
+
+            let internalOnly = entryNamed all "InternalOnly"
+            Assert.Equal("internal", internalOnly["accessibility"].GetValue<string>())
+        }
+
+    [<Fact>]
+    member _.``NugetMembers preserves imported CLR accessibility and generic constraints``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let! publicSurface = bridge.NugetMembers(metadataArgs fx.ConsumerFsproj false)
+            Assert.Equal("ok", publicSurface["status"].GetValue<string>())
+            Assert.True((publicSurface["matchedTypes"] :?> JsonArray).Count > 0, "MetadataProbe.Api must match")
+
+            let protectedAbstract = entryNamed publicSurface "ProtectedAbstract"
+            Assert.Equal("protected", protectedAbstract["accessibility"].GetValue<string>())
+            Assert.True(protectedAbstract["isAbstract"].GetValue<bool>())
+
+            // ECMA-335 metadata preserves the CLR combination that FCS's F# source
+            // accessibility model otherwise collapses to `protected`.
+            let protectedInternal = entryNamed publicSurface "ProtectedInternal"
+            Assert.Equal("protected internal", protectedInternal["accessibility"].GetValue<string>())
+            Assert.False(protectedInternal["isAbstract"].GetValue<bool>())
+
+            let echo = entryNamed publicSurface "Echo"
+            let echoSignature = echo["signature"].GetValue<string>()
+            Assert.False(echo["isAbstract"].GetValue<bool>())
+            Assert.Contains("where T : class, new()", echoSignature)
+
+            let genericParameters = echo["genericParameters"] :?> JsonArray
+            Assert.Single(genericParameters) |> ignore
+            Assert.Equal("T", (genericParameters[0]["name"]).GetValue<string>())
+
+            let constraints =
+                (genericParameters[0]["constraints"] :?> JsonArray)
+                |> Seq.cast<JsonNode>
+                |> Seq.map _.GetValue<string>()
+                |> Seq.toArray
+
+            Assert.Equal<string array>([| "class"; "new()" |], constraints)
+
         }
 
     // ─── Issue #191: miss payload through the real tool path ────────────────────

@@ -23,7 +23,14 @@
     "process": <number>,
     "threadPool": <number>,
     "pendingWorkItems": <number>,
-    "completedWorkItems": <number>
+    "completedWorkItems": <number>,
+    "health": {
+      "status": "<thread-health>",
+      "warningThreshold": 128,
+      "restartRecommended": <bool>,
+      "warning": <thread-warning>,
+      "recommendation": <thread-recommendation>
+    }
   },
   "assemblies": {
     "loaded": <number>,

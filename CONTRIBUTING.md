@@ -85,14 +85,14 @@ The v0.16.0 surface ships 35 tools that all follow the same registration shape. 
 ## PR process
 
 - Keep PRs small and focused. One conceptual change per PR.
-- Link to a GitHub issue in the PR description. For ad-hoc UX feedback without a dedicated issue, comment on the catch-all tracking issue (see "Reporting bugs" below) and link it from the PR.
+- Link to a GitHub issue in the PR description. One reproducible behavior belongs to one bounded issue; add evidence to an existing issue only when it is the same behavior.
 - Include test coverage for new behaviour. Reviewers will ask for proof-by-breaking on refactors.
 - Maintainer review uses subagent loops with `engineering-code-reviewer` and `engineering-fsharp-developer` agents. See recent CHANGELOG entries (v0.8.1, v0.8.2, v0.9.0) for examples of the iterate-until-approved pattern. Expect reviewer iter-1 to catch test theatre, scope creep, and stale comments — re-spin until the gate passes clean.
 
 ## Reporting bugs / requesting features
 
-- **Usage-pattern UX feedback** (subagent observations, tool-discipline notes, missing-feature signals from real multi-agent sessions) → comment on the catch-all tracking issue [`Neftedollar/FsLangMCP#100`](https://github.com/Neftedollar/FsLangMCP/issues/100). Batch low-signal issues there to avoid maintainer thread fatigue.
-- **Concrete bugs or actionable feature requests** → open a dedicated issue with a minimal repro (commit SHA, MCP request payload, observed response, expected response).
+- **Concrete UX bugs or actionable feature requests** → open one dedicated, bounded issue per reproducible behavior. Include the FsLangMCP version, project shape, request payload, observed response/timing, and expected behavior. If an issue already tracks that exact behavior, add the evidence there instead of opening a duplicate.
+- **Positive or non-actionable usage notes** → keep them in the originating task/PR report; they do not need a GitHub catch-all. Promote a note to an issue when it becomes a falsifiable behavior or a concrete request.
 - **Security-sensitive reports** → see `SECURITY.md` if present; otherwise email the maintainer directly via the repo owner contact on GitHub.
 
 See also: [AGENT_INTEGRATION.md](AGENT_INTEGRATION.md) for integration patterns that contributors writing about FsLangMcp should align with, and [`docs/architecture.md`](docs/architecture.md) for a codebase tour.

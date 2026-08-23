@@ -89,7 +89,7 @@ let ``toFileUri returns a URI starting with file scheme and containing filename`
 let ``toolResult success case returns Ok with Content text`` () : Task =
     task {
         let node: JsonNode = JsonValue.Create(42)
-        let! result = toolResult (Task.FromResult(node))
+        let! result = toolResult (fun () -> Task.FromResult(node))
 
         match result with
         | Ok contents -> Assert.NotEmpty(contents)
@@ -99,7 +99,7 @@ let ``toolResult success case returns Ok with Content text`` () : Task =
 [<Fact>]
 let ``toolResult OperationCanceledException returns Error with FcsAborted errorKind`` () : Task =
     task {
-        let work =
+        let work () =
             task {
                 raise (OperationCanceledException("cancelled by user"))
                 return (null: JsonNode)
@@ -118,7 +118,7 @@ let ``toolResult OperationCanceledException returns Error with FcsAborted errorK
 [<Fact>]
 let ``toolResult ArgumentException returns Error with InvalidArgs errorKind`` () : Task =
     task {
-        let work =
+        let work () =
             task {
                 raise (ArgumentException("bad param"))
                 return (null: JsonNode)
@@ -137,7 +137,7 @@ let ``toolResult ArgumentException returns Error with InvalidArgs errorKind`` ()
 [<Fact>]
 let ``toolResult FileNotFoundException returns Error with FileNotFound errorKind`` () : Task =
     task {
-        let work =
+        let work () =
             task {
                 raise (System.IO.FileNotFoundException("file is missing"))
                 return (null: JsonNode)
@@ -156,7 +156,7 @@ let ``toolResult FileNotFoundException returns Error with FileNotFound errorKind
 [<Fact>]
 let ``toolResult generic exception returns Error with InfraFailure errorKind`` () : Task =
     task {
-        let work =
+        let work () =
             task {
                 raise (Exception("something went wrong"))
                 return (null: JsonNode)
@@ -175,7 +175,7 @@ let ``toolResult generic exception returns Error with InfraFailure errorKind`` (
 [<Fact>]
 let ``toolResult exception with not ready message returns Error with NotReady errorKind`` () : Task =
     task {
-        let work =
+        let work () =
             task {
                 raise (Exception("service not ready yet"))
                 return (null: JsonNode)

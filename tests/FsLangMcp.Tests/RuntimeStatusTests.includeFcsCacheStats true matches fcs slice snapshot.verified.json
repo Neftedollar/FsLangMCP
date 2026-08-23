@@ -4,6 +4,13 @@
     "approximateBytes": null
   },
   "projectCacheSize": 3,
+  "projectOptions": {
+    "loadAttempts": 0,
+    "staleReloads": 0,
+    "cacheValidations": 0,
+    "inFlight": 0,
+    "note": "loadAttempts counts actual Ionide.ProjInfo/MSBuild evaluations; cache hits are excluded. staleReloads counts cached entries invalidated by a changed project-options input fingerprint."
+  },
   "checker": {
     "keepAssemblyContents": true,
     "keepAllBackgroundResolutions": true,

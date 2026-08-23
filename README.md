@@ -61,7 +61,7 @@ Full setup: [`docs/getting-started.md`](docs/getting-started.md) · Per-client c
 | Tool | What it does |
 |------|--------------|
 | `find` | Multi-project semantic search with explicit coverage. A failed/timed-out project makes absence indeterminate instead of returning a false `matched=false`. |
-| `check` | One trustworthy verdict (`clean`/`errors`/`unknown`). Default mode is a fresh FCS check; fast FSAC mode returns `clean` only with complete current coverage. |
+| `check` | One trustworthy verdict (`clean`/`errors`/`unknown`). Default mode is a fresh FCS check; fast FSAC mode returns `clean` only with complete current coverage. Project scope warns that downstream consumers were not checked; workspace scope requires a solution or directory. |
 
 ### Navigate / understand
 
@@ -70,7 +70,7 @@ Full setup: [`docs/getting-started.md`](docs/getting-started.md) · Per-client c
 | `set_project` | Initialize or switch FSAC/LSP context. Results are bound to the active project and session generation; a no-restart cross-project switch is rejected. |
 | `project_health` | Fast read-only preflight: options readiness, source files, analyzer setup, test project discovery. No build, no tests. |
 | `fcs_project_outline` | Compact project-wide outline over all compile files. |
-| `fcs_file_outline` | Per-file outline; `summaryOnly=true` (default) keeps token cost low. |
+| `fcs_file_outline` | Per-file outline with attributes, bounded/truncation-aware CustomOperation and diagnostic arrays, and a hard serialized-response guard; `summaryOnly=true` (default) keeps token cost low. |
 | `fsharp_project_inspect` | Read-only `.fsproj` inspection: compile order, references, signature/implementation pairing. |
 | `fcs_symbol_at_word` | Tolerant symbol lookup by line + word — no exact cursor column needed. |
 | `fcs_get_project_options` | Get compiler `OtherOptions` for a `.fsproj` via proj-info. Diagnostic helper. |
@@ -115,7 +115,7 @@ Full setup: [`docs/getting-started.md`](docs/getting-started.md) · Per-client c
 | Tool | What it does |
 |------|--------------|
 | `fcs_nuget_types` | Enumerate types in one referenced assembly, by NuGet package id or by the assembly `SimpleName` it ships (exact, case-insensitive). |
-| `fcs_nuget_members` | Enumerate members of one type from a referenced assembly. |
+| `fcs_nuget_members` | Enumerate members of one type, including metadata accessibility, abstractness, and generic constraints. |
 | `fcs_referenced_symbols` | Substring search across all referenced assemblies (NuGet + framework). |
 
 ### Exact-position helpers
@@ -138,7 +138,7 @@ Prefer the semantic tools above for free-form agent flows.
 | Tool | What it does |
 |------|--------------|
 | `fslangmcp_version` | Returns installed version. Zero-arg. Use when filing UX feedback. |
-| `fsharp_runtime_status` | Read-only runtime snapshot: heap/GC, FCS cache, FSAC working set, and `process.threads` (OS/ThreadPool counts plus pending/completed work items). |
+| `fsharp_runtime_status` | Read-only runtime snapshot: heap/GC, FCS cache, project-options load/reload telemetry, FSAC working set, and `process.threads`; emits a heuristic restart warning above the anomalous thread threshold. |
 
 ## Example Agent Session
 

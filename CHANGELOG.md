@@ -10,6 +10,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `find(kind="members", query="Resolve", member="Resolve")` now treats `query` as matching either
+  the requested member or its declaring type (#219). The documented member-name form previously
+  applied `query` only to the declaring entity, so four real internal-member calls could produce a
+  43-second `not_found`; the declaring-type form remains supported.
+- Long-lived global-tool processes now fail with a typed `stale_tool_process` envelope before
+  entering ProjInfo when `dotnet tool update` has replaced their version directory (#220). The
+  payload names the running version, installation directory, missing dependencies, and required
+  parent-process restart, separating stale-process skew from a genuinely incomplete package.
+  Tool handlers are passed as cold thunks, so the guard runs before any handler code starts.
+- `fcs_file_outline` now surfaces attribute full names in both summary/full entries and emits a
+  compact top-level CustomOperation index (`customOperationCount` + operation/member/range rows),
+  so computation-expression builders can be inspected without raw source reads (#221). The index
+  obeys both `maxResults` and the response budget and reports count/budget truncation explicitly.
+  Entries and parse/check diagnostics now participate in the same budget; an exact final
+  serialized-size check caps the complete response at 60,000 characters and reports full counts
+  plus per-array truncation instead of allowing diagnostic-heavy malformed files to escape the cap.
+- `check(scope="project")` now makes its narrow evidence explicit with
+  `downstreamProjectsChecked=false`, `recommendedScope="workspace"`, and a coverage note (#222).
+  It does not run another ProjInfo/MSBuild sweep merely to count consumers. A workspace request
+  against one `.fsproj` is rejected instead of returning a misleading one-project workspace verdict.
+- `fcs_nuget_members` now recovers exact method accessibility from ECMA-335 metadata when
+  available, keeps protected members in the default surface, reports `isAbstract`, and emits
+  generic constraints both in `signature` and structured `genericParameters` (#223). Metadata is
+  read without loading/executing the target assembly; it distinguishes ordinary CLR virtual
+  methods from abstract methods. Ambiguous/unavailable rows fall back to FCS.
+- `fsharp_runtime_status` now reports project-options load attempts, true stale-cache reloads,
+  validations, and in-flight evaluations. At 128+ OS-visible threads it emits a heuristic warning
+  and parent-process restart recommendation (#150); the payload explicitly does not claim that
+  thread count alone proves a ProjInfo/MSBuild leak.
 - `project_health` no longer reports `tests.status="no_test_projects_found"` when reverse test
   discovery actually FAILED (review finding on #171). Discovery evaluates every candidate
   `.fsproj` under the workspace root, and MSBuild evaluation is admitted one project at a time
