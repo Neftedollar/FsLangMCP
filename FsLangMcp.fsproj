@@ -69,7 +69,7 @@
       <IncludeAssets>analyzers</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="Ionide.ProjInfo.FCS" Version="[0.74.2]" />
+    <PackageReference Include="Ionide.ProjInfo.FCS" Version="[0.75.0]" />
     <!-- 2.25.29 pulls patched MessagePack 2.5.302, clearing the NU1902/NU1903
          advisories on the 2.5.198 that 2.24.* dragged in transitively. -->
     <PackageReference Include="StreamJsonRpc" Version="[2.25.29]" />
