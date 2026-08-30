@@ -26,6 +26,12 @@ open FsLangMcp.Types
 open FsLangMcp.FcsBridge
 open FsLangMcp.Dispatcher
 
+let private dotnetHost =
+    Environment.GetEnvironmentVariable("DOTNET_HOST_PATH")
+    |> Option.ofObj
+    |> Option.filter (String.IsNullOrWhiteSpace >> not)
+    |> Option.defaultValue "dotnet"
+
 // ── Fixture sources ────────────────────────────────────────────────────────────
 
 let private domainFs =
@@ -222,7 +228,7 @@ type FindFixture() =
     let buildOnce () =
         let psi =
             ProcessStartInfo(
-                "dotnet",
+                dotnetHost,
                 $"build \"{slnxPath}\" -c Debug -m:1 -nologo --disable-build-servers -nodeReuse:false -p:UseSharedCompilation=false"
             )
 
@@ -326,7 +332,7 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
         ()
         : Task =
         task {
-            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit %d{fx.BuildExitCode}):\n%s{fx.BuildLog}")
 
             let bridge = FcsBridge()
 
@@ -426,6 +432,41 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                 totalSites > baseExactUses + baseExactRefs,
                 $"Expected find ({totalSites}) > single-project baseline ({baseExactUses + baseExactRefs})"
             )
+        }
+
+    [<Fact>]
+    member _.``find pagination keeps sweep coverage complete but marks a partial site delivery incomplete``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit %d{fx.BuildExitCode}):\n%s{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let! first =
+                bridge.Find({ findArgs fx.Slnx "TraderRole" with maxResults = Some 1 })
+
+            let totalSites = gi first "totalSites"
+            Assert.True((totalSites > 1), "regression fixture must exceed maxResults")
+            Assert.True(gb first["coverage"] "complete", "the project sweep itself completed")
+            Assert.False(gb first["resolution"] "complete", "one returned site is not the complete result set")
+            Assert.True(gb first "truncated")
+            Assert.Equal(1, (first["sites"] :?> JsonArray).Count)
+            Assert.Equal(totalSites, gi first["totalEstimate"] "sites")
+
+            let nextCursor = gs first "nextCursor"
+
+            // The final cursor page has no later rows, but still omits page 1. Its
+            // resolution therefore remains incomplete even though truncated=false.
+            let! finalPage =
+                bridge.Find(
+                    { findArgs fx.Slnx "TraderRole" with
+                        maxResults = Some 500
+                        cursor = Some nextCursor }
+                )
+
+            Assert.False(gb finalPage "truncated")
+            Assert.Null(finalPage["nextCursor"])
+            Assert.True(gb finalPage["coverage"] "complete")
+            Assert.False(gb finalPage["resolution"] "complete")
+            Assert.Equal(totalSites, gi finalPage["totalEstimate"] "sites")
         }
 
     [<Fact>]
@@ -1088,7 +1129,7 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                 // (it timed out), and it must still name the file-level filter, not just the
                 // sibling-project blind spot.
                 Assert.Equal(
-                    $"find could not fully analyze this project (0 failed, 1 timed out) — this response is incomplete; see coverage/message before trusting an absence of matches. Sites, where present, are also filtered to '{Path.GetFullPath(outsideSource)}'; other files in this project, and all sibling projects, are not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.",
+                    $"find could not fully analyze this project (0 failed, 1 timed out, 0 busy) — this response is incomplete; see coverage/message before trusting an absence of matches. Sites, where present, are also filtered to '{Path.GetFullPath(outsideSource)}'; other files in this project, and all sibling projects, are not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.",
                     gs result "scopeNote"
                 )
             finally
@@ -1302,9 +1343,10 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
             Assert.Equal(0, gi find "projectsAnalyzed")
             Assert.Equal(0, gi find "projectsFailed")
             Assert.Equal(1, gi find "projectsTimedOut")
+            Assert.Equal(0, gi find "projectsBusy")
 
             Assert.Equal(
-                "find could not fully analyze this project (0 failed, 1 timed out) — this response is incomplete; see coverage/message before trusting an absence of matches. Cross-project usages in sibling projects are also not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.",
+                "find could not fully analyze this project (0 failed, 1 timed out, 0 busy) — this response is incomplete; see coverage/message before trusting an absence of matches. Cross-project usages in sibling projects are also not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.",
                 gs find "scopeNote"
             )
         }
@@ -1423,6 +1465,7 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
             Assert.Equal(0, gi result "projectsAnalyzed")
             Assert.Equal(0, gi result "projectsFailed")
             Assert.Equal(3, gi result "projectsTimedOut")
+            Assert.Equal(0, gi result "projectsBusy")
 
             let perProject = result["perProject"].AsArray()
             Assert.Equal(3, perProject.Count)
@@ -1435,7 +1478,7 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
             // scopeNote must say so honestly ("analyzed 0 of 3") rather than claiming
             // "find swept 3 member projects", which would overstate work that never ran.
             Assert.Equal(
-                $"find analyzed 0 of 3 member projects of '{Path.GetFullPath(fx.Slnx)}' (0 failed, 3 timed out) — this response is incomplete; see coverage/message before trusting an absence of matches. To narrow to just one project (faster, but misses cross-project usages), pass its .fsproj as projectPath.",
+                $"find analyzed 0 of 3 member projects of '{Path.GetFullPath(fx.Slnx)}' (0 failed, 3 timed out, 0 busy) — this response is incomplete; see coverage/message before trusting an absence of matches. To narrow to just one project (faster, but misses cross-project usages), pass its .fsproj as projectPath.",
                 gs result "scopeNote"
             )
         }
@@ -1908,7 +1951,7 @@ type ConfigFixture() =
     let buildOnce () =
         let psi =
             ProcessStartInfo(
-                "dotnet",
+                dotnetHost,
                 $"build \"{fsproj}\" -c Debug -m:1 -nologo --disable-build-servers -nodeReuse:false -p:UseSharedCompilation=false"
             )
 

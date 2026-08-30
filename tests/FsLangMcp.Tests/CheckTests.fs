@@ -378,7 +378,9 @@ let ``auto scope discovery obeys the overall timeout before options start`` () :
                         scope = Some "workspace"
                         projectPath = Some root
                         speed = Some "trusted"
-                        timeoutMs = Some 1000 }
+                        // This call proves admission was released, not another deadline.
+                        // Leave enough headroom for a CPU-saturated full-suite run.
+                        timeoutMs = Some 5000 }
                 )
 
             Assert.Equal("invalid_args", gs retry "status")

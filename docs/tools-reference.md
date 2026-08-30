@@ -52,17 +52,24 @@ write as a read. `fieldRead` counts in `breakdown` drop accordingly; the new
 `fieldSetMutation` / `fieldPattern` counters make up the difference.
 
 **Absence contract:** inspect `outcome` and `coverage.complete`. A complete miss returns
-`outcome="not_found"` and `resolution.matched=false`. A failed/timed-out project makes absence
+`outcome="not_found"` and `resolution.matched=false`. A failed/timed-out/busy project makes absence
 indeterminate (`status="unknown"`, `outcome="indeterminate"`, `matched=null`); positive results
-from an incomplete sweep return `status="partial"`.
+from an incomplete sweep return `status="partial"`. A busy `perProject` entry carries
+`errorKind="fcs_worker_busy"` and `retryable=true`; `projectsBusy` keeps it separate from failures.
+
+**Delivery completeness:** `coverage.complete` means every requested project was analyzed;
+`resolution.complete` means this response contains the entire site set from offset zero. A page
+capped by `maxResults`, and every nonzero cursor page, has `resolution.complete=false` even if
+the project sweep completed. Follow `truncated` / `nextCursor` and reconcile the collected rows
+with `totalEstimate.sites` before treating a refactor count as exhaustive.
 
 ---
 
 ### `check`
 
-**Purpose:** One trustworthy compile verdict — `clean` | `errors` | `unknown`. The default uses a
-fresh in-process type-check; fast mode requires complete, current, project-bound FSAC coverage
-before it can return `clean`.
+**Purpose:** One trustworthy verdict for the current FCS/check profile — `clean` | `errors` |
+`unknown`. The default uses a fresh in-process type-check; fast mode requires complete, current,
+project-bound FSAC coverage before it can return `clean`.
 
 **Key args:**
 - `scope` — `auto` | `file` | `project` | `workspace` | `snippet` (default: `auto`)
@@ -72,6 +79,11 @@ before it can return `clean`.
 - `severity` — filter results by severity level
 
 **Use when:** "Did my edit compile?", "Are there errors in this file?", "Is the workspace clean?"
+
+**Build-profile boundary:** `clean` means zero errors under the compiler options represented by
+the current FCS/check profile. It does not prove every build configuration. Release-only
+diagnostics such as FS3511 can appear only under optimized compilation; before merge or release,
+run `dotnet build -c Release --warnaserror`.
 
 **Snippet scope:** diagnostics describe the snippet's *content* only. Bare expression code
 without a `module` header is valid — the missing-module FS0222 and source-file-bookkeeping
@@ -140,6 +152,13 @@ The `evaluation` object identifies the evaluated source and restore state. LSP r
 **Key args:**
 - `projectPath` — optional after `set_project`
 - `maxFiles` / `maxResultsPerFile` — cap output on large projects
+- `filter` / `nameContains` — retain matching entries and omit files with no matches
+- `includeTests` — include test source files; defaults to `true` when a test project is targeted directly
+
+When `filter` or `nameContains` is present, filtering happens before `maxFiles`/cursor pagination,
+so `totalEstimate.files` and `nextCursor` describe matching files rather than every compile file.
+Directly targeting a test project includes evaluated sources such as `tests/.../Program.fs` and
+`Tests.fs` by default; test-result, coverage, `bin`, and `obj` artifacts remain excluded.
 
 **Use when:** Getting a structural overview of the whole project before editing or reviewing it.
 
@@ -286,6 +305,13 @@ The response includes `evaluation.status`, `evaluation.source`, `evaluation.impo
 
 **Use when:** Before any rename, move, or delete. Gives the project-wide picture; use `fcs_rename_preview` for the exact edits.
 
+The report is `status="succeeded", complete=true` only when both the `find` delivery and test
+coverage/delivery are exhaustive. Otherwise it returns `status="partial"`: inspect
+`impact.complete` / `impact.nextCursor` and `tests.status` / `tests.coverage` /
+`tests.nextCursor`. While impact rows are paginated, `fileCount` and `projectCount` are explicitly
+lower bounds even though `totalSites` remains the full count; `crossProject` is `null` until the
+whole site set is delivered, while `observedCrossProject` describes the current page.
+
 ---
 
 ### `fcs_make_internal_visible`
@@ -302,11 +328,24 @@ The response includes `evaluation.status`, `evaluation.source`, `evaluation.impo
 
 ### `fcs_tests_for_symbol`
 
-**Purpose:** List tests that likely cover a symbol. Sweeps test projects (detected via `<IsTestProject>` or xunit/nunit/expecto refs), filters FCS symbol uses to test files, and tags each with its enclosing test name.
+**Purpose:** List tests that likely cover a symbol. Sweeps test projects (detected via `<IsTestProject>` or xunit/nunit/expecto refs), excludes definition sites, and tags each reference site with its enclosing test name when one can be established without crossing a binding/module boundary.
 
 **Key args:**
 - `symbolQuery` (required) — symbol name to look for in test files
 - `projectPath` — optional after `set_project`
+- `maxResults` / `cursor` — page reference sites (default page size: 100)
+- `timeoutMs` — non-negative whole-sweep wall-clock budget (default: 120000)
+
+`testCount` and `siteCount` are the full reference-site count (the former is retained for
+compatibility); `uniqueTestCount` counts distinct enclosing tests. Top-level fixture sites remain
+in those site counts with no `enclosingTest`. Read
+`coverage.complete` plus requested/scanned/failed/timed-out/busy project counts and `perProject` before
+trusting zero. For an explicit production `.fsproj`, the tool reuses the active containing
+solution as its separate discovery context when available (`requestedProjectPath`,
+`discoveryProjectPath`, `usedActiveSolutionContext`). Without such context it returns
+`unknown`/`indeterminate` with a hint to set or pass the containing solution/workspace directory.
+An admission-limited project is `status="busy"`, `errorKind="fcs_worker_busy"`, and
+`retryable=true`; retry it after the active worker completes.
 
 **Use when:** "What tests cover this function?" — gives the test-coverage slice that `find` (which returns all uses) doesn't directly filter.
 

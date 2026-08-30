@@ -27,7 +27,7 @@ just analyze   # run F# analyzers (Ionide.Analyzers, G-Research.FSharp.Analyzers
 
 ## Adding a new MCP tool
 
-The v0.16.0 surface ships 35 tools that all follow the same registration shape. To add another:
+The v0.17.0 surface ships 35 tools that all follow the same registration shape. To add another:
 
 1. **Define the args record in `Types.fs`** with `///` doc-comments on every field. Use current records such as `FindArgs` and `CheckArgs` as style templates. Defaults stated in `///` text must match the actual `defaultArg` call site in the handler.
 

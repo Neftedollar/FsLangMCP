@@ -77,6 +77,35 @@ let processData (x: int) = x * 2
 
     projectPath, root
 
+/// Three files in deterministic path order: the first has no "Needle" entry,
+/// while the second and third do. Used to prove entry filtering precedes file paging.
+let private createFilteredPaginationProject () =
+    let runId = Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_outline_filtered_%s{runId}")
+    Directory.CreateDirectory(root) |> ignore
+
+    File.WriteAllText(Path.Combine(root, "A.fs"), "module A\n\nlet unrelated = 1\n")
+    File.WriteAllText(Path.Combine(root, "B.fs"), "module B\n\nlet NeedleOne = 1\n")
+    File.WriteAllText(Path.Combine(root, "C.fs"), "module C\n\nlet NeedleTwo = 2\n")
+
+    let projectPath = Path.Combine(root, "FilteredFixture.fsproj")
+
+    File.WriteAllText(
+        projectPath,
+        String.concat
+            Environment.NewLine
+            [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+              "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+              "  <ItemGroup>"
+              "    <Compile Include=\"A.fs\" />"
+              "    <Compile Include=\"B.fs\" />"
+              "    <Compile Include=\"C.fs\" />"
+              "  </ItemGroup>"
+              "</Project>" ]
+    )
+
+    projectPath, root
+
 let private defaultArgs projectPath : FcsProjectOutlineArgs =
     { projectPath = Some projectPath
       workspacePath = None
@@ -375,6 +404,93 @@ let ``ProjectOutline cursor pagination: page-1 has nextCursor and page-2 returns
             // Together they cover both project files.
             let combined = Set.union page1Files page2Files
             Assert.Equal(2, combined.Count)
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``ProjectOutline applies nameContains before file pagination and cursors only matching files`` () : System.Threading.Tasks.Task =
+    task {
+        let projectPath, root = createFilteredPaginationProject ()
+        let bridge = FcsBridge()
+
+        try
+            let! page1 =
+                bridge.ProjectOutline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 1
+                        nameContains = Some [ "Needle" ] }
+                )
+
+            Assert.Equal("ok", page1["status"].GetValue<string>())
+            Assert.True(page1["truncated"].GetValue<bool>())
+            let firstEstimate = page1["totalEstimate"]
+            let firstTotal = firstEstimate["files"].GetValue<int>()
+            Assert.Equal(2, firstTotal)
+
+            let firstFile = filesArray page1 |> Seq.exactlyOne
+            Assert.EndsWith("B.fs", firstFile["file"].GetValue<string>())
+
+            let cursor = page1["nextCursor"].GetValue<string>()
+
+            match tryDecode cursor with
+            | Ok payload -> Assert.Equal(1, payload.offset)
+            | Error message -> Assert.Fail($"nextCursor did not decode: %s{message}")
+
+            let! page2 =
+                bridge.ProjectOutline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 1
+                        nameContains = Some [ "Needle" ]
+                        cursor = Some cursor }
+                )
+
+            Assert.False(page2["truncated"].GetValue<bool>())
+            Assert.Null(page2["nextCursor"])
+            let secondEstimate = page2["totalEstimate"]
+            let secondTotal = secondEstimate["files"].GetValue<int>()
+            Assert.Equal(2, secondTotal)
+
+            let secondFile = filesArray page2 |> Seq.exactlyOne
+            Assert.EndsWith("C.fs", secondFile["file"].GetValue<string>())
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``ProjectOutline directly scoped to a test project includes Tests fs by default`` () : System.Threading.Tasks.Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_outline_tests_%s{runId}")
+        Directory.CreateDirectory(root) |> ignore
+
+        let sourcePath = Path.Combine(root, "Tests.fs")
+        File.WriteAllText(sourcePath, "module Direct.Tests\n\nlet testValue = 42\n")
+
+        let projectPath = Path.Combine(root, "Direct.Tests.fsproj")
+
+        File.WriteAllText(
+            projectPath,
+            String.concat
+                Environment.NewLine
+                [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+                  "  <PropertyGroup>"
+                  "    <TargetFramework>net10.0</TargetFramework>"
+                  "    <IsTestProject>true</IsTestProject>"
+                  "  </PropertyGroup>"
+                  "  <ItemGroup><Compile Include=\"Tests.fs\" /></ItemGroup>"
+                  "</Project>" ]
+        )
+
+        let bridge = FcsBridge()
+
+        try
+            let! result = bridge.ProjectOutline(defaultArgs projectPath)
+
+            Assert.Equal("ok", result["status"].GetValue<string>())
+            Assert.Equal(1, filesArray result |> Seq.length)
+            let onlyFile = filesArray result |> Seq.exactlyOne
+            Assert.EndsWith("Tests.fs", onlyFile["file"].GetValue<string>())
         finally
             if Directory.Exists(root) then Directory.Delete(root, true)
     }

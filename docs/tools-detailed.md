@@ -2,7 +2,7 @@
 
 The MCP description tells you *whether* to call a tool; this file tells you *how it works internally*.
 
-**Start here.** `find` and `check` are the primary entry points in the 35-tool v0.16.0 surface.
+**Start here.** `find` and `check` are the primary entry points in the 35-tool v0.17.0 surface.
 The consolidation aliases below were removed in v0.13.1 and are no longer registered:
 
 | Removed names | Current route |
@@ -129,10 +129,20 @@ note-less, because none of them reach the code that builds the note.
   that one project (faster, but misses cross-project usages). This is the discoverability that
   answers the field report behind #193: a 40 s sweep against a solution/directory target now tells
   the caller, in the response, how to narrow it next time.
-- **Coverage is never overstated**: if a project timed out or failed before analysis completed
+- **Coverage is never overstated**: if a project timed out, failed, or was rejected as busy before analysis completed
   (`status="partial"`/`"unknown"`, `projectsAnalyzed < projectsRequested`), the note says "analyzed
   K of N" instead of "swept N" and calls out the incompleteness explicitly, instead of claiming a
   sweep happened that didn't.
+
+### Result delivery vs sweep coverage (#235)
+
+`coverage.complete` and `resolution.complete` answer different questions. Coverage is true when
+every requested project was analyzed. Resolution is true only when the current response starts at
+offset zero and contains all `totalSites`. A first page capped by `maxResults` therefore has
+`coverage.complete=true` but `resolution.complete=false`; a later cursor page remains resolution-
+incomplete even when it is the final page and `truncated=false`, because that page omits earlier
+sites. For an exhaustive refactor count, follow `nextCursor`, reconcile against
+`totalEstimate.sites`, and treat only an unpaged offset-zero response as complete in isolation.
 
 ### kind and scope
 
@@ -279,7 +289,7 @@ the bare call already swept all of them.
 
 1. **Read `outcome` and `coverage.complete` before acting on absence.** `matched=false` /
    `outcome="not_found"` is emitted only after every requested FCS project completed. If any
-   project failed or timed out, `matched` is `null`, `outcome="indeterminate"`, and
+   project failed, timed out, or was rejected as busy, `matched` is `null`, `outcome="indeterminate"`, and
    `status="unknown"` unless another backend positively proves a match. Positive sites from an
    incomplete sweep use `status="partial"` because more sites may still exist.
 2. **`exact=true` is the default** — set `exact=false` for case-insensitive substring matching;
@@ -300,7 +310,7 @@ the bare call already swept all of them.
 
 **Routing description:** One trustworthy verdict for the active F# context. Bare `check()`
 suffices: returns `verdict` (`clean`|`errors`|`unknown`) after a FRESH in-process type-check, so it
-never reports a stale-`{}` false-clean and you don't fall back to `dotnet build`. Optional `scope`
+never reports a stale-`{}` false-clean within the current FCS/check profile. Optional `scope`
 (`auto`|`file`|`project`|`workspace`|`snippet`), `path`, `snippet` (inline source), `speed` (trusted
 default | `fast` = cached FSAC snapshot), and `severity` shape the request.
 
@@ -321,7 +331,7 @@ project, collapsed to a single `verdict`. No path, no project, no flags needed f
 
 | `verdict` | Meaning |
 |-----------|---------|
-| `clean` | The checked unit type-checked with zero errors |
+| `clean` | The checked unit type-checked with zero errors under the current FCS/check profile |
 | `errors` | At least one error-severity diagnostic |
 | `unknown` | The check could not run (no project context / resolution failed) — **not** clean |
 
@@ -392,6 +402,10 @@ the rest of the scope is incomplete.
    fresh type-check of a just-written on-disk edit.
 5. **Project scope is not a workspace verdict** — read `downstreamProjectsChecked` and follow
    `recommendedScope` before treating a clean library check as evidence about tests/apps.
+6. **The current FCS/check profile is not every build configuration** — `clean` does not cover
+   configuration-specific compiler options that are absent from that profile. Optimized Release
+   compilation can surface diagnostics such as FS3511; before merge or release, run
+   `dotnet build -c Release --warnaserror`.
 
 ### Related tools
 

@@ -24,6 +24,7 @@ type internal ExclusionReason =
     | GitDirectory
     | ToolCacheDirectory
     | TestResultArtifact
+    | TestSource
     | GeneratedFile
     | DesignerFile
     | AssemblyInfoFile
@@ -198,13 +199,33 @@ let private isTestResultArtifact (path: string) =
     || hasSegment "test-results" path
     || hasSegment "coverage" path
 
-let private isTestFile (path: string) =
+let private isTestSource (path: string) =
     let fileName = Path.GetFileNameWithoutExtension(path)
     let normalized = normalizeSeparators path
 
-    fileName.EndsWith("Tests", StringComparison.OrdinalIgnoreCase)
-    || fileName.EndsWith("Test", StringComparison.OrdinalIgnoreCase)
+    // A case-insensitive EndsWith("Test") also classifies Contest.fs,
+    // Latest.fs, and Protest.fs as tests. Keep conventional camel/Pascal
+    // suffixes precise while still supporting explicit delimiter conventions.
+    let hasTestName =
+        fileName.Equals("Test", StringComparison.OrdinalIgnoreCase)
+        || fileName.Equals("Tests", StringComparison.OrdinalIgnoreCase)
+        || fileName.EndsWith("Test", StringComparison.Ordinal)
+        || fileName.EndsWith("Tests", StringComparison.Ordinal)
+        || fileName.EndsWith("_test", StringComparison.OrdinalIgnoreCase)
+        || fileName.EndsWith("_tests", StringComparison.OrdinalIgnoreCase)
+        || fileName.EndsWith("-test", StringComparison.OrdinalIgnoreCase)
+        || fileName.EndsWith("-tests", StringComparison.OrdinalIgnoreCase)
+
+    hasTestName
     || normalized.Contains($"%c{Path.DirectorySeparatorChar}tests%c{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase)
+
+let private isWithinWorkspace (workspaceRoot: string) (path: string) =
+    let relative = Path.GetRelativePath(workspaceRoot, path)
+    let parentPrefix = $"..%c{Path.DirectorySeparatorChar}"
+
+    not (Path.IsPathRooted relative)
+    && not (relative.Equals("..", StringComparison.Ordinal))
+    && not (relative.StartsWith(parentPrefix, StringComparison.Ordinal))
 
 let private reasonToString reason =
     match reason with
@@ -212,6 +233,7 @@ let private reasonToString reason =
     | GitDirectory -> "git_directory"
     | ToolCacheDirectory -> "tool_cache_directory"
     | TestResultArtifact -> "test_result_artifact"
+    | TestSource -> "test_source"
     | GeneratedFile -> "generated_file"
     | DesignerFile -> "designer_file"
     | AssemblyInfoFile -> "assembly_info_file"
@@ -311,7 +333,9 @@ let internal compileFiles (projectPath: string) (doc: XDocument) =
 
 let private classifyFile (workspaceRoot: string) (options: ScanFilterOptions) (file: ProjectFile) =
     let path = file.Path
-    let fullWorkspaceRoot = Path.GetFullPath(workspaceRoot).TrimEnd(Path.DirectorySeparatorChar)
+    // Preserve volume roots (`/`, `C:\`). Path.GetRelativePath already accepts
+    // trailing separators; trimming a root turns it into an empty/drive-relative path.
+    let fullWorkspaceRoot = Path.GetFullPath(workspaceRoot)
     let fullPath = Path.GetFullPath(path)
 
     if not (isFsFile path) then Some UnsupportedExtension
@@ -331,9 +355,9 @@ let private classifyFile (workspaceRoot: string) (options: ScanFilterOptions) (f
         if options.IncludeGenerated then None else Some GeneratedFile
     elif hasSegment "obj" path || hasSegment "bin" path then
         if options.IncludeObjBin then None else Some ObjOrBinDirectory
-    elif isTestFile path && not options.IncludeTests then Some TestResultArtifact
+    elif isTestSource path && not options.IncludeTests then Some TestSource
     elif file.Link.IsSome && not options.IncludeExternalLinkedFiles then Some ExternalLinkedFile
-    elif not (fullPath.StartsWith(fullWorkspaceRoot, StringComparison.OrdinalIgnoreCase)) then Some OutsideWorkspace
+    elif not (isWithinWorkspace fullWorkspaceRoot fullPath) then Some OutsideWorkspace
     else None
 
 let internal filterProjectFiles workspaceRoot options files =

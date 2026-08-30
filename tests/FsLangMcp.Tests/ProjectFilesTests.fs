@@ -28,6 +28,7 @@ let ``filterProjectFiles excludes generated build linked and test artifacts by d
         [ projectFile "Library.fs"
           projectFile "obj/Debug/net10.0/App.AssemblyInfo.fs"
           projectFile "obj/Debug/net10.0/Plain.fs"
+          projectFile "bin/Debug/net10.0/Plain.fs"
           projectFile "Generated.g.fs"
           projectFile "View.Designer.fs"
           projectFile "tests/LibraryTests.fs"
@@ -41,8 +42,107 @@ let ``filterProjectFiles excludes generated build linked and test artifacts by d
     Assert.Contains(AssemblyInfoFile, excludedReasons filtered)
     Assert.Contains(GeneratedFile, excludedReasons filtered)
     Assert.Contains(DesignerFile, excludedReasons filtered)
-    Assert.Contains(TestResultArtifact, excludedReasons filtered)
+    Assert.Contains(TestSource, excludedReasons filtered)
     Assert.Contains(ExternalLinkedFile, excludedReasons filtered)
+
+[<Fact>]
+let ``IncludeTests distinguishes evaluated test sources from test result artifacts`` () =
+    let files =
+        [ "src/Library.fs"
+          "src/Contest.fs"
+          "src/Latest.fs"
+          "src/Protest.fs"
+          "tests/App/Program.fs"
+          "Tests.fs"
+          "Generated.g.fs"
+          "obj/Debug/net10.0/Plain.fs"
+          "bin/Debug/net10.0/Plain.fs"
+          "TestResults/run/Instrumented.fs"
+          "test-results/run/Instrumented.fs"
+          "coverage/run/Instrumented.fs" ]
+        |> List.map (fun includePath -> underRoot includePath, includePath, None)
+        |> projectFilesFromEvaluatedItems
+
+    let defaults = filterProjectFiles workspaceRoot (defaultFilterOptions Outline) files
+
+    Assert.Equal<string>(
+        [ "src/Library.fs"; "src/Contest.fs"; "src/Latest.fs"; "src/Protest.fs" ],
+        defaults.Included |> List.map _.IncludePath
+    )
+
+    Assert.Equal<ProjectFile * ExclusionReason>(
+        [ projectFile "tests/App/Program.fs", TestSource
+          projectFile "Tests.fs", TestSource
+          projectFile "Generated.g.fs", GeneratedFile
+          projectFile "obj/Debug/net10.0/Plain.fs", ObjOrBinDirectory
+          projectFile "bin/Debug/net10.0/Plain.fs", ObjOrBinDirectory
+          projectFile "TestResults/run/Instrumented.fs", TestResultArtifact
+          projectFile "test-results/run/Instrumented.fs", TestResultArtifact
+          projectFile "coverage/run/Instrumented.fs", TestResultArtifact ],
+        defaults.Excluded
+    )
+
+    let summary = filterSummaryToJson defaults
+    Assert.Equal(2, (summary["exclusionsByReason"]["test_source"]).GetValue<int>())
+    Assert.Equal(3, (summary["exclusionsByReason"]["test_result_artifact"]).GetValue<int>())
+
+    let withTests =
+        filterProjectFiles
+            workspaceRoot
+            { defaultFilterOptions Outline with
+                IncludeTests = true }
+            files
+
+    Assert.Equal<string>(
+        [ "src/Library.fs"
+          "src/Contest.fs"
+          "src/Latest.fs"
+          "src/Protest.fs"
+          "tests/App/Program.fs"
+          "Tests.fs" ],
+        withTests.Included |> List.map _.IncludePath
+    )
+
+    Assert.Equal<ProjectFile * ExclusionReason>(
+        [ projectFile "Generated.g.fs", GeneratedFile
+          projectFile "obj/Debug/net10.0/Plain.fs", ObjOrBinDirectory
+          projectFile "bin/Debug/net10.0/Plain.fs", ObjOrBinDirectory
+          projectFile "TestResults/run/Instrumented.fs", TestResultArtifact
+          projectFile "test-results/run/Instrumented.fs", TestResultArtifact
+          projectFile "coverage/run/Instrumented.fs", TestResultArtifact ],
+        withTests.Excluded
+    )
+
+[<Fact>]
+let ``workspace containment uses path boundaries instead of string prefixes (#241)`` () =
+    let siblingRoot = workspaceRoot + "Sibling"
+
+    let siblingFile =
+        { projectFile "Sibling.fs" with
+            Path = Path.Combine(siblingRoot, "Sibling.fs") }
+
+    let filtered =
+        filterProjectFiles
+            workspaceRoot
+            (defaultFilterOptions ProjectInspection)
+            [ projectFile "Inside.fs"; siblingFile ]
+
+    Assert.Equal<string>([ "Inside.fs" ], filtered.Included |> List.map _.IncludePath)
+    Assert.Equal<ProjectFile * ExclusionReason>([ siblingFile, OutsideWorkspace ], filtered.Excluded)
+
+[<Fact>]
+let ``workspace containment accepts the filesystem root (#241)`` () =
+    let volumeRoot = Path.GetPathRoot(Path.GetFullPath(workspaceRoot))
+
+    let rootFile =
+        { projectFile "RootProbe.fs" with
+            Path = Path.Combine(volumeRoot, "RootProbe.fs") }
+
+    let filtered =
+        filterProjectFiles volumeRoot (defaultFilterOptions ProjectInspection) [ rootFile ]
+
+    Assert.Equal<ProjectFile>([ rootFile ], filtered.Included)
+    Assert.Empty(filtered.Excluded)
 
 [<Fact>]
 let ``IncludeGenerated surfaces generated files even when they live under obj (#186)`` () =

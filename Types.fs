@@ -267,8 +267,14 @@ type FcsTestsForSymbolArgs =
       text: string option
       /// .fsproj / .sln / .slnx / directory to sweep. Falls back to active set_project.
       projectPath: string option
-      /// Maximum test sites returned. Default 100.
-      maxResults: int option }
+      /// Maximum test sites returned per page. Default 100.
+      maxResults: int option
+      /// Overall wall-clock budget in ms for the whole multi-project test sweep.
+      /// Default 120000 (120 s). Must be non-negative; 0 requests an immediate,
+      /// typed timeout result.
+      timeoutMs: int option
+      /// Opaque cursor from a prior call's nextCursor. Omit for the first page.
+      cursor: string option }
 
 type CheckArgs =
     { /// What to check: "auto" (default) | "file" | "project" | "workspace" | "snippet".

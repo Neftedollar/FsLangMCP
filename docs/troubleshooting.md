@@ -225,6 +225,11 @@ outputs, source contents, and source-directory inputs are unchanged.
 cached fingerprint became stale and was re-evaluated; cold loads and explicit evictions
 do not inflate it.
 
+If trusted `check` is `clean` but a Release build fails, first compare build profiles rather than
+assuming stale FCS state. `clean` covers the current FCS/check profile; optimized Release
+compilation can add configuration-specific diagnostics such as FS3511. The merge/release gate is
+still `dotnet build -c Release --warnaserror`.
+
 ---
 
 ## `fsharp_runtime_status` recommends restarting because of high thread count

@@ -55,12 +55,22 @@ find { "query": "OrderId" }                        // all sites
 find { "query": "Ship", "kind": "members", "member": "Ship" }  // member call-sites
 ```
 
+For an exhaustive refactor count, require both `coverage.complete=true` (all requested projects
+were analyzed) and `resolution.complete=true` (this response contains the whole site set). Follow
+`nextCursor` while `truncated=true`; a final cursor page is not exhaustive by itself because it
+omits earlier pages.
+
 **`check`** answers "did my edit compile?" with a fresh in-process type-check. It never reports a stale-cache false-clean:
 
 ```json
 check {}                           // whole workspace, auto scope
 check { "scope": "file", "path": "/abs/path/Domain/Order.fs" }
 ```
+
+`clean` is scoped to the current FCS/check profile. It is not proof that every build
+configuration is clean: optimized Release compilation can surface configuration-specific
+diagnostics such as FS3511. Before merge or release, run
+`dotnet build -c Release --warnaserror`.
 
 ### Step 3 — dig deeper as needed
 
@@ -70,7 +80,7 @@ Once you have a base signal from `find` and `check`, the other 33 tools let you 
 
 ```
 1. set_project  {"projectPath": "/abs/path/MyApp.sln"}
-   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.16.0"
+   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.17.0"
 
 2. check  {}
    → verdict="clean"

@@ -8,8 +8,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-08-31
+
+0.17.0 keeps the 35-tool surface intact and hardens the evidence agents use to plan changes:
+bounded results now say when they are incomplete, timeout budgets include admission waits, and
+test/outline helpers distinguish what they actually scanned and counted. It also rolls up the
+post-0.16.0 UX/runtime work from #215 and #232: honest project/workspace coverage, stale global-tool
+detection, dependency-closure corrections, bounded outline enrichment, exact NuGet metadata, and
+thread/reload telemetry. Together these changes tighten existing contracts without presenting a
+partial answer as exhaustive.
+
 ### Fixed
 
+- `find` now separates project-sweep coverage from delivery of the complete site set (#235).
+  `coverage.complete` can remain true when every project was analyzed, but
+  `resolution.complete` is true only when the response contains the whole result set from offset
+  zero. A `maxResults` page and every later cursor page therefore remain visibly incomplete even
+  when the final page has `truncated=false`; `totalEstimate.sites`, `truncated`, and `nextCursor`
+  describe how to retrieve the omitted sites.
+- FCS/LSP admission waits now observe MCP cancellation instead of starting cancelled handlers
+  later (#236). For `find` and `check`, time spent waiting for the FCS gate consumes the same
+  `timeoutMs` budget and only the remainder reaches the operation. An expired/cancelled queued
+  call never enters protected work. An entered handler keeps its host slot until its returned task
+  completes; an uncancellable project-use sweep additionally retains a bounded actual-worker slot
+  until `ParseAndCheckProject` / `GetAllUsesOfAllSymbols` really finishes, so timed-out callers
+  cannot accumulate distinct-key FCS workers in the background.
+  Admission expiry is a typed `fcs_admission_timeout` payload, and a negative timeout is rejected
+  before queueing instead of becoming an accidental infinite wait. Per-project admission rejection
+  is reported as retryable `status="busy"` / `errorKind="fcs_worker_busy"`, with a separate
+  `projectsBusy` count, rather than being folded into a permanent-looking project failure.
+- `fcs_tests_for_symbol` now reports bounded, coverage-aware solution sweeps (#237). It accepts
+  `timeoutMs` and cursor pagination, separates requested/scanned/failed/timed-out/busy projects with a
+  `perProject` ledger, and returns `unknown`/`indeterminate` for an incomplete zero. A production
+  `.fsproj` target reuses the active containing solution for reverse test-project discovery when
+  available; without that context it no longer looks like confident zero coverage and instead
+  returns a precise widening hint.
+- `fcs_project_outline` now applies `filter` / `nameContains` before file pagination (#238).
+  Files with no matching entries are omitted, `maxFiles` and cursors operate on the matching-file
+  set, and `totalEstimate.files` counts matching files. Unfiltered requests keep their existing
+  page-first path.
+- A direct `fcs_project_outline` call on a test project now includes its evaluated compile sources
+  by default (#239), including ordinary `tests/.../Program.fs` and `Tests.fs` files. The shared
+  filter distinguishes `test_source` from `test_result_artifact`; `TestResults`, `test-results`,
+  coverage, `bin`, and `obj` artifacts remain excluded, and explicit `includeTests=false` still
+  opts out of test sources.
+- `fcs_tests_for_symbol` now excludes definition sites, stops enclosing-test attribution at the
+  next binding/module/namespace/type boundary, and leaves top-level fixture sites unassigned
+  instead of borrowing the preceding test (#240). Compatibility `testCount` and `siteCount` both
+  count all reference sites; additive `uniqueTestCount` counts distinct enclosing tests.
+  Project identity participates in de-duplication, so one linked test file compiled by two test
+  projects remains two pieces of coverage evidence. Pagination is by site and preserves the full
+  counts. The enclosing-test scan now advances past rejected test
+  attributes, checks the whole-sweep budget inside its synchronous loops, and uses bounded
+  non-backtracking regexes. An unrelated attribute can no longer trap the tool after FCS analysis
+  has already completed.
+- `fcs_refactor_impact` now preserves the active solution as a separate discovery context when an
+  explicit production `.fsproj` is supplied. It propagates test coverage/outcome and pagination
+  metadata, returns `status="partial"` for incomplete evidence, and labels page-derived file/project
+  counts as lower bounds. `crossProject` stays unknown until delivery is complete instead of
+  turning an incomplete page or test sweep into a successful false-negative.
+- Shared project-file filtering now uses path-segment containment rather than a raw string prefix
+  (#241), so a sibling such as `ProjectSibling/` is no longer mistaken for `Project/`; filesystem
+  roots remain valid workspaces. Test-source filename detection also avoids false positives such
+  as `Contest.fs`, `Latest.fs`, and `Protest.fs` while preserving conventional `FooTests.fs` and
+  delimited `_test`/`-test` names.
+- The FsMcp-to-official-SDK adapter now forwards structured `TransportError` JSON byte-for-byte
+  instead of wrapping it in F# `%A` debug syntax (#242). Typed `InvalidArgs`, `NotReady`,
+  `FcsAborted`, and infrastructure envelopes therefore remain directly machine-readable in
+  `isError=true` MCP responses.
 - `find(kind="members", query="Resolve", member="Resolve")` now treats `query` as matching either
   the requested member or its declaring type (#219). The documented member-name form previously
   applied `query` only to the declaring entity, so four real internal-member calls could produce a
@@ -91,6 +157,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attribute at all (shared-framework ref pack, ProjectReference output) is kept, so framework
   unification still resolves. Package ids survive with an empty set, keeping the miss payload's
   "restored, but contributes no reference here" signal — now also naming the other-target case.
+
+### Known limitations
+
+- `fcs_project_outline` bounds response size and pagination but does not yet expose a whole-operation
+  deadline. A fresh 0.16.0 field report observed a cold project outline remaining in flight for
+  more than 90 seconds; the bounded timeout/partial-coverage contract is tracked in #243. The
+  admission-aware deadlines added here apply to `find`, `check`, and `fcs_tests_for_symbol`, not
+  every registered tool.
 
 ## [0.16.0] - 2026-08-16
 
@@ -986,7 +1060,8 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
   above), so it has no link definition either — 0.15.0 compares from the
   last version that actually was tagged, 0.13.2.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.13.2...v0.15.0
 [0.13.2]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.13.2
