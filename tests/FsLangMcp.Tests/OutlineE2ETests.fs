@@ -106,6 +106,36 @@ let private createFilteredPaginationProject () =
 
     projectPath, root
 
+/// One file with the sole matching declaration after FileOutline's default
+/// 200-definition response cap. ProjectOutline must not call this exhaustive.
+let private createTailMatchProject () =
+    let runId = Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_outline_tail_%s{runId}")
+    Directory.CreateDirectory(root) |> ignore
+
+    let declarations =
+        [ for index in 1..220 -> $"let value%d{index} = %d{index}" ]
+        @ [ "let NeedleAfterTwoHundred = 221" ]
+
+    File.WriteAllText(
+        Path.Combine(root, "Large.fs"),
+        String.concat Environment.NewLine ([ "module Large"; "" ] @ declarations)
+    )
+
+    let projectPath = Path.Combine(root, "Large.fsproj")
+
+    File.WriteAllText(
+        projectPath,
+        String.concat
+            Environment.NewLine
+            [ "<Project Sdk=\"Microsoft.NET.Sdk\">"
+              "  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>"
+              "  <ItemGroup><Compile Include=\"Large.fs\" /></ItemGroup>"
+              "</Project>" ]
+    )
+
+    projectPath, root
+
 let private defaultArgs projectPath : FcsProjectOutlineArgs =
     { projectPath = Some projectPath
       workspacePath = None
@@ -453,6 +483,103 @@ let ``ProjectOutline applies nameContains before file pagination and cursors onl
 
             let secondFile = filesArray page2 |> Seq.exactlyOne
             Assert.EndsWith("C.fs", secondFile["file"].GetValue<string>())
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``ProjectOutline reports partial filter coverage when a file outline aborts`` () : System.Threading.Tasks.Task =
+    task {
+        let projectPath, root = createFixtureProject ()
+
+        let outlineOverride (args: FcsFileOutlineArgs) =
+            let filePath: string = args.path
+            let outline = JsonObject()
+
+            if filePath.EndsWith("File1.fs", StringComparison.Ordinal) then
+                outline["status"] <- JsonValue.Create("aborted")
+                outline["message"] <- JsonValue.Create("controlled outline abort")
+            else
+                let entry = JsonObject()
+                entry["name"] <- JsonValue.Create("Needle")
+                entry["signature"] <- JsonValue.Create("unit -> int")
+                entry["kind"] <- JsonValue.Create("function")
+                let entries = JsonArray()
+                entries.Add(entry)
+                outline["status"] <- JsonValue.Create("succeeded")
+                outline["entries"] <- entries
+                outline["count"] <- JsonValue.Create(1)
+                outline["totalDefinitionCount"] <- JsonValue.Create(1)
+                outline["returnedEntryCount"] <- JsonValue.Create(1)
+                outline["entriesComplete"] <- JsonValue.Create(true)
+
+            System.Threading.Tasks.Task.FromResult(outline :> JsonNode)
+
+        let bridge = FcsBridge(projectOutlineFileOutlineOverride = outlineOverride)
+
+        try
+            let! result =
+                bridge.ProjectOutline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 100
+                        nameContains = Some [ "Needle" ] }
+                )
+
+            Assert.Equal("partial", result["status"].GetValue<string>())
+            let totalEstimate = result["totalEstimate"]
+            Assert.Equal(1, totalEstimate["files"].GetValue<int>())
+
+            let coverage = result["filterCoverage"]
+            Assert.False(coverage["complete"].GetValue<bool>())
+            Assert.Equal(2, coverage["filesRequested"].GetValue<int>())
+            Assert.Equal(1, coverage["filesAnalyzed"].GetValue<int>())
+            Assert.Equal(0, coverage["filesIncomplete"].GetValue<int>())
+            Assert.Equal(1, coverage["filesFailed"].GetValue<int>())
+            Assert.Equal(1, coverage["matchingFiles"].GetValue<int>())
+            Assert.True(coverage["matchingFilesIsLowerBound"].GetValue<bool>())
+            Assert.Equal(1, coverage["issuesReturned"].GetValue<int>())
+            Assert.False(coverage["issuesTruncated"].GetValue<bool>())
+
+            let failure = coverage["issues"] :?> JsonArray |> Seq.exactlyOne
+            Assert.EndsWith("File1.fs", failure["file"].GetValue<string>())
+            Assert.Equal("aborted", failure["status"].GetValue<string>())
+            Assert.Equal("outline_unavailable", failure["errorKind"].GetValue<string>())
+            Assert.Equal("controlled outline abort", failure["message"].GetValue<string>())
+
+            let onlyMatch = filesArray result |> Seq.exactlyOne
+            Assert.EndsWith("File2.fs", onlyMatch["file"].GetValue<string>())
+        finally
+            if Directory.Exists(root) then Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``ProjectOutline does not claim exhaustive filtering when a match is beyond FileOutline's cap`` () : System.Threading.Tasks.Task =
+    task {
+        let projectPath, root = createTailMatchProject ()
+        let bridge = FcsBridge()
+
+        try
+            let! result =
+                bridge.ProjectOutline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 100
+                        nameContains = Some [ "NeedleAfterTwoHundred" ] }
+                )
+
+            Assert.Equal("partial", result["status"].GetValue<string>())
+            let coverage = result["filterCoverage"]
+            Assert.False(coverage["complete"].GetValue<bool>())
+            Assert.Equal(1, coverage["filesRequested"].GetValue<int>())
+            Assert.Equal(0, coverage["filesAnalyzed"].GetValue<int>())
+            Assert.Equal(1, coverage["filesIncomplete"].GetValue<int>())
+            Assert.Equal(0, coverage["filesFailed"].GetValue<int>())
+            Assert.True(coverage["matchingFilesIsLowerBound"].GetValue<bool>())
+
+            let issue = coverage["issues"] :?> JsonArray |> Seq.exactlyOne
+            Assert.EndsWith("Large.fs", issue["file"].GetValue<string>())
+            Assert.Equal("incomplete", issue["status"].GetValue<string>())
+            Assert.Equal("outline_entries_incomplete", issue["errorKind"].GetValue<string>())
+            Assert.Contains("definitions", issue["message"].GetValue<string>())
         finally
             if Directory.Exists(root) then Directory.Delete(root, true)
     }

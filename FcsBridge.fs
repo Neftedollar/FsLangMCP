@@ -1321,6 +1321,11 @@ let private enclosingTestScopeBoundaryRegex =
         enclosingTestRegexTimeout
     )
 
+type private EnclosingTestIdentity =
+    { Name: string
+      StartLine: int
+      StartColumn: int }
+
 let private fsharpTypeNameRegex =
     System.Text.RegularExpressions.Regex(
         @"(?<![\w.])Microsoft\.FSharp\.(?:Core|Collections)\.(?<name>[\w']+)(?![\w])",
@@ -2311,6 +2316,7 @@ type internal FcsBridge
         ?testsForSymbolSiteScanBeforeUseOverride: (unit -> unit),
         ?testsForSymbolFailureDeadlineExpiredOverride: (unit -> bool),
         ?testsForSymbolProjectSweepWaitMsOverride: (int -> int),
+        ?projectOutlineFileOutlineOverride: (FcsFileOutlineArgs -> Task<JsonNode>),
         ?checkFastSnapshotDeadlineExpiredOverride: (unit -> bool),
         // #207: test-only seam for find's PER-SITE siteType deadline. The production check
         // is `sweepSw.ElapsedMilliseconds >= sweepBudgetMs`, which cannot be driven from a
@@ -4852,6 +4858,8 @@ type internal FcsBridge
                            "includeLocal", jbool includeLocal
                            "summaryOnly", jbool summaryOnly
                            "count", jint entries.Length
+                           "totalDefinitionCount", jint allUses.Length
+                           "entriesComplete", jbool false
                            "returnedEntryCount", jint outEntriesArray.Count
                            "entriesTruncatedByBudget", jbool entriesTruncatedByBudget
                            "memberCounts", memberCounts
@@ -4881,6 +4889,12 @@ type internal FcsBridge
 
                     response["returnedEntryCount"] <- jint outEntriesArray.Count
                     response["entriesTruncatedByBudget"] <- jbool entriesWereTruncated
+                    response["entriesComplete"] <-
+                        jbool (
+                            not summaryOnly
+                            && not downgradedToSummary
+                            && outEntriesArray.Count = allUses.Length
+                        )
                     response["customOperationsTruncated"] <- jbool customOperationsTruncated
                     response["customOperationsTruncatedByBudget"] <- jbool customOperationsTruncatedByBudget
                     response["parseDiagnosticsTruncated"] <- jbool parseDiagnosticsTruncated
@@ -7109,7 +7123,7 @@ type internal FcsBridge
             // A candidate owns the use only until the next binding at the same or a
             // shallower indentation. This prevents top-level fixture/setup code after a
             // test from being attributed to the preceding test binding (#240).
-            let findEnclosingTest (lines: string array) (useLine1: int) : string option =
+            let findEnclosingTest (lines: string array) (useLine1: int) : EnclosingTestIdentity option =
                 if lines.Length = 0 then
                     None
                 else
@@ -7154,7 +7168,11 @@ type internal FcsBridge
                         let labelMatch = expectoLabelRegex.Match lines[i]
 
                         if labelMatch.Success && candidateOwnsUse i (indentation lines[i]) then
-                            result <- Some labelMatch.Groups[1].Value
+                            result <-
+                                Some
+                                    { Name = labelMatch.Groups[1].Value
+                                      StartLine = i + 1
+                                      StartColumn = labelMatch.Index + 1 }
                         elif testAttrRegex.IsMatch lines[i] then
                             // Scan downward from the attribute to the use for the decorated name.
                             let mutable j = i
@@ -7174,7 +7192,13 @@ type internal FcsBridge
                             | Some(bindingLine, bindingIndent, name) when
                                 candidateOwnsUse bindingLine bindingIndent
                                 ->
-                                result <- Some name
+                                let bindingMatch = bindingNameRegex.Match lines[bindingLine]
+
+                                result <-
+                                    Some
+                                        { Name = name
+                                          StartLine = bindingLine + 1
+                                          StartColumn = bindingMatch.Index + 1 }
                             | Some _
                             | None -> ()
 
@@ -7210,7 +7234,7 @@ type internal FcsBridge
                        EndCol: int
                        Project: string
                        Fsproj: string
-                       EnclosingTest: string option
+                       EnclosingTest: EnclosingTestIdentity option
                        LineText: string |}
                  >()
 
@@ -7365,7 +7389,12 @@ type internal FcsBridge
                 sortedSites
                 |> Array.choose (fun site ->
                     site.EnclosingTest
-                    |> Option.map (fun testName -> site.Fsproj, site.File, testName))
+                    |> Option.map (fun test ->
+                        site.Fsproj,
+                        site.File,
+                        test.StartLine,
+                        test.StartColumn,
+                        test.Name))
                 |> Array.distinct
                 |> Array.length
 
@@ -7383,7 +7412,7 @@ type internal FcsBridge
                        EndCol: int
                        Project: string
                        Fsproj: string
-                       EnclosingTest: string option
+                       EnclosingTest: EnclosingTestIdentity option
                        LineText: string |})
                 =
                 // range carries coordinates only — `file` is the sibling field above, so it
@@ -7398,7 +7427,7 @@ type internal FcsBridge
 
                 let enclosing =
                     match s.EnclosingTest with
-                    | Some t -> jstr t
+                    | Some test -> jstr test.Name
                     | None -> null
 
                 jobj
@@ -9910,6 +9939,11 @@ type internal FcsBridge
                   summaryOnly = Some false
                   maxResults = None }
 
+            let fileOutlineForProject args =
+                match projectOutlineFileOutlineOverride with
+                | Some overrideOutline -> overrideOutline args
+                | None -> this.FileOutline args
+
             let rawEntriesOf (outline: JsonNode) : JsonNode array =
                 match outline["entries"] with
                 | :? JsonArray as arr -> arr |> Seq.cast<JsonNode> |> Seq.toArray
@@ -10016,13 +10050,83 @@ type internal FcsBridge
             let filteredOutlines =
                 ResizeArray<FsLangMcp.ProjectFiles.ProjectFile * JsonNode * JsonNode array>()
 
+            // Keep the aggregate bounded even when a large project has many unavailable
+            // or truncated outlines. Counts cover every file; the issue rows are a sample.
+            let filterIssueLimit = 50
+            let filterIssues = ResizeArray<JsonNode>()
+            let mutable filterIssueCount = 0
+            let mutable filterAnalyzedFiles = 0
+            let mutable filterIncompleteFiles = 0
+            let mutable filterFailedFiles = 0
+
+            let addFilterIssue (issue: JsonNode) =
+                filterIssueCount <- filterIssueCount + 1
+
+                if filterIssues.Count < filterIssueLimit then
+                    filterIssues.Add issue
+
             if filtersActive then
                 for file in allFiles.Included do
-                    let! outline = this.FileOutline(outlineArgs file.Path)
-                    let postFilterEntries = postFilterEntriesOf outline
+                    let! outline = fileOutlineForProject (outlineArgs file.Path)
 
-                    if postFilterEntries.Length > 0 then
-                        filteredOutlines.Add(file, outline, postFilterEntries)
+                    let outlineStatus =
+                        match outline["status"] with
+                        | null -> "unknown"
+                        | status -> status.GetValue<string>()
+
+                    if
+                        String.Equals(outlineStatus, "succeeded", StringComparison.OrdinalIgnoreCase)
+                        || String.Equals(outlineStatus, "ok", StringComparison.OrdinalIgnoreCase)
+                    then
+                        let postFilterEntries = postFilterEntriesOf outline
+
+                        if postFilterEntries.Length > 0 then
+                            filteredOutlines.Add(file, outline, postFilterEntries)
+
+                        let entriesComplete =
+                            match outline["entriesComplete"] with
+                            | null -> false
+                            | complete -> complete.GetValue<bool>()
+
+                        if entriesComplete then
+                            filterAnalyzedFiles <- filterAnalyzedFiles + 1
+                        else
+                            filterIncompleteFiles <- filterIncompleteFiles + 1
+
+                            let returnedCount =
+                                match outline["returnedEntryCount"] with
+                                | null -> rawEntriesOf outline |> Array.length
+                                | count -> count.GetValue<int>()
+
+                            let totalCount =
+                                match outline["totalDefinitionCount"] with
+                                | null -> max returnedCount 1
+                                | count -> count.GetValue<int>()
+
+                            addFilterIssue (
+                                jobj
+                                    [ "file", jstr file.Path
+                                      "status", jstr "incomplete"
+                                      "errorKind", jstr "outline_entries_incomplete"
+                                      "message",
+                                      jstr
+                                          $"File outline returned %d{returnedCount} of %d{totalCount} definitions; filter matches beyond the returned entries remain unknown." ]
+                                :> JsonNode
+                            )
+                    else
+                        filterFailedFiles <- filterFailedFiles + 1
+
+                        addFilterIssue (
+                            jobj
+                                [ "file", jstr file.Path
+                                  "status", jstr outlineStatus
+                                  "errorKind", jstr "outline_unavailable"
+                                  "message",
+                                  (match outline["message"] with
+                                   | null -> null
+                                   | message -> message.DeepClone()) ]
+                            :> JsonNode
+                        )
 
             let totalFileCount =
                 if filtersActive then filteredOutlines.Count else allFiles.Included.Length
@@ -10049,7 +10153,7 @@ type internal FcsBridge
                 returnedFileCount <- pageFiles.Length
 
                 for file in pageFiles do
-                    let! outline = this.FileOutline(outlineArgs file.Path)
+                    let! outline = fileOutlineForProject (outlineArgs file.Path)
                     addFileEntry file outline (rawEntriesOf outline)
 
             // ── Pagination envelope ─────────────────────────────────────────────
@@ -10066,11 +10170,37 @@ type internal FcsBridge
                 |> List.map (fun f -> f.Path)
                 |> List.filter (File.Exists >> not)
 
+            let filterCoverage =
+                if filtersActive then
+                    let complete = filterIssueCount = 0
+
+                    jobj
+                        [ "complete", jbool complete
+                          "filesRequested", jint allFiles.Included.Length
+                          "filesAnalyzed", jint filterAnalyzedFiles
+                          "filesIncomplete", jint filterIncompleteFiles
+                          "filesFailed", jint filterFailedFiles
+                          "matchingFiles", jint totalFileCount
+                          "matchingFilesIsLowerBound", jbool (not complete)
+                          "issues", JsonArray(filterIssues.ToArray()) :> JsonNode
+                          "issuesReturned", jint filterIssues.Count
+                          "issuesTruncated", jbool (filterIssueCount > filterIssues.Count)
+                          "hint",
+                          (if complete then
+                               null
+                           else
+                               jstr
+                                   "Some file outlines were unavailable or did not return every definition, so totalEstimate.files and matchingFiles are lower bounds. Inspect filterCoverage.issues and run check before treating an absent match as exhaustive.") ]
+                    :> JsonNode
+                else
+                    null
+
             let baseFields =
-                [ "status", jstr "ok"
+                [ "status", jstr (if filtersActive && filterIssueCount > 0 then "partial" else "ok")
                   "projectPath", jstr projectPath
                   "workspaceRoot", jstr workspaceRoot
                   "summaryOnly", jbool summaryOnly
+                  "filterCoverage", filterCoverage
                   "filterSummary", filterSummaryToJson allFiles :> JsonNode
                   "unresolvedFiles", JsonArray(unresolvedFiles |> List.map jstr |> List.toArray) :> JsonNode
                   "files", JsonArray(fileEntries.ToArray()) :> JsonNode ]

@@ -45,8 +45,11 @@ partial answer as exhaustive.
   returns a precise widening hint.
 - `fcs_project_outline` now applies `filter` / `nameContains` before file pagination (#238).
   Files with no matching entries are omitted, `maxFiles` and cursors operate on the matching-file
-  set, and `totalEstimate.files` counts matching files. Unfiltered requests keep their existing
-  page-first path.
+  set, and `totalEstimate.files` counts matching files. If a file outline aborts during a filtered
+  sweep, or if the bounded per-file outline did not return every definition, the response is now
+  `partial` with a bounded `filterCoverage` issue ledger and marks the matching count as a lower
+  bound instead of silently treating the file as a non-match. Unfiltered requests keep their
+  existing page-first path.
 - A direct `fcs_project_outline` call on a test project now includes its evaluated compile sources
   by default (#239), including ordinary `tests/.../Program.fs` and `Tests.fs` files. The shared
   filter distinguishes `test_source` from `test_result_artifact`; `TestResults`, `test-results`,
@@ -56,9 +59,10 @@ partial answer as exhaustive.
   next binding/module/namespace/type boundary, and leaves top-level fixture sites unassigned
   instead of borrowing the preceding test (#240). Compatibility `testCount` and `siteCount` both
   count all reference sites; additive `uniqueTestCount` counts distinct enclosing tests.
-  Project identity participates in de-duplication, so one linked test file compiled by two test
-  projects remains two pieces of coverage evidence. Pagination is by site and preserves the full
-  counts. The enclosing-test scan now advances past rejected test
+  Project identity and the enclosing declaration's source position participate in de-duplication,
+  so one linked test file compiled by two test projects remains two pieces of coverage evidence and
+  separate same-named declarations in one file remain distinct tests. Pagination is by site and
+  preserves the full counts. The enclosing-test scan now advances past rejected test
   attributes, checks the whole-sweep budget inside its synchronous loops, and uses bounded
   non-backtracking regexes. An unrelated attribute can no longer trap the tool after FCS analysis
   has already completed.

@@ -36,6 +36,8 @@ let private libFs =
           "let linkedTarget (value: int) = value * 2"
           ""
           "let boundaryTarget (value: int) = value + 1"
+          ""
+          "let duplicateTarget (value: int) = value + 10"
           "" ]
 
 // A self-contained FactAttribute so the test project compiles WITHOUT a real xunit
@@ -94,6 +96,16 @@ let private testsFs =
           "        boundaryTarget 3 |> ignore"
           "and SecondBoundaryType() ="
           "    do boundaryTarget 4 |> ignore"
+          ""
+          "module DuplicateNameOne ="
+          "    [<Fact>]"
+          "    let ``same display name`` () ="
+          "        duplicateTarget 1 |> ignore"
+          ""
+          "module DuplicateNameTwo ="
+          "    [<Fact>]"
+          "    let ``same display name`` () ="
+          "        duplicateTarget 2 |> ignore"
           "" ]
 
 let private linkedTestsFs =
@@ -461,6 +473,21 @@ type TestsForSymbolTests(fx: TestsForSymbolFixture, output: ITestOutputHelper) =
             Assert.Equal(2, gi result "testCount")
             Assert.Equal(2, gi result "uniqueTestCount")
             Assert.Equal(2, gi result "siteCount")
+        }
+
+    [<Fact>]
+    member _.``tests_for_symbol counts same-named declarations in one file as distinct tests``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit %d{fx.BuildExitCode}):\n%s{fx.BuildLog}")
+            let! result = fx.Bridge.TestsForSymbol(tfsArgs fx.Slnx "duplicateTarget")
+            let sites = testEntries result
+
+            Assert.Equal("succeeded", gs result "status")
+            Assert.Equal(2, sites.Length)
+            Assert.All(sites, fun site -> Assert.Equal("same display name", gs site "enclosingTest"))
+            Assert.Equal(2, gi result "siteCount")
+            Assert.Equal(2, gi result "testCount")
+            Assert.Equal(2, gi result "uniqueTestCount")
         }
 
     [<Fact>]
