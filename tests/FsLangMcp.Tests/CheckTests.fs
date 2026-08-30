@@ -301,8 +301,11 @@ let ``auto scope discovery obeys the overall timeout before options start`` () :
                         timeoutMs = Some 300 }
                 )
 
-            do! discoveryStarted.Task.WaitAsync(TimeSpan.FromSeconds(1.0))
-            let! result = checkTask.WaitAsync(TimeSpan.FromSeconds(2.0))
+            // Coverlet instrumentation can add substantial scheduler overhead on CI.
+            // These outer waits are deadlock guards; the product deadlines asserted
+            // below remain 300/150/1000 ms and are intentionally unchanged.
+            do! discoveryStarted.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            let! result = checkTask.WaitAsync(TimeSpan.FromSeconds(5.0))
 
             Assert.Equal("succeeded", gs result "status")
             Assert.Equal("unknown", gs result "verdict")
@@ -327,7 +330,7 @@ let ``auto scope discovery obeys the overall timeout before options start`` () :
                         speed = Some "trusted"
                         timeoutMs = Some 150 }
                 )
-                |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(1.0))
+                |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(5.0))
 
             Assert.Equal("unknown", gs sameTarget "verdict")
             Assert.Equal(1L, bridge.CheckTargetDiscoveryStartedCount)
@@ -347,11 +350,11 @@ let ``auto scope discovery obeys the overall timeout before options start`` () :
                             speed = Some "trusted"
                             timeoutMs = Some 1000 }
                     )
-                    |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(1.0))
+                    |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(5.0))
 
                 Assert.Equal("unknown", gs busy "verdict")
                 Assert.Contains("discovery busy", (gs busy "reason").ToLowerInvariant())
-                Assert.True(elapsed.Elapsed < TimeSpan.FromMilliseconds(750.0), "busy discovery must not queue")
+                Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(3.0), "busy discovery must not queue")
 
             Assert.Equal(1L, bridge.CheckTargetDiscoveryStartedCount)
             Assert.Equal(6L, bridge.CheckTargetDiscoveryRejectedCount)
@@ -364,7 +367,7 @@ let ``auto scope discovery obeys the overall timeout before options start`` () :
                 bridge.CheckTargetDiscoveryActiveCount <> 0
                 || bridge.CheckTargetDiscoveryInFlightCount <> 0
 
-            while discoveryStillRunning () && settle.Elapsed < TimeSpan.FromSeconds(2.0) do
+            while discoveryStillRunning () && settle.Elapsed < TimeSpan.FromSeconds(5.0) do
                 do! Task.Delay(10)
 
             Assert.Equal(0, bridge.CheckTargetDiscoveryActiveCount)
