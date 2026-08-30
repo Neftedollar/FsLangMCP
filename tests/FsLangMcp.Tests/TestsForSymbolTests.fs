@@ -625,7 +625,10 @@ type TestsForSymbolTests(fx: TestsForSymbolFixture, output: ITestOutputHelper) =
                     projectSweepWorkerOverride = controlledSweep,
                     // Deterministically model the deadline crossing while a real
                     // admission-busy exception propagates. Busy must keep priority.
-                    testsForSymbolFailureDeadlineExpiredOverride = (fun () -> true)
+                    testsForSymbolFailureDeadlineExpiredOverride = (fun () -> true),
+                    // Give project/options preprocessing normal full-suite headroom,
+                    // then bound only the injected blocked sweep itself.
+                    testsForSymbolProjectSweepWaitMsOverride = (fun _ -> 500)
                 )
 
             try
@@ -637,15 +640,16 @@ type TestsForSymbolTests(fx: TestsForSymbolFixture, output: ITestOutputHelper) =
                     Assert.True(Result.isOk snapshot)
 
                 let firstCaller =
-                    bridge.TestsForSymbol({ tfsArgs fx.TestFsproj "add" with timeoutMs = Some 500 })
+                    bridge.TestsForSymbol({ tfsArgs fx.TestFsproj "add" with timeoutMs = Some 60_000 })
 
-                do! firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
-                let! firstResult = firstCaller.WaitAsync(TimeSpan.FromSeconds(5.0))
+                do! firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(30.0))
+                let! firstResult = firstCaller.WaitAsync(TimeSpan.FromSeconds(10.0))
                 Assert.Equal(1, gi firstResult "projectsTimedOut")
                 Assert.Equal(0, gi firstResult "projectsScanned")
 
                 let! busyResult =
-                    bridge.TestsForSymbol({ tfsArgs fx.LinkedSlnx "linkedTarget" with timeoutMs = Some 5_000 })
+                    bridge.TestsForSymbol({ tfsArgs fx.LinkedSlnx "linkedTarget" with timeoutMs = Some 60_000 })
+                    |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(30.0))
 
                 Assert.Equal("unknown", gs busyResult "status")
                 Assert.Equal("indeterminate", gs busyResult "outcome")

@@ -2310,6 +2310,7 @@ type internal FcsBridge
         ?projectSweepWorkerOverride: (string -> Task<FSharpSymbolUse array * FSharpDiagnostic array>),
         ?testsForSymbolSiteScanBeforeUseOverride: (unit -> unit),
         ?testsForSymbolFailureDeadlineExpiredOverride: (unit -> bool),
+        ?testsForSymbolProjectSweepWaitMsOverride: (int -> int),
         ?checkFastSnapshotDeadlineExpiredOverride: (unit -> bool),
         // #207: test-only seam for find's PER-SITE siteType deadline. The production check
         // is `sweepSw.ElapsedMilliseconds >= sweepBudgetMs`, which cannot be driven from a
@@ -7245,7 +7246,12 @@ type internal FcsBridge
                     if remainingMs <= 0 then
                         raise (TimeoutException($"Overall tests_for_symbol budget of %d{sweepBudgetMs}ms was exhausted."))
 
-                    let! allUses, _ = this.ProjectSweepUses(usesKey, options, remainingMs)
+                    let projectSweepWaitMs =
+                        match testsForSymbolProjectSweepWaitMsOverride with
+                        | Some overrideWait -> max 1 (overrideWait remainingMs)
+                        | None -> remainingMs
+
+                    let! allUses, _ = this.ProjectSweepUses(usesKey, options, projectSweepWaitMs)
 
                     if remainingBudget () <= TimeSpan.Zero then
                         raise (TimeoutException($"Overall tests_for_symbol budget of %d{sweepBudgetMs}ms was exhausted."))
