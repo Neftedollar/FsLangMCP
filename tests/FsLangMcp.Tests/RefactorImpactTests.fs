@@ -27,6 +27,18 @@ open FsLangMcp.FcsBridge
 
 // ── Cross-project fixture sources (Lib / Lib.Tests / App) ─────────────────────────
 
+let private budgetApiLines =
+    [ for moduleIndex in 1..80 do
+          yield ""
+          yield $"module Api%d{moduleIndex} ="
+
+          for memberIndex in 1..12 do
+              yield $"    let publicMember%d{memberIndex} (value: int) : int = value + %d{memberIndex}"
+
+      yield ""
+      yield "module ZzzBudgetCutoff ="
+      yield "    let afterBudgetCutoff (value: int) : int = value + 1" ]
+
 let private libFs =
     String.concat
         "\n"
@@ -38,6 +50,9 @@ let private libFs =
           ""
           "let paged (value: int) = value + 1"
           "" ]
+
+let private largeApiFs =
+    String.concat "\n" ([ "module LargeApi.Surface" ] @ budgetApiLines @ [ "" ])
 
 let private pagedTestLines =
     [ for index in 1..105 -> $"        paged %d{index} |> ignore" ]
@@ -115,6 +130,7 @@ let private slnx =
         "\n"
         [ "<Solution>"
           "  <Project Path=\"Lib/Lib.fsproj\" />"
+          "  <Project Path=\"LargeApi/LargeApi.fsproj\" />"
           "  <Project Path=\"Lib.Tests/Lib.Tests.fsproj\" />"
           "  <Project Path=\"App/App.fsproj\" />"
           "</Solution>" ]
@@ -133,12 +149,15 @@ type ImpactFixture() =
 
     do write "Lib/Lib.fsproj" (leafProject "Lib.fs") |> ignore
     do write "Lib/Lib.fs" libFs |> ignore
+    do write "LargeApi/LargeApi.fsproj" (leafProject "LargeApi.fs") |> ignore
+    do write "LargeApi/LargeApi.fs" largeApiFs |> ignore
     do write "Lib.Tests/Lib.Tests.fsproj" (testProject "Tests.fs" "../Lib/Lib.fsproj") |> ignore
     do write "Lib.Tests/Tests.fs" testsFs |> ignore
     do write "App/App.fsproj" (refProject "App.fs" "../Lib/Lib.fsproj") |> ignore
     do write "App/App.fs" appFs |> ignore
     let slnxPath = write "Impact.slnx" slnx
     let libFsproj = Path.Combine(root, "Lib", "Lib.fsproj")
+    let largeApiFsproj = Path.Combine(root, "LargeApi", "LargeApi.fsproj")
 
     let buildOnce () =
         let psi =
@@ -172,6 +191,7 @@ type ImpactFixture() =
     member _.Root = root
     member _.Slnx = slnxPath
     member _.LibFsproj = libFsproj
+    member _.LargeApiFsproj = largeApiFsproj
     member _.BuildExitCode = buildExit
     member _.BuildLog = buildLog
 
@@ -466,6 +486,76 @@ type ImpactCrossProjectTests(fx: ImpactFixture, output: ITestOutputHelper) =
             Assert.Contains(lines, fun l -> l.Contains "BREAKING")
 
             output.WriteLine(String.concat "\n" lines)
+        }
+
+    [<Fact>]
+    member _.``refactor_impact keeps public API membership indeterminate after response budget cutoff``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit %d{fx.BuildExitCode}):\n%s{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let publicApiArgs cursor =
+                { projectPath = Some fx.LargeApiFsproj
+                  includeInternal = Some false
+                  namespaceFilter = None
+                  maxResults = Some 1000
+                  cursor = cursor }
+
+            let pageContainsTarget (page: JsonNode) =
+                arr page "entities"
+                |> List.exists (fun entity ->
+                    arr entity "members"
+                    |> List.exists (fun memberNode ->
+                        String.Equals(
+                            gs memberNode "name",
+                            "afterBudgetCutoff",
+                            StringComparison.Ordinal
+                        )))
+
+            let nextCursor (page: JsonNode) =
+                page["nextCursor"]
+                |> Option.ofObj
+                |> Option.map (fun node -> node.GetValue<string>())
+
+            let! firstPage = bridge.PublicApi(publicApiArgs None)
+            Assert.Equal("ok", gs firstPage "status")
+            Assert.True(gb firstPage "truncated")
+            Assert.True(gb firstPage "truncatedByBudget")
+            Assert.False(pageContainsTarget firstPage)
+
+            let mutable cursor = nextCursor firstPage
+            let mutable foundAfterCutoff = false
+            let mutable pagesFollowed = 0
+
+            while cursor.IsSome && not foundAfterCutoff && pagesFollowed < 16 do
+                let currentCursor =
+                    cursor |> Option.defaultWith (fun () -> failwith "cursor disappeared inside guarded loop")
+
+                let! page = bridge.PublicApi(publicApiArgs (Some currentCursor))
+                pagesFollowed <- pagesFollowed + 1
+                foundAfterCutoff <- pageContainsTarget page
+                cursor <- nextCursor page
+
+            Assert.True(foundAfterCutoff, "the target must be public and located after the first response-budget cutoff")
+            Assert.InRange(pagesFollowed, 1, 16)
+
+            let! result =
+                bridge.RefactorImpact(impactArgs fx.Slnx "afterBudgetCutoff" (Some "signature"))
+
+            Assert.Equal("partial", gs result "status")
+            Assert.False(gb result "complete")
+
+            let api = result["apiSurface"]
+            Assert.False(gb api "complete")
+            Assert.True(gb api "truncated")
+            Assert.True(gb api "truncatedByBudget")
+            Assert.NotNull(api["nextCursor"])
+            Assert.Null(api["isPublic"])
+            Assert.Empty(arr api "affectedPublicMembers")
+
+            let lines = verifyLines result
+            Assert.Contains(lines, fun line -> line.Contains("indeterminate", StringComparison.OrdinalIgnoreCase))
+            Assert.DoesNotContain(lines, fun line -> line.Contains("stays internal", StringComparison.Ordinal))
         }
 
     [<Fact>]

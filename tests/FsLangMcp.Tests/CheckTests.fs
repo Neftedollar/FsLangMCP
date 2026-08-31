@@ -1568,6 +1568,72 @@ type CheckTests(fx: CheckFixture) =
         }
 
     [<Fact>]
+    member _.``trusted file aborted answer carries a typed project failure``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+
+            let bridge =
+                FcsBridge(
+                    trustedFileCheckAnswerOverride =
+                        (fun _ -> FSharp.Compiler.CodeAnalysis.FSharpCheckFileAnswer.Aborted)
+                )
+
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        scope = Some "file"
+                        path = Some fx.MainFs
+                        speed = Some "trusted"
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            Assert.Equal("unknown", gs result "verdict")
+            Assert.False(gb result "analyzed")
+            Assert.False(gb result "groundTruth")
+            Assert.Equal("project_failure", gs (result["blockingReason"]) "errorKind")
+            Assert.False(gb (result["blockingReason"]) "retryable")
+        }
+
+    [<Fact>]
+    member _.``trusted file exceptions retain timeout cancellation busy and generic kinds``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+
+            let cases: (string * bool * (unit -> exn)) array =
+                [| "timeout", true, (fun () -> TimeoutException("simulated trusted file timeout"))
+                   "cancelled", true, (fun () -> OperationCanceledException("simulated trusted file cancellation"))
+                   "fcs_worker_busy", true, (fun () -> ProjectEvaluationBusyException(fx.ProbeFsproj))
+                   "fcs_worker_busy",
+                   true,
+                   (fun () -> BoundedCheckWorkBusyException("file type-check", fx.MainFs))
+                   "project_failure", false, (fun () -> InvalidOperationException("simulated trusted file failure")) |]
+
+            for expectedErrorKind, expectedRetryable, createFailure in cases do
+                let bridge =
+                    FcsBridge(
+                        trustedFileCheckAnswerOverride =
+                            (fun _ -> raise (createFailure ()))
+                    )
+
+                let! result =
+                    bridge.Check(
+                        { bareCheck with
+                            scope = Some "file"
+                            path = Some fx.MainFs
+                            speed = Some "trusted"
+                            projectPath = Some fx.ProbeFsproj }
+                    )
+
+                Assert.Equal("unknown", gs result "verdict")
+                Assert.False(gb result "analyzed")
+                Assert.False(gb result "groundTruth")
+                Assert.Equal(expectedErrorKind, gs (result["blockingReason"]) "errorKind")
+                Assert.Equal(expectedRetryable, gb (result["blockingReason"]) "retryable")
+        }
+
+    [<Fact>]
     member _.``fast snapshot success observed after the deadline is never conclusive``() : Task =
         task {
             Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")

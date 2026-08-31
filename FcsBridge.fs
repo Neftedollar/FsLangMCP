@@ -2397,7 +2397,8 @@ type internal FcsBridge
         // returning and its site loop finishing) deterministically testable.
         ?findSiteTypeDeadlineExpiredOverride: (unit -> bool),
         ?referenceResolutionProbeOverride: (string array -> int * int),
-        ?projectOptionsCacheValidationBeforeComputeOverride: (string -> unit)
+        ?projectOptionsCacheValidationBeforeComputeOverride: (string -> unit),
+        ?trustedFileCheckAnswerOverride: (FSharpCheckFileAnswer -> FSharpCheckFileAnswer)
     ) =
     // FCS default projectCacheSize is 3. The `find` multi-project union sweep
     // (issue #128) re-checks EVERY member project of the active solution on each
@@ -9063,6 +9064,11 @@ type internal FcsBridge
                                     checker.ParseAndCheckFileInProject(fullPath, 0, sourceText, projectOptions)
                                     |> asTask
 
+                                let checkAnswer =
+                                    match trustedFileCheckAnswerOverride with
+                                    | Some overrideAnswer -> overrideAnswer checkAnswer
+                                    | None -> checkAnswer
+
                                 let checkedResults =
                                     match checkAnswer with
                                     | FSharpCheckFileAnswer.Succeeded results -> Some results
@@ -9078,15 +9084,30 @@ type internal FcsBridge
                                 let errorCount, warningCount = countDiagnosticsBySeverity allDiags
                                 let infoCount = countInfoDiagnostics allDiags
 
-                                let verdict, analyzed, reason =
-                                    if not succeeded then
-                                        "unknown", false, Some "Type checking was aborted; file verdict is indeterminate."
-                                    elif errorCount > 0 then
-                                        "errors", true, None
+                                let abortedReason =
+                                    "Type checking was aborted; file verdict is indeterminate."
+
+                                let blockingFailure =
+                                    if succeeded then
+                                        None
                                     else
-                                        "clean", true, None
+                                        Some(CheckProjectFailure abortedReason)
+
+                                let verdict, analyzed, reason =
+                                    match blockingFailure with
+                                    | Some failure -> "unknown", false, Some(blockingFailureMessage failure)
+                                    | None when errorCount > 0 -> "errors", true, None
+                                    | None -> "clean", true, None
 
                                 let nodes, files = surfaceFcs allDiags
+
+                                let responseFields =
+                                    [ "projectFileName", jstr projectOptions.ProjectFileName
+                                      "optionsSource", jstr optionsSource
+                                      "projectsSwept", jint 1 ]
+                                    @ (blockingFailure
+                                       |> Option.map blockingFields
+                                       |> Option.defaultValue [])
 
                                 return
                                     build
@@ -9101,10 +9122,25 @@ type internal FcsBridge
                                         nodes
                                         files
                                         reason
-                                        [ "projectFileName", jstr projectOptions.ProjectFileName
-                                          "optionsSource", jstr optionsSource
-                                          "projectsSwept", jint 1 ]
+                                        responseFields
                             }
+
+                        let blockedTrustedFile failure =
+                            let message = blockingFailureMessage failure
+
+                            build
+                                "unknown"
+                                false
+                                "fcs"
+                                (Some "fcs-reanalyze")
+                                0
+                                0
+                                0
+                                0
+                                [||]
+                                [||]
+                                (Some $"File could not be analyzed: {message}")
+                                ([ ("projectsSwept", jint 1) ] @ blockingFields failure)
 
                         let sdkDirectories =
                             [ match args.projectPath with
@@ -9138,7 +9174,20 @@ type internal FcsBridge
                                     (Some failure.Message)
                                     ([ ("projectsSwept", jint 0) ]
                                      @ blockingFields (CheckSdkNotFound failure))
-                        | SdkPreflight.Proceed -> return! runTrustedFileCheck ()
+                        | SdkPreflight.Proceed ->
+                            try
+                                return! runTrustedFileCheck ()
+                            with
+                            | :? OperationCanceledException as cancelled ->
+                                return blockedTrustedFile (CheckCancelled cancelled.Message)
+                            | :? TimeoutException ->
+                                return blockedTrustedFile CheckTimedOut
+                            | :? ProjectEvaluationBusyException as busy ->
+                                return blockedTrustedFile (CheckBusy busy.Message)
+                            | busy when boundedCheckWorkFailureIsBusy busy ->
+                                return blockedTrustedFile (CheckBusy busy.Message)
+                            | ex ->
+                                return blockedTrustedFile (CheckProjectFailure ex.Message)
                 | _ -> return invalid "scope='file' requires 'path'."
 
             | "project" ->
@@ -13297,15 +13346,18 @@ type internal FcsBridge
             // ── Public-API breaking surface (kind=signature|delete) ──────────────────
             let wantApi = kindResolved = "signature" || kindResolved = "delete"
             let mutable apiSurfaceNode: JsonNode option = None
-            let mutable apiIsPublic = false
+            let mutable apiIsPublic: bool option = None
+            let mutable apiComplete = not wantApi
 
             if wantApi then
                 match definingFsproj with
                 | None ->
+                    apiComplete <- false
                     apiSurfaceNode <-
                         Some(
                             jobj
-                                [ "isPublic", jbool false
+                                [ "complete", jbool false
+                                  "isPublic", null
                                   "affectedPublicMembers", JsonArray() :> JsonNode
                                   "note", jstr "could not resolve the defining project for the target" ]
                             :> JsonNode
@@ -13318,6 +13370,16 @@ type internal FcsBridge
                               namespaceFilter = None
                               maxResults = Some 1000
                               cursor = None }
+
+                    let apiStatus = readStr api "status" |> Option.defaultValue "unknown"
+                    let apiTruncated = readBool api "truncated" |> Option.defaultValue false
+                    let apiNextCursor = readStr api "nextCursor"
+                    let apiTruncatedByBudget = readBool api "truncatedByBudget" |> Option.defaultValue false
+                    let apiScanComplete =
+                        apiStatus = "ok"
+                        && not apiTruncated
+                        && not apiTruncatedByBudget
+                        && apiNextCursor.IsNone
 
                     let entities = arrayOf api "entities"
                     let affected = ResizeArray<JsonNode>()
@@ -13356,13 +13418,27 @@ type internal FcsBridge
                                 )
                             | _ -> ()
 
-                    apiIsPublic <- affected.Count > 0
+                    apiIsPublic <-
+                        if affected.Count > 0 then
+                            Some true
+                        elif apiScanComplete then
+                            Some false
+                        else
+                            None
+
+                    apiComplete <- apiScanComplete
 
                     apiSurfaceNode <-
                         Some(
                             jobj
-                                [ "isPublic", jbool apiIsPublic
+                                [ "status", jstr apiStatus
+                                  "complete", jbool apiComplete
+                                  "scanComplete", jbool apiScanComplete
+                                  "isPublic", (apiIsPublic |> Option.map jbool |> Option.defaultValue null)
                                   "project", jstr fsproj
+                                  "truncated", jbool apiTruncated
+                                  "truncatedByBudget", jbool apiTruncatedByBudget
+                                  "nextCursor", (apiNextCursor |> Option.map jstr |> Option.defaultValue null)
                                   "affectedPublicMembers", JsonArray(affected.ToArray()) :> JsonNode ]
                             :> JsonNode
                         )
@@ -13472,12 +13548,20 @@ type internal FcsBridge
                 )
 
             if wantApi then
-                if apiIsPublic then
+                if not apiComplete then
+                    verify.Add(
+                        "public API evidence is incomplete — apiSurface.isPublic is indeterminate unless the target was already observed; follow apiSurface.nextCursor or narrow fcs_public_api before deciding the change is internal"
+                    )
+
+                match apiIsPublic with
+                | Some true ->
                     verify.Add(
                         $"'%s{resolvedName}' is part of the public API surface — this is a BREAKING change; bump the minor version and update consumers"
                     )
-                else
+                | Some false ->
                     verify.Add($"'%s{resolvedName}' is not on the public API surface — the change stays internal")
+                | None ->
+                    verify.Add($"public API membership for '%s{resolvedName}' is indeterminate — do not treat it as internal")
 
             if kindResolved = "move" then
                 if compileProblemCount > 0 then
@@ -13555,7 +13639,7 @@ type internal FcsBridge
                       "tests", JsonArray(testNodes) :> JsonNode ]
                 :> JsonNode
 
-            let reportComplete = findDeliveryComplete && testsComplete
+            let reportComplete = findDeliveryComplete && testsComplete && apiComplete
             let reportStatus = if reportComplete then "succeeded" else "partial"
 
             let baseProps =

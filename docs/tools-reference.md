@@ -326,10 +326,15 @@ The response includes `evaluation.status`, `evaluation.source`, `evaluation.impo
 
 **Use when:** Before any rename, move, or delete. Gives the project-wide picture; use `fcs_rename_preview` for the exact edits.
 
-The report is `status="succeeded", complete=true` only when both the `find` delivery and test
-coverage/delivery are exhaustive. Otherwise it returns `status="partial"`: inspect
+The report is `status="succeeded", complete=true` only when the `find` delivery, test
+coverage/delivery, and any requested public-API scan are exhaustive. Otherwise it returns
+`status="partial"`: inspect
 `impact.complete` / `impact.nextCursor` and `tests.status` / `tests.coverage` /
-`tests.nextCursor`. While impact rows are paginated, `fileCount` and `projectCount` are explicitly
+`tests.nextCursor`. For `kind=signature|delete`, inspect `apiSurface.complete`, `truncated`, and
+`nextCursor`; an incomplete miss reports `isPublic=null`, never a false `false`. A target already
+observed on a truncated page remains `isPublic=true`, but the report stays partial because
+`apiSurface.scanComplete=false`. While impact rows
+are paginated, `fileCount` and `projectCount` are explicitly
 lower bounds even though `totalSites` remains the full count; `crossProject` is `null` until the
 whole site set is delivered, while `observedCrossProject` describes the current page.
 
