@@ -100,6 +100,13 @@ partial answer as exhaustive.
   `downstreamProjectsChecked=false`, `recommendedScope="workspace"`, and a coverage note (#222).
   It does not run another ProjInfo/MSBuild sweep merely to count consumers. A workspace request
   against one `.fsproj` is rejected instead of returning a misleading one-project workspace verdict.
+- `check` now preserves typed blocking causes when a semantic verdict is `unknown` (#244).
+  An unavailable exact SDK pin remains `verdict="unknown"` / `groundTruth=false`, while
+  `blockingReason.errorKind="sdk_not_found"` carries the requested SDK, visible installed SDKs,
+  selected dotnet host/root evidence, `global.json`, and remedies without parsing prose. Project
+  checks expose the cause at the top level; workspace checks keep it on the affected project.
+  Timeout, worker-busy, and generic project failures use distinct typed causes. `find` now attaches
+  the same SDK evidence to its existing `sdk_not_found` per-project row.
 - `fcs_nuget_members` now recovers exact method accessibility from ECMA-335 metadata when
   available, keeps protected members in the default surface, reports `isAbstract`, and emits
   generic constraints both in `signature` and structured `genericParameters` (#223). Metadata is

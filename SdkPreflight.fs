@@ -41,6 +41,38 @@ let private describeInstalled (installedSdks: string list) =
     else
         String.concat ", " installedSdks
 
+/// Mirrors `Ionide.ProjInfo.Paths.dotnetRoot`: DOTNET_HOST_PATH, then
+/// DOTNET_ROOT[(x86)], then the bare name for PATH resolution. Keeping this next
+/// to the failure envelope lets callers see which host selector produced the
+/// installed-SDK view without parsing the human-readable message.
+let internal resolveDotnetBinary () : string =
+    let binaryName =
+        if OperatingSystem.IsWindows() then
+            "dotnet.exe"
+        else
+            "dotnet"
+
+    let fromEnvironment (variable: string) (toBinaryPath: string -> string) =
+        match Environment.GetEnvironmentVariable(variable) with
+        | value when String.IsNullOrWhiteSpace value -> None
+        | value ->
+            let candidate = toBinaryPath value
+            if File.Exists candidate then Some candidate else None
+
+    fromEnvironment "DOTNET_HOST_PATH" id
+    |> Option.orElseWith (fun () -> fromEnvironment "DOTNET_ROOT" (fun root -> Path.Combine(root, binaryName)))
+    |> Option.orElseWith (fun () -> fromEnvironment "DOTNET_ROOT(x86)" (fun root -> Path.Combine(root, binaryName)))
+    |> Option.defaultValue binaryName
+
+let private configuredSdkRoots () =
+    [ "DOTNET_ROOT"; "DOTNET_ROOT(x86)" ]
+    |> List.choose (fun variable ->
+        Environment.GetEnvironmentVariable(variable)
+        |> Option.ofObj
+        |> Option.map _.Trim()
+        |> Option.filter (String.IsNullOrWhiteSpace >> not))
+    |> List.distinct
+
 let internal describe (pin: SdkPin) (installedSdks: string list) =
     $".NET SDK %s{pin.Version} is pinned by %s{pin.GlobalJsonPath} with rollForward \"disable\", "
     + $"but it is not installed (installed SDKs: %s{describeInstalled installedSdks}). "
@@ -48,27 +80,35 @@ let internal describe (pin: SdkPin) (installedSdks: string list) =
     + "version, or use a rollForward policy other than \"disable\". FsLangMCP stopped before MSBuild "
     + "project load: fsautocomplete and Ionide.ProjInfo both fail fatally on this pin."
 
+let private failureFields (pin: SdkPin) (installedSdks: string list) =
+    [ "errorKind", jstr "sdk_not_found"
+      "message", jstr (describe pin installedSdks)
+      "requestedSdkVersion", jstr pin.Version
+      // Echoed verbatim rather than defaulted to "disable": only a disable pin can
+      // reach here, and the file's own casing is what the caller will search for.
+      "rollForward", (pin.RollForward |> Option.map jstr |> Option.defaultValue null)
+      "globalJsonPath", jstr pin.GlobalJsonPath
+      "installedSdks", JsonArray(installedSdks |> List.map jstr |> List.toArray) :> JsonNode
+      "dotnetHostPath", jstr (resolveDotnetBinary ())
+      "sdkRoots", JsonArray(configuredSdkRoots () |> List.map jstr |> List.toArray) :> JsonNode
+      "remedies",
+      JsonArray(
+          [| jstr $"Install the .NET SDK %s{pin.Version}."
+             jstr
+                 $"Or edit %s{pin.GlobalJsonPath}: pin an installed SDK version, or replace rollForward \"disable\" with a policy that allows a newer SDK (for example \"latestMajor\")." |]
+      )
+      :> JsonNode ]
+
 /// House error shape: `status`/`errorKind`/`message` as elsewhere, plus the
 /// structured fields an agent needs to act without re-reading `global.json`.
 let internal toEnvelope (pin: SdkPin) (installedSdks: string list) : JsonNode =
-    jobj
-        [ "status", jstr "infrastructure_error"
-          "errorKind", jstr "sdk_not_found"
-          "message", jstr (describe pin installedSdks)
-          "requestedSdkVersion", jstr pin.Version
-          // Echoed verbatim rather than defaulted to "disable": only a disable pin can
-          // reach here, and the file's own casing is what the caller will search for.
-          "rollForward", (pin.RollForward |> Option.map jstr |> Option.defaultValue null)
-          "globalJsonPath", jstr pin.GlobalJsonPath
-          "installedSdks", JsonArray(installedSdks |> List.map jstr |> List.toArray) :> JsonNode
-          "remedies",
-          JsonArray(
-              [| jstr $"Install the .NET SDK %s{pin.Version}."
-                 jstr
-                     $"Or edit %s{pin.GlobalJsonPath}: pin an installed SDK version, or replace rollForward \"disable\" with a policy that allows a newer SDK (for example \"latestMajor\")." |]
-          )
-          :> JsonNode ]
-    :> JsonNode
+    jobj ([ "status", jstr "infrastructure_error" ] @ failureFields pin installedSdks) :> JsonNode
+
+/// Additive cause object embedded by successful tool envelopes whose semantic
+/// verdict is nevertheless unknown. It intentionally mirrors the actionable
+/// fields from `toEnvelope` while omitting the outer transport `status`.
+let internal toBlockingReason (pin: SdkPin) (installedSdks: string list) : JsonNode =
+    jobj (failureFields pin installedSdks) :> JsonNode
 
 /// Raised from the FCS project-load path. Every tool funnelling through
 /// `EnsureProjectResults` therefore reports the same typed envelope (rendered
@@ -159,29 +199,6 @@ let internal tryReadPin (globalJsonPath: string) : SdkPin option =
         // Missing, locked, or malformed global.json: the pre-flight abstains rather
         // than blocking a project the real SDK resolver might load fine.
         None
-
-/// Mirrors `Ionide.ProjInfo.Paths.dotnetRoot`: DOTNET_HOST_PATH, then
-/// DOTNET_ROOT[(x86)], then the bare name for PATH resolution. Probing the same
-/// binary the loader will use keeps our SDK list and MSBuild's view of the machine
-/// in agreement.
-let internal resolveDotnetBinary () : string =
-    let binaryName =
-        if OperatingSystem.IsWindows() then
-            "dotnet.exe"
-        else
-            "dotnet"
-
-    let fromEnvironment (variable: string) (toBinaryPath: string -> string) =
-        match Environment.GetEnvironmentVariable(variable) with
-        | value when String.IsNullOrWhiteSpace value -> None
-        | value ->
-            let candidate = toBinaryPath value
-            if File.Exists candidate then Some candidate else None
-
-    fromEnvironment "DOTNET_HOST_PATH" id
-    |> Option.orElseWith (fun () -> fromEnvironment "DOTNET_ROOT" (fun root -> Path.Combine(root, binaryName)))
-    |> Option.orElseWith (fun () -> fromEnvironment "DOTNET_ROOT(x86)" (fun root -> Path.Combine(root, binaryName)))
-    |> Option.defaultValue binaryName
 
 let private listSdksTimeout = TimeSpan.FromSeconds(20.0)
 

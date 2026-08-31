@@ -186,7 +186,14 @@ module CheckDispatch =
                             )
 
                         return CheckFsacSnapshot.ofDiagnosticsResponse response
-                    with ex ->
+                    with
+                    | SdkPreflight.SdkPinUnsatisfiable failure ->
+                        return
+                            CheckFsacSnapshot.unavailableWithBlockingReason
+                                expectation
+                                failure.Message
+                                (SdkPreflight.toBlockingReason failure.Pin failure.InstalledSdks)
+                    | ex ->
                         return CheckFsacSnapshot.unavailable expectation ex.Message
                 }
 

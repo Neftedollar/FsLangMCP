@@ -61,7 +61,7 @@ Full setup: [`docs/getting-started.md`](docs/getting-started.md) · Per-client c
 | Tool | What it does |
 |------|--------------|
 | `find` | Multi-project semantic search with explicit sweep and delivery completeness. A failed/timed-out/busy project makes absence indeterminate; pagination keeps `resolution.complete=false` until one response contains the whole site set. |
-| `check` | One trustworthy verdict (`clean`/`errors`/`unknown`) for the current FCS/check profile. Default mode is a fresh FCS check; fast FSAC mode returns `clean` only with complete current coverage. Project scope warns that downstream consumers were not checked; workspace scope requires a solution or directory. |
+| `check` | One trustworthy verdict (`clean`/`errors`/`unknown`) for the current FCS/check profile. Default mode is a fresh FCS check; fast FSAC mode returns `clean` only with complete current coverage. An `unknown` caused by SDK/preflight failure includes a typed `blockingReason`. Project scope warns that downstream consumers were not checked; workspace scope requires a solution or directory. |
 
 `check` is the fast semantic edit loop, not the final Release gate. A `clean` verdict covers the
 compiler options in its current FCS/check profile; configuration-specific diagnostics such as

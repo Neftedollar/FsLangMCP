@@ -95,6 +95,11 @@ In `speed=fast`, inspect `complete`, `expectedFiles`, `missingFiles`, `staleFile
 `sessionGeneration`. Current errors remain actionable with `complete=false`; an incomplete
 zero-error snapshot is `unknown`, never `clean`.
 
+For an infrastructure-blocked `unknown`, inspect `blockingReason` (or workspace
+`blockingReasons`/`perProject[].blockingReason`). SDK pin failures are typed as `sdk_not_found` and
+include the requested SDK, installed SDKs, selected dotnet host/root evidence, `global.json`, and
+remedies. Timeout, busy, and generic failures retain different `errorKind` values.
+
 **Project-scope coverage boundary:** a resolved `scope=project` response always includes
 `downstreamProjectsChecked: false`, `recommendedScope: "workspace"`, and `coverageNote`.
 A clean project verdict says only that the selected project is clean; apps/tests that reference

@@ -456,6 +456,8 @@ type internal CheckFsacExpectation =
       Complete: bool
       /// Why expectation derivation was incomplete, when applicable.
       FailureReason: string option
+      /// Structured causes preserved while deriving evaluated SourceFiles.
+      BlockingReasons: JsonNode array
       /// Workspace-only URI glob preserved from CheckArgs.
       FileGlob: string option }
 
@@ -481,6 +483,8 @@ type internal CheckFsacSnapshot =
       SessionGeneration: int64 option
       /// Typed failure/readiness/context explanation, when present.
       FailureReason: string option
+      /// Structured causes preserved from expectation derivation or FSAC startup.
+      BlockingReasons: JsonNode array
       /// Number of expected files FSAC currently holds diagnostics for.
       AnalyzedFileCount: int
       /// Error-severity (LSP code 1) diagnostics across the snapshot.
@@ -510,6 +514,7 @@ module internal CheckFsacSnapshot =
           StaleFiles = [||]
           SessionGeneration = None
           FailureReason = Some "No context-bound FSAC diagnostics snapshot was supplied."
+          BlockingReasons = [||]
           AnalyzedFileCount = 0
           ErrorCount = 0
           WarningCount = 0
@@ -520,7 +525,19 @@ module internal CheckFsacSnapshot =
         { empty with
             ExpectedFiles = Array.copy expectation.ExpectedFiles
             MissingFiles = Array.copy expectation.ExpectedFiles
-            FailureReason = Some reason }
+            FailureReason = Some reason
+            BlockingReasons = expectation.BlockingReasons |> Array.map _.DeepClone() }
+
+    let unavailableWithBlockingReason
+        (expectation: CheckFsacExpectation)
+        (reason: string)
+        (blockingReason: JsonNode)
+        : CheckFsacSnapshot =
+        { unavailable expectation reason with
+            BlockingReasons =
+                Array.append
+                    (expectation.BlockingReasons |> Array.map _.DeepClone())
+                    [| blockingReason.DeepClone() |] }
 
     /// Projects the context-bound DiagnosticsForContext envelope into a snapshot.
     /// Tolerant of missing fields — anything it cannot read degrades toward `empty`,
@@ -592,6 +609,14 @@ module internal CheckFsacSnapshot =
             let fileCount = readInt "diagnosticsFileCount" |> Option.defaultValue receivedFiles.Length
             let failureReason = readString "message"
 
+            let blockingReasons =
+                match resp["blockingReasons"], resp["blockingReason"], readString "errorKind" with
+                | (:? JsonArray as reasons), _, _ ->
+                    reasons |> Seq.map _.DeepClone() |> Seq.toArray
+                | _, reason, _ when not (isNull reason) -> [| reason.DeepClone() |]
+                | _, _, Some "sdk_not_found" -> [| resp.DeepClone() |]
+                | _ -> [||]
+
             let analyzedAt =
                 let read (key: string) =
                     match resp[key] with
@@ -657,6 +682,7 @@ module internal CheckFsacSnapshot =
               StaleFiles = staleFiles
               SessionGeneration = sessionGeneration
               FailureReason = failureReason
+              BlockingReasons = blockingReasons
               AnalyzedFileCount = fileCount
               ErrorCount = errorCount
               WarningCount = warningCount
@@ -1893,6 +1919,16 @@ type internal BoundedCheckWorkBusyException(operation: string, target: string) =
 
     member _.Operation = operation
     member _.Target = target
+
+/// Machine-readable reason why a trusted Check could not produce a semantic
+/// verdict. Keep this typed until the response boundary: collapsing an SDK
+/// pre-flight exception to `ex.Message` made `check` the odd tool out (#244).
+[<NoComparison; NoEquality>]
+type internal CheckBlockingFailure =
+    | CheckTimedOut
+    | CheckBusy of message: string
+    | CheckSdkNotFound of failure: SdkPreflight.SdkNotFoundException
+    | CheckProjectFailure of message: string
 
 let rec private boundedCheckWorkFailureIsBusy (ex: exn) =
     match ex with
@@ -6445,6 +6481,13 @@ type internal FcsBridge
                     let timedOut = findFailureIsTimeout ex
                     let busy = not timedOut && boundedCheckWorkFailureIsBusy ex
 
+                    let typedFailureFields =
+                        match ex with
+                        | SdkPreflight.SdkPinUnsatisfiable failure ->
+                            [ "blockingReason",
+                              SdkPreflight.toBlockingReason failure.Pin failure.InstalledSdks ]
+                        | _ -> []
+
                     if timedOut then
                         projectsTimedOut <- projectsTimedOut + 1
                     elif busy then
@@ -6453,7 +6496,7 @@ type internal FcsBridge
                         projectsFailed <- projectsFailed + 1
 
                     perProject.Add(
-                        jobj
+                        jobj (
                             [ "project", jstr projDisplay
                               "fsproj", jstr (normalizePath fsproj)
                               "status",
@@ -6479,6 +6522,8 @@ type internal FcsBridge
                               "retryable", jbool busy
                               "error", jstr ex.Message
                               "elapsedMs", jint (int projSw.ElapsedMilliseconds) ]
+                            @ typedFailureFields
+                        )
                         :> JsonNode
                     )
 
@@ -7527,7 +7572,7 @@ type internal FcsBridge
     // the caller turns into verdict="unknown" rather than a confident clean.
     member private this.FreshProjectCheck
         (fsproj: string, remainingBudget: unit -> TimeSpan)
-        : Task<Result<FSharpDiagnostic array * string * string, string>> =
+        : Task<Result<FSharpDiagnostic array * string * string, CheckBlockingFailure>> =
         task {
             try
                 let! options, optionsSource =
@@ -7538,7 +7583,7 @@ type internal FcsBridge
                 // Check budget elapsed while it was running, do not launch a late FCS
                 // type-check after the original request has already returned unknown.
                 if remaining <= TimeSpan.Zero then
-                    return Error "timeout"
+                    return Error CheckTimedOut
                 else
                     // Hashing the full source/reference closure is synchronous and can
                     // be expensive. The single-flight worker remains admitted until the
@@ -7548,7 +7593,7 @@ type internal FcsBridge
                     let remainingAfterSnapshot = remainingBudget ()
 
                     if remainingAfterSnapshot <= TimeSpan.Zero then
-                        return Error "timeout"
+                        return Error CheckTimedOut
                     else
                         let workKey = $"{analysisProjectIdentity options}|{cacheKey}"
                         let generation = Volatile.Read(&freshProjectCheckGeneration)
@@ -7681,8 +7726,11 @@ type internal FcsBridge
             with
             | :? OperationCanceledException
             | :? TaskCanceledException
-            | :? TimeoutException -> return Error "timeout"
-            | ex -> return Error ex.Message
+            | :? TimeoutException -> return Error CheckTimedOut
+            | SdkPreflight.SdkPinUnsatisfiable failure -> return Error(CheckSdkNotFound failure)
+            | :? ProjectEvaluationBusyException as ex -> return Error(CheckBusy ex.Message)
+            | ex when boundedCheckWorkFailureIsBusy ex -> return Error(CheckBusy ex.Message)
+            | ex -> return Error(CheckProjectFailure ex.Message)
         }
 
     /// Deterministic reference-resolution probe over a project's resolved OtherOptions
@@ -7693,22 +7741,38 @@ type internal FcsBridge
     /// timed-out, or unloadable probe becomes an honest unknown Check verdict.
     member private this.ProbeReferenceResolution
         (fsproj: string, remainingBudget: unit -> TimeSpan)
-        : Task<Result<int * int, string>> =
+        : Task<Result<int * int, CheckBlockingFailure>> =
         task {
             try
                 let! options, _ =
                     this.ResolveFsprojOptionsWithinBudget(normalizePath fsproj, Some remainingBudget)
 
                 if remainingBudget () <= TimeSpan.Zero then
-                    return Error "timeout"
+                    return Error CheckTimedOut
                 else
-                    return!
+                    let! result =
                         runReferenceResolutionProbe
                             (referenceResolutionProbeKey options)
                             (Array.copy options.OtherOptions)
                             (Some remainingBudget)
+
+                    return
+                        match result with
+                        | Ok counts -> Ok counts
+                        | Error "timeout" -> Error CheckTimedOut
+                        | Error message when message.Contains("busy", StringComparison.OrdinalIgnoreCase) ->
+                            Error(CheckBusy message)
+                        | Error message -> Error(CheckProjectFailure message)
             with ex ->
-                return Error ex.Message
+                return
+                    match ex with
+                    | SdkPreflight.SdkPinUnsatisfiable failure -> Error(CheckSdkNotFound failure)
+                    | :? OperationCanceledException
+                    | :? TaskCanceledException
+                    | :? TimeoutException -> Error CheckTimedOut
+                    | :? ProjectEvaluationBusyException as busy -> Error(CheckBusy busy.Message)
+                    | _ when boundedCheckWorkFailureIsBusy ex -> Error(CheckBusy ex.Message)
+                    | _ -> Error(CheckProjectFailure ex.Message)
         }
 
     /// Resolve the exact evaluated FCS SourceFiles covered by a fast check. This is
@@ -7731,8 +7795,19 @@ type internal FcsBridge
 
             let expected = System.Collections.Generic.HashSet<string>(comparer)
             let failures = ResizeArray<string>()
+            let blockingReasons = ResizeArray<JsonNode>()
             let contextFingerprints = ResizeArray<string>()
             let mutable deadlineExpired = false
+
+            let preserveBlockingReason (projectPath: string) (ex: exn) =
+                match ex with
+                | SdkPreflight.SdkPinUnsatisfiable failure ->
+                    let reason =
+                        SdkPreflight.toBlockingReason failure.Pin failure.InstalledSdks
+
+                    reason["projectPath"] <- jstr (normalizePath projectPath)
+                    blockingReasons.Add reason
+                | _ -> ()
 
             let markDeadlineExpired description =
                 if not deadlineExpired then
@@ -7834,6 +7909,7 @@ type internal FcsBridge
                                 failures.Add($"File is not present in the evaluated SourceFiles: {fullPath}")
                         | None -> ()
                     with ex ->
+                        preserveBlockingReason path ex
                         failures.Add($"Could not evaluate SourceFiles for file scope: {ex.Message}")
                 | _ -> failures.Add("scope='file' requires a source path.")
 
@@ -7869,6 +7945,7 @@ type internal FcsBridge
                         | None -> ()
                         | Some _ -> failures.Add("Project discovery returned an unexpected result.")
                     with ex ->
+                        preserveBlockingReason target ex
                         failures.Add($"Could not resolve/evaluate SourceFiles from '{target}': {ex.Message}")
                 | None -> failures.Add("Could not resolve a project for the fast check.")
 
@@ -7916,11 +7993,13 @@ type internal FcsBridge
                                         | Some(options, _) -> do! addProjectSources options
                                         | None -> ()
                                     with ex ->
+                                        preserveBlockingReason fsproj ex
                                         failures.Add($"Could not evaluate SourceFiles for '{fsproj}': {ex.Message}")
                         | Some(CheckTargetDiscoveryResult.Busy reason) -> failures.Add(reason)
                         | None -> ()
                         | Some _ -> failures.Add("Workspace discovery returned an unexpected result.")
                     with ex ->
+                        preserveBlockingReason target ex
                         failures.Add($"Could not resolve workspace projects from '{target}': {ex.Message}")
                 | None -> failures.Add("Could not resolve a workspace for the fast check.")
 
@@ -7954,6 +8033,7 @@ type internal FcsBridge
                         None
                     else
                         Some(String.concat " | " failures)
+                  BlockingReasons = blockingReasons.ToArray()
                   FileGlob = if resolvedScope = "workspace" then args.fileGlob else None }
         }
 
@@ -8182,6 +8262,30 @@ type internal FcsBridge
             let overallDeadlineApplies = resolvedScope = "project" || resolvedScope = "workspace"
             let overallTimeoutReason = $"Check timed out after {timeoutMs}ms before analysis completed."
 
+            let genericBlockingReason errorKind message retryable =
+                jobj
+                    [ "errorKind", jstr errorKind
+                      "message", jstr message
+                      "retryable", jbool retryable ]
+                :> JsonNode
+
+            let blockingFailureMessage failure =
+                match failure with
+                | CheckTimedOut -> overallTimeoutReason
+                | CheckBusy message
+                | CheckProjectFailure message -> message
+                | CheckSdkNotFound sdkFailure -> sdkFailure.Message
+
+            let blockingReasonFor failure =
+                match failure with
+                | CheckTimedOut -> genericBlockingReason "timeout" overallTimeoutReason true
+                | CheckBusy message -> genericBlockingReason "fcs_worker_busy" message true
+                | CheckProjectFailure message -> genericBlockingReason "project_failure" message false
+                | CheckSdkNotFound sdkFailure ->
+                    SdkPreflight.toBlockingReason sdkFailure.Pin sdkFailure.InstalledSdks
+
+            let blockingFields failure = [ "blockingReason", blockingReasonFor failure ]
+
             let awaitWithinOverallBudget (start: unit -> Task<'T>) : Task<'T option> =
                 task {
                     let remaining = remainingCheckBudget ()
@@ -8228,6 +8332,7 @@ type internal FcsBridge
                   ContextFingerprint = None
                   Complete = false
                   FailureReason = Some reason
+                  BlockingReasons = [||]
                   FileGlob = if resolvedScope = "workspace" then args.fileGlob else None }
 
             // A project verdict is intentionally narrow: FCS checks the selected
@@ -8337,6 +8442,14 @@ type internal FcsBridge
                     | Some reason -> reason
                     | None -> overallTimeoutReason
 
+                let discoveryFailure =
+                    match scopeDiscoveryFailure with
+                    | Some "timeout" -> CheckTimedOut
+                    | Some reason when reason.Contains("busy", StringComparison.OrdinalIgnoreCase) ->
+                        CheckBusy reason
+                    | Some reason -> CheckProjectFailure reason
+                    | None -> CheckTimedOut
+
                 return
                     build
                         "unknown"
@@ -8350,7 +8463,7 @@ type internal FcsBridge
                         [||]
                         [||]
                         (Some discoveryReason)
-                        [ ("projectsSwept", jint 0) ]
+                        ([ ("projectsSwept", jint 0) ] @ blockingFields discoveryFailure)
             // ── snippet: always FRESH (ignores speed); old ValidateSnippet logic ──
             | "snippet" ->
                 match args.snippet with
@@ -8511,6 +8624,13 @@ type internal FcsBridge
 
                 let! snap =
                     match fsacSnapshot with
+                    | _ when expectation.BlockingReasons.Length > 0 ->
+                        Task.FromResult(
+                            CheckFsacSnapshot.unavailable
+                                expectation
+                                (expectation.FailureReason
+                                 |> Option.defaultValue "Fast-check expectation is blocked by infrastructure preflight.")
+                        )
                     | Some thunk ->
                         task {
                             if overallDeadlineApplies && remainingCheckBudget () <= TimeSpan.Zero then
@@ -8564,7 +8684,14 @@ type internal FcsBridge
                                                 return CheckFsacSnapshot.unavailable expectation overallTimeoutReason
                                     else
                                         return! work
-                                with ex ->
+                                with
+                                | SdkPreflight.SdkPinUnsatisfiable failure ->
+                                    return
+                                        CheckFsacSnapshot.unavailableWithBlockingReason
+                                            expectation
+                                            failure.Message
+                                            (SdkPreflight.toBlockingReason failure.Pin failure.InstalledSdks)
+                                | ex ->
                                     return CheckFsacSnapshot.unavailable expectation ex.Message
                         }
                     | None ->
@@ -8653,6 +8780,18 @@ type internal FcsBridge
                         snap.FailureReason
                         |> Option.orElse (Some "FSAC diagnostics coverage is incomplete.")
 
+                let fastBlockingReasons =
+                    Array.append expectation.BlockingReasons snap.BlockingReasons
+                    |> Array.distinctBy (fun reason -> reason.ToJsonString())
+
+                let fastBlockingFields =
+                    match fastBlockingReasons with
+                    | [||] -> []
+                    | [| one |] -> [ "blockingReason", one.DeepClone() ]
+                    | many ->
+                        [ "blockingReasons",
+                          JsonArray(many |> Array.map _.DeepClone()) :> JsonNode ]
+
                 // Surface the snapshot's diagnostics by the requested severity floor —
                 // LSP severity codes (1=Error … 4=Hint) line up with floorRank, so a node
                 // is emitted when 1 ≤ code ≤ floorRank. This is what makes
@@ -8718,6 +8857,32 @@ type internal FcsBridge
                         |> Seq.length
                     | _ -> 0
 
+                let fastResponseFields =
+                    [ "lspState", jstr (if snap.Ready then "ready" else "warming")
+                      "fsacStatus", jstr snap.Status
+                      "requestedProjectPath",
+                      (expectation.RequestedProjectPath |> Option.map jstr |> Option.defaultValue null)
+                      "fileGlob", (expectation.FileGlob |> Option.map jstr |> Option.defaultValue null)
+                      "contextMatched", jbool snap.ContextMatched
+                      "complete", jbool coverageComplete
+                      "expectationComplete", jbool expectation.Complete
+                      "expectedFileCount", jint snap.ExpectedFiles.Length
+                      "receivedFileCount", jint snap.ReceivedFiles.Length
+                      "missingFileCount", jint snap.MissingFiles.Length
+                      "staleFileCount", jint snap.StaleFiles.Length
+                      "expectedFiles", JsonArray(snap.ExpectedFiles |> Array.map jstr) :> JsonNode
+                      "receivedFiles", JsonArray(snap.ReceivedFiles |> Array.map jstr) :> JsonNode
+                      "missingFiles", JsonArray(snap.MissingFiles |> Array.map jstr) :> JsonNode
+                      "staleFiles", JsonArray(snap.StaleFiles |> Array.map jstr) :> JsonNode
+                      "sessionGeneration",
+                      (snap.SessionGeneration |> Option.map jint64 |> Option.defaultValue null)
+                      "mostRecentAnalyzedAt",
+                      (match snap.MostRecentAnalyzedAt with
+                       | Some timestamp -> jstr timestamp
+                       | None -> null)
+                      "analyzedFileCount", jint snap.AnalyzedFileCount ]
+                    @ fastBlockingFields
+
                 return
                     build
                         verdict
@@ -8731,26 +8896,7 @@ type internal FcsBridge
                         nodes
                         files
                         coverageReason
-                        [ "lspState", jstr (if snap.Ready then "ready" else "warming")
-                          "fsacStatus", jstr snap.Status
-                          "requestedProjectPath",
-                          (expectation.RequestedProjectPath |> Option.map jstr |> Option.defaultValue null)
-                          "fileGlob", (expectation.FileGlob |> Option.map jstr |> Option.defaultValue null)
-                          "contextMatched", jbool snap.ContextMatched
-                          "complete", jbool coverageComplete
-                          "expectationComplete", jbool expectation.Complete
-                          "expectedFileCount", jint snap.ExpectedFiles.Length
-                          "receivedFileCount", jint snap.ReceivedFiles.Length
-                          "missingFileCount", jint snap.MissingFiles.Length
-                          "staleFileCount", jint snap.StaleFiles.Length
-                          "expectedFiles", JsonArray(snap.ExpectedFiles |> Array.map jstr) :> JsonNode
-                          "receivedFiles", JsonArray(snap.ReceivedFiles |> Array.map jstr) :> JsonNode
-                          "missingFiles", JsonArray(snap.MissingFiles |> Array.map jstr) :> JsonNode
-                          "staleFiles", JsonArray(snap.StaleFiles |> Array.map jstr) :> JsonNode
-                          "sessionGeneration",
-                          (snap.SessionGeneration |> Option.map jint64 |> Option.defaultValue null)
-                          "mostRecentAnalyzedAt", (match snap.MostRecentAnalyzedAt with Some t -> jstr t | None -> null)
-                          "analyzedFileCount", jint snap.AnalyzedFileCount ]
+                        fastResponseFields
 
             | "file" ->
                 match args.path with
@@ -8761,59 +8907,98 @@ type internal FcsBridge
                         // Resolve options, invalidate THIS project, then re-check fresh so
                         // on-disk edits (incl. cross-file) are reflected — mirrors fcs_check_file.
                         let fullPath = normalizePath path
-                        let source = File.ReadAllText(fullPath)
-                        let sourceText = SourceText.ofString source
-                        let! projectOptions, optionsSource =
-                            this.ResolveProjectOptions(fullPath, source, args.projectPath, None)
 
-                        let projectResultsKey = analysisSnapshotKey projectOptions
-                        projectResultsCache.TryRemove(projectResultsKey) |> ignore
-                        checker.InvalidateConfiguration(projectOptions)
+                        let runTrustedFileCheck () =
+                            task {
+                                let source = File.ReadAllText(fullPath)
+                                let sourceText = SourceText.ofString source
+                                let! projectOptions, optionsSource =
+                                    this.ResolveProjectOptions(fullPath, source, args.projectPath, None)
 
-                        let! parseResults, checkAnswer =
-                            checker.ParseAndCheckFileInProject(fullPath, 0, sourceText, projectOptions) |> asTask
+                                let projectResultsKey = analysisSnapshotKey projectOptions
+                                projectResultsCache.TryRemove(projectResultsKey) |> ignore
+                                checker.InvalidateConfiguration(projectOptions)
 
-                        let checkedResults =
-                            match checkAnswer with
-                            | FSharpCheckFileAnswer.Succeeded results -> Some results
-                            | FSharpCheckFileAnswer.Aborted -> None
+                                let! parseResults, checkAnswer =
+                                    checker.ParseAndCheckFileInProject(fullPath, 0, sourceText, projectOptions)
+                                    |> asTask
 
-                        let checkDiagnostics =
-                            checkedResults
-                            |> Option.map (fun r -> r.Diagnostics)
-                            |> Option.defaultValue [||]
+                                let checkedResults =
+                                    match checkAnswer with
+                                    | FSharpCheckFileAnswer.Succeeded results -> Some results
+                                    | FSharpCheckFileAnswer.Aborted -> None
 
-                        let allDiags = Array.append parseResults.Diagnostics checkDiagnostics
-                        let succeeded = checkedResults.IsSome
-                        let errorCount, warningCount = countDiagnosticsBySeverity allDiags
-                        let infoCount = countInfoDiagnostics allDiags
+                                let checkDiagnostics =
+                                    checkedResults
+                                    |> Option.map (fun r -> r.Diagnostics)
+                                    |> Option.defaultValue [||]
 
-                        let verdict, analyzed, reason =
-                            if not succeeded then
-                                "unknown", false, Some "Type checking was aborted; file verdict is indeterminate."
-                            elif errorCount > 0 then
-                                "errors", true, None
-                            else
-                                "clean", true, None
+                                let allDiags = Array.append parseResults.Diagnostics checkDiagnostics
+                                let succeeded = checkedResults.IsSome
+                                let errorCount, warningCount = countDiagnosticsBySeverity allDiags
+                                let infoCount = countInfoDiagnostics allDiags
 
-                        let nodes, files = surfaceFcs allDiags
+                                let verdict, analyzed, reason =
+                                    if not succeeded then
+                                        "unknown", false, Some "Type checking was aborted; file verdict is indeterminate."
+                                    elif errorCount > 0 then
+                                        "errors", true, None
+                                    else
+                                        "clean", true, None
 
-                        return
-                            build
-                                verdict
-                                analyzed
-                                "fcs"
-                                (Some "fcs-reanalyze")
-                                errorCount
-                                warningCount
-                                infoCount
-                                allDiags.Length
-                                nodes
-                                files
-                                reason
-                                [ "projectFileName", jstr projectOptions.ProjectFileName
-                                  "optionsSource", jstr optionsSource
-                                  "projectsSwept", jint 1 ]
+                                let nodes, files = surfaceFcs allDiags
+
+                                return
+                                    build
+                                        verdict
+                                        analyzed
+                                        "fcs"
+                                        (Some "fcs-reanalyze")
+                                        errorCount
+                                        warningCount
+                                        infoCount
+                                        allDiags.Length
+                                        nodes
+                                        files
+                                        reason
+                                        [ "projectFileName", jstr projectOptions.ProjectFileName
+                                          "optionsSource", jstr optionsSource
+                                          "projectsSwept", jint 1 ]
+                            }
+
+                        let sdkDirectories =
+                            [ match args.projectPath with
+                              | Some project when
+                                  project.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase)
+                                  ->
+                                  yield Path.GetDirectoryName(normalizePath project)
+                              | _ -> ()
+
+                              match findNearestFsproj fullPath with
+                              | Some project -> yield Path.GetDirectoryName(normalizePath project)
+                              | None -> () ]
+                            |> List.distinct
+
+                        match SdkPreflight.check sdkDirectories with
+                        | SdkPreflight.SdkNotFound(pin, installedSdks) ->
+                            let failure = SdkPreflight.SdkNotFoundException(pin, installedSdks)
+
+                            return
+                                build
+                                    "unknown"
+                                    false
+                                    "fcs"
+                                    (Some "fcs-reanalyze")
+                                    0
+                                    0
+                                    0
+                                    0
+                                    [||]
+                                    [||]
+                                    (Some failure.Message)
+                                    ([ ("projectsSwept", jint 0) ]
+                                     @ blockingFields (CheckSdkNotFound failure))
+                        | SdkPreflight.Proceed -> return! runTrustedFileCheck ()
                 | _ -> return invalid "scope='file' requires 'path'."
 
             | "project" ->
@@ -8851,7 +9036,7 @@ type internal FcsBridge
                                 [||]
                                 [||]
                                 (Some overallTimeoutReason)
-                                [ ("projectsSwept", jint 0) ]
+                                ([ ("projectsSwept", jint 0) ] @ blockingFields CheckTimedOut)
                     | Some(CheckTargetDiscoveryResult.Busy reason) ->
                         return
                             build
@@ -8866,7 +9051,7 @@ type internal FcsBridge
                                 [||]
                                 [||]
                                 (Some reason)
-                                [ ("projectsSwept", jint 0) ]
+                                ([ ("projectsSwept", jint 0) ] @ blockingFields (CheckBusy reason))
                     | Some(CheckTargetDiscoveryResult.Project None) ->
                         return invalid $"check could not resolve a single .fsproj to check from: {target}"
                     | Some(CheckTargetDiscoveryResult.Project(Some proj)) ->
@@ -8882,7 +9067,7 @@ type internal FcsBridge
 
                         match boundedProbe with
                         | None
-                        | Some(Error "timeout") ->
+                        | Some(Error CheckTimedOut) ->
                             return
                                 build
                                     "unknown"
@@ -8896,8 +9081,10 @@ type internal FcsBridge
                                     [||]
                                     [||]
                                     (Some overallTimeoutReason)
-                                    [ ("projectsSwept", jint 0) ]
-                        | Some(Error reason) ->
+                                    ([ ("projectsSwept", jint 0) ] @ blockingFields CheckTimedOut)
+                        | Some(Error failure) ->
+                            let failureMessage = blockingFailureMessage failure
+
                             return
                                 build
                                     "unknown"
@@ -8910,8 +9097,8 @@ type internal FcsBridge
                                     0
                                     [||]
                                     [||]
-                                    (Some $"Reference resolution probe incomplete: {reason}")
-                                    [ ("projectsSwept", jint 0) ]
+                                    (Some $"Reference resolution probe incomplete: {failureMessage}")
+                                    ([ ("projectsSwept", jint 0) ] @ blockingFields failure)
                         | Some(Ok(refExisting, refTotal)) when
                             ReferenceResolution.looksUnrestored refExisting refTotal
                             ->
@@ -8941,10 +9128,10 @@ type internal FcsBridge
                                 awaitWithinOverallBudget (fun () ->
                                     this.FreshProjectCheck(proj, remainingCheckBudget))
 
-                            let result = boundedResult |> Option.defaultValue (Error "timeout")
+                            let result = boundedResult |> Option.defaultValue (Error CheckTimedOut)
 
                             match result with
-                            | Error "timeout" ->
+                            | Error CheckTimedOut ->
                                 return
                                     build
                                         "unknown"
@@ -8958,8 +9145,10 @@ type internal FcsBridge
                                         [||]
                                         [||]
                                         (Some overallTimeoutReason)
-                                        [ ("projectsSwept", jint 1) ]
-                            | Error msg ->
+                                        ([ ("projectsSwept", jint 1) ] @ blockingFields CheckTimedOut)
+                            | Error failure ->
+                                let message = blockingFailureMessage failure
+
                                 return
                                     build
                                         "unknown"
@@ -8972,8 +9161,8 @@ type internal FcsBridge
                                         0
                                         [||]
                                         [||]
-                                        (Some $"Project could not be analyzed: {msg}")
-                                        [ ("projectsSwept", jint 1) ]
+                                        (Some $"Project could not be analyzed: {message}")
+                                        ([ ("projectsSwept", jint 1) ] @ blockingFields failure)
                             | Ok(diags, projFileName, optionsSource) ->
                                 let errorCount, warningCount = countDiagnosticsBySeverity diags
                                 let infoCount = countInfoDiagnostics diags
@@ -9053,8 +9242,10 @@ type internal FcsBridge
                                 [||]
                                 [||]
                                 (Some overallTimeoutReason)
-                                [ ("projectsSwept", jint 0) ]
+                                ([ ("projectsSwept", jint 0) ] @ blockingFields CheckTimedOut)
                     elif targetDiscoveryBusy.IsSome then
+                        let busyReason = targetDiscoveryBusy.Value
+
                         return
                             build
                                 "unknown"
@@ -9068,7 +9259,7 @@ type internal FcsBridge
                                 [||]
                                 [||]
                                 targetDiscoveryBusy
-                                [ ("projectsSwept", jint 0) ]
+                                ([ ("projectsSwept", jint 0) ] @ blockingFields (CheckBusy busyReason))
                     elif projects.Length = 0 then
                         return invalid $"check could not resolve any .fsproj to check from: {target}"
                     else
@@ -9089,6 +9280,7 @@ type internal FcsBridge
                                       "fsproj", jstr (normalizePath proj)
                                       "error", jstr "timeout"
                                       "reason", jstr overallTimeoutReason
+                                      "blockingReason", blockingReasonFor CheckTimedOut
                                       "analyzed", jbool false ]
                                 :> JsonNode
                             )
@@ -9107,17 +9299,19 @@ type internal FcsBridge
 
                                 match boundedProbe with
                                 | None
-                                | Some(Error "timeout") ->
+                                | Some(Error CheckTimedOut) ->
                                     deadlineExhausted <- true
                                     addTimedOutProject proj
-                                | Some(Error reason) ->
+                                | Some(Error failure) ->
                                     failCount <- failCount + 1
+                                    let message = blockingFailureMessage failure
 
                                     perProject.Add(
                                         jobj
                                             [ "project", jstr (Path.GetFileNameWithoutExtension proj)
                                               "fsproj", jstr (normalizePath proj)
-                                              "error", jstr reason
+                                              "error", jstr message
+                                              "blockingReason", blockingReasonFor failure
                                               "analyzed", jbool false ]
                                         :> JsonNode
                                     )
@@ -9149,7 +9343,7 @@ type internal FcsBridge
 
                                     match boundedResult with
                                     | None
-                                    | Some(Error "timeout") ->
+                                    | Some(Error CheckTimedOut) ->
                                         deadlineExhausted <- true
                                         addTimedOutProject proj
                                     | Some(Ok(diags, _, _)) ->
@@ -9171,14 +9365,16 @@ type internal FcsBridge
                                                   "analyzed", jbool true ]
                                             :> JsonNode
                                         )
-                                    | Some(Error msg) ->
+                                    | Some(Error failure) ->
                                         failCount <- failCount + 1
+                                        let message = blockingFailureMessage failure
 
                                         perProject.Add(
                                             jobj
                                                 [ "project", jstr (Path.GetFileNameWithoutExtension proj)
                                                   "fsproj", jstr (normalizePath proj)
-                                                  "error", jstr msg
+                                                  "error", jstr message
+                                                  "blockingReason", blockingReasonFor failure
                                                   "analyzed", jbool false ]
                                             :> JsonNode
                                         )

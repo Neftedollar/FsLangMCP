@@ -273,7 +273,44 @@ let ``project check rejects negative timeout and treats zero as immediate unknow
         Assert.Equal("succeeded", gs zero "status")
         Assert.Equal("unknown", gs zero "verdict")
         Assert.False(gb zero "analyzed")
+        Assert.Equal("timeout", gs (zero["blockingReason"]) "errorKind")
         Assert.Equal(0L, bridge.ProjectEvaluationStartedCount)
+    }
+
+[<Fact>]
+let ``generic project evaluation failure stays distinct from sdk_not_found`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_generic_block_{Guid.NewGuid():N}")
+        Directory.CreateDirectory(root) |> ignore
+        let projectPath = Path.Combine(root, "Broken.fsproj")
+        let sourcePath = Path.Combine(root, "Library.fs")
+
+        File.WriteAllText(
+            projectPath,
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><ItemGroup><Compile Include=\"Library.fs\" /></ItemGroup></Project>"
+        )
+
+        File.WriteAllText(sourcePath, "module Broken\n\nlet value = 1\n")
+
+        let failEvaluation (_: string) =
+            Task.FromException(InvalidOperationException("simulated project evaluation failure"))
+
+        let bridge = FcsBridge(projectEvaluationBeforeLoadOverride = failEvaluation)
+
+        try
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        scope = Some "project"
+                        speed = Some "trusted"
+                        projectPath = Some projectPath
+                        timeoutMs = Some 5_000 }
+                )
+
+            Assert.Equal("unknown", gs result "verdict")
+            Assert.Equal("project_failure", gs (result["blockingReason"]) "errorKind")
+        finally
+            Directory.Delete(root, true)
     }
 
 [<Fact>]
@@ -865,6 +902,7 @@ type CheckTests(fx: CheckFixture) =
                     Assert.Equal("unknown", gs busy "verdict")
                     Assert.False(gb busy "analyzed")
                     Assert.Contains("type-check busy", (gs busy "reason").ToLowerInvariant())
+                    Assert.Equal("fcs_worker_busy", gs (busy["blockingReason"]) "errorKind")
                     Assert.True(elapsed.Elapsed < TimeSpan.FromMilliseconds(750.0), "busy type-check must not queue")
 
                 Assert.Equal(1, workerCalls)

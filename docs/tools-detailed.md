@@ -335,6 +335,14 @@ project, collapsed to a single `verdict`. No path, no project, no flags needed f
 | `errors` | At least one error-severity diagnostic |
 | `unknown` | The check could not run (no project context / resolution failed) — **not** clean |
 
+When `unknown` has a machine-actionable infrastructure cause, inspect `blockingReason` rather than
+parsing `reason`. An unavailable exact SDK pin reports `errorKind="sdk_not_found"` together with
+`requestedSdkVersion`, `installedSdks`, `dotnetHostPath`, configured `sdkRoots`, `globalJsonPath`,
+and `remedies`. Project/file checks place it at the top level; a trusted workspace check places it
+on the affected `perProject` row. Fast workspace expectation failures may expose multiple
+`blockingReasons`. Timeout, admission pressure, and generic project failures remain separately
+typed as `timeout`, `fcs_worker_busy`, and `project_failure`.
+
 | `speed` | Behaviour |
 |---------|-----------|
 | `trusted` (default) | Runs a FRESH FCS check; the verdict reflects the current source on disk |
@@ -384,7 +392,8 @@ the rest of the scope is incomplete.
 ### Caveats
 
 1. **`unknown` ≠ `clean`** — `unknown` means the check could not run (no `set_project`, unresolved
-   options). Establish project context and retry; do not treat it as a pass.
+   options). Establish project context and retry; do not treat it as a pass. Prefer its structured
+   `blockingReason`/`blockingReasons` when present; `reason` remains the human-readable explanation.
 2. **`severity` filters the array only** — `errorCount`/`warningCount` always reflect the full
    result regardless of the `severity` cutoff applied to the returned `diagnostics`.
 3. **`totalDiagnostics = errorCount + warningCount + infoCount`, always** — `totalDiagnostics`
