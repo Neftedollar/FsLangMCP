@@ -68,7 +68,7 @@ let private assertSdkEvidence (globalJsonPath: string) (node: JsonNode) =
     Assert.Equal(globalJsonPath, node["globalJsonPath"].GetValue<string>())
     Assert.NotEmpty(node["installedSdks"].AsArray())
     Assert.False(String.IsNullOrWhiteSpace(node["dotnetHostPath"].GetValue<string>()))
-    Assert.NotNull(node["sdkRoots"])
+    Assert.NotEmpty(node["sdkRoots"].AsArray())
     Assert.Equal(2, node["remedies"].AsArray().Count)
 
 // ─── Verdict: the provable failure ────────────────────────────────────────────
@@ -312,6 +312,16 @@ let ``dotnet --list-sdks output parses to bare version strings`` () =
         "9.0.100 [/usr/local/share/dotnet/sdk]\r\n10.0.400 [/Users/dev/.dotnet/sdk]\n\n"
 
     Assert.Equal<string list>([ "9.0.100"; "10.0.400" ], SdkPreflight.parseInstalledSdks stdout)
+
+[<Fact>]
+let ``dotnet --list-sdks output preserves distinct SDK roots`` () =
+    let stdout =
+        "9.0.100 [/usr/local/share/dotnet/sdk]\r\n10.0.400 [/Users/dev/.dotnet/sdk]\n10.0.401 [/Users/dev/.dotnet/sdk]\n"
+
+    Assert.Equal<string list>(
+        [ "/usr/local/share/dotnet/sdk"; "/Users/dev/.dotnet/sdk" ],
+        SdkPreflight.parseInstalledSdkRoots stdout
+    )
 
 [<Fact>]
 let ``the test host's own SDK set is enumerable`` () =
@@ -588,6 +598,19 @@ let ``set_project find and check preserve the same typed SDK blocking evidence``
                 Assert.False(fileCheck["analyzed"].GetValue<bool>())
                 Assert.False(fileCheck["groundTruth"].GetValue<bool>())
                 assertSdkEvidence globalJsonPath fileCheck["blockingReason"]
+
+            let! implicitFastFileCheck =
+                fcs.Check(
+                    { baseCheck with
+                        scope = Some "file"
+                        path = Some sourcePath
+                        speed = Some "fast"
+                        projectPath = None }
+                )
+
+            Assert.Equal("unknown", implicitFastFileCheck["verdict"].GetValue<string>())
+            Assert.True(implicitFastFileCheck["expectationComplete"].GetValue<bool>() |> not)
+            assertSdkEvidence globalJsonPath implicitFastFileCheck["blockingReason"]
 
             let! workspaceCheck =
                 fcs.Check(

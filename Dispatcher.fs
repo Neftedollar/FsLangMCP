@@ -193,8 +193,27 @@ module CheckDispatch =
                                 expectation
                                 failure.Message
                                 (SdkPreflight.toBlockingReason failure.Pin failure.InstalledSdks)
+                    | :? System.TimeoutException as timedOut ->
+                        return
+                            CheckFsacSnapshot.unavailableWithTypedFailure
+                                expectation
+                                timedOut.Message
+                                "timeout"
+                                true
+                    | :? System.OperationCanceledException as cancelled ->
+                        return
+                            CheckFsacSnapshot.unavailableWithTypedFailure
+                                expectation
+                                cancelled.Message
+                                "cancelled"
+                                true
                     | ex ->
-                        return CheckFsacSnapshot.unavailable expectation ex.Message
+                        return
+                            CheckFsacSnapshot.unavailableWithTypedFailure
+                                expectation
+                                ex.Message
+                                "fsac_unavailable"
+                                true
                 }
 
             fcsBridge.Check(args, fsacSnapshot = fsacSnapshot)

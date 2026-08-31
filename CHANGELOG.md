@@ -50,6 +50,15 @@ partial answer as exhaustive.
   `partial` with a bounded `filterCoverage` issue ledger and marks the matching count as a lower
   bound instead of silently treating the file as a non-match. Unfiltered requests keep their
   existing page-first path.
+- `fcs_project_outline` now has one admission-aware end-to-end deadline and a general partial-
+  coverage ledger (#243). Optional non-negative `timeoutMs` defaults to 60 seconds; queue wait,
+  one shared project-options evaluation, and sequential file outlines consume the same budget.
+  Zero is a deterministic typed timeout. Expired/cancelled calls start no later file, and if a hot,
+  non-cancellable FCS/MSBuild task outlives the response, the shared FCS gate remains retained until
+  that actual task settles (including the pre-`WaitAsync` race and fault path). Responses use
+  `ok`/`partial`/`unknown` with requested/scanned/timed-out/failed/not-started counts plus bounded
+  phase/issues rows. Incomplete filtered discovery suppresses `nextCursor` and marks its estimate as
+  a lower bound requiring a restart from offset zero.
 - A direct `fcs_project_outline` call on a test project now includes its evaluated compile sources
   by default (#239), including ordinary `tests/.../Program.fs` and `Tests.fs` files. The shared
   filter distinguishes `test_source` from `test_result_artifact`; `TestResults`, `test-results`,
@@ -105,8 +114,10 @@ partial answer as exhaustive.
   `blockingReason.errorKind="sdk_not_found"` carries the requested SDK, visible installed SDKs,
   selected dotnet host/root evidence, `global.json`, and remedies without parsing prose. Project
   checks expose the cause at the top level; workspace checks keep it on the affected project.
-  Timeout, worker-busy, and generic project failures use distinct typed causes. `find` now attaches
-  the same SDK evidence to its existing `sdk_not_found` per-project row.
+  Timeout, cancellation, worker-busy, and generic project failures use distinct typed causes in
+  trusted and fast modes. Fast file checks retain the SDK blocker even when the owning project is
+  auto-discovered. `find` now attaches the same SDK evidence to its existing `sdk_not_found`
+  per-project row, and SDK roots reported by `dotnet --list-sdks` are preserved.
 - `fcs_nuget_members` now recovers exact method accessibility from ECMA-335 metadata when
   available, keeps protected members in the default surface, reports `isAbstract`, and emits
   generic constraints both in `signature` and structured `genericParameters` (#223). Metadata is
@@ -168,14 +179,6 @@ partial answer as exhaustive.
   attribute at all (shared-framework ref pack, ProjectReference output) is kept, so framework
   unification still resolves. Package ids survive with an empty set, keeping the miss payload's
   "restored, but contributes no reference here" signal — now also naming the other-target case.
-
-### Known limitations
-
-- `fcs_project_outline` bounds response size and pagination but does not yet expose a whole-operation
-  deadline. A fresh 0.16.0 field report observed a cold project outline remaining in flight for
-  more than 90 seconds; the bounded timeout/partial-coverage contract is tracked in #243. The
-  admission-aware deadlines added here apply to `find`, `check`, and `fcs_tests_for_symbol`, not
-  every registered tool.
 
 ## [0.16.0] - 2026-08-16
 

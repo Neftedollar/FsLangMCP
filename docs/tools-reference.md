@@ -99,6 +99,8 @@ For an infrastructure-blocked `unknown`, inspect `blockingReason` (or workspace
 `blockingReasons`/`perProject[].blockingReason`). SDK pin failures are typed as `sdk_not_found` and
 include the requested SDK, installed SDKs, selected dotnet host/root evidence, `global.json`, and
 remedies. Timeout, busy, and generic failures retain different `errorKind` values.
+Cancellation and an otherwise-untyped unavailable FSAC snapshot are likewise distinct as
+`cancelled` and `fsac_unavailable`.
 
 **Project-scope coverage boundary:** a resolved `scope=project` response always includes
 `downstreamProjectsChecked: false`, `recommendedScope: "workspace"`, and `coverageNote`.
@@ -159,11 +161,25 @@ The `evaluation` object identifies the evaluated source and restore state. LSP r
 - `maxFiles` / `maxResultsPerFile` — cap output on large projects
 - `filter` / `nameContains` — retain matching entries and omit files with no matches
 - `includeTests` — include test source files; defaults to `true` when a test project is targeted directly
+- `timeoutMs` — non-negative end-to-end budget; default `60000`. Includes FCS queue admission,
+  project evaluation, and every file scan.
 
 When `filter` or `nameContains` is present, filtering happens before `maxFiles`/cursor pagination,
 so `totalEstimate.files` and `nextCursor` describe matching files rather than every compile file.
 Directly targeting a test project includes evaluated sources such as `tests/.../Program.fs` and
 `Tests.fs` by default; test-result, coverage, `bin`, and `obj` artifacts remain excluded.
+
+Read `status` (`ok` / `partial` / `unknown`) with `coverage`. The ledger reconciles
+`filesRequested` into `filesScanned`, `filesTimedOut`, `filesFailed`, and `filesNotStarted`, and
+includes bounded phase/issue rows. A zero budget deterministically returns typed
+`project_outline_timeout` without starting project evaluation. Queue wait consumes the same budget.
+If cancellation or expiry wins while non-cancellable FCS/MSBuild work remains active, the shared
+FCS admission slot stays owned until that actual work settles, and no later file starts.
+
+For filtered calls, `filterCoverage.complete=false` means the matching-file count is only a lower
+bound. Such a response deliberately has `nextCursor=null`, `totalEstimateIsLowerBound=true`, and
+`paginationRestartRequired=true`; retry from the beginning rather than treating a cursor page as
+an exhaustive continuation.
 
 **Use when:** Getting a structural overview of the whole project before editing or reviewing it.
 

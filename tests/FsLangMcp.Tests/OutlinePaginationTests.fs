@@ -237,7 +237,8 @@ let ``FcsProjectOutlineArgs all optional fields default to None`` () =
           summaryOnly = None        // default true at runtime
           cursor = None
           filter = None
-          nameContains = None }
+          nameContains = None
+          timeoutMs = None }
 
     Assert.Equal(Some "/some/project.fsproj", args.projectPath)
     Assert.True(args.summaryOnly.IsNone, "summaryOnly should be None (uses runtime default)")
@@ -246,6 +247,7 @@ let ``FcsProjectOutlineArgs all optional fields default to None`` () =
     Assert.True(args.cursor.IsNone)
     Assert.True(args.filter.IsNone)
     Assert.True(args.nameContains.IsNone)
+    Assert.True(args.timeoutMs.IsNone, "timeoutMs should be None (runtime default 60000)")
 
 [<Fact>]
 let ``FcsProjectOutlineArgs accepts explicit values for all new fields`` () =
@@ -260,7 +262,8 @@ let ``FcsProjectOutlineArgs accepts explicit values for all new fields`` () =
           summaryOnly = Some false
           cursor = Some (encode 50)
           filter = Some "Timer|Channel"
-          nameContains = Some [ "Event"; "Timer" ] }
+          nameContains = Some [ "Event"; "Timer" ]
+          timeoutMs = Some 60_000 }
 
     Assert.Equal(Some 100, args.maxFiles)
     Assert.Equal(Some 60, args.maxResultsPerFile)
@@ -268,6 +271,7 @@ let ``FcsProjectOutlineArgs accepts explicit values for all new fields`` () =
     Assert.True(args.cursor.IsSome)
     Assert.Equal(Some "Timer|Channel", args.filter)
     Assert.Equal(Some [ "Event"; "Timer" ], args.nameContains)
+    Assert.Equal(Some 60_000, args.timeoutMs)
 
 [<Fact>]
 let ``cursor stored in FcsProjectOutlineArgs round-trips correctly`` () =
@@ -283,7 +287,8 @@ let ``cursor stored in FcsProjectOutlineArgs round-trips correctly`` () =
           summaryOnly = None
           cursor = Some cursorStr
           filter = None
-          nameContains = None }
+          nameContains = None
+          timeoutMs = None }
 
     match args.cursor with
     | None -> Assert.Fail("cursor was None")

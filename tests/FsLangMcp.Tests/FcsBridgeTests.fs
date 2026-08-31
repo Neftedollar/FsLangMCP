@@ -894,7 +894,8 @@ let ``fcs_project_outline returns filtered per file outline`` () : Task =
                       summaryOnly = None
                       cursor = None
                       filter = None
-                      nameContains = None }
+                      nameContains = None
+                      timeoutMs = None }
                 )
 
             Assert.Equal("ok", result["status"].GetValue<string>())

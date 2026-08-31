@@ -340,8 +340,9 @@ parsing `reason`. An unavailable exact SDK pin reports `errorKind="sdk_not_found
 `requestedSdkVersion`, `installedSdks`, `dotnetHostPath`, configured `sdkRoots`, `globalJsonPath`,
 and `remedies`. Project/file checks place it at the top level; a trusted workspace check places it
 on the affected `perProject` row. Fast workspace expectation failures may expose multiple
-`blockingReasons`. Timeout, admission pressure, and generic project failures remain separately
-typed as `timeout`, `fcs_worker_busy`, and `project_failure`.
+`blockingReasons`. Timeout, cancellation, admission pressure, generic project failures, and an
+untyped unavailable FSAC snapshot remain separately classified as `timeout`, `cancelled`,
+`fcs_worker_busy`, `project_failure`, and `fsac_unavailable`.
 
 | `speed` | Behaviour |
 |---------|-----------|
@@ -744,6 +745,35 @@ oversized type is never dropped into an empty page just because it alone exceeds
 - `fcs_file_outline` — shares the same response-char-budget mechanism for one file's outline.
 
 ---
+
+## fcs_project_outline
+
+`timeoutMs` is one end-to-end deadline (default 60,000 ms), not a fresh allowance per phase. Queue
+admission subtracts from it; project evaluation and each sequential file outline receive only the
+remainder. Negative values return `invalid_args` / `invalid_timeout`; zero returns deterministic
+`unknown` / `project_outline_timeout` before project evaluation starts.
+
+### Coverage and filtered pagination (#243)
+
+Read `status` together with the general `coverage` ledger. `filesRequested` reconciles into
+`filesScanned`, `filesTimedOut`, `filesFailed`, and `filesNotStarted`; `phases` and `issues` are
+bounded, with `issuesReturned` / `issuesTruncated` describing the sample. `ok` means the requested
+work completed, `partial` means at least one file was scanned but evidence is incomplete, and
+`unknown` means no file outline completed successfully.
+
+`filterCoverage` remains the semantic filter-exhaustiveness ledger. If filtered discovery is
+incomplete, `matchingFiles` and `totalEstimate.files` are lower bounds and the response suppresses
+`nextCursor`; `paginationRestartRequired=true` tells callers to retry from offset zero after the
+blocking work settles. This avoids a cursor that falsely implies the matching set was fully known.
+
+### Protected-worker lifetime
+
+FCS/MSBuild tasks are not reliably cancellable. If timeout or cancellation wins a race, the
+response may return while the actual task continues, but the shared FCS gate remains retained until
+that task really completes or faults. Deadline checks between options, parse, and check phases stop
+later phases from starting; the project loop never starts another file after expiry/cancellation.
+Public `fcs_file_outline` keeps its existing independent behavior—the deadline-aware core is used
+only by `fcs_project_outline` with one pre-resolved project-options snapshot.
 
 ## fcs_file_outline
 

@@ -182,6 +182,95 @@ let internal runLimitedWithTimeout
     : Task<JsonNode> =
     runLimitedWithTimeoutCore gate cancellationToken timeoutMs ignore work
 
+/// Owns one admitted FCS slot while the response-producing task and any explicitly
+/// retained non-cancellable workers are still active. Retention must happen before
+/// the response task settles; ProjectOutline does that in the timeout/cancellation
+/// catch path that observed the underlying task still running.
+type internal ProtectedWorkLifetime(gate: SemaphoreSlim) =
+    let mutable pendingOwners = 1
+
+    let releaseOne () =
+        if Interlocked.Decrement(&pendingOwners) = 0 then
+            gate.Release() |> ignore
+
+    member _.Retain(operation: Task) =
+        Interlocked.Increment(&pendingOwners) |> ignore
+
+        operation.ContinueWith(
+            (fun (completed: Task) ->
+                if completed.IsFaulted then
+                    completed.Exception |> ignore
+
+                releaseOne ()),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default
+        )
+        |> ignore
+
+    member _.CompleteResponseOwner() = releaseOne ()
+
+let internal runLimitedWithTimeoutRetainedCore
+    (gate: SemaphoreSlim)
+    (cancellationToken: CancellationToken)
+    (timeoutMs: int option)
+    (onAdmitted: unit -> unit)
+    (work: int option -> (Task -> unit) -> Task<JsonNode>)
+    : Task<JsonNode> =
+    match timeoutMs with
+    | Some milliseconds when milliseconds < 0 ->
+        Task.FromResult(
+            jobj
+                [ "status", jstr "invalid_args"
+                  "errorKind", jstr "invalid_timeout"
+                  "message", jstr $"timeoutMs must be non-negative; got %d{milliseconds}."
+                  "timeoutMs", jint milliseconds ]
+            :> JsonNode
+        )
+    | _ ->
+        task {
+            let stopwatch = Stopwatch.StartNew()
+            let admissionTimeoutMs = timeoutMs |> Option.defaultValue Timeout.Infinite
+            let mutable lifetime: ProtectedWorkLifetime option = None
+
+            try
+                let! admitted = gate.WaitAsync(admissionTimeoutMs, cancellationToken)
+
+                if not admitted then
+                    return
+                        jobj
+                            [ "status", jstr "timeout"
+                              "errorKind", jstr "fcs_admission_timeout"
+                              "message",
+                              jstr
+                                  $"FCS admission timed out after %d{admissionTimeoutMs} ms before protected work started."
+                              "timeoutMs", jint admissionTimeoutMs
+                              "retryable", jbool true ]
+                        :> JsonNode
+                else
+                    let admittedLifetime = ProtectedWorkLifetime(gate)
+                    lifetime <- Some admittedLifetime
+                    onAdmitted ()
+                    cancellationToken.ThrowIfCancellationRequested()
+
+                    let remainingTimeoutMs =
+                        timeoutMs
+                        |> Option.map (fun milliseconds ->
+                            max 0L (int64 milliseconds - stopwatch.ElapsedMilliseconds) |> int)
+
+                    return! work remainingTimeoutMs admittedLifetime.Retain
+            finally
+                lifetime |> Option.iter _.CompleteResponseOwner()
+        }
+
+let internal runLimitedWithTimeoutRetained
+    (gate: SemaphoreSlim)
+    (cancellationToken: CancellationToken)
+    (timeoutMs: int option)
+    (work: int option -> (Task -> unit) -> Task<JsonNode>)
+    : Task<JsonNode> =
+    runLimitedWithTimeoutRetainedCore gate cancellationToken timeoutMs ignore work
+
 let internal runLimited
     (gate: SemaphoreSlim)
     (cancellationToken: CancellationToken)
@@ -744,12 +833,76 @@ let private mainCore argv =
                 tool (
                     TypedTool.define<FcsProjectOutlineArgs>
                         "fcs_project_outline"
-                        "Agent-friendly whole-project structural overview over filtered compile files. Skips generated/build artifacts and returns compact per-file outlines; use `find` for symbol sites instead. `projectPath` is optional after `set_project` (falls back to the active project); pass it explicitly for a different .fsproj. Use `maxFiles`/`maxResultsPerFile` on large projects."
+                        "Whole-project structural overview over filtered compile files. Default timeoutMs=60000 covers queue admission, project evaluation, and file scans. Read status plus coverage before treating absence as exhaustive; incomplete filtered discovery emits no continuation cursor. Skips generated/build artifacts. Prefer find for symbol sites and fcs_file_outline for one file."
                         (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.ProjectOutline args)))
+                            let timeoutMs = args.timeoutMs |> Option.defaultValue 60_000 |> Some
+
+                            toolResult (fun () ->
+                                task {
+                                    let! result =
+                                        runLimitedWithTimeoutRetained
+                                            fcsGate
+                                            ct
+                                            timeoutMs
+                                            (fun remainingTimeoutMs retainUntil ->
+                                                let args =
+                                                    { args with
+                                                        timeoutMs = remainingTimeoutMs }
+
+                                                fcsBridge.ProjectOutlineWithinDeadline(args, ct, retainUntil))
+
+                                    let isAdmissionTimeout =
+                                        match result["errorKind"] with
+                                        | null -> false
+                                        | kind -> kind.GetValue<string>() = "fcs_admission_timeout"
+
+                                    if isAdmissionTimeout then
+                                        let issue =
+                                            jobj
+                                                [ "phase", jstr "admission"
+                                                  "status", jstr "timed_out"
+                                                  "errorKind", jstr "fcs_admission_timeout"
+                                                  "message", result["message"].DeepClone() ]
+                                            :> JsonNode
+
+                                        return
+                                            jobj
+                                                [ "status", jstr "unknown"
+                                                  "errorKind", jstr "fcs_admission_timeout"
+                                                  "message", result["message"].DeepClone()
+                                                  "timeoutMs", jint (timeoutMs |> Option.defaultValue 60_000)
+                                                  "retryable", jbool true
+                                                  "resultSetComplete", jbool false
+                                                  "coverage",
+                                                  jobj
+                                                      [ "complete", jbool false
+                                                        "filesRequested", jint 0
+                                                        "filesScanned", jint 0
+                                                        "filesTimedOut", jint 0
+                                                        "filesFailed", jint 0
+                                                        "filesNotStarted", jint 0
+                                                        "phases",
+                                                        JsonArray(
+                                                            [| jobj
+                                                                   [ "phase", jstr "admission"
+                                                                     "status", jstr "timed_out" ]
+                                                               :> JsonNode |]
+                                                        )
+                                                        :> JsonNode
+                                                        "issues", JsonArray([| issue |]) :> JsonNode
+                                                        "issuesReturned", jint 1
+                                                        "issuesTruncated", jbool false ]
+                                                  :> JsonNode
+                                                  "truncated", jbool false
+                                                  "nextCursor", null
+                                                  "files", JsonArray() :> JsonNode ]
+                                            :> JsonNode
+                                    else
+                                        return result
+                                }))
                     |> unwrapResult
                 )
 

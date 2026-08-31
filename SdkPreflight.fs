@@ -64,13 +64,22 @@ let internal resolveDotnetBinary () : string =
     |> Option.orElseWith (fun () -> fromEnvironment "DOTNET_ROOT(x86)" (fun root -> Path.Combine(root, binaryName)))
     |> Option.defaultValue binaryName
 
+let private sdkRootsGate = obj ()
+let mutable private observedSdkRoots: string list = []
+
+let private rememberObservedSdkRoots roots =
+    lock sdkRootsGate (fun () -> observedSdkRoots <- roots |> List.distinct)
+
 let private configuredSdkRoots () =
-    [ "DOTNET_ROOT"; "DOTNET_ROOT(x86)" ]
-    |> List.choose (fun variable ->
-        Environment.GetEnvironmentVariable(variable)
-        |> Option.ofObj
-        |> Option.map _.Trim()
-        |> Option.filter (String.IsNullOrWhiteSpace >> not))
+    let environmentRoots =
+        [ "DOTNET_ROOT"; "DOTNET_ROOT(x86)" ]
+        |> List.choose (fun variable ->
+            Environment.GetEnvironmentVariable(variable)
+            |> Option.ofObj
+            |> Option.map _.Trim()
+            |> Option.filter (String.IsNullOrWhiteSpace >> not))
+
+    lock sdkRootsGate (fun () -> environmentRoots @ observedSdkRoots)
     |> List.distinct
 
 let internal describe (pin: SdkPin) (installedSdks: string list) =
@@ -211,6 +220,25 @@ let internal parseInstalledSdks (stdout: string) : string list =
         | parts -> Some parts[0])
     |> Array.toList
 
+/// Preserves the installation roots that `dotnet --list-sdks` already reports.
+/// The version-only verdict stays backward compatible, while failure envelopes can
+/// now explain which SDK roots the selected host actually searched.
+let internal parseInstalledSdkRoots (stdout: string) : string list =
+    stdout.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+    |> Array.choose (fun line ->
+        let trimmed = line.Trim()
+        let openBracket = trimmed.LastIndexOf('[')
+        let closeBracket = trimmed.LastIndexOf(']')
+
+        if openBracket >= 0 && closeBracket > openBracket + 1 then
+            trimmed.Substring(openBracket + 1, closeBracket - openBracket - 1).Trim()
+            |> Option.ofObj
+            |> Option.filter (String.IsNullOrWhiteSpace >> not)
+        else
+            None)
+    |> Array.distinct
+    |> Array.toList
+
 /// `dotnet --list-sdks` does not read `global.json`, so it stays answerable from
 /// inside the very directory whose pin we are about to reject. `None` means "could
 /// not determine" and always resolves to `Proceed` upstream.
@@ -220,12 +248,15 @@ let internal enumerateInstalledSdks () : string list option =
             ProcessRunner.run (resolveDotnetBinary ()) [ "--list-sdks" ] listSdksTimeout
 
         if result.ExitCode <> 0 then
+            rememberObservedSdkRoots []
             None
         else
+            rememberObservedSdkRoots (parseInstalledSdkRoots result.StandardOutput)
             Some(parseInstalledSdks result.StandardOutput)
     with _ ->
         // No dotnet on PATH, a hung muxer, a restricted host: our own probe must
         // never become the reason a project fails to load.
+        rememberObservedSdkRoots []
         None
 
 /// Pure verdict for one directory, given a lister for the installed SDK set.
@@ -309,7 +340,9 @@ let private refreshInstalledSdks () = sdkList.Refreshed()
 /// `set_project` is the session boundary where re-probing is affordable — one
 /// `dotnet --list-sdks` next to the FSAC restart and MSBuild workspace load it is
 /// about to pay for. The lazy per-project load paths keep using the cache.
-let internal invalidateCache () = sdkList.Invalidate()
+let internal invalidateCache () =
+    sdkList.Invalidate()
+    rememberObservedSdkRoots []
 
 /// Cache-then-confirm: a cached list is enough to let a project through, but never
 /// enough to reject one. Someone who installs the missing SDK and retries would

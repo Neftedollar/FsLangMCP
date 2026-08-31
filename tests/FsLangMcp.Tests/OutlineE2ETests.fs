@@ -18,11 +18,14 @@ module FsLangMcp.Tests.OutlineE2ETests
 
 open System
 open System.IO
+open System.Threading
+open System.Threading.Tasks
 open System.Text.Json.Nodes
 open Xunit
 open FsLangMcp.Types
 open FsLangMcp.FcsBridge
 open FsLangMcp.Cursor
+open FsLangMcp.Program
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -147,10 +150,27 @@ let private defaultArgs projectPath : FcsProjectOutlineArgs =
       summaryOnly = Some false   // full detail so we can inspect entries
       cursor = None
       filter = None
-      nameContains = None }
+      nameContains = None
+      timeoutMs = None }
 
 let private filesArray (result: JsonNode) =
     result["files"] :?> JsonArray
+
+let private successfulControlledOutline () =
+    let entry = JsonObject()
+    entry["name"] <- JsonValue.Create("Needle")
+    entry["signature"] <- JsonValue.Create("unit -> int")
+    entry["kind"] <- JsonValue.Create("function")
+    let entries = JsonArray()
+    entries.Add(entry)
+    let outline = JsonObject()
+    outline["status"] <- JsonValue.Create("succeeded")
+    outline["entries"] <- entries
+    outline["count"] <- JsonValue.Create(1)
+    outline["totalDefinitionCount"] <- JsonValue.Create(1)
+    outline["returnedEntryCount"] <- JsonValue.Create(1)
+    outline["entriesComplete"] <- JsonValue.Create(true)
+    outline :> JsonNode
 
 // ─── F. No filter — all files included ────────────────────────────────────────
 
@@ -164,6 +184,12 @@ let ``ProjectOutline without filter returns all project files`` () : System.Thre
             let! result = bridge.ProjectOutline({ defaultArgs projectPath with maxFiles = Some 100 })
 
             Assert.Equal("ok", result["status"].GetValue<string>())
+            let operationalCoverage = result["coverage"]
+            Assert.True(operationalCoverage["complete"].GetValue<bool>())
+            Assert.Equal(2, operationalCoverage["filesRequested"].GetValue<int>())
+            Assert.Equal(2, operationalCoverage["filesScanned"].GetValue<int>())
+            Assert.Equal(1L, bridge.ProjectEvaluationStartedCount)
+            Assert.Equal(1L, bridge.ProjectOptionsLoadCount)
 
             let files = filesArray result
             // We have 2 .fs files; both should be included.
@@ -197,7 +223,9 @@ let ``ProjectOutline lists compiled files missing on disk in unresolvedFiles`` (
         try
             let! result = bridge.ProjectOutline({ defaultArgs projectPath with maxFiles = Some 100 })
 
-            Assert.Equal("ok", result["status"].GetValue<string>())
+            Assert.Equal("partial", result["status"].GetValue<string>())
+            let operationalCoverage = result["coverage"]
+            Assert.Equal(1, operationalCoverage["filesFailed"].GetValue<int>())
 
             let unresolved =
                 result["unresolvedFiles"] :?> JsonArray
@@ -553,7 +581,271 @@ let ``ProjectOutline reports partial filter coverage when a file outline aborts`
     }
 
 [<Fact>]
-let ``ProjectOutline does not claim exhaustive filtering when a match is beyond FileOutline's cap`` () : System.Threading.Tasks.Task =
+let ``ProjectOutline rejects negative timeout and zero is deterministic unknown without starting work`` () =
+    task {
+        let mutable starts = 0
+
+        let outlineOverride (_: FcsFileOutlineArgs) =
+            Interlocked.Increment(&starts) |> ignore
+            Task.FromResult(successfulControlledOutline ())
+
+        let bridge = FcsBridge(projectOutlineFileOutlineOverride = outlineOverride)
+
+        let invalidPath =
+            Path.Combine(Path.GetTempPath(), $"missing-outline-{Guid.NewGuid():N}.fsproj")
+
+        let! negative =
+            bridge.ProjectOutline(
+                { defaultArgs invalidPath with
+                    timeoutMs = Some -1 }
+            )
+
+        Assert.Equal("invalid_args", negative["status"].GetValue<string>())
+        Assert.Equal("invalid_timeout", negative["errorKind"].GetValue<string>())
+
+        let! zero =
+            bridge.ProjectOutline(
+                { defaultArgs invalidPath with
+                    timeoutMs = Some 0 }
+            )
+
+        Assert.Equal("unknown", zero["status"].GetValue<string>())
+        Assert.Equal("project_outline_timeout", zero["errorKind"].GetValue<string>())
+        let operationalCoverage = zero["coverage"]
+        Assert.False(operationalCoverage["complete"].GetValue<bool>())
+        Assert.Equal(0, Volatile.Read(&starts))
+        Assert.Equal(0L, bridge.ProjectEvaluationStartedCount)
+    }
+
+[<Fact>]
+let ``ProjectOutline times out after a completed file retains worker and never starts the next file`` () =
+    task {
+        let projectPath, root = createFilteredPaginationProject ()
+
+        let secondStarted =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let blockedOutline =
+            TaskCompletionSource<JsonNode>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let mutable starts = 0
+        let mutable retained: Task option = None
+
+        let outlineOverride (_: FcsFileOutlineArgs) =
+            match Interlocked.Increment(&starts) with
+            | 1 -> Task.FromResult(successfulControlledOutline ())
+            | 2 ->
+                secondStarted.TrySetResult(()) |> ignore
+                blockedOutline.Task
+            | _ -> Task.FromResult(successfulControlledOutline ())
+
+        let bridge = FcsBridge(projectOutlineFileOutlineOverride = outlineOverride)
+
+        try
+            let pending =
+                bridge.ProjectOutlineWithinDeadline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 1
+                        nameContains = Some [ "Needle" ]
+                        timeoutMs = Some 150 },
+                    CancellationToken.None,
+                    fun operation -> retained <- Some operation
+                )
+
+            do! secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
+            let! result = pending
+            Assert.Equal("partial", result["status"].GetValue<string>())
+            let operationalCoverage = result["coverage"]
+            Assert.Equal(1, operationalCoverage["filesScanned"].GetValue<int>())
+            Assert.Equal(1, operationalCoverage["filesTimedOut"].GetValue<int>())
+            Assert.Equal(1, operationalCoverage["filesNotStarted"].GetValue<int>())
+            Assert.False(result["resultSetComplete"].GetValue<bool>())
+            Assert.True(result["truncated"].GetValue<bool>())
+            Assert.Null(result["nextCursor"])
+            Assert.True(result["paginationRestartRequired"].GetValue<bool>())
+            Assert.Equal(2, Volatile.Read(&starts))
+            Assert.True(retained.IsSome)
+
+            blockedOutline.TrySetResult(successfulControlledOutline ()) |> ignore
+            do! retained.Value.WaitAsync(TimeSpan.FromSeconds(2.0))
+            Assert.Equal(2, Volatile.Read(&starts))
+        finally
+            blockedOutline.TrySetResult(successfulControlledOutline ()) |> ignore
+
+            if Directory.Exists(root) then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``ProjectOutline cancellation returns partial coverage retains worker and starts no later file`` () =
+    task {
+        let projectPath, root = createFilteredPaginationProject ()
+        use cancellation = new CancellationTokenSource()
+
+        let secondStarted =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let blockedOutline =
+            TaskCompletionSource<JsonNode>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let mutable starts = 0
+        let mutable retained: Task option = None
+
+        let outlineOverride (_: FcsFileOutlineArgs) =
+            match Interlocked.Increment(&starts) with
+            | 1 -> Task.FromResult(successfulControlledOutline ())
+            | 2 ->
+                secondStarted.TrySetResult(()) |> ignore
+                blockedOutline.Task
+            | _ -> Task.FromResult(successfulControlledOutline ())
+
+        let bridge = FcsBridge(projectOutlineFileOutlineOverride = outlineOverride)
+
+        try
+            let pending =
+                bridge.ProjectOutlineWithinDeadline(
+                    { defaultArgs projectPath with
+                        maxFiles = Some 3
+                        timeoutMs = Some 5_000 },
+                    cancellation.Token,
+                    fun operation -> retained <- Some operation
+                )
+
+            do! secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
+            cancellation.Cancel()
+            let! result = pending
+            Assert.Equal("partial", result["status"].GetValue<string>())
+            let operationalCoverage = result["coverage"]
+            Assert.Equal(1, operationalCoverage["filesScanned"].GetValue<int>())
+            Assert.Equal(1, operationalCoverage["filesFailed"].GetValue<int>())
+            Assert.Equal(1, operationalCoverage["filesNotStarted"].GetValue<int>())
+            Assert.Equal(2, Volatile.Read(&starts))
+            Assert.True(retained.IsSome)
+
+            blockedOutline.TrySetResult(successfulControlledOutline ()) |> ignore
+            do! retained.Value.WaitAsync(TimeSpan.FromSeconds(2.0))
+            Assert.Equal(2, Volatile.Read(&starts))
+        finally
+            blockedOutline.TrySetResult(successfulControlledOutline ()) |> ignore
+
+            if Directory.Exists(root) then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``ProjectOutline pre-wait cancellation retains hot worker and outer FCS gate`` () =
+    task {
+        let projectPath, root = createFilteredPaginationProject ()
+        use operationCancellation = new CancellationTokenSource()
+        use gate = new SemaphoreSlim(1, 1)
+
+        let blockedOutline =
+            TaskCompletionSource<JsonNode>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let mutable starts = 0
+        let mutable lateStarts = 0
+
+        let outlineOverride (_: FcsFileOutlineArgs) =
+            Interlocked.Increment(&starts) |> ignore
+            // Deterministic pre-wait race: the hot task exists and remains incomplete,
+            // while cancellation becomes visible before awaitWithinDeadline calls WaitAsync.
+            operationCancellation.Cancel()
+            blockedOutline.Task
+
+        let bridge = FcsBridge(projectOutlineFileOutlineOverride = outlineOverride)
+
+        try
+            let! result =
+                runLimitedWithTimeoutRetained gate CancellationToken.None (Some 5_000) (fun remaining retainUntil ->
+                    bridge.ProjectOutlineWithinDeadline(
+                        { defaultArgs projectPath with
+                            timeoutMs = remaining },
+                        operationCancellation.Token,
+                        retainUntil
+                    ))
+
+            Assert.Equal("unknown", result["status"].GetValue<string>())
+            Assert.Equal(1, Volatile.Read(&starts))
+            Assert.Equal(0, gate.CurrentCount)
+
+            let! queued =
+                runLimitedWithTimeoutRetained gate CancellationToken.None (Some 0) (fun _ _ ->
+                    Interlocked.Increment(&lateStarts) |> ignore
+                    Task.FromResult(successfulControlledOutline ()))
+
+            Assert.Equal("fcs_admission_timeout", queued["errorKind"].GetValue<string>())
+            Assert.Equal(0, Volatile.Read(&lateStarts))
+
+            blockedOutline.TrySetResult(successfulControlledOutline ()) |> ignore
+            do! gate.WaitAsync().WaitAsync(TimeSpan.FromSeconds(2.0))
+            Assert.Equal(1, Volatile.Read(&starts))
+            gate.Release() |> ignore
+        finally
+            blockedOutline.TrySetResult(successfulControlledOutline ()) |> ignore
+
+            if Directory.Exists(root) then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``ProjectOutline options timeout returns unknown and retains actual evaluation`` () =
+    task {
+        let projectPath, root = createFixtureProject ()
+
+        let evaluationStarted =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let releaseEvaluation =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let mutable retained: Task option = None
+
+        let beforeLoad (_: string) =
+            task {
+                evaluationStarted.TrySetResult(()) |> ignore
+                do! releaseEvaluation.Task
+            }
+            :> Task
+
+        let bridge = FcsBridge(projectEvaluationBeforeLoadOverride = beforeLoad)
+
+        try
+            let pending =
+                bridge.ProjectOutlineWithinDeadline(
+                    { defaultArgs projectPath with
+                        timeoutMs = Some 150 },
+                    CancellationToken.None,
+                    fun operation -> retained <- Some operation
+                )
+
+            do! evaluationStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
+            let! result = pending
+            Assert.Equal("unknown", result["status"].GetValue<string>())
+            let operationalCoverage = result["coverage"]
+            Assert.Equal(0, operationalCoverage["filesScanned"].GetValue<int>())
+            Assert.Equal(2, operationalCoverage["filesNotStarted"].GetValue<int>())
+            Assert.Equal(1, bridge.ProjectEvaluationActiveCount)
+            Assert.True(retained.IsSome)
+
+            releaseEvaluation.TrySetResult(()) |> ignore
+
+            try
+                do! retained.Value.WaitAsync(TimeSpan.FromSeconds(10.0))
+            with :? TimeoutException ->
+                ()
+
+            Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
+        finally
+            releaseEvaluation.TrySetResult(()) |> ignore
+
+            if Directory.Exists(root) then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``ProjectOutline does not claim exhaustive filtering when a match is beyond FileOutline's cap``
+    ()
+    : System.Threading.Tasks.Task =
     task {
         let projectPath, root = createTailMatchProject ()
         let bridge = FcsBridge()

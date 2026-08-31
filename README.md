@@ -74,7 +74,7 @@ Release-only FS3511 can still appear under optimized compilation. Before merge o
 |------|--------------|
 | `set_project` | Initialize or switch FSAC/LSP context. Results are bound to the active project and session generation; a no-restart cross-project switch is rejected. |
 | `project_health` | Fast read-only preflight: options readiness, source files, analyzer setup, test project discovery. No build, no tests. |
-| `fcs_project_outline` | Compact project-wide outline over filtered compile files. Entry filters run before file pagination; directly targeted test projects include their compile sources by default while result/build artifacts stay excluded. |
+| `fcs_project_outline` | Deadline-bounded project outline (default `timeoutMs=60000`). `coverage` reports requested/scanned/timed-out/failed/not-started files; filtered incomplete discovery returns no continuation cursor. Direct test projects include compile sources while result/build artifacts stay excluded. |
 | `fcs_file_outline` | Per-file outline with attributes, bounded/truncation-aware CustomOperation and diagnostic arrays, and a hard serialized-response guard; `summaryOnly=true` (default) keeps token cost low. |
 | `fsharp_project_inspect` | Read-only `.fsproj` inspection: compile order, references, signature/implementation pairing. |
 | `fcs_symbol_at_word` | Tolerant symbol lookup by line + word — no exact cursor column needed. |

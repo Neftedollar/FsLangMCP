@@ -287,6 +287,41 @@ let ``FCS admission restores its slot for synchronous faulted and cancelled work
     }
 
 [<Fact>]
+let ``retained protected worker keeps FCS slot through response and fault then releases`` () =
+    task {
+        use gate = new SemaphoreSlim(1, 1)
+
+        let retainedWorker =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let mutable lateStarts = 0
+
+        let! response =
+            runLimitedWithTimeoutRetained gate CancellationToken.None (Some 1_000) (fun _ retainUntil ->
+                retainUntil retainedWorker.Task
+                Task.FromResult(JsonObject() :> JsonNode))
+
+        Assert.NotNull(response)
+        Assert.Equal(0, gate.CurrentCount)
+
+        let! queued =
+            runLimitedWithTimeoutRetained gate CancellationToken.None (Some 0) (fun _ _ ->
+                Interlocked.Increment(&lateStarts) |> ignore
+                Task.FromResult(JsonObject() :> JsonNode))
+
+        Assert.Equal("fcs_admission_timeout", queued["errorKind"].GetValue<string>())
+        Assert.Equal(0, Volatile.Read(&lateStarts))
+
+        retainedWorker.TrySetException(InvalidOperationException("retained worker fault"))
+        |> ignore
+
+        do! gate.WaitAsync().WaitAsync(TimeSpan.FromSeconds(2.0))
+        Assert.Equal(0, gate.CurrentCount)
+        gate.Release() |> ignore
+        Assert.Equal(1, gate.CurrentCount)
+    }
+
+[<Fact>]
 let ``MCP adapter preserves structured transport errors without debug wrapping (#242)`` () =
     let payload = "{\"errorKind\":\"FcsAborted\",\"message\":\"cancelled\"}"
     Assert.Equal(payload, mcpErrorText (McpError.TransportError payload))

@@ -338,7 +338,10 @@ type FcsProjectOutlineArgs =
       /// Regex applied to member names/signatures before truncation.
       filter: string option
       /// OR-joined substring list applied to member names before truncation.
-      nameContains: string list option }
+      nameContains: string list option
+      /// End-to-end timeout in milliseconds, including FCS queue admission and project
+      /// evaluation. Must be non-negative. Default: 60000.
+      timeoutMs: int option }
 
 type FSharpProjectInspectArgs =
     { /// .fsproj to inspect. Falls back to active set_project when omitted.
