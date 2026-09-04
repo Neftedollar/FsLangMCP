@@ -598,6 +598,15 @@ let ``trusted workspace overall timeout skips later project loaders`` () : Task 
 
 // ─────────────────────────────────────────────────────────────────────────────────
 
+[<CollectionDefinition("FsLangMcp check worker isolation", DisableParallelization = true)>]
+type CheckWorkerIsolationCollection() = class end
+
+// Several tests deliberately hold and release the process-wide FCS admission
+// gates. Running unrelated FCS fixtures beside them turns scheduler pressure
+// into false 5-12s test timeouts and can leave a failed run waiting on the
+// deliberately retained worker. Keep this class serial with the rest of the
+// assembly; methods within the class were already serialized by xUnit.
+[<Collection("FsLangMcp check worker isolation")>]
 type CheckTests(fx: CheckFixture) =
     interface IClassFixture<CheckFixture>
 

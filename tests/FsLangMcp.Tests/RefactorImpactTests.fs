@@ -27,13 +27,23 @@ open FsLangMcp.FcsBridge
 
 // ── Cross-project fixture sources (Lib / Lib.Tests / App) ─────────────────────────
 
-let private budgetApiLines =
-    [ for moduleIndex in 1..80 do
-          yield ""
-          yield $"module Api%d{moduleIndex} ="
+let private budgetApiLongSuffix = String.replicate 700 "x"
 
-          for memberIndex in 1..12 do
-              yield $"    let publicMember%d{memberIndex} (value: int) : int = value + %d{memberIndex}"
+let private budgetApiLines =
+    [ yield ""
+      yield "module ApiBudgetPayload ="
+
+      // Keep the fixture cheap for parallel test runs: PublicApi renders each
+      // public name both as `name` and inside `signature`, so a few long names
+      // exercise the real ~45k cumulative entity-node cutoff without
+      // compiling ~1k symbols.
+      for memberIndex in 1..48 do
+          yield
+              sprintf
+                  "    let publicMember%d_%s (value: int) : int = value + %d"
+                  memberIndex
+                  budgetApiLongSuffix
+                  memberIndex
 
       yield ""
       yield "module ZzzBudgetCutoff ="
