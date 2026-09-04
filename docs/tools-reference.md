@@ -1,4 +1,10 @@
-# Tools Reference
+---
+title: Tools reference
+description: All 35 FsLangMCP tools, grouped by intent with parameters, defaults, and response behavior.
+toc:
+  from: 2
+  to: 2
+---
 
 FsLangMCP exposes 35 tools over MCP stdio, grouped below by intent. Start with `find` and `check` — they cover the two most common agent questions ("where is X?" and "did my edit compile?"). The other 33 tools provide deeper access to specific compiler, LSP, and project capabilities.
 
@@ -10,7 +16,7 @@ Arguments are **strictly typed JSON** (since v0.15.0): string-encoded scalars su
 
 ## Headline tools
 
-These two tools replace the legacy search/check entry points removed in v0.13.1. Reach for them first.
+These two tools replace the legacy search/check entry points removed in v0.11.0. Reach for them first.
 
 ### `find`
 

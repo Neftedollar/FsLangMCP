@@ -25,6 +25,24 @@ just check     # build + test
 just analyze   # run F# analyzers (Ionide.Analyzers, G-Research.FSharp.Analyzers)
 ```
 
+## Documentation site
+
+The public documentation is a [Nacara](https://github.com/MangelMaxime/Nacara) site. Its F# project and configuration live in `docs/`; the published output is generated and must not be committed.
+
+```bash
+# Validate every page, route, anchor, and generated asset without writing output
+dotnet run --project docs/FsLangMcp.Docs.fsproj -- check --strict
+
+# Preview at the URL printed by Nacara and rebuild on edits
+dotnet run --project docs/FsLangMcp.Docs.fsproj -- watch
+```
+
+Every public Markdown page needs Nacara front matter with at least `title`. The public allow-list, routes, and menus are explicit in `docs/Site.fs`; operational files such as `docs/process.md`, `docs/workflows/`, and launch drafts are intentionally not published. Adding a public page therefore requires both the Markdown file and its entry in `Site.fs`.
+
+### First production publish (one time)
+
+The deployment job writes the generated site to the `gh-pages` branch. After that branch has been created by the first successful run, a repository administrator must open **Settings → Pages**, select **Deploy from a branch**, choose **`gh-pages`** and **`/(root)`**, then save. GitHub documents the exact steps in [Configuring a publishing source](https://docs.github.com/en/pages/getting-started-with-github-pages/configuring-a-publishing-source-for-your-github-pages-site). Later documentation changes on `main` publish automatically.
+
 ## Adding a new MCP tool
 
 The v0.17.0 surface ships 35 tools that all follow the same registration shape. To add another:

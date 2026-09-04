@@ -32,7 +32,7 @@ Drop this into your project's `CLAUDE.md` (Claude Code), your `.cursorrules` (Cu
     project). The former aliases `workspace_symbol`,
     `fcs_find_symbol`, `fcs_project_symbol_uses`, `fcs_find_member_usages`,
     `fcs_record_field_audit`, `textDocument_references`, and
-    `textDocument_definition` were removed in v0.13.1; use `find` instead.
+    `textDocument_definition` were removed in v0.11.0; use `find` instead.
     For exhaustive refactor counts, require both `coverage.complete=true` and
     `resolution.complete=true`; follow `nextCursor` while `truncated=true`.
   - **"Did my edit compile?"** → `mcp__fslangmcp__check` (one
@@ -43,7 +43,7 @@ Drop this into your project's `CLAUDE.md` (Claude Code), your `.cursorrules` (Cu
     `dotnet build -c Release --warnaserror` before merge or release.
     The former aliases `workspace_diagnostics`, `fsharp_compile`,
     `fcs_check_file`, `fcs_parse_and_check_file`, and `fcs_validate_snippet`
-    were removed in v0.13.1; use `check` instead.
+    were removed in v0.11.0; use `check` instead.
   - Removed aliases are not registered. Update old prompts rather than falling
     back to a legacy tool name.
   - Other entry points as needed: `project_health`, `fcs_project_outline`,

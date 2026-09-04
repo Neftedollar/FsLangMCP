@@ -8,8 +8,10 @@
 [![Target](https://img.shields.io/badge/target-net10.0-blue.svg)](https://dotnet.microsoft.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
+[Documentation](https://neftedollar.github.io/FsLangMCP/) · [Getting started](https://neftedollar.github.io/FsLangMCP/guide/getting-started/) · [Tools reference](https://neftedollar.github.io/FsLangMCP/tools/reference/)
+
 <p align="center">
-  <img src="docs/assets/agent-session.gif" width="840"
+  <img src="docs/static/agent-session.gif" width="840"
        alt="An AI agent answering 'where is Order used, and does it compile?' against examples/quickstart: set_project, then check returns clean, then find resolves 17 cross-project Order sites including 9 in App that grep-on-Domain missed. Real MCP calls, no grep." />
 </p>
 <p align="center"><sub>An agent working a real task against <a href="examples/quickstart"><code>examples/quickstart</code></a> — <code>set_project</code> → <code>check</code> (clean) → <code>find</code> (17 cross-project sites). Real <a href="docs/tools-reference.md">MCP calls</a>, no grep.</sub></p>
@@ -303,8 +305,8 @@ installation. The reviewed compatibility set is pinned in
 - `fantomas` `7.0.5`
 
 The FsLangMCP package dependency graph is audited separately from those external
-tools. The latest available FSAC and Fantomas packages still carry
-advisory-listed MessagePack assemblies, although the supported FsLangMCP paths
+tools. The supported external-tool pins above still carry advisory-listed
+MessagePack assemblies, although the supported FsLangMCP paths
 explicitly use JSON and do not select a MessagePack formatter. No patched
 upstream tool package is currently available, so the exact pins above are a
 documented, process-contained risk acceptance rather than a guarantee that every

@@ -1,9 +1,15 @@
-# Detailed Tool Mechanics
+---
+title: Detailed tool mechanics
+description: Implementation behavior, caveats, and routing guidance for the FsLangMCP tools that need deeper explanation.
+toc:
+  from: 2
+  to: 2
+---
 
 The MCP description tells you *whether* to call a tool; this file tells you *how it works internally*.
 
 **Start here.** `find` and `check` are the primary entry points in the 35-tool v0.17.0 surface.
-The consolidation aliases below were removed in v0.13.1 and are no longer registered:
+The consolidation aliases below were removed in v0.11.0 and are no longer registered:
 
 | Removed names | Current route |
 |---|---|

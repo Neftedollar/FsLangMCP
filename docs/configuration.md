@@ -1,15 +1,18 @@
-# MCP Client Configuration
+---
+title: MCP client configuration
+description: Connect FsLangMCP to Claude Code, Cursor, Codex, GitHub Copilot, or any MCP stdio client.
+---
 
 FsLangMCP is a standard MCP stdio server. This page covers per-client wiring. All clients use the same executable (`fslangmcp`) and the same `set_project` first-call pattern; only the config file location and format differ.
 
-**Prerequisite:** install FsLangMCP first — see [`docs/getting-started.md`](getting-started.md).
+**Prerequisite:** install FsLangMCP first — see [Getting started](getting-started.md).
 
 ## Claude Code
 
 Add with the CLI:
 
 ```bash
-claude mcp add fslangmcp fslangmcp
+claude mcp add --scope project fslangmcp -- fslangmcp
 ```
 
 Or create / edit `.mcp.json` in the project root (committed to the repo so all contributors share it):
@@ -68,11 +71,19 @@ With a pre-loaded project:
 When no `--project` argument is configured, call `set_project` as the first tool
 call. Add the tool-discipline rule to `.cursorrules` so Cursor's agent knows to
 use `find` and `check` instead of grep — the snippet is in
-[`AGENT_INTEGRATION.md`](../AGENT_INTEGRATION.md).
+[Agent integration guide](https://github.com/Neftedollar/FsLangMCP/blob/main/AGENT_INTEGRATION.md).
 
 ## Codex (OpenAI)
 
-Codex CLI reads MCP server configuration from `~/.codex/config.toml`. Each server is a `[mcp_servers.<name>]` table:
+Add FsLangMCP from the command line:
+
+```bash
+codex mcp add fslangmcp -- fslangmcp
+```
+
+Codex also reads MCP server configuration from `~/.codex/config.toml`, or from
+`.codex/config.toml` in a trusted project. Each server is a
+`[mcp_servers.<name>]` table:
 
 ```toml
 [mcp_servers.fslangmcp]
@@ -82,30 +93,51 @@ args    = []
 
 > Codex's config schema is evolving — see [Codex's MCP documentation](https://developers.openai.com/codex/mcp) for the current exact key names if the above doesn't match your installed version.
 
-Put the tool-discipline rules in `AGENTS.md` at the repo root (Codex's equivalent of `CLAUDE.md`). The snippet from [`AGENT_INTEGRATION.md`](../AGENT_INTEGRATION.md) applies unchanged.
+Put the tool-discipline rules in `AGENTS.md` at the repo root (Codex's equivalent of `CLAUDE.md`). The snippet from the [Agent integration guide](https://github.com/Neftedollar/FsLangMCP/blob/main/AGENT_INTEGRATION.md) applies unchanged.
 
-## GitHub Copilot
+## GitHub Copilot CLI
 
-GitHub Copilot's MCP support is exposed through the IDE extensions (VS Code, Visual Studio, JetBrains) rather than through a standalone CLI MCP config file. Configuration steps differ by IDE.
+Add FsLangMCP to the user configuration at `~/.copilot/mcp-config.json`:
 
-For **VS Code with GitHub Copilot Chat** (MCP support requires a recent Copilot extension):
+```bash
+copilot mcp add fslangmcp -- fslangmcp
+```
 
-Add to your VS Code workspace settings (`.vscode/mcp.json` or user `settings.json`):
+For a shared project configuration, create `.github/mcp.json`:
 
 ```json
 {
-  "mcp": {
-    "servers": {
-      "fslangmcp": {
-        "type": "stdio",
-        "command": "fslangmcp"
-      }
+  "mcpServers": {
+    "fslangmcp": {
+      "type": "local",
+      "command": "fslangmcp",
+      "args": []
     }
   }
 }
 ```
 
-> The exact key path (`mcp.servers` vs. `mcpServers`, and where the file lives) varies by Copilot extension version — see [GitHub Copilot's MCP documentation](https://docs.github.com/en/copilot) for the current format.
+Copilot CLI also reads a repository-level `.mcp.json`, but its local-server
+schema includes `"type": "local"`; do not copy the Claude Code example without
+adding that field. Project-level servers are loaded only after the repository
+folder is trusted. See GitHub's current [Copilot CLI MCP documentation](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers) for precedence and trust details.
+
+## VS Code with GitHub Copilot
+
+Create `.vscode/mcp.json` in the workspace:
+
+```json
+{
+  "servers": {
+    "fslangmcp": {
+      "type": "stdio",
+      "command": "fslangmcp"
+    }
+  }
+}
+```
+
+See the current [VS Code MCP documentation](https://code.visualstudio.com/docs/agent-customization/mcp-servers) for user-profile, remote-workspace, and sandbox options.
 
 Add tool-discipline instructions to `.github/copilot-instructions.md` (Copilot's project-rules file). The `AGENT_INTEGRATION.md` snippet applies.
 
@@ -135,7 +167,7 @@ Place it under whatever key your client uses for MCP server definitions (commonl
 Unless the server was started with `--project` (or `FSA_PROJECT_PATH`), the first
 tool call in every agent session must be `set_project`:
 
-```json
+```text
 set_project { "projectPath": "/absolute/path/to/App.sln" }
 ```
 

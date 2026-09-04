@@ -44,15 +44,15 @@ every `.fsproj` in the solution via the F# compiler — no text matching.
 | FSAC toolchain | `fslangmcp --bootstrap-tools` (one-time) |
 | An MCP-capable agent | Claude Code, Cursor, Copilot CLI, Codex |
 
-The `--bootstrap-tools` step fetches `fsautocomplete` and `ionide.projinfo.tool`.
-Run it once after install; it writes nothing into the example project.
+The `--bootstrap-tools` step fetches the supported `fsautocomplete`, Fantomas,
+and `ionide.projinfo.tool` versions and creates the Fantomas command alias FSAC
+expects. Run it once after install; it writes nothing into the example project.
 
 ---
 
 ## MCP server config
 
-Add to your agent's MCP config. Claude Code (`.mcp.json` in repo root or
-`~/.claude/settings.json` globally):
+Add to your agent's MCP config. For Claude Code, use `.mcp.json` in the repo root:
 
 ```json
 {

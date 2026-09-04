@@ -1,6 +1,9 @@
-# Getting Started with FsLangMCP
+---
+title: Getting started
+description: Install FsLangMCP, connect an MCP client, and run the core set_project → find → check loop.
+---
 
-FsLangMCP is an MCP stdio server that gives AI coding agents real F# compiler semantics — cross-project `find`, a trustworthy `check` verdict, type inspection, rename preview, dead-code detection, and more — via FCS in-process and an FsAutoComplete LSP child process. The single sentence version: it replaces grep with the actual compiler. For the full motivation, see [`docs/why-agents-grep-fsharp.md`](why-agents-grep-fsharp.md).
+FsLangMCP is an MCP stdio server that gives AI coding agents real F# compiler semantics — cross-project `find`, a trustworthy `check` verdict, type inspection, rename preview, dead-code detection, and more — via FCS in-process and an FsAutoComplete LSP child process. The single sentence version: it replaces grep with the actual compiler. For the full motivation, see [Why your AI agent shouldn't grep F#](why-agents-grep-fsharp.md).
 
 ## Prerequisites
 
@@ -31,7 +34,7 @@ Tell your agent's MCP client where to find the server. The minimal config (works
 }
 ```
 
-For per-client instructions — Claude Code, Cursor, Codex, Copilot, generic stdio — see [`docs/configuration.md`](configuration.md).
+For per-client instructions — Claude Code, Cursor, Codex, Copilot, generic stdio — see [MCP client configuration](configuration.md).
 
 ## The core loop
 
@@ -39,7 +42,7 @@ For per-client instructions — Claude Code, Cursor, Codex, Copilot, generic std
 
 Call `set_project` with the path to your `.fsproj`, `.sln`, `.slnx`, or project directory. A directory is searched recursively when it has no top-level workspace file: one nested project/solution is selected, while multiple candidates return `ambiguous_workspace` so you can choose explicitly. You only need to do this once; the project context persists for all subsequent calls.
 
-```json
+```text
 set_project { "projectPath": "/absolute/path/to/MyApp.sln" }
 ```
 
@@ -49,7 +52,7 @@ The response includes `readiness` flags (`lsp`, `projectOptions`, `symbolIndex`)
 
 **`find`** answers "where is X used or defined?" across every project in the solution. It resolves definitions, references, record-field set sites, and member call-sites in one sweep — no grep noise from comments or unrelated types:
 
-```json
+```text
 find { "query": "OrderId", "kind": "definition" }
 find { "query": "OrderId" }                        // all sites
 find { "query": "Ship", "kind": "members", "member": "Ship" }  // member call-sites
@@ -62,7 +65,7 @@ omits earlier pages.
 
 **`check`** answers "did my edit compile?" with a fresh in-process type-check. It never reports a stale-cache false-clean:
 
-```json
+```text
 check {}                           // whole workspace, auto scope
 check { "scope": "file", "path": "/abs/path/Domain/Order.fs" }
 ```
@@ -97,7 +100,7 @@ Once you have a base signal from `find` and `check`, the other 33 tools let you 
 
 ## Next steps
 
-- **Hands-on examples**: [`examples/`](../examples/) — runnable traces for common agent tasks.
-- **All 35 tools**: [`docs/tools-reference.md`](tools-reference.md) — full reference grouped by intent.
-- **Troubleshooting**: [`docs/troubleshooting.md`](troubleshooting.md) — symptom-keyed remediation guide.
-- **Multi-agent patterns**: [`AGENT_INTEGRATION.md`](../AGENT_INTEGRATION.md) — tool-discipline snippets for CLAUDE.md / .cursorrules / AGENTS.md, subagent brief templates, feedback routing.
+- **Hands-on examples**: [the quickstart repository](https://github.com/Neftedollar/FsLangMCP/tree/main/examples) — runnable traces for common agent tasks.
+- **All 35 tools**: [Tools reference](tools-reference.md) — the complete surface grouped by intent.
+- **Troubleshooting**: [Troubleshooting](troubleshooting.md) — symptom-keyed remediation.
+- **Multi-agent patterns**: [Agent integration guide](https://github.com/Neftedollar/FsLangMCP/blob/main/AGENT_INTEGRATION.md) — tool-discipline snippets, subagent briefs, and feedback routing.

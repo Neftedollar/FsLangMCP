@@ -13,6 +13,10 @@ CoverletSourceRootsMapping_*
 __pycache__/
 *.py[cod]
 
+# Nacara documentation output. The generated site is published from CI.
+docs/output/
+docs/.nacara/
+
 # Verify (snapshot testing): *.received.* are produced when a snapshot diverges
 # from its *.verified.* baseline. Reviewed locally, then either approved
 # (renamed to .verified.*) or the test is fixed. Never committed.
