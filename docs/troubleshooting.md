@@ -55,7 +55,9 @@ The response carries `requestedSdkVersion`, `globalJsonPath`, `installedSdks`, a
    SDK is picked up on the next call.
 2. Edit the `globalJsonPath` from the response: pin an installed version, or
    replace `"rollForward": "disable"` with a policy that allows a newer SDK
-   (for example `"latestMajor"`).
+   (prefer `"latestFeature"` when the project supports newer feature bands in
+   the same major/minor; use `"latestMajor"` only when later major SDKs are also
+   supported and tested).
 
 Confirm what the machine actually has with `dotnet --list-sdks`. Note that the
 FsLangMCP server process and your shell can resolve different `dotnet` binaries —

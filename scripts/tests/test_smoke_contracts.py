@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
+import json
+import re
 import tempfile
 import unittest
 import zipfile
+from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -303,6 +305,75 @@ class PackageVersionContractTests(unittest.TestCase):
 
 
 class WorkflowGateContractTests(unittest.TestCase):
+    def test_repository_sdk_floor_is_flexible_but_release_jobs_stay_pinned(self) -> None:
+        def job_block(workflow: str, job_name: str) -> str:
+            marker = f"  {job_name}:\n"
+            start = workflow.index(marker)
+            remainder = workflow[start + len(marker) :]
+            next_job = re.search(r"(?m)^  [A-Za-z0-9_-]+:\s*$", remainder)
+            end = start + len(marker) + (next_job.start() if next_job else len(remainder))
+            return workflow[start:end]
+
+        global_json = json.loads(
+            (REPOSITORY_ROOT / "global.json").read_text(encoding="utf-8")
+        )
+        sdk = global_json["sdk"]
+
+        self.assertEqual("10.0.100", sdk["version"])
+        self.assertEqual("latestFeature", sdk["rollForward"])
+        self.assertIs(sdk["allowPrerelease"], False)
+
+        ci_workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        minimum_job = job_block(ci_workflow, "minimum-sdk")
+        self.assertIn(
+            "DOTNET_INSTALL_DIR: ${{ github.workspace }}/.dotnet-minimum", minimum_job
+        )
+        self.assertIn("DOTNET_MULTILEVEL_LOOKUP: '0'", minimum_job)
+        self.assertIn("dotnet-version: '10.0.100'", minimum_job)
+        self.assertIn('test "$(dotnet --version)" = "10.0.100"', minimum_job)
+        self.assertIn("dotnet restore FsLangMcp.slnx --locked-mode", minimum_job)
+        self.assertIn("dotnet build FsLangMcp.slnx", minimum_job)
+        self.assertIn("dotnet test FsLangMcp.slnx", minimum_job)
+
+        live_workflow = (
+            REPOSITORY_ROOT / ".github/workflows/live-fsac.yml"
+        ).read_text(encoding="utf-8")
+        publish_workflow = (
+            REPOSITORY_ROOT / ".github/workflows/publish.yml"
+        ).read_text(encoding="utf-8")
+        exact_jobs = {
+            "primary": (
+                job_block(ci_workflow, "build-and-test"),
+                ('test "$(dotnet --version)" = "10.0.400"',),
+            ),
+            "live-fsac": (
+                job_block(live_workflow, "live-fsac"),
+                (
+                    '$actual -ne "10.0.400"',
+                    'throw "Expected .NET SDK 10.0.400, got $actual"',
+                ),
+            ),
+            "publish": (
+                job_block(publish_workflow, "build-and-verify"),
+                ('test "$(dotnet --version)" = "10.0.400"',),
+            ),
+        }
+
+        for name, (exact_job, guards) in exact_jobs.items():
+            with self.subTest(job=name):
+                self.assertIn(
+                    "DOTNET_INSTALL_DIR: ${{ github.workspace }}/.dotnet-exact",
+                    exact_job,
+                )
+                self.assertIn("DOTNET_MULTILEVEL_LOOKUP: '0'", exact_job)
+                self.assertRegex(
+                    exact_job, r"dotnet-version:\s+['\"]10\.0\.400['\"]"
+                )
+                for guard in guards:
+                    self.assertIn(guard, exact_job)
+
     def test_publish_waits_for_same_commit_reusable_live_matrix(self) -> None:
         live_workflow = (REPOSITORY_ROOT / ".github/workflows/live-fsac.yml").read_text(
             encoding="utf-8"

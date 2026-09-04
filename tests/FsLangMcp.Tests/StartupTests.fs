@@ -1,6 +1,7 @@
 module FsLangMcp.Tests.StartupTests
 
 open System
+open System.Collections.Generic
 open System.Diagnostics
 open System.IO
 open System.Threading
@@ -320,6 +321,58 @@ let ``retained protected worker keeps FCS slot through response and fault then r
         gate.Release() |> ignore
         Assert.Equal(1, gate.CurrentCount)
     }
+
+[<Fact>]
+let ``project outline keeps a non-admission result unchanged`` () =
+    let result =
+        JsonObject(
+            [ KeyValuePair<string, JsonNode>("status", JsonValue.Create("ok"))
+              KeyValuePair<string, JsonNode>("files", JsonArray()) ]
+        )
+        :> JsonNode
+
+    let normalized = normalizeProjectOutlineAdmissionResult 60_000 result
+
+    Assert.Same(result, normalized)
+
+[<Fact>]
+let ``project outline expands an admission timeout into unknown coverage`` () =
+    let result =
+        JsonObject(
+            [ KeyValuePair<string, JsonNode>("status", JsonValue.Create("timeout"))
+              KeyValuePair<string, JsonNode>("errorKind", JsonValue.Create("fcs_admission_timeout"))
+              KeyValuePair<string, JsonNode>("message", JsonValue.Create("queue expired")) ]
+        )
+        :> JsonNode
+
+    let normalized = normalizeProjectOutlineAdmissionResult 321 result
+    let coverage = normalized["coverage"]
+    let phases = coverage["phases"].AsArray()
+    let issues = coverage["issues"].AsArray()
+
+    Assert.Equal("unknown", normalized["status"].GetValue<string>())
+    Assert.Equal("fcs_admission_timeout", normalized["errorKind"].GetValue<string>())
+    Assert.Equal("queue expired", normalized["message"].GetValue<string>())
+    Assert.Equal(321, normalized["timeoutMs"].GetValue<int>())
+    Assert.True(normalized["retryable"].GetValue<bool>())
+    Assert.False(normalized["resultSetComplete"].GetValue<bool>())
+    Assert.False(coverage["complete"].GetValue<bool>())
+    Assert.Equal(0, coverage["filesRequested"].GetValue<int>())
+    Assert.Equal(0, coverage["filesScanned"].GetValue<int>())
+    Assert.Equal(0, coverage["filesTimedOut"].GetValue<int>())
+    Assert.Equal(0, coverage["filesFailed"].GetValue<int>())
+    Assert.Equal(0, coverage["filesNotStarted"].GetValue<int>())
+    let phase = Assert.Single(phases)
+    Assert.Equal("admission", phase["phase"].GetValue<string>())
+    Assert.Equal("timed_out", phase["status"].GetValue<string>())
+    let issue = Assert.Single(issues)
+    Assert.Equal("fcs_admission_timeout", issue["errorKind"].GetValue<string>())
+    Assert.Equal("queue expired", issue["message"].GetValue<string>())
+    Assert.Equal(1, coverage["issuesReturned"].GetValue<int>())
+    Assert.False(coverage["issuesTruncated"].GetValue<bool>())
+    Assert.False(normalized["truncated"].GetValue<bool>())
+    Assert.Null(normalized["nextCursor"])
+    Assert.Empty(normalized["files"].AsArray())
 
 [<Fact>]
 let ``MCP adapter preserves structured transport errors without debug wrapping (#242)`` () =
