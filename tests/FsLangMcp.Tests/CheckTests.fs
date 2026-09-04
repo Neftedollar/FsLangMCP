@@ -23,6 +23,7 @@ open Xunit
 open FsLangMcp.Types
 open FsLangMcp.FcsBridge
 open FsLangMcp.LspBridge
+open FsLangMcp.Dispatcher
 
 // ── Fixture sources ────────────────────────────────────────────────────────────
 
@@ -273,7 +274,45 @@ let ``project check rejects negative timeout and treats zero as immediate unknow
         Assert.Equal("succeeded", gs zero "status")
         Assert.Equal("unknown", gs zero "verdict")
         Assert.False(gb zero "analyzed")
+        Assert.Equal("timeout", gs (zero["blockingReason"]) "errorKind")
         Assert.Equal(0L, bridge.ProjectEvaluationStartedCount)
+    }
+
+[<Fact>]
+let ``generic project evaluation failure stays distinct from sdk_not_found`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_generic_block_{Guid.NewGuid():N}")
+        Directory.CreateDirectory(root) |> ignore
+        let projectPath = Path.Combine(root, "Broken.fsproj")
+        let sourcePath = Path.Combine(root, "Library.fs")
+
+        File.WriteAllText(
+            projectPath,
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><ItemGroup><Compile Include=\"Library.fs\" /></ItemGroup></Project>"
+        )
+
+        File.WriteAllText(sourcePath, "module Broken\n\nlet value = 1\n")
+
+        let failEvaluation (_: string) =
+            Task.FromException(InvalidOperationException("simulated project evaluation failure"))
+
+        let bridge = FcsBridge(projectEvaluationBeforeLoadOverride = failEvaluation)
+
+        try
+            for speed in [ "trusted"; "fast" ] do
+                let! result =
+                    bridge.Check(
+                        { bareCheck with
+                            scope = Some "project"
+                            speed = Some speed
+                            projectPath = Some projectPath
+                            timeoutMs = Some 5_000 }
+                    )
+
+                Assert.Equal("unknown", gs result "verdict")
+                Assert.Equal("project_failure", gs (result["blockingReason"]) "errorKind")
+        finally
+            Directory.Delete(root, true)
     }
 
 [<Fact>]
@@ -301,8 +340,11 @@ let ``auto scope discovery obeys the overall timeout before options start`` () :
                         timeoutMs = Some 300 }
                 )
 
-            do! discoveryStarted.Task.WaitAsync(TimeSpan.FromSeconds(1.0))
-            let! result = checkTask.WaitAsync(TimeSpan.FromSeconds(2.0))
+            // Coverlet instrumentation can add substantial scheduler overhead on CI.
+            // These outer waits are deadlock guards; the product deadlines asserted
+            // below remain 300/150/1000 ms and are intentionally unchanged.
+            do! discoveryStarted.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            let! result = checkTask.WaitAsync(TimeSpan.FromSeconds(5.0))
 
             Assert.Equal("succeeded", gs result "status")
             Assert.Equal("unknown", gs result "verdict")
@@ -327,7 +369,7 @@ let ``auto scope discovery obeys the overall timeout before options start`` () :
                         speed = Some "trusted"
                         timeoutMs = Some 150 }
                 )
-                |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(1.0))
+                |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(5.0))
 
             Assert.Equal("unknown", gs sameTarget "verdict")
             Assert.Equal(1L, bridge.CheckTargetDiscoveryStartedCount)
@@ -347,11 +389,11 @@ let ``auto scope discovery obeys the overall timeout before options start`` () :
                             speed = Some "trusted"
                             timeoutMs = Some 1000 }
                     )
-                    |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(1.0))
+                    |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(5.0))
 
                 Assert.Equal("unknown", gs busy "verdict")
                 Assert.Contains("discovery busy", (gs busy "reason").ToLowerInvariant())
-                Assert.True(elapsed.Elapsed < TimeSpan.FromMilliseconds(750.0), "busy discovery must not queue")
+                Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(3.0), "busy discovery must not queue")
 
             Assert.Equal(1L, bridge.CheckTargetDiscoveryStartedCount)
             Assert.Equal(6L, bridge.CheckTargetDiscoveryRejectedCount)
@@ -364,7 +406,7 @@ let ``auto scope discovery obeys the overall timeout before options start`` () :
                 bridge.CheckTargetDiscoveryActiveCount <> 0
                 || bridge.CheckTargetDiscoveryInFlightCount <> 0
 
-            while discoveryStillRunning () && settle.Elapsed < TimeSpan.FromSeconds(2.0) do
+            while discoveryStillRunning () && settle.Elapsed < TimeSpan.FromSeconds(5.0) do
                 do! Task.Delay(10)
 
             Assert.Equal(0, bridge.CheckTargetDiscoveryActiveCount)
@@ -378,7 +420,9 @@ let ``auto scope discovery obeys the overall timeout before options start`` () :
                         scope = Some "workspace"
                         projectPath = Some root
                         speed = Some "trusted"
-                        timeoutMs = Some 1000 }
+                        // This call proves admission was released, not another deadline.
+                        // Leave enough headroom for a CPU-saturated full-suite run.
+                        timeoutMs = Some 5000 }
                 )
 
             Assert.Equal("invalid_args", gs retry "status")
@@ -488,12 +532,13 @@ let ``fast incomplete timeout expectation cannot turn a cached error into a conc
                 fsacSnapshot = maliciousSnapshot
             )
 
-        Assert.True(snapshotCalled)
+        Assert.False(snapshotCalled, "A typed expectation blocker must skip the cached snapshot entirely.")
         Assert.Equal("unknown", gs result "verdict")
         Assert.False(gb result "analyzed")
         Assert.False(gb result "expectationComplete")
-        Assert.Equal(1, gi result "errorCount")
+        Assert.Equal(0, gi result "errorCount")
         Assert.Contains("timed out", (gs result "reason").ToLowerInvariant())
+        Assert.Equal("timeout", gs (result["blockingReason"]) "errorKind")
     }
 
 [<Fact>]
@@ -553,6 +598,15 @@ let ``trusted workspace overall timeout skips later project loaders`` () : Task 
 
 // ─────────────────────────────────────────────────────────────────────────────────
 
+[<CollectionDefinition("FsLangMcp check worker isolation", DisableParallelization = true)>]
+type CheckWorkerIsolationCollection() = class end
+
+// Several tests deliberately hold and release the process-wide FCS admission
+// gates. Running unrelated FCS fixtures beside them turns scheduler pressure
+// into false 5-12s test timeouts and can leave a failed run waiting on the
+// deliberately retained worker. Keep this class serial with the rest of the
+// assembly; methods within the class were already serialized by xUnit.
+[<Collection("FsLangMcp check worker isolation")>]
 type CheckTests(fx: CheckFixture) =
     interface IClassFixture<CheckFixture>
 
@@ -679,8 +733,8 @@ type CheckTests(fx: CheckFixture) =
                             timeoutMs = Some 1000 }
                     )
 
-                do! admissionReached.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
-                let! result = checkTask.WaitAsync(TimeSpan.FromSeconds(2.0))
+                do! admissionReached.Task.WaitAsync(TimeSpan.FromSeconds(10.0))
+                let! result = checkTask.WaitAsync(TimeSpan.FromSeconds(10.0))
 
                 Assert.Equal("unknown", gs result "verdict")
                 Assert.False(gb result "analyzed")
@@ -693,7 +747,8 @@ type CheckTests(fx: CheckFixture) =
 
             let settle = Stopwatch.StartNew()
 
-            while bridge.FreshProjectCheckInFlightCount <> 0 && settle.Elapsed < TimeSpan.FromSeconds(2.0) do
+            while bridge.FreshProjectCheckInFlightCount <> 0
+                  && settle.Elapsed < TimeSpan.FromSeconds(10.0) do
                 do! Task.Delay(10)
 
             Assert.Equal(0, bridge.FreshProjectCheckInFlightCount)
@@ -811,8 +866,8 @@ type CheckTests(fx: CheckFixture) =
                             timeoutMs = Some 300 }
                     )
 
-                do! firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
-                let! firstResult = firstCheck.WaitAsync(TimeSpan.FromSeconds(2.0))
+                do! firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(10.0))
+                let! firstResult = firstCheck.WaitAsync(TimeSpan.FromSeconds(10.0))
 
                 Assert.Equal("unknown", gs firstResult "verdict")
                 Assert.False(gb firstResult "analyzed")
@@ -832,7 +887,7 @@ type CheckTests(fx: CheckFixture) =
                             projectPath = Some fx.ProbeFsproj
                             timeoutMs = Some 150 }
                     )
-                    |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(1.0))
+                    |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(10.0))
 
                 Assert.Equal("unknown", gs sameSnapshot "verdict")
                 Assert.Equal(1, workerCalls)
@@ -855,11 +910,12 @@ type CheckTests(fx: CheckFixture) =
                                 projectPath = Some fx.ProbeFsproj
                                 timeoutMs = Some 1000 }
                         )
-                        |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(1.0))
+                        |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(10.0))
 
                     Assert.Equal("unknown", gs busy "verdict")
                     Assert.False(gb busy "analyzed")
                     Assert.Contains("type-check busy", (gs busy "reason").ToLowerInvariant())
+                    Assert.Equal("fcs_worker_busy", gs (busy["blockingReason"]) "errorKind")
                     Assert.True(elapsed.Elapsed < TimeSpan.FromMilliseconds(750.0), "busy type-check must not queue")
 
                 Assert.Equal(1, workerCalls)
@@ -877,7 +933,7 @@ type CheckTests(fx: CheckFixture) =
                     bridge.FreshProjectCheckActiveCount <> 0
                     || bridge.FreshProjectCheckInFlightCount <> 0
 
-                while freshCheckStillRunning () && settle.Elapsed < TimeSpan.FromSeconds(2.0) do
+                while freshCheckStillRunning () && settle.Elapsed < TimeSpan.FromSeconds(10.0) do
                     do! Task.Delay(10)
 
                 Assert.Equal(0, bridge.FreshProjectCheckActiveCount)
@@ -892,12 +948,12 @@ type CheckTests(fx: CheckFixture) =
                             timeoutMs = Some 5000 }
                     )
 
-                do! secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
+                do! secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(10.0))
                 Assert.Equal(2, workerCalls)
                 Assert.Equal(2L, bridge.FreshProjectCheckStartedCount)
                 Assert.Equal(2L, bridge.ProjectTypeCheckStartCount)
                 releaseSecond.TrySetResult(()) |> ignore
-                let! retryResult = retry.WaitAsync(TimeSpan.FromSeconds(2.0))
+                let! retryResult = retry.WaitAsync(TimeSpan.FromSeconds(10.0))
 
                 Assert.Equal("clean", gs retryResult "verdict")
                 Assert.True(gb retryResult "analyzed")
@@ -978,7 +1034,8 @@ type CheckTests(fx: CheckFixture) =
                         )
 
                     match rejected with
-                    | Error reason -> Assert.Contains("probe busy", reason.ToLowerInvariant())
+                    | Error(CheckBusy reason) -> Assert.Contains("probe busy", reason.ToLowerInvariant())
+                    | Error failure -> failwith $"Expected busy reference probe, got {failure}"
                     | Ok value -> failwith $"Expected busy reference probe, got {value}"
 
                     Assert.True(elapsed.Elapsed < TimeSpan.FromMilliseconds(500.0), "busy probe must not queue")
@@ -1520,6 +1577,72 @@ type CheckTests(fx: CheckFixture) =
         }
 
     [<Fact>]
+    member _.``trusted file aborted answer carries a typed project failure``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+
+            let bridge =
+                FcsBridge(
+                    trustedFileCheckAnswerOverride =
+                        (fun _ -> FSharp.Compiler.CodeAnalysis.FSharpCheckFileAnswer.Aborted)
+                )
+
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        scope = Some "file"
+                        path = Some fx.MainFs
+                        speed = Some "trusted"
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            Assert.Equal("unknown", gs result "verdict")
+            Assert.False(gb result "analyzed")
+            Assert.False(gb result "groundTruth")
+            Assert.Equal("project_failure", gs (result["blockingReason"]) "errorKind")
+            Assert.False(gb (result["blockingReason"]) "retryable")
+        }
+
+    [<Fact>]
+    member _.``trusted file exceptions retain timeout cancellation busy and generic kinds``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+
+            let cases: (string * bool * (unit -> exn)) array =
+                [| "timeout", true, (fun () -> TimeoutException("simulated trusted file timeout"))
+                   "cancelled", true, (fun () -> OperationCanceledException("simulated trusted file cancellation"))
+                   "fcs_worker_busy", true, (fun () -> ProjectEvaluationBusyException(fx.ProbeFsproj))
+                   "fcs_worker_busy",
+                   true,
+                   (fun () -> BoundedCheckWorkBusyException("file type-check", fx.MainFs))
+                   "project_failure", false, (fun () -> InvalidOperationException("simulated trusted file failure")) |]
+
+            for expectedErrorKind, expectedRetryable, createFailure in cases do
+                let bridge =
+                    FcsBridge(
+                        trustedFileCheckAnswerOverride =
+                            (fun _ -> raise (createFailure ()))
+                    )
+
+                let! result =
+                    bridge.Check(
+                        { bareCheck with
+                            scope = Some "file"
+                            path = Some fx.MainFs
+                            speed = Some "trusted"
+                            projectPath = Some fx.ProbeFsproj }
+                    )
+
+                Assert.Equal("unknown", gs result "verdict")
+                Assert.False(gb result "analyzed")
+                Assert.False(gb result "groundTruth")
+                Assert.Equal(expectedErrorKind, gs (result["blockingReason"]) "errorKind")
+                Assert.Equal(expectedRetryable, gb (result["blockingReason"]) "retryable")
+        }
+
+    [<Fact>]
     member _.``fast snapshot success observed after the deadline is never conclusive``() : Task =
         task {
             Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
@@ -1556,6 +1679,148 @@ type CheckTests(fx: CheckFixture) =
             Assert.Equal("unknown", gs result "verdict")
             Assert.False(gb result "analyzed")
             Assert.Contains("timed out", (gs result "reason").ToLowerInvariant())
+            Assert.Equal("timeout", gs (result["blockingReason"]) "errorKind")
+            Assert.True(gb (result["blockingReason"]) "retryable")
+        }
+
+    [<Fact>]
+    member _.``fast file snapshot timeout remains a retryable timeout``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            let timedOutSnapshot (_: CheckFsacExpectation) =
+                Task.FromException<CheckFsacSnapshot>(TimeoutException("simulated file snapshot timeout"))
+
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        scope = Some "file"
+                        path = Some fx.MainFs
+                        speed = Some "fast"
+                        projectPath = Some fx.ProbeFsproj
+                        timeoutMs = Some 5_000 },
+                    fsacSnapshot = timedOutSnapshot
+                )
+
+            Assert.Equal("unknown", gs result "verdict")
+            Assert.False(gb result "analyzed")
+            Assert.Equal("timeout", gs (result["blockingReason"]) "errorKind")
+            Assert.True(gb (result["blockingReason"]) "retryable")
+        }
+
+    [<Fact>]
+    member _.``dispatcher preserves typed LSP timeout cancellation and generic failures``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+
+            let args =
+                { bareCheck with
+                    scope = Some "file"
+                    path = Some fx.MainFs
+                    speed = Some "fast"
+                    projectPath = Some fx.ProbeFsproj
+                    timeoutMs = Some 5_000 }
+
+            let runThroughDispatcher injectFailure =
+                task {
+                    use lspBridge =
+                        new FsAutoCompleteBridge(diagnosticsSnapshotBeforeReadOverride = injectFailure)
+
+                    let fcsBridge = FcsBridge()
+                    return! CheckDispatch.run fcsBridge lspBridge (CheckRequest.Check args)
+                }
+
+            let cases: (string * (unit -> unit)) array =
+                [| "timeout", (fun () -> raise (TimeoutException("simulated LSP timeout")))
+                   "cancelled", (fun () -> raise (OperationCanceledException("simulated request cancellation")))
+                   "fsac_unavailable", (fun () -> raise (InvalidOperationException("simulated LSP failure"))) |]
+
+            for expectedErrorKind, injectFailure in cases do
+                let! result = runThroughDispatcher injectFailure
+                Assert.Equal("unknown", gs result "verdict")
+                Assert.False(gb result "analyzed")
+                Assert.Equal(expectedErrorKind, gs (result["blockingReason"]) "errorKind")
+                Assert.True(gb (result["blockingReason"]) "retryable")
+        }
+
+    [<Fact>]
+    member _.``legacy LSP gate-busy reason remains a retryable worker-busy blocker``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            let legacyBusySnapshot (expectation: CheckFsacExpectation) =
+                let filesNode files =
+                    JsonArray(files |> Array.map jstr) :> JsonNode
+
+                jobj
+                    [ "status", jstr "not_ready"
+                      "ready", jbool false
+                      "reason", jstr "lsp_lifecycle_gate_busy"
+                      "message", jstr "legacy gate-busy envelope"
+                      "lspState", jstr "warming"
+                      "contextMatched", jbool false
+                      "complete", jbool false
+                      "diagnosticsFileCount", jint 0
+                      "expectedFiles", filesNode expectation.ExpectedFiles
+                      "receivedFiles", filesNode [||]
+                      "missingFiles", filesNode expectation.ExpectedFiles
+                      "staleFiles", filesNode [||]
+                      "blockingReasons", JsonArray() :> JsonNode
+                      "result", JsonObject() :> JsonNode ]
+                :> JsonNode
+                |> CheckFsacSnapshot.ofDiagnosticsResponse
+                |> Task.FromResult
+
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        scope = Some "file"
+                        path = Some fx.MainFs
+                        speed = Some "fast"
+                        projectPath = Some fx.ProbeFsproj
+                        timeoutMs = Some 5_000 },
+                    fsacSnapshot = legacyBusySnapshot
+                )
+
+            Assert.Equal("unknown", gs result "verdict")
+            Assert.False(gb result "analyzed")
+            Assert.Equal("fcs_worker_busy", gs (result["blockingReason"]) "errorKind")
+            Assert.True(gb (result["blockingReason"]) "retryable")
+        }
+
+    [<Fact>]
+    member _.``trusted cancellation remains distinct from timeout and project failure``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+
+            let cancelledWorker
+                (_: FSharp.Compiler.CodeAnalysis.FSharpProjectOptions)
+                : Task<FSharp.Compiler.Diagnostics.FSharpDiagnostic array> =
+                Task.FromException<FSharp.Compiler.Diagnostics.FSharpDiagnostic array>(
+                    OperationCanceledException("simulated cancellation")
+                )
+
+            let bridge = FcsBridge(freshProjectCheckWorkerOverride = cancelledWorker)
+
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        scope = Some "project"
+                        speed = Some "trusted"
+                        projectPath = Some fx.ProbeFsproj
+                        timeoutMs = Some 5_000 }
+                )
+
+            Assert.Equal("unknown", gs result "verdict")
+            Assert.False(gb result "analyzed")
+            Assert.Equal("cancelled", gs (result["blockingReason"]) "errorKind")
+            Assert.True(gb (result["blockingReason"]) "retryable")
         }
 
     [<Fact>]

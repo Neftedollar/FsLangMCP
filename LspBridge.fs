@@ -1235,7 +1235,8 @@ type internal FsAutoCompleteBridge
         ?cleanupDrainBarrierOverride: (unit -> Task option),
         ?fsacCommandOverride: string,
         ?fsacArgsOverride: string list,
-        ?evaluatedSourceFilesProvider: (string -> Task<Result<string array, string>>)
+        ?evaluatedSourceFilesProvider: (string -> Task<Result<string array, string>>),
+        ?diagnosticsSnapshotBeforeReadOverride: (unit -> unit)
     ) =
     let gate = new SemaphoreSlim(1, 1)
     let projectSwitchGate = new SemaphoreSlim(1, 1)
@@ -2742,10 +2743,20 @@ type internal FsAutoCompleteBridge
                 let message =
                     "The diagnostics snapshot was not admitted because another LSP operation is in progress. Retry the check; no snapshot work was queued."
 
+                let blockingReason =
+                    jobj
+                        [ "errorKind", jstr "fcs_worker_busy"
+                          "message", jstr message
+                          "retryable", jbool true ]
+                    :> JsonNode
+
                 jobj
                     [ "status", jstr "not_ready"
                       "ready", jbool false
                       "reason", jstr reason
+                      "errorKind", jstr "fcs_worker_busy"
+                      "retryable", jbool true
+                      "blockingReason", blockingReason
                       "lspState", jstr "warming"
                       "contextMatched", jbool false
                       "complete", jbool false
@@ -2769,11 +2780,49 @@ type internal FsAutoCompleteBridge
             let gateAcquired = gate.Wait(0)
             let mutable contextWasMatched = false
 
+            let typedFailureResponse errorKind retryable message =
+                let expected =
+                    try
+                        distinctExpectedFiles ()
+                    with _ ->
+                        [||]
+
+                let blockingReason =
+                    jobj
+                        [ "errorKind", jstr errorKind
+                          "message", jstr message
+                          "retryable", jbool retryable ]
+                    :> JsonNode
+
+                jobj
+                    [ "status", jstr "infrastructure_error"
+                      "reason", jstr errorKind
+                      "errorKind", jstr errorKind
+                      "retryable", jbool retryable
+                      "blockingReason", blockingReason
+                      "lspState", jstr (LspResponseShape.lspStateString workspaceReady)
+                      "contextMatched", jbool contextWasMatched
+                      "complete", jbool false
+                      "message", jstr message
+                      "sessionGeneration", jint64 (Volatile.Read(&activeSessionGeneration))
+                      "diagnosticsFileCount", jint 0
+                      "expectedFileCount", jint expected.Length
+                      "receivedFileCount", jint 0
+                      "missingFileCount", jint expected.Length
+                      "staleFileCount", jint 0
+                      "expectedFiles", filesNode expected
+                      "receivedFiles", filesNode [||]
+                      "missingFiles", filesNode expected
+                      "staleFiles", filesNode [||]
+                      "result", JsonObject() :> JsonNode ]
+                :> JsonNode
+
             try
                 if not gateAcquired then
                     raise DiagnosticsSnapshotGateBusyException
 
                 use _gateLease = releaseOnDispose gate
+                diagnosticsSnapshotBeforeReadOverride |> Option.iter (fun probe -> probe ())
                 let expected = distinctExpectedFiles ()
                 let globMatchedNoFiles =
                     fileGlob.IsSome
@@ -2980,32 +3029,12 @@ type internal FsAutoCompleteBridge
                             :> JsonNode
             with
             | DiagnosticsSnapshotGateBusyException -> return gateBusyResponse ()
+            | :? TimeoutException as timedOut ->
+                return typedFailureResponse "timeout" true timedOut.Message
+            | :? OperationCanceledException as cancelled ->
+                return typedFailureResponse "cancelled" true cancelled.Message
             | ex ->
-                let expected =
-                    try
-                        distinctExpectedFiles ()
-                    with _ ->
-                        [||]
-
-                return
-                    jobj
-                        [ "status", jstr "infrastructure_error"
-                          "lspState", jstr (LspResponseShape.lspStateString workspaceReady)
-                          "contextMatched", jbool contextWasMatched
-                          "complete", jbool false
-                          "message", jstr ex.Message
-                          "sessionGeneration", jint64 (Volatile.Read(&activeSessionGeneration))
-                          "diagnosticsFileCount", jint 0
-                          "expectedFileCount", jint expected.Length
-                          "receivedFileCount", jint 0
-                          "missingFileCount", jint expected.Length
-                          "staleFileCount", jint 0
-                          "expectedFiles", filesNode expected
-                          "receivedFiles", filesNode [||]
-                          "missingFiles", filesNode expected
-                          "staleFiles", filesNode [||]
-                          "result", JsonObject() :> JsonNode ]
-                    :> JsonNode
+                return typedFailureResponse "fsac_unavailable" true ex.Message
         }
 
     member _.Diagnostics(args: DiagnosticsArgs) : Task<JsonNode> =

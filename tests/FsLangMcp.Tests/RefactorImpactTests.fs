@@ -27,6 +27,28 @@ open FsLangMcp.FcsBridge
 
 // ── Cross-project fixture sources (Lib / Lib.Tests / App) ─────────────────────────
 
+let private budgetApiLongSuffix = String.replicate 700 "x"
+
+let private budgetApiLines =
+    [ yield ""
+      yield "module ApiBudgetPayload ="
+
+      // Keep the fixture cheap for parallel test runs: PublicApi renders each
+      // public name both as `name` and inside `signature`, so a few long names
+      // exercise the real ~45k cumulative entity-node cutoff without
+      // compiling ~1k symbols.
+      for memberIndex in 1..48 do
+          yield
+              sprintf
+                  "    let publicMember%d_%s (value: int) : int = value + %d"
+                  memberIndex
+                  budgetApiLongSuffix
+                  memberIndex
+
+      yield ""
+      yield "module ZzzBudgetCutoff ="
+      yield "    let afterBudgetCutoff (value: int) : int = value + 1" ]
+
 let private libFs =
     String.concat
         "\n"
@@ -35,35 +57,54 @@ let private libFs =
           "let add (a: int) (b: int) = a + b"
           ""
           "let subtract (a: int) (b: int) = a - b"
+          ""
+          "let paged (value: int) = value + 1"
           "" ]
+
+let private largeApiFs =
+    String.concat "\n" ([ "module LargeApi.Surface" ] @ budgetApiLines @ [ "" ])
+
+let private pagedTestLines =
+    [ for index in 1..105 -> $"        paged %d{index} |> ignore" ]
 
 let private testsFs =
     String.concat
         "\n"
-        [ "namespace Lib.Tests"
-          ""
-          "open System"
-          "open Lib.Math"
-          ""
-          "type FactAttribute() ="
-          "    inherit Attribute()"
-          ""
-          "module AddTests ="
-          ""
-          "    [<Fact>]"
-          "    let ``add returns the sum`` () ="
-          "        let actual = add 2 3"
-          "        if actual <> 5 then failwith \"add broken\""
-          ""
-          "    [<Fact>]"
-          "    let ``add is commutative`` () ="
-          "        let left = add 1 2"
-          "        let right = add 2 1"
-          "        if left <> right then failwith \"add not commutative\""
-          "" ]
+        ([ "namespace Lib.Tests"
+           ""
+           "open System"
+           "open Lib.Math"
+           ""
+           "type FactAttribute() ="
+           "    inherit Attribute()"
+           ""
+           "module AddTests ="
+           ""
+           "    [<Fact>]"
+           "    let ``add returns the sum`` () ="
+           "        let actual = add 2 3"
+           "        if actual <> 5 then failwith \"add broken\""
+           ""
+           "    [<Fact>]"
+           "    let ``add is commutative`` () ="
+           "        let left = add 1 2"
+           "        let right = add 2 1"
+           "        if left <> right then failwith \"add not commutative\""
+           ""
+           "    [<Fact>]"
+           "    let ``paged symbol spans more than one result page`` () =" ]
+         @ pagedTestLines
+         @ [ "" ])
+
+let private pagedAppLines =
+    [ for index in 1..1005 -> $"let pagedUse%d{index} = paged %d{index}" ]
 
 let private appFs =
-    String.concat "\n" [ "module App.Run"; ""; "open Lib.Math"; ""; "let go () = subtract 10 4"; "" ]
+    String.concat
+        "\n"
+        ([ "module App.Run"; ""; "open Lib.Math"; ""; "let go () = subtract 10 4"; "" ]
+         @ pagedAppLines
+         @ [ "" ])
 
 let private leafProject (sourceFile: string) =
     String.concat
@@ -99,6 +140,7 @@ let private slnx =
         "\n"
         [ "<Solution>"
           "  <Project Path=\"Lib/Lib.fsproj\" />"
+          "  <Project Path=\"LargeApi/LargeApi.fsproj\" />"
           "  <Project Path=\"Lib.Tests/Lib.Tests.fsproj\" />"
           "  <Project Path=\"App/App.fsproj\" />"
           "</Solution>" ]
@@ -117,12 +159,15 @@ type ImpactFixture() =
 
     do write "Lib/Lib.fsproj" (leafProject "Lib.fs") |> ignore
     do write "Lib/Lib.fs" libFs |> ignore
+    do write "LargeApi/LargeApi.fsproj" (leafProject "LargeApi.fs") |> ignore
+    do write "LargeApi/LargeApi.fs" largeApiFs |> ignore
     do write "Lib.Tests/Lib.Tests.fsproj" (testProject "Tests.fs" "../Lib/Lib.fsproj") |> ignore
     do write "Lib.Tests/Tests.fs" testsFs |> ignore
     do write "App/App.fsproj" (refProject "App.fs" "../Lib/Lib.fsproj") |> ignore
     do write "App/App.fs" appFs |> ignore
     let slnxPath = write "Impact.slnx" slnx
     let libFsproj = Path.Combine(root, "Lib", "Lib.fsproj")
+    let largeApiFsproj = Path.Combine(root, "LargeApi", "LargeApi.fsproj")
 
     let buildOnce () =
         let psi =
@@ -156,6 +201,7 @@ type ImpactFixture() =
     member _.Root = root
     member _.Slnx = slnxPath
     member _.LibFsproj = libFsproj
+    member _.LargeApiFsproj = largeApiFsproj
     member _.BuildExitCode = buildExit
     member _.BuildLog = buildLog
 
@@ -262,19 +308,131 @@ let private impactArgs (projectPath: string) (symbol: string) (kind: string opti
       kind = kind
       projectPath = Some projectPath }
 
+let private refactorImpactWithActiveSolution
+    (bridge: FcsBridge)
+    (args: FcsRefactorImpactArgs)
+    (activeSolution: string)
+    : Task<JsonNode> =
+    let methodInfo =
+        typeof<FcsBridge>.GetMethods(
+            System.Reflection.BindingFlags.Instance
+            ||| System.Reflection.BindingFlags.Public
+            ||| System.Reflection.BindingFlags.NonPublic
+        )
+        |> Array.filter (fun candidate -> candidate.Name = "RefactorImpact")
+        |> Array.maxBy (fun candidate -> candidate.GetParameters().Length)
+
+    let parameters = methodInfo.GetParameters()
+
+    Assert.Contains(
+        parameters,
+        fun parameter -> parameter.Name = "activeProjectPath"
+    )
+
+    let invocationArgs =
+        parameters
+        |> Array.map (fun parameter ->
+            match parameter.Name with
+            | "args" -> box args
+            | "activeProjectPath" -> box (Some activeSolution)
+            | "renamePreview" -> null
+            | name -> failwith $"Unexpected RefactorImpact parameter: %s{name}")
+
+    methodInfo.Invoke(bridge, invocationArgs) :?> Task<JsonNode>
+
 // ─── Cross-project impact + covering tests ────────────────────────────────────────
 
 type ImpactCrossProjectTests(fx: ImpactFixture, output: ITestOutputHelper) =
     interface IClassFixture<ImpactFixture>
 
     [<Fact>]
+    member _.``refactor_impact source fsproj uses the active solution for test discovery``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit %d{fx.BuildExitCode}):\n%s{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let! result =
+                refactorImpactWithActiveSolution
+                    bridge
+                    (impactArgs fx.LibFsproj "add" None)
+                    fx.Slnx
+
+            Assert.Equal("succeeded", gs result "status")
+
+            let impact = result["impact"]
+            Assert.True(gb impact "complete")
+            Assert.True(gb impact "crossProject")
+            Assert.True((gi impact "projectCount" >= 2), "active solution must widen the main find blast radius")
+
+            let tests = result["tests"]
+            Assert.Equal("succeeded", gs tests "status")
+            Assert.Equal("matched", gs tests "outcome")
+            Assert.True(gb tests["coverage"] "complete")
+            Assert.Equal(3, gi tests "count")
+            Assert.Equal(2, gi tests "uniqueTestCount")
+            Assert.Equal(3, gi tests "siteCount")
+        }
+
+    [<Fact>]
+    member _.``refactor_impact preserves an indeterminate tests_for_symbol outcome``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit %d{fx.BuildExitCode}):\n%s{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // A source .fsproj cannot discover projects that reference it without a
+            // separate active solution. The impact report must not turn that discovery
+            // gap into a confident successful zero-test result.
+            let! result = bridge.RefactorImpact(impactArgs fx.LibFsproj "add" None)
+
+            Assert.NotEqual<string>("succeeded", gs result "status")
+
+            let tests = result["tests"]
+            Assert.Equal("unknown", gs tests "status")
+            Assert.Equal("indeterminate", gs tests "outcome")
+            Assert.False(gb tests["coverage"] "complete")
+            Assert.Equal(0, gi tests "count")
+            Assert.Equal(0, gi tests "siteCount")
+            Assert.Contains(".sln/.slnx", gs tests "message")
+        }
+
+    [<Fact>]
+    member _.``refactor_impact marks paginated find and test slices as incomplete``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit %d{fx.BuildExitCode}):\n%s{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            // RefactorImpact currently asks Find for at most 1000 sites and
+            // TestsForSymbol for at most 100. This fixture deliberately exceeds both.
+            let! result = bridge.RefactorImpact(impactArgs fx.Slnx "paged" None)
+
+            let impact = result["impact"]
+            let tests = result["tests"]
+
+            Assert.True((gi impact "totalSites" > 1000), "find fixture must exceed its internal page size")
+            Assert.True((gi tests "siteCount" > 100), "test fixture must exceed its internal page size")
+            Assert.Equal(100, (arr tests "tests").Length)
+
+            Assert.NotEqual<string>("succeeded", gs result "status")
+            Assert.False(gb result "complete")
+            Assert.True(gb impact "truncated")
+            Assert.False(gb impact "complete")
+            Assert.True(gb impact "fileCountIsLowerBound")
+            Assert.True(gb impact "projectCountIsLowerBound")
+            Assert.False(gb impact "crossProjectKnown")
+            Assert.Null(impact["crossProject"])
+            Assert.True(gb tests "truncated")
+            Assert.True(gb tests["coverage"] "complete")
+            Assert.False(gb tests "complete")
+        }
+
+    [<Fact>]
     member _.``refactor_impact on a cross-project symbol reports the projects, files, and covering tests``() : Task =
         task {
-            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit %d{fx.BuildExitCode}):\n%s{fx.BuildLog}")
             let bridge = FcsBridge()
 
             // `add` is defined in Lib and used inside Lib.Tests' two [<Fact>] tests →
-            // the blast radius spans 2 projects and 3 covering test references.
+            // the blast radius spans 2 projects, 2 unique tests, and 3 test sites.
             let! result = bridge.RefactorImpact(impactArgs fx.Slnx "add" None)
 
             Assert.Equal("succeeded", gs result "status")
@@ -296,6 +454,8 @@ type ImpactCrossProjectTests(fx: ImpactFixture, output: ITestOutputHelper) =
             // Tests: the two [<Fact>] tests reference `add` three times.
             let tests = result["tests"]
             Assert.Equal(3, gi tests "count")
+            Assert.Equal(2, gi tests "uniqueTestCount")
+            Assert.Equal(3, gi tests "siteCount")
             Assert.Equal(3, (arr tests "tests").Length)
 
             // Generic blast-radius preview: no move/signature sections requested.
@@ -314,7 +474,7 @@ type ImpactCrossProjectTests(fx: ImpactFixture, output: ITestOutputHelper) =
     [<Fact>]
     member _.``refactor_impact kind=signature on a public member flags a breaking change``() : Task =
         task {
-            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit %d{fx.BuildExitCode}):\n%s{fx.BuildLog}")
             let bridge = FcsBridge()
 
             // `add` is a public let in module Lib.Math → a signature change is breaking.
@@ -336,6 +496,76 @@ type ImpactCrossProjectTests(fx: ImpactFixture, output: ITestOutputHelper) =
             Assert.Contains(lines, fun l -> l.Contains "BREAKING")
 
             output.WriteLine(String.concat "\n" lines)
+        }
+
+    [<Fact>]
+    member _.``refactor_impact keeps public API membership indeterminate after response budget cutoff``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit %d{fx.BuildExitCode}):\n%s{fx.BuildLog}")
+            let bridge = FcsBridge()
+
+            let publicApiArgs cursor =
+                { projectPath = Some fx.LargeApiFsproj
+                  includeInternal = Some false
+                  namespaceFilter = None
+                  maxResults = Some 1000
+                  cursor = cursor }
+
+            let pageContainsTarget (page: JsonNode) =
+                arr page "entities"
+                |> List.exists (fun entity ->
+                    arr entity "members"
+                    |> List.exists (fun memberNode ->
+                        String.Equals(
+                            gs memberNode "name",
+                            "afterBudgetCutoff",
+                            StringComparison.Ordinal
+                        )))
+
+            let nextCursor (page: JsonNode) =
+                page["nextCursor"]
+                |> Option.ofObj
+                |> Option.map (fun node -> node.GetValue<string>())
+
+            let! firstPage = bridge.PublicApi(publicApiArgs None)
+            Assert.Equal("ok", gs firstPage "status")
+            Assert.True(gb firstPage "truncated")
+            Assert.True(gb firstPage "truncatedByBudget")
+            Assert.False(pageContainsTarget firstPage)
+
+            let mutable cursor = nextCursor firstPage
+            let mutable foundAfterCutoff = false
+            let mutable pagesFollowed = 0
+
+            while cursor.IsSome && not foundAfterCutoff && pagesFollowed < 16 do
+                let currentCursor =
+                    cursor |> Option.defaultWith (fun () -> failwith "cursor disappeared inside guarded loop")
+
+                let! page = bridge.PublicApi(publicApiArgs (Some currentCursor))
+                pagesFollowed <- pagesFollowed + 1
+                foundAfterCutoff <- pageContainsTarget page
+                cursor <- nextCursor page
+
+            Assert.True(foundAfterCutoff, "the target must be public and located after the first response-budget cutoff")
+            Assert.InRange(pagesFollowed, 1, 16)
+
+            let! result =
+                bridge.RefactorImpact(impactArgs fx.Slnx "afterBudgetCutoff" (Some "signature"))
+
+            Assert.Equal("partial", gs result "status")
+            Assert.False(gb result "complete")
+
+            let api = result["apiSurface"]
+            Assert.False(gb api "complete")
+            Assert.True(gb api "truncated")
+            Assert.True(gb api "truncatedByBudget")
+            Assert.NotNull(api["nextCursor"])
+            Assert.Null(api["isPublic"])
+            Assert.Empty(arr api "affectedPublicMembers")
+
+            let lines = verifyLines result
+            Assert.Contains(lines, fun line -> line.Contains("indeterminate", StringComparison.OrdinalIgnoreCase))
+            Assert.DoesNotContain(lines, fun line -> line.Contains("stays internal", StringComparison.Ordinal))
         }
 
     [<Fact>]
@@ -365,7 +595,7 @@ type ImpactMoveTests(fx: MoveFixture, output: ITestOutputHelper) =
     [<Fact>]
     member _.``refactor_impact kind=move surfaces a compile-order forward-reference problem``() : Task =
         task {
-            Assert.True((fx.RestoreExit = 0), $"Fixture restore failed (exit {fx.RestoreExit}):\n{fx.RestoreLog}")
+            Assert.True((fx.RestoreExit = 0), $"Fixture restore failed (exit %d{fx.RestoreExit}):\n%s{fx.RestoreLog}")
             let bridge = FcsBridge()
 
             // Wrong project: Uses.fs (referencing Defs.answer) compiles BEFORE Defs.fs, so
@@ -373,7 +603,8 @@ type ImpactMoveTests(fx: MoveFixture, output: ITestOutputHelper) =
             // move would have to respect.
             let! result = bridge.RefactorImpact(impactArgs fx.WrongFsproj "Defs" (Some "move"))
 
-            Assert.Equal("succeeded", gs result "status")
+            Assert.Equal("partial", gs result "status")
+            Assert.False(gb result "complete")
             Assert.Equal("move", gs result "kind")
 
             let compileOrder = result["compileOrder"]

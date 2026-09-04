@@ -8,8 +8,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-08-31
+
+0.17.0 keeps the 35-tool surface intact and hardens the evidence agents use to plan changes:
+bounded results now say when they are incomplete, timeout budgets include admission waits, and
+test/outline helpers distinguish what they actually scanned and counted. It also rolls up the
+post-0.16.0 UX/runtime work from #215 and #232: honest project/workspace coverage, stale global-tool
+detection, dependency-closure corrections, bounded outline enrichment, exact NuGet metadata, and
+thread/reload telemetry. Together these changes tighten existing contracts without presenting a
+partial answer as exhaustive.
+
 ### Fixed
 
+- `find` now separates project-sweep coverage from delivery of the complete site set (#235).
+  `coverage.complete` can remain true when every project was analyzed, but
+  `resolution.complete` is true only when the response contains the whole result set from offset
+  zero. A `maxResults` page and every later cursor page therefore remain visibly incomplete even
+  when the final page has `truncated=false`; `totalEstimate.sites`, `truncated`, and `nextCursor`
+  describe how to retrieve the omitted sites.
+- FCS/LSP admission waits now observe MCP cancellation instead of starting cancelled handlers
+  later (#236). For `find` and `check`, time spent waiting for the FCS gate consumes the same
+  `timeoutMs` budget and only the remainder reaches the operation. An expired/cancelled queued
+  call never enters protected work. An entered handler keeps its host slot until its returned task
+  completes; an uncancellable project-use sweep additionally retains a bounded actual-worker slot
+  until `ParseAndCheckProject` / `GetAllUsesOfAllSymbols` really finishes, so timed-out callers
+  cannot accumulate distinct-key FCS workers in the background.
+  Admission expiry is a typed `fcs_admission_timeout` payload, and a negative timeout is rejected
+  before queueing instead of becoming an accidental infinite wait. Per-project admission rejection
+  is reported as retryable `status="busy"` / `errorKind="fcs_worker_busy"`, with a separate
+  `projectsBusy` count, rather than being folded into a permanent-looking project failure.
+- `fcs_tests_for_symbol` now reports bounded, coverage-aware solution sweeps (#237). It accepts
+  `timeoutMs` and cursor pagination, separates requested/scanned/failed/timed-out/busy projects with a
+  `perProject` ledger, and returns `unknown`/`indeterminate` for an incomplete zero. A production
+  `.fsproj` target reuses the active containing solution for reverse test-project discovery when
+  available; without that context it no longer looks like confident zero coverage and instead
+  returns a precise widening hint.
+- `fcs_project_outline` now applies `filter` / `nameContains` before file pagination (#238).
+  Files with no matching entries are omitted, `maxFiles` and cursors operate on the matching-file
+  set, and `totalEstimate.files` counts matching files. If a file outline aborts during a filtered
+  sweep, or if the bounded per-file outline did not return every definition, the response is now
+  `partial` with a bounded `filterCoverage` issue ledger and marks the matching count as a lower
+  bound instead of silently treating the file as a non-match. Unfiltered requests keep their
+  existing page-first path.
+- `fcs_project_outline` now has one admission-aware end-to-end deadline and a general partial-
+  coverage ledger (#243). Optional non-negative `timeoutMs` defaults to 60 seconds; queue wait,
+  one shared project-options evaluation, and sequential file outlines consume the same budget.
+  Zero is a deterministic typed timeout. Expired/cancelled calls start no later file, and if a hot,
+  non-cancellable FCS/MSBuild task outlives the response, the shared FCS gate remains retained until
+  that actual task settles (including the pre-`WaitAsync` race and fault path). Responses use
+  `ok`/`partial`/`unknown` with requested/scanned/timed-out/failed/not-started counts plus bounded
+  phase/issues rows. Incomplete filtered discovery suppresses `nextCursor` and marks its estimate as
+  a lower bound requiring a restart from offset zero.
+- A direct `fcs_project_outline` call on a test project now includes its evaluated compile sources
+  by default (#239), including ordinary `tests/.../Program.fs` and `Tests.fs` files. The shared
+  filter distinguishes `test_source` from `test_result_artifact`; `TestResults`, `test-results`,
+  coverage, `bin`, and `obj` artifacts remain excluded, and explicit `includeTests=false` still
+  opts out of test sources.
+- `fcs_tests_for_symbol` now excludes definition sites, stops enclosing-test attribution at the
+  next binding/module/namespace/type boundary, and leaves top-level fixture sites unassigned
+  instead of borrowing the preceding test (#240). Compatibility `testCount` and `siteCount` both
+  count all reference sites; additive `uniqueTestCount` counts distinct enclosing tests.
+  Project identity and the enclosing declaration's source position participate in de-duplication,
+  so one linked test file compiled by two test projects remains two pieces of coverage evidence and
+  separate same-named declarations in one file remain distinct tests. Pagination is by site and
+  preserves the full counts. The enclosing-test scan now advances past rejected test
+  attributes, checks the whole-sweep budget inside its synchronous loops, and uses bounded
+  non-backtracking regexes. An unrelated attribute can no longer trap the tool after FCS analysis
+  has already completed.
+- `fcs_refactor_impact` now preserves the active solution as a separate discovery context when an
+  explicit production `.fsproj` is supplied. It propagates test coverage/outcome and pagination
+  metadata, returns `status="partial"` for incomplete evidence, and labels page-derived file/project
+  counts as lower bounds. `crossProject` stays unknown until delivery is complete instead of
+  turning an incomplete page or test sweep into a successful false-negative.
+- Shared project-file filtering now uses path-segment containment rather than a raw string prefix
+  (#241), so a sibling such as `ProjectSibling/` is no longer mistaken for `Project/`; filesystem
+  roots remain valid workspaces. Test-source filename detection also avoids false positives such
+  as `Contest.fs`, `Latest.fs`, and `Protest.fs` while preserving conventional `FooTests.fs` and
+  delimited `_test`/`-test` names.
+- The FsMcp-to-official-SDK adapter now forwards structured `TransportError` JSON byte-for-byte
+  instead of wrapping it in F# `%A` debug syntax (#242). Typed `InvalidArgs`, `NotReady`,
+  `FcsAborted`, and infrastructure envelopes therefore remain directly machine-readable in
+  `isError=true` MCP responses.
 - `find(kind="members", query="Resolve", member="Resolve")` now treats `query` as matching either
   the requested member or its declaring type (#219). The documented member-name form previously
   applied `query` only to the declaring entity, so four real internal-member calls could produce a
@@ -30,6 +109,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `downstreamProjectsChecked=false`, `recommendedScope="workspace"`, and a coverage note (#222).
   It does not run another ProjInfo/MSBuild sweep merely to count consumers. A workspace request
   against one `.fsproj` is rejected instead of returning a misleading one-project workspace verdict.
+- `check` now preserves typed blocking causes when a semantic verdict is `unknown` (#244).
+  An unavailable exact SDK pin remains `verdict="unknown"` / `groundTruth=false`, while
+  `blockingReason.errorKind="sdk_not_found"` carries the requested SDK, visible installed SDKs,
+  selected dotnet host/root evidence, `global.json`, and remedies without parsing prose. Project
+  checks expose the cause at the top level; workspace checks keep it on the affected project.
+  Timeout, cancellation, worker-busy, and generic project failures use distinct typed causes in
+  trusted and fast modes. Fast file checks retain the SDK blocker even when the owning project is
+  auto-discovered. `find` now attaches the same SDK evidence to its existing `sdk_not_found`
+  per-project row, and SDK roots reported by `dotnet --list-sdks` are preserved.
 - `fcs_nuget_members` now recovers exact method accessibility from ECMA-335 metadata when
   available, keeps protected members in the default surface, reports `isAbstract`, and emits
   generic constraints both in `signature` and structured `genericParameters` (#223). Metadata is
@@ -986,7 +1074,8 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
   above), so it has no link definition either — 0.15.0 compares from the
   last version that actually was tagged, 0.13.2.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.13.2...v0.15.0
 [0.13.2]: https://github.com/Neftedollar/FsLangMCP/releases/tag/v0.13.2

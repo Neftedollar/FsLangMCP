@@ -2,7 +2,7 @@
 
 The MCP description tells you *whether* to call a tool; this file tells you *how it works internally*.
 
-**Start here.** `find` and `check` are the primary entry points in the 35-tool v0.16.0 surface.
+**Start here.** `find` and `check` are the primary entry points in the 35-tool v0.17.0 surface.
 The consolidation aliases below were removed in v0.13.1 and are no longer registered:
 
 | Removed names | Current route |
@@ -129,10 +129,20 @@ note-less, because none of them reach the code that builds the note.
   that one project (faster, but misses cross-project usages). This is the discoverability that
   answers the field report behind #193: a 40 s sweep against a solution/directory target now tells
   the caller, in the response, how to narrow it next time.
-- **Coverage is never overstated**: if a project timed out or failed before analysis completed
+- **Coverage is never overstated**: if a project timed out, failed, or was rejected as busy before analysis completed
   (`status="partial"`/`"unknown"`, `projectsAnalyzed < projectsRequested`), the note says "analyzed
   K of N" instead of "swept N" and calls out the incompleteness explicitly, instead of claiming a
   sweep happened that didn't.
+
+### Result delivery vs sweep coverage (#235)
+
+`coverage.complete` and `resolution.complete` answer different questions. Coverage is true when
+every requested project was analyzed. Resolution is true only when the current response starts at
+offset zero and contains all `totalSites`. A first page capped by `maxResults` therefore has
+`coverage.complete=true` but `resolution.complete=false`; a later cursor page remains resolution-
+incomplete even when it is the final page and `truncated=false`, because that page omits earlier
+sites. For an exhaustive refactor count, follow `nextCursor`, reconcile against
+`totalEstimate.sites`, and treat only an unpaged offset-zero response as complete in isolation.
 
 ### kind and scope
 
@@ -279,7 +289,7 @@ the bare call already swept all of them.
 
 1. **Read `outcome` and `coverage.complete` before acting on absence.** `matched=false` /
    `outcome="not_found"` is emitted only after every requested FCS project completed. If any
-   project failed or timed out, `matched` is `null`, `outcome="indeterminate"`, and
+   project failed, timed out, or was rejected as busy, `matched` is `null`, `outcome="indeterminate"`, and
    `status="unknown"` unless another backend positively proves a match. Positive sites from an
    incomplete sweep use `status="partial"` because more sites may still exist.
 2. **`exact=true` is the default** — set `exact=false` for case-insensitive substring matching;
@@ -300,7 +310,7 @@ the bare call already swept all of them.
 
 **Routing description:** One trustworthy verdict for the active F# context. Bare `check()`
 suffices: returns `verdict` (`clean`|`errors`|`unknown`) after a FRESH in-process type-check, so it
-never reports a stale-`{}` false-clean and you don't fall back to `dotnet build`. Optional `scope`
+never reports a stale-`{}` false-clean within the current FCS/check profile. Optional `scope`
 (`auto`|`file`|`project`|`workspace`|`snippet`), `path`, `snippet` (inline source), `speed` (trusted
 default | `fast` = cached FSAC snapshot), and `severity` shape the request.
 
@@ -321,9 +331,18 @@ project, collapsed to a single `verdict`. No path, no project, no flags needed f
 
 | `verdict` | Meaning |
 |-----------|---------|
-| `clean` | The checked unit type-checked with zero errors |
+| `clean` | The checked unit type-checked with zero errors under the current FCS/check profile |
 | `errors` | At least one error-severity diagnostic |
 | `unknown` | The check could not run (no project context / resolution failed) — **not** clean |
+
+When `unknown` has a machine-actionable infrastructure cause, inspect `blockingReason` rather than
+parsing `reason`. An unavailable exact SDK pin reports `errorKind="sdk_not_found"` together with
+`requestedSdkVersion`, `installedSdks`, `dotnetHostPath`, configured `sdkRoots`, `globalJsonPath`,
+and `remedies`. Project/file checks place it at the top level; a trusted workspace check places it
+on the affected `perProject` row. Fast workspace expectation failures may expose multiple
+`blockingReasons`. Timeout, cancellation, admission pressure, generic project failures, and an
+untyped unavailable FSAC snapshot remain separately classified as `timeout`, `cancelled`,
+`fcs_worker_busy`, `project_failure`, and `fsac_unavailable`.
 
 | `speed` | Behaviour |
 |---------|-----------|
@@ -374,7 +393,8 @@ the rest of the scope is incomplete.
 ### Caveats
 
 1. **`unknown` ≠ `clean`** — `unknown` means the check could not run (no `set_project`, unresolved
-   options). Establish project context and retry; do not treat it as a pass.
+   options). Establish project context and retry; do not treat it as a pass. Prefer its structured
+   `blockingReason`/`blockingReasons` when present; `reason` remains the human-readable explanation.
 2. **`severity` filters the array only** — `errorCount`/`warningCount` always reflect the full
    result regardless of the `severity` cutoff applied to the returned `diagnostics`.
 3. **`totalDiagnostics = errorCount + warningCount + infoCount`, always** — `totalDiagnostics`
@@ -392,6 +412,10 @@ the rest of the scope is incomplete.
    fresh type-check of a just-written on-disk edit.
 5. **Project scope is not a workspace verdict** — read `downstreamProjectsChecked` and follow
    `recommendedScope` before treating a clean library check as evidence about tests/apps.
+6. **The current FCS/check profile is not every build configuration** — `clean` does not cover
+   configuration-specific compiler options that are absent from that profile. Optimized Release
+   compilation can surface diagnostics such as FS3511; before merge or release, run
+   `dotnet build -c Release --warnaserror`.
 
 ### Related tools
 
@@ -721,6 +745,35 @@ oversized type is never dropped into an empty page just because it alone exceeds
 - `fcs_file_outline` — shares the same response-char-budget mechanism for one file's outline.
 
 ---
+
+## fcs_project_outline
+
+`timeoutMs` is one end-to-end deadline (default 60,000 ms), not a fresh allowance per phase. Queue
+admission subtracts from it; project evaluation and each sequential file outline receive only the
+remainder. Negative values return `invalid_args` / `invalid_timeout`; zero returns deterministic
+`unknown` / `project_outline_timeout` before project evaluation starts.
+
+### Coverage and filtered pagination (#243)
+
+Read `status` together with the general `coverage` ledger. `filesRequested` reconciles into
+`filesScanned`, `filesTimedOut`, `filesFailed`, and `filesNotStarted`; `phases` and `issues` are
+bounded, with `issuesReturned` / `issuesTruncated` describing the sample. `ok` means the requested
+work completed, `partial` means at least one file was scanned but evidence is incomplete, and
+`unknown` means no file outline completed successfully.
+
+`filterCoverage` remains the semantic filter-exhaustiveness ledger. If filtered discovery is
+incomplete, `matchingFiles` and `totalEstimate.files` are lower bounds and the response suppresses
+`nextCursor`; `paginationRestartRequired=true` tells callers to retry from offset zero after the
+blocking work settles. This avoids a cursor that falsely implies the matching set was fully known.
+
+### Protected-worker lifetime
+
+FCS/MSBuild tasks are not reliably cancellable. If timeout or cancellation wins a race, the
+response may return while the actual task continues, but the shared FCS gate remains retained until
+that task really completes or faults. Deadline checks between options, parse, and check phases stop
+later phases from starting; the project loop never starts another file after expiry/cancellation.
+Public `fcs_file_outline` keeps its existing independent behavior—the deadline-aware core is used
+only by `fcs_project_outline` with one pre-resolved project-options snapshot.
 
 ## fcs_file_outline
 

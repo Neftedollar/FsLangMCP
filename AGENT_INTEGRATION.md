@@ -1,6 +1,6 @@
 # Agent Integration Guide
 
-This document describes a recommended workflow for AI coding agents (Claude Code, Cursor, GitHub Copilot CLI, Codex, etc.) that delegate F# work to subagents and use FsLangMCP as the semantic-query layer. It targets the 35-tool v0.16.0 surface and is opinionated — the patterns here came from real production multi-agent runs and have been refined through ~12 subagent sessions and ~700 tool calls against this server.
+This document describes a recommended workflow for AI coding agents (Claude Code, Cursor, GitHub Copilot CLI, Codex, etc.) that delegate F# work to subagents and use FsLangMCP as the semantic-query layer. It targets the 35-tool v0.17.0 surface and is opinionated — the patterns here came from real production multi-agent runs and have been refined through ~12 subagent sessions and ~700 tool calls against this server.
 
 ## Why this guide exists
 
@@ -33,9 +33,14 @@ Drop this into your project's `CLAUDE.md` (Claude Code), your `.cursorrules` (Cu
     `fcs_find_symbol`, `fcs_project_symbol_uses`, `fcs_find_member_usages`,
     `fcs_record_field_audit`, `textDocument_references`, and
     `textDocument_definition` were removed in v0.13.1; use `find` instead.
+    For exhaustive refactor counts, require both `coverage.complete=true` and
+    `resolution.complete=true`; follow `nextCursor` while `truncated=true`.
   - **"Did my edit compile?"** → `mcp__fslangmcp__check` (one
     `clean` / `errors` / `unknown` verdict from a FRESH in-process
-    type-check — no stale-`{}` false-clean, no `dotnet build` fallback).
+    type-check for the current FCS/check profile — no stale-`{}` false-clean).
+    A `clean` verdict is not the final Release gate: configuration-specific
+    diagnostics such as Release-only FS3511 require
+    `dotnet build -c Release --warnaserror` before merge or release.
     The former aliases `workspace_diagnostics`, `fsharp_compile`,
     `fcs_check_file`, `fcs_parse_and_check_file`, and `fcs_validate_snippet`
     were removed in v0.13.1; use `check` instead.
@@ -114,6 +119,14 @@ A minimal F# subagent brief skeleton. Embed your task-specific content where ind
   as needed. The removed `workspace_diagnostics`, `workspace_symbol`, and
   `textDocument_references` aliases are not available; use `find` / `check`.
 - `rg` is OK for non-F# files (.fsproj, .md, .json, .yml).
+- Before treating a `find` result as an exhaustive refactor plan, inspect both
+  `coverage.complete` (all requested projects analyzed) and `resolution.complete`
+  (the response contains the whole site set). Follow `nextCursor` while
+  `truncated=true`; a final cursor page still omits earlier pages by itself.
+- Treat `check(clean)` as evidence for the current FCS/check profile, not every
+  build configuration. Before merge or release, run
+  `dotnet build -c Release --warnaserror` to catch Release-only diagnostics such
+  as FS3511.
 - For NuGet third-party type enumeration: `fcs_nuget_types` (one package or
   assembly — `packageId` takes either spelling) and `fcs_referenced_symbols`
   (cross-assembly search), both shipped v0.7.0.

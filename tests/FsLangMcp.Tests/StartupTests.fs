@@ -3,9 +3,15 @@ module FsLangMcp.Tests.StartupTests
 open System
 open System.Diagnostics
 open System.IO
+open System.Threading
+open System.Threading.Tasks
 open System.Text.Json
+open System.Text.Json.Nodes
 open Xunit
 open FsLangMcp.Program
+open FsLangMcp.McpHost
+open FsMcp.Core
+open FsMcp.Server
 
 let private executablePath () =
     Path.Combine(
@@ -121,3 +127,201 @@ let ``stdio server answers MCP initialize without host file watching`` () =
                 server.Kill(true)
                 server.WaitForExit()
     }
+
+[<Fact>]
+let ``FCS admission bounds queued requests and never starts them after cancellation`` () =
+    task {
+        use gate = new SemaphoreSlim(2, 2)
+        use protectedCancellation = new CancellationTokenSource()
+        use queuedCancellation = new CancellationTokenSource()
+        let releaseProtected = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let protectedStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable protectedStarts = 0
+        let mutable lateStarts = 0
+
+        let protectedWork () =
+            runLimited gate protectedCancellation.Token (fun () ->
+                task {
+                    if Interlocked.Increment(&protectedStarts) = 2 then
+                        protectedStarted.TrySetResult(()) |> ignore
+
+                    do! releaseProtected.Task
+                    return JsonObject() :> JsonNode
+                })
+
+        let first = protectedWork ()
+        let second = protectedWork ()
+        do! protectedStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
+
+        // Once work has started, cancellation must not release its slots early.
+        protectedCancellation.Cancel()
+
+        let startLateWork () =
+            Interlocked.Increment(&lateStarts) |> ignore
+            Task.FromResult(JsonObject() :> JsonNode)
+
+        let stopwatch = Stopwatch.StartNew()
+
+        let deadlineRequest =
+            runLimitedWithTimeout gate CancellationToken.None (Some 100) (fun _ -> startLateWork ())
+
+        let cancelledRequest = runLimited gate queuedCancellation.Token startLateWork
+        queuedCancellation.CancelAfter(50)
+
+        let! deadlineResult = deadlineRequest
+        let! _ = Assert.ThrowsAnyAsync<OperationCanceledException>(fun () -> cancelledRequest :> Task)
+
+        stopwatch.Stop()
+        Assert.Equal("timeout", deadlineResult["status"].GetValue<string>())
+        Assert.Equal("fcs_admission_timeout", deadlineResult["errorKind"].GetValue<string>())
+        Assert.Equal(100, deadlineResult["timeoutMs"].GetValue<int>())
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(2.0), $"Queued requests took %O{stopwatch.Elapsed}.")
+        Assert.Equal(0, Volatile.Read(&lateStarts))
+        Assert.Equal(0, gate.CurrentCount)
+
+        releaseProtected.TrySetResult(()) |> ignore
+        let! _ = first
+        and! _ = second
+
+        do! Task.Delay(150)
+        Assert.Equal(0, Volatile.Read(&lateStarts))
+        Assert.Equal(2, gate.CurrentCount)
+    }
+
+[<Fact>]
+let ``FCS admission subtracts queue time from the operation timeout`` () =
+    task {
+        use gate = new SemaphoreSlim(1, 1)
+        do! gate.WaitAsync()
+
+        let mutable remainingTimeoutMs = None
+
+        let request =
+            runLimitedWithTimeout gate CancellationToken.None (Some 2_000) (fun remaining ->
+                remainingTimeoutMs <- remaining
+                Task.FromResult(JsonObject() :> JsonNode))
+
+        do! Task.Delay(100)
+        gate.Release() |> ignore
+        let! _ = request
+
+        match remainingTimeoutMs with
+        | Some remaining -> Assert.InRange(remaining, 1, 1_950)
+        | None -> Assert.Fail("The admitted operation did not receive its remaining timeout.")
+    }
+
+[<Fact>]
+let ``FCS admission rejects negative timeouts before waiting`` () =
+    task {
+        use gate = new SemaphoreSlim(0, 1)
+        let mutable starts = 0
+
+        for timeoutMs in [ -1; Int32.MinValue ] do
+            let stopwatch = Stopwatch.StartNew()
+
+            let! result =
+                runLimitedWithTimeout gate CancellationToken.None (Some timeoutMs) (fun _ ->
+                    Interlocked.Increment(&starts) |> ignore
+                    Task.FromResult(JsonObject() :> JsonNode))
+
+            stopwatch.Stop()
+            Assert.Equal("invalid_args", result["status"].GetValue<string>())
+            Assert.Equal("invalid_timeout", result["errorKind"].GetValue<string>())
+            Assert.Equal(timeoutMs, result["timeoutMs"].GetValue<int>())
+            Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(1.0))
+
+        Assert.Equal(0, Volatile.Read(&starts))
+        Assert.Equal(0, gate.CurrentCount)
+    }
+
+[<Fact>]
+let ``FCS admission rechecks cancellation after receiving a slot`` () =
+    task {
+        use gate = new SemaphoreSlim(1, 1)
+        use cancellation = new CancellationTokenSource()
+        let mutable starts = 0
+
+        let request =
+            runLimitedWithTimeoutCore
+                gate
+                cancellation.Token
+                None
+                cancellation.Cancel
+                (fun _ ->
+                    Interlocked.Increment(&starts) |> ignore
+                    Task.FromResult(JsonObject() :> JsonNode))
+
+        let! _ = Assert.ThrowsAnyAsync<OperationCanceledException>(fun () -> request :> Task)
+        Assert.Equal(0, Volatile.Read(&starts))
+        Assert.Equal(1, gate.CurrentCount)
+    }
+
+[<Fact>]
+let ``FCS admission restores its slot for synchronous faulted and cancelled work`` () =
+    task {
+        use gate = new SemaphoreSlim(1, 1)
+
+        let synchronous =
+            runLimited gate CancellationToken.None (fun () ->
+                raise (InvalidOperationException("synchronous")))
+
+        let! _ = Assert.ThrowsAsync<InvalidOperationException>(fun () -> synchronous :> Task)
+        Assert.Equal(1, gate.CurrentCount)
+
+        let faulted =
+            runLimited gate CancellationToken.None (fun () ->
+                Task.FromException<JsonNode>(InvalidOperationException("faulted")))
+
+        let! _ = Assert.ThrowsAsync<InvalidOperationException>(fun () -> faulted :> Task)
+        Assert.Equal(1, gate.CurrentCount)
+
+        use workCancellation = new CancellationTokenSource()
+        workCancellation.Cancel()
+
+        let cancelled =
+            runLimited gate CancellationToken.None (fun () ->
+                Task.FromCanceled<JsonNode>(workCancellation.Token))
+
+        let! _ = Assert.ThrowsAnyAsync<OperationCanceledException>(fun () -> cancelled :> Task)
+        Assert.Equal(1, gate.CurrentCount)
+    }
+
+[<Fact>]
+let ``retained protected worker keeps FCS slot through response and fault then releases`` () =
+    task {
+        use gate = new SemaphoreSlim(1, 1)
+
+        let retainedWorker =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let mutable lateStarts = 0
+
+        let! response =
+            runLimitedWithTimeoutRetained gate CancellationToken.None (Some 1_000) (fun _ retainUntil ->
+                retainUntil retainedWorker.Task
+                Task.FromResult(JsonObject() :> JsonNode))
+
+        Assert.NotNull(response)
+        Assert.Equal(0, gate.CurrentCount)
+
+        let! queued =
+            runLimitedWithTimeoutRetained gate CancellationToken.None (Some 0) (fun _ _ ->
+                Interlocked.Increment(&lateStarts) |> ignore
+                Task.FromResult(JsonObject() :> JsonNode))
+
+        Assert.Equal("fcs_admission_timeout", queued["errorKind"].GetValue<string>())
+        Assert.Equal(0, Volatile.Read(&lateStarts))
+
+        retainedWorker.TrySetException(InvalidOperationException("retained worker fault"))
+        |> ignore
+
+        do! gate.WaitAsync().WaitAsync(TimeSpan.FromSeconds(2.0))
+        Assert.Equal(0, gate.CurrentCount)
+        gate.Release() |> ignore
+        Assert.Equal(1, gate.CurrentCount)
+    }
+
+[<Fact>]
+let ``MCP adapter preserves structured transport errors without debug wrapping (#242)`` () =
+    let payload = "{\"errorKind\":\"FcsAborted\",\"message\":\"cancelled\"}"
+    Assert.Equal(payload, mcpErrorText (McpError.TransportError payload))

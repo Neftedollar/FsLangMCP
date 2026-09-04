@@ -60,8 +60,13 @@ Full setup: [`docs/getting-started.md`](docs/getting-started.md) · Per-client c
 
 | Tool | What it does |
 |------|--------------|
-| `find` | Multi-project semantic search with explicit coverage. A failed/timed-out project makes absence indeterminate instead of returning a false `matched=false`. |
-| `check` | One trustworthy verdict (`clean`/`errors`/`unknown`). Default mode is a fresh FCS check; fast FSAC mode returns `clean` only with complete current coverage. Project scope warns that downstream consumers were not checked; workspace scope requires a solution or directory. |
+| `find` | Multi-project semantic search with explicit sweep and delivery completeness. A failed/timed-out/busy project makes absence indeterminate; pagination keeps `resolution.complete=false` until one response contains the whole site set. |
+| `check` | One trustworthy verdict (`clean`/`errors`/`unknown`) for the current FCS/check profile. Default mode is a fresh FCS check; fast FSAC mode returns `clean` only with complete current coverage. An `unknown` caused by SDK/preflight failure includes a typed `blockingReason`. Project scope warns that downstream consumers were not checked; workspace scope requires a solution or directory. |
+
+`check` is the fast semantic edit loop, not the final Release gate. A `clean` verdict covers the
+compiler options in its current FCS/check profile; configuration-specific diagnostics such as
+Release-only FS3511 can still appear under optimized compilation. Before merge or release, run
+`dotnet build -c Release --warnaserror`.
 
 ### Navigate / understand
 
@@ -69,7 +74,7 @@ Full setup: [`docs/getting-started.md`](docs/getting-started.md) · Per-client c
 |------|--------------|
 | `set_project` | Initialize or switch FSAC/LSP context. Results are bound to the active project and session generation; a no-restart cross-project switch is rejected. |
 | `project_health` | Fast read-only preflight: options readiness, source files, analyzer setup, test project discovery. No build, no tests. |
-| `fcs_project_outline` | Compact project-wide outline over all compile files. |
+| `fcs_project_outline` | Deadline-bounded project outline (default `timeoutMs=60000`). `coverage` reports requested/scanned/timed-out/failed/not-started files; filtered incomplete discovery returns no continuation cursor. Direct test projects include compile sources while result/build artifacts stay excluded. |
 | `fcs_file_outline` | Per-file outline with attributes, bounded/truncation-aware CustomOperation and diagnostic arrays, and a hard serialized-response guard; `summaryOnly=true` (default) keeps token cost low. |
 | `fsharp_project_inspect` | Read-only `.fsproj` inspection: compile order, references, signature/implementation pairing. |
 | `fcs_symbol_at_word` | Tolerant symbol lookup by line + word — no exact cursor column needed. |
@@ -91,7 +96,7 @@ Full setup: [`docs/getting-started.md`](docs/getting-started.md) · Per-client c
 | `fcs_rename_preview` | Preview a semantic rename's full impact (edits grouped by file, with before/after text) without writing. |
 | `fcs_refactor_impact` | Blast-radius preview: uses, tests, compile order, public API — all orchestrated in one call. |
 | `fcs_make_internal_visible` | Drop `private` from a declaration at a position; returns a workspace edit, writes nothing. |
-| `fcs_tests_for_symbol` | List the tests that likely cover a symbol (test-file uses + enclosing test name). |
+| `fcs_tests_for_symbol` | Coverage-aware, bounded test-project sweep. Returns reference sites plus enclosing test names, separate site/unique-test counts, pagination, and per-project failure/timeout evidence. |
 
 ### Review / cleanup
 
@@ -144,7 +149,7 @@ Prefer the semantic tools above for free-form agent flows.
 
 ```
 1. set_project  {"projectPath": "/abs/path/MyApp.sln"}
-   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.16.0"
+   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.17.0"
 
 2. check  {}
    → verdict="clean"
@@ -248,7 +253,11 @@ running FSAC process was actually replaced. FSAC-derived responses include
 
 `find` has its own completeness contract: `status="partial"` means matches were
 found but some projects were not analyzed; `status="unknown"` plus
-`resolution.matched=null` means absence could not be proven. `check(speed="fast")`
+`resolution.matched=null` means absence could not be proven. Separately,
+`coverage.complete` says whether the project sweep finished, while
+`resolution.complete` says whether this response delivered the entire site set; follow
+`truncated` / `nextCursor` and verify `totalEstimate.sites` before treating a refactor count as
+exhaustive. `check(speed="fast")`
 similarly exposes expected/received/missing/stale file coverage and never turns an
 incomplete empty snapshot into `clean`.
 

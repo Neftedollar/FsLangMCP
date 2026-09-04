@@ -45,6 +45,11 @@ let private toSdkContentBlock (content: Content) : ContentBlock =
 
         EmbeddedResourceBlock(Resource = sdkResource) :> ContentBlock
 
+let internal mcpErrorText (error: McpError) =
+    match error with
+    | McpError.TransportError payload -> payload
+    | other -> $"%A{other}"
+
 type private ToolAIFunction(definition: ToolDefinition) =
     inherit AIFunction()
 
@@ -87,7 +92,7 @@ type private ToolAIFunction(definition: ToolDefinition) =
                 | Error error ->
                     return
                         CallToolResult(
-                            Content = [| TextContentBlock(Text = $"%A{error}") |],
+                            Content = [| TextContentBlock(Text = mcpErrorText error) |],
                             IsError = true
                         )
                         :> obj

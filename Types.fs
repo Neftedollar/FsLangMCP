@@ -267,8 +267,14 @@ type FcsTestsForSymbolArgs =
       text: string option
       /// .fsproj / .sln / .slnx / directory to sweep. Falls back to active set_project.
       projectPath: string option
-      /// Maximum test sites returned. Default 100.
-      maxResults: int option }
+      /// Maximum test sites returned per page. Default 100.
+      maxResults: int option
+      /// Overall wall-clock budget in ms for the whole multi-project test sweep.
+      /// Default 120000 (120 s). Must be non-negative; 0 requests an immediate,
+      /// typed timeout result.
+      timeoutMs: int option
+      /// Opaque cursor from a prior call's nextCursor. Omit for the first page.
+      cursor: string option }
 
 type CheckArgs =
     { /// What to check: "auto" (default) | "file" | "project" | "workspace" | "snippet".
@@ -332,7 +338,10 @@ type FcsProjectOutlineArgs =
       /// Regex applied to member names/signatures before truncation.
       filter: string option
       /// OR-joined substring list applied to member names before truncation.
-      nameContains: string list option }
+      nameContains: string list option
+      /// End-to-end timeout in milliseconds, including FCS queue admission and project
+      /// evaluation. Must be non-negative. Default: 60000.
+      timeoutMs: int option }
 
 type FSharpProjectInspectArgs =
     { /// .fsproj to inspect. Falls back to active set_project when omitted.

@@ -5,8 +5,11 @@ open System
 open System.Diagnostics
 open System.IO
 open System.Text.Json
+open System.Text.Json.Nodes
 open System.Threading.Tasks
 open Xunit
+open FsLangMcp.Types
+open FsLangMcp.FcsBridge
 open FsLangMcp.LspBridge
 
 [<CollectionDefinition("FsLangMcp LSP process isolation", DisableParallelization = true)>]
@@ -543,11 +546,13 @@ let ``diagnostic snapshots fail fast instead of queueing behind an in-flight LSP
         let sourcePath = Path.Combine(root, "App.fs")
         let scriptPath = Path.Combine(root, "slow-fsac.fsx")
         let markerPath = Path.Combine(root, "formatting-entered")
+        let checkSourcePath = Path.Combine(Path.GetTempPath(), $"fslangmcp_diag_gate_check_{Guid.NewGuid():N}.fs")
 
         try
             Directory.CreateDirectory(root) |> ignore
             File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
             File.WriteAllText(sourcePath, "module App\nlet value = 1\n")
+            File.WriteAllText(checkSourcePath, "module StandaloneCheck\nlet value = 1\n")
             File.WriteAllText(scriptPath, fakeFsacScriptWithSlowFormatting markerPath 1500)
 
             let evaluatedFiles (_: string) = Task.FromResult(Ok [| sourcePath |])
@@ -602,8 +607,44 @@ let ``diagnostic snapshots fail fast instead of queueing behind an in-flight LSP
                 Assert.False(response["contextMatched"].GetValue<bool>())
                 Assert.False(response["complete"].GetValue<bool>())
                 Assert.Equal("lsp_lifecycle_gate_busy", response["reason"].GetValue<string>())
+                Assert.Equal("fcs_worker_busy", response["errorKind"].GetValue<string>())
+                Assert.True(response["retryable"].GetValue<bool>())
                 Assert.Contains("no snapshot work was queued", response["message"].GetValue<string>())
+
+                let snapshot = CheckFsacSnapshot.ofDiagnosticsResponse response
+                Assert.Equal(1, snapshot.BlockingReasons.Length)
+                Assert.Equal("fcs_worker_busy", (snapshot.BlockingReasons[0]["errorKind"]).GetValue<string>())
+                Assert.True((snapshot.BlockingReasons[0]["retryable"]).GetValue<bool>())
+
+            let checkBridge = FcsBridge()
+
+            let exactBusySnapshot (_: CheckFsacExpectation) =
+                responses[0]
+                |> CheckFsacSnapshot.ofDiagnosticsResponse
+                |> Task.FromResult
+
+            let! checkedResult =
+                checkBridge.Check(
+                    { scope = Some "file"
+                      path = Some checkSourcePath
+                      snippet = None
+                      fileGlob = None
+                      mode = None
+                      speed = Some "fast"
+                      severity = None
+                      projectPath = None
+                      timeoutMs = Some 5_000 },
+                    fsacSnapshot = exactBusySnapshot
+                )
+
+            Assert.Equal("unknown", checkedResult["verdict"].GetValue<string>())
+            Assert.False(checkedResult["analyzed"].GetValue<bool>())
+            Assert.Equal("fcs_worker_busy", (checkedResult["blockingReason"]["errorKind"]).GetValue<string>())
+            Assert.True((checkedResult["blockingReason"]["retryable"]).GetValue<bool>())
         finally
+            if File.Exists checkSourcePath then
+                File.Delete(checkSourcePath)
+
             if Directory.Exists root then
                 Directory.Delete(root, true)
     }

@@ -456,6 +456,8 @@ type internal CheckFsacExpectation =
       Complete: bool
       /// Why expectation derivation was incomplete, when applicable.
       FailureReason: string option
+      /// Structured causes preserved while deriving evaluated SourceFiles.
+      BlockingReasons: JsonNode array
       /// Workspace-only URI glob preserved from CheckArgs.
       FileGlob: string option }
 
@@ -481,6 +483,8 @@ type internal CheckFsacSnapshot =
       SessionGeneration: int64 option
       /// Typed failure/readiness/context explanation, when present.
       FailureReason: string option
+      /// Structured causes preserved from expectation derivation or FSAC startup.
+      BlockingReasons: JsonNode array
       /// Number of expected files FSAC currently holds diagnostics for.
       AnalyzedFileCount: int
       /// Error-severity (LSP code 1) diagnostics across the snapshot.
@@ -496,6 +500,13 @@ type internal CheckFsacSnapshot =
       /// the warnings the caller asked for — not just errors.
       Diagnostics: JsonNode }
 
+let private checkGenericBlockingReason errorKind message retryable =
+    jobj
+        [ "errorKind", jstr errorKind
+          "message", jstr message
+          "retryable", jbool retryable ]
+    :> JsonNode
+
 [<RequireQualifiedAccess>]
 module internal CheckFsacSnapshot =
 
@@ -510,6 +521,7 @@ module internal CheckFsacSnapshot =
           StaleFiles = [||]
           SessionGeneration = None
           FailureReason = Some "No context-bound FSAC diagnostics snapshot was supplied."
+          BlockingReasons = [||]
           AnalyzedFileCount = 0
           ErrorCount = 0
           WarningCount = 0
@@ -520,7 +532,27 @@ module internal CheckFsacSnapshot =
         { empty with
             ExpectedFiles = Array.copy expectation.ExpectedFiles
             MissingFiles = Array.copy expectation.ExpectedFiles
-            FailureReason = Some reason }
+            FailureReason = Some reason
+            BlockingReasons = expectation.BlockingReasons |> Array.map _.DeepClone() }
+
+    let unavailableWithBlockingReason
+        (expectation: CheckFsacExpectation)
+        (reason: string)
+        (blockingReason: JsonNode)
+        : CheckFsacSnapshot =
+        { unavailable expectation reason with
+            BlockingReasons =
+                Array.append
+                    (expectation.BlockingReasons |> Array.map _.DeepClone())
+                    [| blockingReason.DeepClone() |] }
+
+    let unavailableWithTypedFailure
+        (expectation: CheckFsacExpectation)
+        (reason: string)
+        (errorKind: string)
+        (retryable: bool)
+        : CheckFsacSnapshot =
+        unavailableWithBlockingReason expectation reason (checkGenericBlockingReason errorKind reason retryable)
 
     /// Projects the context-bound DiagnosticsForContext envelope into a snapshot.
     /// Tolerant of missing fields — anything it cannot read degrades toward `empty`,
@@ -589,8 +621,35 @@ module internal CheckFsacSnapshot =
             let missingFiles = readStringArray "missingFiles"
             let staleFiles = readStringArray "staleFiles"
             let sessionGeneration = readInt64 "sessionGeneration"
-            let fileCount = readInt "diagnosticsFileCount" |> Option.defaultValue receivedFiles.Length
-            let failureReason = readString "message"
+
+            let fileCount =
+                readInt "diagnosticsFileCount" |> Option.defaultValue receivedFiles.Length
+
+            let responseReason = readString "reason"
+
+            let failureReason =
+                readString "message" |> Option.orElse responseReason
+
+            let blockingReasons =
+                match resp["blockingReasons"], resp["blockingReason"], readString "errorKind" with
+                | (:? JsonArray as reasons), _, _ when reasons.Count > 0 ->
+                    reasons |> Seq.map _.DeepClone() |> Seq.toArray
+                | _, reason, _ when not (isNull reason) -> [| reason.DeepClone() |]
+                | _, _, Some _ -> [| resp.DeepClone() |]
+                | _ ->
+                    match responseReason with
+                    | Some "lsp_lifecycle_gate_busy" ->
+                        let message =
+                            failureReason
+                            |> Option.defaultValue
+                                "The diagnostics snapshot was not admitted because another LSP operation is in progress."
+
+                        [| checkGenericBlockingReason "fcs_worker_busy" message true |]
+                    | _ ->
+                        failureReason
+                        |> Option.map (fun message ->
+                            [| checkGenericBlockingReason "fsac_unavailable" message true |])
+                        |> Option.defaultValue [||]
 
             let analyzedAt =
                 let read (key: string) =
@@ -657,6 +716,7 @@ module internal CheckFsacSnapshot =
               StaleFiles = staleFiles
               SessionGeneration = sessionGeneration
               FailureReason = failureReason
+              BlockingReasons = blockingReasons
               AnalyzedFileCount = fileCount
               ErrorCount = errorCount
               WarningCount = warningCount
@@ -1277,24 +1337,54 @@ module private ReviewScanner =
         List.ofSeq acc
 
 
-// Compiled once for all fcs_tests_for_symbol requests.
+// Shared linear-time regexes for fcs_tests_for_symbol. The explicit timeout is a
+// second safety boundary around the synchronous enclosing-test scan: the outer
+// stopwatch is cooperative and cannot interrupt a Regex.Match already in flight.
+let private enclosingTestRegexOptions =
+    System.Text.RegularExpressions.RegexOptions.NonBacktracking
+
+let private enclosingTestRegexTimeout = TimeSpan.FromSeconds 1.0
+
 let private testAttrRegex =
     System.Text.RegularExpressions.Regex(
         """\[<\s*(?:[\w.]+\.)?(?:Fact|Theory|Test|TestCase|TestMethod|Property)(?:Attribute)?\b""",
-        System.Text.RegularExpressions.RegexOptions.Compiled
+        enclosingTestRegexOptions,
+        enclosingTestRegexTimeout
     )
 
 let private expectoLabelRegex =
     System.Text.RegularExpressions.Regex(
         "\\b(?:ftestCaseAsync|ptestCaseAsync|testCaseAsync|ftestCase|ptestCase|testCase|ftestAsync|ptestAsync|testAsync|ftestProperty|ptestProperty|testProperty|test)\\s+\"([^\"]*)\"",
-        System.Text.RegularExpressions.RegexOptions.Compiled
+        enclosingTestRegexOptions,
+        enclosingTestRegexTimeout
     )
 
 let private bindingNameRegex =
     System.Text.RegularExpressions.Regex(
         """\b(?:let|member)\s+(?:rec\s+|inline\s+|mutable\s+|private\s+|internal\s+|this\.|_\.)*(``[^`]+``|[A-Za-z_][\w']*)""",
-        System.Text.RegularExpressions.RegexOptions.Compiled
+        enclosingTestRegexOptions,
+        enclosingTestRegexTimeout
     )
+
+// A test binding cannot own source that has crossed into a later declaration
+// scope, even when no intervening let/member exists. This is deliberately
+// line-oriented and conservative: module/namespace/type/exception declarations
+// mutually-recursive `and` declarations, and module/type initializers (`do`/`do!`)
+// at the same or shallower indentation terminate the enclosing-test candidate.
+// The `do` alternative consumes any F# token delimiter but excludes identifier
+// continuations, so `do`, `do(...)`, `do(*comment*)`, and `do//comment` match while
+// `double` and an identifier such as `do'` do not.
+let private enclosingTestScopeBoundaryRegex =
+    System.Text.RegularExpressions.Regex(
+        """^\s*(?:(?:module|namespace)\s+(?:rec\s+)?|(?:type|exception|and)\s+|do(?:[^\w']|$))""",
+        enclosingTestRegexOptions,
+        enclosingTestRegexTimeout
+    )
+
+type private EnclosingTestIdentity =
+    { Name: string
+      StartLine: int
+      StartColumn: int }
 
 let private fsharpTypeNameRegex =
     System.Text.RegularExpressions.Regex(
@@ -1864,6 +1954,25 @@ type internal BoundedCheckWorkBusyException(operation: string, target: string) =
     member _.Operation = operation
     member _.Target = target
 
+/// Machine-readable reason why a trusted Check could not produce a semantic
+/// verdict. Keep this typed until the response boundary: collapsing an SDK
+/// pre-flight exception to `ex.Message` made `check` the odd tool out (#244).
+[<NoComparison; NoEquality>]
+type internal CheckBlockingFailure =
+    | CheckTimedOut
+    | CheckCancelled of message: string
+    | CheckBusy of message: string
+    | CheckSdkNotFound of failure: SdkPreflight.SdkNotFoundException
+    | CheckProjectFailure of message: string
+
+let rec private boundedCheckWorkFailureIsBusy (ex: exn) =
+    match ex with
+    | :? BoundedCheckWorkBusyException -> true
+    | :? AggregateException as aggregate ->
+        aggregate.Flatten().InnerExceptions |> Seq.exists boundedCheckWorkFailureIsBusy
+    | _ when not (isNull ex.InnerException) -> boundedCheckWorkFailureIsBusy ex.InnerException
+    | _ -> false
+
 /// No-queue admission for Check work that cannot be cancelled once it has started.
 /// Exact-key callers share a Lazy task outside this type; a distinct key is rejected
 /// immediately rather than becoming an abandoned waiter after its caller times out.
@@ -2274,6 +2383,11 @@ type internal FcsBridge
         ?freshProjectCheckConcurrencyOverride: int,
         ?freshProjectCheckBeforeAdmissionOverride: (unit -> Task),
         ?freshProjectCheckBeforeFcsStartOverride: (unit -> Task),
+        ?projectSweepWorkerOverride: (string -> Task<FSharpSymbolUse array * FSharpDiagnostic array>),
+        ?testsForSymbolSiteScanBeforeUseOverride: (unit -> unit),
+        ?testsForSymbolFailureDeadlineExpiredOverride: (unit -> bool),
+        ?testsForSymbolProjectSweepWaitMsOverride: (int -> int),
+        ?projectOutlineFileOutlineOverride: (FcsFileOutlineArgs -> Task<JsonNode>),
         ?checkFastSnapshotDeadlineExpiredOverride: (unit -> bool),
         // #207: test-only seam for find's PER-SITE siteType deadline. The production check
         // is `sweepSw.ElapsedMilliseconds >= sweepBudgetMs`, which cannot be driven from a
@@ -2283,7 +2397,8 @@ type internal FcsBridge
         // returning and its site loop finishing) deterministically testable.
         ?findSiteTypeDeadlineExpiredOverride: (unit -> bool),
         ?referenceResolutionProbeOverride: (string array -> int * int),
-        ?projectOptionsCacheValidationBeforeComputeOverride: (string -> unit)
+        ?projectOptionsCacheValidationBeforeComputeOverride: (string -> unit),
+        ?trustedFileCheckAnswerOverride: (FSharpCheckFileAnswer -> FSharpCheckFileAnswer)
     ) =
     // FCS default projectCacheSize is 3. The `find` multi-project union sweep
     // (issue #128) re-checks EVERY member project of the active solution on each
@@ -2373,7 +2488,7 @@ type internal FcsBridge
         BoundedCheckWorkAdmission("reference resolution probe", 1)
 
     let referenceResolutionProbesInFlight =
-        ConcurrentDictionary<string, Lazy<Task<Result<int * int, string>>>>()
+        ConcurrentDictionary<string, Lazy<Task<Result<int * int, CheckBlockingFailure>>>>()
 
     let mutable freshProjectCheckGeneration = 0L
 
@@ -2398,6 +2513,14 @@ type internal FcsBridge
     // observe the same task instead of accumulating abandoned worker threads.
     let projectUsesInFlight =
         ConcurrentDictionary<string, Lazy<Task<FSharpSymbolUse array * FSharpDiagnostic array>>>()
+
+    // A caller deadline can expire while ParseAndCheckProject or the synchronous
+    // GetAllUsesOfAllSymbols walk is still running. Keep a separate actual-worker
+    // admission around that underlying work: the caller may return a typed timeout,
+    // but a distinct snapshot cannot accumulate another uncancellable sweep once all
+    // real worker slots are occupied. Exact-key callers still share projectUsesInFlight.
+    let projectUsesAdmission =
+        BoundedCheckWorkAdmission("project symbol-use sweep", freshProjectCheckCapacity)
 
     let mutable projectUsesCacheGeneration = 0L
 
@@ -2488,7 +2611,26 @@ type internal FcsBridge
 
         let operation = pending.Value
         observeFault operation
-        operation
+
+        match remainingBudget with
+        | None -> operation
+        | Some getRemaining ->
+            task {
+                let remaining = getRemaining ()
+
+                if remaining <= TimeSpan.Zero then
+                    return raise (TimeoutException("Analysis-snapshot budget was exhausted."))
+                else
+                    try
+                        return! operation.WaitAsync(remaining)
+                    with :? TimeoutException ->
+                        return
+                            raise (
+                                TimeoutException(
+                                    $"Analysis-snapshot computation exceeded the remaining %d{int remaining.TotalMilliseconds}ms budget."
+                                )
+                            )
+            }
 
     let resolveSingleCheckProject
         (target: string)
@@ -3417,12 +3559,12 @@ type internal FcsBridge
         (workKey: string)
         (otherOptions: string array)
         (remainingBudget: (unit -> TimeSpan) option)
-        : Task<Result<int * int, string>> =
+        : Task<Result<int * int, CheckBlockingFailure>> =
         let pending =
             referenceResolutionProbesInFlight.GetOrAdd(
                 workKey,
                 fun _ ->
-                    Lazy<Task<Result<int * int, string>>>(
+                    Lazy<Task<Result<int * int, CheckBlockingFailure>>>(
                         (fun () ->
                             task {
                                 try
@@ -3444,9 +3586,10 @@ type internal FcsBridge
 
                                         return Ok result
                                     with
-                                    | :? BoundedCheckWorkBusyException as ex -> return Error ex.Message
-                                    | :? TimeoutException -> return Error "timeout"
-                                    | ex -> return Error ex.Message
+                                    | :? OperationCanceledException as ex -> return Error(CheckCancelled ex.Message)
+                                    | :? BoundedCheckWorkBusyException as ex -> return Error(CheckBusy ex.Message)
+                                    | :? TimeoutException -> return Error CheckTimedOut
+                                    | ex -> return Error(CheckProjectFailure ex.Message)
                                 finally
                                     referenceResolutionProbesInFlight.TryRemove(workKey) |> ignore
                             }),
@@ -3499,7 +3642,16 @@ type internal FcsBridge
 
         let operation = pending.Value
         observeFault operation
-        operation
+
+        match remainingBudget with
+        | Some getRemaining ->
+            let remaining = getRemaining ()
+
+            if remaining <= TimeSpan.Zero then
+                Task.FromException<string>(TimeoutException("Analysis snapshot budget was exhausted."))
+            else
+                operation.WaitAsync(remaining)
+        | None -> operation
 
     let commitAnalysisSnapshotKey (projectOptions: FSharpProjectOptions) (key: string) =
         let projectIdentity = analysisProjectIdentity projectOptions
@@ -3896,17 +4048,22 @@ type internal FcsBridge
         accepted.ToArray(), renderedCharsUsed, truncated
 
     member private _.LoadProjectOptionsFromFsproj
-        (fsprojPath: string)
+        (fsprojPath: string, ensureCanContinue: unit -> unit)
         : Task<(FSharpProjectOptions * ProjectOptionsFingerprint * EvaluatedProjectSnapshot) option> =
         task {
             match projectEvaluationBeforeLoadOverride with
             | Some beforeLoad -> do! beforeLoad fsprojPath
             | None -> ()
 
+            // A caller deadline may expire while a test/probe/cache phase is awaiting.
+            // Recheck immediately before the non-cancellable MSBuild worker starts.
+            ensureCanContinue ()
+
             // Offload to thread pool — MSBuild/SDK probing is CPU+IO bound. The
             // caller owns the outer admission slot across this actual completion.
             return!
                 Task.Run(fun () ->
+                    ensureCanContinue ()
                     let projectDir = Path.GetDirectoryName(fsprojPath)
 
                     // #192: outside the try on purpose. Init.init inherits this
@@ -3936,7 +4093,7 @@ type internal FcsBridge
         }
 
     member private this.ResolveFsprojEntryWithinBudget
-        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option)
+        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option, waitWithinBudget: bool)
         : Task<ProjectOptionsCacheEntry> =
         let fullPath = normalizePath fsprojPath
         let fsprojKey = makeFsprojOptionsCacheKey fullPath
@@ -4004,7 +4161,7 @@ type internal FcsBridge
                                                     | None ->
                                                         ensureBudget ()
                                                         let! projInfoResult =
-                                                            this.LoadProjectOptionsFromFsproj(fullPath)
+                                                            this.LoadProjectOptionsFromFsproj(fullPath, ensureBudget)
 
                                                         match projInfoResult with
                                                         | Some(projOpts, fingerprint, evaluatedSnapshot) ->
@@ -4036,16 +4193,47 @@ type internal FcsBridge
 
         let work = pending.Value
         observeFault work
-        work
+
+        match remainingBudget, waitWithinBudget with
+        | _, false -> work
+        | None, true -> work
+        | Some getRemaining, true ->
+            task {
+                let remaining = getRemaining ()
+
+                if remaining <= TimeSpan.Zero then
+                    return raise (TimeoutException("Project-options evaluation budget was exhausted."))
+                else
+                    try
+                        return! work.WaitAsync(remaining)
+                    with :? TimeoutException ->
+                        return
+                            raise (
+                                TimeoutException(
+                                    $"Project-options evaluation for '%s{Path.GetFileName fullPath}' exceeded the remaining %d{int remaining.TotalMilliseconds}ms budget."
+                                )
+                            )
+            }
 
     member private this.ResolveFsprojEntry(fsprojPath: string) : Task<ProjectOptionsCacheEntry> =
-        this.ResolveFsprojEntryWithinBudget(fsprojPath, None)
+        this.ResolveFsprojEntryWithinBudget(fsprojPath, None, true)
 
     member private this.ResolveFsprojOptionsWithinBudget
         (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option)
         : Task<FSharpProjectOptions * string> =
         task {
-            let! entry = this.ResolveFsprojEntryWithinBudget(fsprojPath, remainingBudget)
+            let! entry = this.ResolveFsprojEntryWithinBudget(fsprojPath, remainingBudget, true)
+            return entry.Options, entry.Source
+        }
+
+    /// Returns the actual project-evaluation task rather than a timeout proxy around it.
+    /// ProjectOutline races this task itself so its outer FCS gate can retain the real lifetime.
+    member private this.ResolveFsprojOptionsActualWithinBudget
+        (fsprojPath: string, remainingBudget: unit -> TimeSpan)
+        : Task<FSharpProjectOptions * string> =
+        task {
+            let! entry = this.ResolveFsprojEntryWithinBudget(fsprojPath, Some remainingBudget, false)
+
             return entry.Options, entry.Source
         }
 
@@ -4115,17 +4303,35 @@ type internal FcsBridge
                         return scriptOptions, "scriptInference"
         }
 
-    member private this.PrepareCheckContext
-        (path: string, text: string option, projectPath: string option, projectOptions: string list option)
-        : Task<string * string * string * FSharpProjectOptions * FSharpParseFileResults * FSharpCheckFileResults option> =
+    member private this.PrepareCheckContextCore
+        (
+            path: string,
+            text: string option,
+            projectPath: string option,
+            projectOptions: string list option,
+            resolvedOptions: (FSharpProjectOptions * string) option,
+            ensureCanContinue: unit -> unit
+        ) : Task<
+                string * string * string * FSharpProjectOptions * FSharpParseFileResults * FSharpCheckFileResults option
+             >
+        =
         task {
+            ensureCanContinue ()
             let fullPath = normalizePath path
             let source = text |> Option.defaultWith (fun () -> File.ReadAllText(fullPath))
             let sourceText = SourceText.ofString source
-            let! options, optionsSource = this.ResolveProjectOptions(fullPath, source, projectPath, projectOptions)
+
+            let! options, optionsSource =
+                match resolvedOptions with
+                | Some context -> Task.FromResult context
+                | None -> this.ResolveProjectOptions(fullPath, source, projectPath, projectOptions)
+
+            ensureCanContinue ()
             let parsingOptions, _ = checker.GetParsingOptionsFromProjectOptions(options)
             let! parseResults = checker.ParseFile(fullPath, sourceText, parsingOptions) |> asTask
+            ensureCanContinue ()
             let! _, checkAnswer = checker.ParseAndCheckFileInProject(fullPath, 0, sourceText, options) |> asTask
+            ensureCanContinue ()
 
             let checkedResults =
                 match checkAnswer with
@@ -4134,6 +4340,11 @@ type internal FcsBridge
 
             return fullPath, source, optionsSource, options, parseResults, checkedResults
         }
+
+    member private this.PrepareCheckContext
+        (path: string, text: string option, projectPath: string option, projectOptions: string list option)
+        : Task<string * string * string * FSharpProjectOptions * FSharpParseFileResults * FSharpCheckFileResults option> =
+        this.PrepareCheckContextCore(path, text, projectPath, projectOptions, None, ignore)
 
     /// Invalidates FCS caches for this file's project and runs a fresh parse+check.
     /// Bypasses the cached projectResults that ProjectSymbolUses/FindSymbol may have
@@ -4494,381 +4705,411 @@ type internal FcsBridge
                     :> JsonNode
         }
 
-    member this.FileOutline(args: FcsFileOutlineArgs) : Task<JsonNode> =
+    member private this.FileOutlineCore
+        (
+            args: FcsFileOutlineArgs,
+            resolvedOptions: (FSharpProjectOptions * string) option,
+            ensureCanContinue: unit -> unit
+        ) : Task<JsonNode> =
         task {
             match validateSourcePath "fcs_file_outline" args.text args.path with
             | Some err -> return err
             | None ->
 
-            let! path, _, optionsSource, _, parseResults, checkedResults =
-                this.PrepareCheckContext(args.path, args.text, args.projectPath, args.projectOptions)
+                let! path, _, optionsSource, _, parseResults, checkedResults =
+                    this.PrepareCheckContextCore(
+                        args.path,
+                        args.text,
+                        args.projectPath,
+                        args.projectOptions,
+                        resolvedOptions,
+                        ensureCanContinue
+                    )
 
-            match checkedResults with
-            | None ->
-                let parseDiagnosticsAll =
-                    parseResults.Diagnostics |> Array.map diagnosticToJson
+                ensureCanContinue ()
 
-                let parseDiagnostics, _, parseDiagnosticsTruncatedByBudget =
-                    takeWithinRenderedBudget responseCharBudget 0 parseDiagnosticsAll
+                match checkedResults with
+                | None ->
+                    let parseDiagnosticsAll = parseResults.Diagnostics |> Array.map diagnosticToJson
 
-                let parseDiagnosticsArray = JsonArray(parseDiagnostics)
+                    let parseDiagnostics, _, parseDiagnosticsTruncatedByBudget =
+                        takeWithinRenderedBudget responseCharBudget 0 parseDiagnosticsAll
 
-                let response =
-                    jobj
-                        [ "status", jstr "aborted"
-                          "file", jstr path
-                          "optionsSource", jstr optionsSource
-                          "parseHadErrors", jbool parseResults.ParseHadErrors
-                          "message", jstr "Type checking was aborted. Outline is unavailable."
-                          "parseDiagnosticCount", jint parseDiagnosticsAll.Length
-                          "parseDiagnostics", parseDiagnosticsArray :> JsonNode
-                          "parseDiagnosticsTruncated", jbool parseDiagnosticsTruncatedByBudget
-                          "responseTruncatedByBudget", jbool parseDiagnosticsTruncatedByBudget
-                          "responseBudgetChars", jint outlineShippedResponseCharBudget
-                          "responseSizeHint", null ]
+                    let parseDiagnosticsArray = JsonArray(parseDiagnostics)
 
-                let updateAbortedBudgetMetadata () =
-                    let truncated = parseDiagnosticsArray.Count < parseDiagnosticsAll.Length
-                    response["parseDiagnosticsTruncated"] <- jbool truncated
-                    response["responseTruncatedByBudget"] <- jbool truncated
+                    let response =
+                        jobj
+                            [ "status", jstr "aborted"
+                              "file", jstr path
+                              "optionsSource", jstr optionsSource
+                              "parseHadErrors", jbool parseResults.ParseHadErrors
+                              "message", jstr "Type checking was aborted. Outline is unavailable."
+                              "parseDiagnosticCount", jint parseDiagnosticsAll.Length
+                              "parseDiagnostics", parseDiagnosticsArray :> JsonNode
+                              "parseDiagnosticsTruncated", jbool parseDiagnosticsTruncatedByBudget
+                              "responseTruncatedByBudget", jbool parseDiagnosticsTruncatedByBudget
+                              "responseBudgetChars", jint outlineShippedResponseCharBudget
+                              "responseSizeHint", null ]
 
-                    response["responseSizeHint"] <-
-                        if truncated then
-                            jstr
-                                $"Returned %d{parseDiagnosticsArray.Count} of %d{parseDiagnosticsAll.Length} parse diagnostics to keep the complete response within %d{outlineShippedResponseCharBudget} serialized characters. Use check(scope=\"file\") for a diagnostic-focused result."
-                        else
-                            null
+                    let updateAbortedBudgetMetadata () =
+                        let truncated = parseDiagnosticsArray.Count < parseDiagnosticsAll.Length
+                        response["parseDiagnosticsTruncated"] <- jbool truncated
+                        response["responseTruncatedByBudget"] <- jbool truncated
 
-                updateAbortedBudgetMetadata ()
+                        response["responseSizeHint"] <-
+                            if truncated then
+                                jstr
+                                    $"Returned %d{parseDiagnosticsArray.Count} of %d{parseDiagnosticsAll.Length} parse diagnostics to keep the complete response within %d{outlineShippedResponseCharBudget} serialized characters. Use check(scope=\"file\") for a diagnostic-focused result."
+                            else
+                                null
 
-                while
-                    renderedLength response > outlineShippedResponseCharBudget
-                    && parseDiagnosticsArray.Count > 0
-                    do
-                    parseDiagnosticsArray.RemoveAt(parseDiagnosticsArray.Count - 1)
                     updateAbortedBudgetMetadata ()
 
-                if renderedLength response > outlineShippedResponseCharBudget then
-                    return
-                        jobj
-                            [ "status", jstr "aborted"
-                              "errorCode", jstr "outline_response_budget_exceeded"
-                              "message",
-                              jstr
-                                  "The fixed outline response metadata exceeded its serialized-size ceiling after all variable arrays were removed."
-                              "responseTruncatedByBudget", jbool true
-                              "responseBudgetChars", jint outlineShippedResponseCharBudget ]
-                        :> JsonNode
-                else
-                    return response :> JsonNode
-            | Some checkResults ->
-                let includeLocal = args.includeLocal |> Option.defaultValue false
-                let includePrivate = args.includePrivate |> Option.defaultValue true
-                let summaryOnly = args.summaryOnly |> Option.defaultValue true
-                let maxResults = args.maxResults |> Option.defaultValue 200
-
-                // Full, untruncated definition set (lightweight symbol uses — no node
-                // building yet). memberCounts is derived from THIS so it reports true
-                // per-kind totals, while only the truncated slice pays for signature
-                // formatting — mirrors fcs_project_outline's count-vs-truncate split.
-                let allUses =
-                    checkResults.GetAllUsesOfAllSymbolsInFile()
-                    |> Seq.filter _.IsFromDefinition
-                    |> Seq.filter (fun symbolUse -> includeLocal || not (isNoisyLocalSymbol symbolUse))
-                    |> Seq.distinctBy (fun symbolUse ->
-                        let r = symbolUse.Range
-                        symbolUse.Symbol.FullName,
-                        r.StartLine,
-                        r.StartColumn,
-                        r.EndLine,
-                        r.EndColumn)
-                    |> Seq.sortBy (fun symbolUse ->
-                        let r = symbolUse.Range
-                        r.StartLine, r.StartColumn)
-                    |> Seq.toArray
-
-                // memberCounts: kind → count over the FULL (untruncated) definition set,
-                // so an agent sees true totals (e.g. "this 5k-line file has 320 functions")
-                // even when summaryOnly drops signatures and maxResults caps the array.
-                // Kind classification is cheap — no signature strings are formatted here.
-                let memberCounts =
-                    allUses
-                    |> Array.countBy (fun symbolUse -> symbolKind symbolUse.Symbol)
-                    |> Array.sortBy fst
-                    |> Array.map (fun (kind, n) -> kind, jint n)
-                    |> Array.toList
-                    |> jobj
-
-                // entries: only the surfaced slice is mapped to full nodes, so signature
-                // formatting cost stays bounded by maxResults.
-                let entries =
-                    allUses
-                    |> Array.truncate maxResults
-                    |> Array.map (fun symbolUse ->
-                        let attributes = attributesOfSymbol symbolUse.Symbol
-
-                        jobj
-                            [ "name", jstr symbolUse.Symbol.DisplayName
-                              "fullName", jstrOrNull symbolUse.Symbol.FullName
-                              "kind", jstr (symbolKind symbolUse.Symbol)
-                              "accessibility", symbolAccessibility symbolUse.Symbol
-                              "attributes", attributesToJson attributes
-                              "range", rangeToJson symbolUse.Range
-                              "signature", jstr (symbolTypeString symbolUse.Symbol)
-                              "declarationRange", tryDeclarationRange symbolUse.Symbol ]
-                        :> JsonNode)
-
-                // Computation-expression operation names live in
-                // CustomOperationAttribute constructor arguments and are not implied by
-                // the CLR/F# member name. Keep this compact index in BOTH summary modes,
-                // so agents can answer "which operations does this builder declare?"
-                // without requesting every signature from a large file.
-                let customOperationsAll =
-                    allUses
-                    |> Array.choose (fun symbolUse ->
-                        let customOperation =
-                            attributesOfSymbol symbolUse.Symbol
-                            |> Array.tryFind isCustomOperationAttribute
-
-                        customOperation
-                        |> Option.map (fun attribute ->
-                            jobj
-                                [ "operationName",
-                                  customOperationName attribute
-                                  |> Option.map jstr
-                                  |> Option.defaultValue null
-                                  "memberName", jstr symbolUse.Symbol.DisplayName
-                                  "fullName", jstrOrNull symbolUse.Symbol.FullName
-                                  "range", rangeToJson symbolUse.Range ]
-                            :> JsonNode))
-
-                let containerKinds =
-                    [| "module"; "record"; "union"; "class"; "interface"; "enum"; "delegate"; "namespace" |]
-
-                let headersOf (fullEntries: JsonNode array) : JsonNode array =
-                    fullEntries
-                    |> Array.filter (fun e ->
-                        match e["kind"] with
-                        | null -> false
-                        | k -> containerKinds |> Array.contains (k.GetValue<string>()))
-                    |> Array.map (fun e ->
-                        jobj
-                            [ "name", e["name"].DeepClone()
-                              "kind", e["kind"].DeepClone()
-                              "fullName",
-                              (match e["fullName"] with
-                               | null -> null
-                               | fn -> fn.DeepClone())
-                              "attributes", e["attributes"].DeepClone()
-                              "range",
-                              (match e["range"] with
-                               | null -> null
-                               | r -> r.DeepClone()) ]
-                        :> JsonNode)
-                let headerEntries = headersOf entries
-
-                // The compact index is derived from the full symbol set so its total is
-                // truthful, but the surfaced rows obey BOTH maxResults and the same
-                // rendered-size budget as outline entries. Without this bound, a file
-                // with hundreds of CustomOperation attributes could make summary mode
-                // larger than the full outline guard was designed to permit.
-                let requestedCustomOperations =
-                    customOperationsAll |> Array.truncate maxResults
-
-                // #206: summaryOnly=false asked for full per-member signatures, but a
-                // large file's full outline can still cross the shared response-char
-                // budget (54KB/65KB outlines observed in the field — issue #100 batch 6)
-                // even though maxResults already bounds entry COUNT; a handful of
-                // signature-heavy entries is enough. Measure the would-be full payload
-                // BEFORE committing to it and downgrade to the same header-only shape
-                // summaryOnly=true produces, rather than ever emitting an over-budget
-                // outline. Only measured when summaryOnly=false was actually requested —
-                // an explicit summaryOnly=true request is already small by construction.
-                // #206 review round 1 Imp-1 / round 2 N6: measured via the shared
-                // `Types.isOverRenderedBudget` — same shipped serialization as
-                // `responseCharBudget`'s comment describes, and it stops serializing
-                // further entries the moment the budget is already crossed rather than
-                // summing every one of `entries` (up to `maxResults`) regardless.
-                let overBudget =
-                    not summaryOnly
-                    && isOverRenderedBudget
-                        responseCharBudget
-                        (Seq.append entries requestedCustomOperations)
-
-                let downgradedToSummary = overBudget
-
-                // summaryOnly (default) OR a budget downgrade: module/type headers with
-                // name/kind/fullName/range only (no per-member signatures). Otherwise the
-                // full per-member output requested.
-                let surfacedEntryNodesAll =
-                    if summaryOnly || downgradedToSummary then headerEntries else entries
-
-                // Allocate one shared node budget across every variable-size array.
-                // Diagnostics used to sit outside this accounting, so a malformed file
-                // with thousands of errors could exceed one megabyte even in summary mode.
-                let surfacedEntryNodes, renderedAfterEntries, entriesTruncatedByBudget =
-                    takeWithinRenderedBudget responseCharBudget 0 surfacedEntryNodesAll
-
-                let customOperations, renderedAfterOperations, customOperationsTruncatedByBudgetInitial =
-                    takeWithinRenderedBudget responseCharBudget renderedAfterEntries requestedCustomOperations
-
-                let parseDiagnosticsAll =
-                    parseResults.Diagnostics |> Array.map diagnosticToJson
-
-                let parseDiagnostics, renderedAfterParseDiagnostics, parseDiagnosticsTruncatedByBudgetInitial =
-                    takeWithinRenderedBudget responseCharBudget renderedAfterOperations parseDiagnosticsAll
-
-                let checkDiagnosticsAll =
-                    checkResults.Diagnostics |> Array.map diagnosticToJson
-
-                let checkDiagnostics, _, checkDiagnosticsTruncatedByBudgetInitial =
-                    takeWithinRenderedBudget responseCharBudget renderedAfterParseDiagnostics checkDiagnosticsAll
-
-                let outEntriesArray = JsonArray(surfacedEntryNodes)
-                let customOperationsArray = JsonArray(customOperations)
-                let parseDiagnosticsArray = JsonArray(parseDiagnostics)
-                let checkDiagnosticsArray = JsonArray(checkDiagnostics)
-
-                let mutable customOperationsTruncatedByBudget =
-                    customOperationsTruncatedByBudgetInitial
-
-                let mutable parseDiagnosticsTruncatedByBudget =
-                    parseDiagnosticsTruncatedByBudgetInitial
-
-                let mutable checkDiagnosticsTruncatedByBudget =
-                    checkDiagnosticsTruncatedByBudgetInitial
-
-                // Additive-only (#206): present exactly when the requested summaryOnly=false
-                // was downgraded to headers because the full outline exceeded the budget —
-                // absent on every other path, so a small file with summaryOnly=false is a
-                // byte-for-byte unchanged response.
-                let downgradeFields =
-                    if downgradedToSummary then
-                        let hint =
-                            $"Full outline for this file exceeds the ~%d{responseCharBudget}-char response budget; returning summary-level headers (name/kind/fullName/attributes/range, no signatures) instead. Narrow with a smaller maxResults (currently %d{maxResults}) so the full per-member signatures for that slice fit within budget."
-
-                        [ "downgradedToSummary", jbool true; "hint", jstr hint ]
-                    else
-                        []
-
-                let response =
-                    jobj
-                        ([ "status", jstr "succeeded"
-                           "file", jstr path
-                           "optionsSource", jstr optionsSource
-                           "includePrivate", jbool includePrivate
-                           "includeLocal", jbool includeLocal
-                           "summaryOnly", jbool summaryOnly
-                           "count", jint entries.Length
-                           "returnedEntryCount", jint outEntriesArray.Count
-                           "entriesTruncatedByBudget", jbool entriesTruncatedByBudget
-                           "memberCounts", memberCounts
-                           "entries", outEntriesArray :> JsonNode
-                           "customOperationCount", jint customOperationsAll.Length
-                           "customOperations", customOperationsArray :> JsonNode
-                           "customOperationsTruncated", jbool false
-                           "customOperationsTruncatedByBudget", jbool false
-                           "customOperationsHint", null ]
-                         @ downgradeFields
-                         @ [ "parseDiagnosticCount", jint parseDiagnosticsAll.Length
-                             "parseDiagnostics", parseDiagnosticsArray :> JsonNode
-                             "parseDiagnosticsTruncated", jbool false
-                             "checkDiagnosticCount", jint checkDiagnosticsAll.Length
-                             "checkDiagnostics", checkDiagnosticsArray :> JsonNode
-                             "checkDiagnosticsTruncated", jbool false
-                             "diagnosticsHint", null
-                             "responseTruncatedByBudget", jbool false
-                             "responseBudgetChars", jint outlineShippedResponseCharBudget
-                             "responseSizeHint", null ])
-
-                let updateBudgetMetadata () =
-                    let entriesWereTruncated = outEntriesArray.Count < surfacedEntryNodesAll.Length
-                    let customOperationsTruncated = customOperationsArray.Count < customOperationsAll.Length
-                    let parseDiagnosticsTruncated = parseDiagnosticsArray.Count < parseDiagnosticsAll.Length
-                    let checkDiagnosticsTruncated = checkDiagnosticsArray.Count < checkDiagnosticsAll.Length
-
-                    response["returnedEntryCount"] <- jint outEntriesArray.Count
-                    response["entriesTruncatedByBudget"] <- jbool entriesWereTruncated
-                    response["customOperationsTruncated"] <- jbool customOperationsTruncated
-                    response["customOperationsTruncatedByBudget"] <- jbool customOperationsTruncatedByBudget
-                    response["parseDiagnosticsTruncated"] <- jbool parseDiagnosticsTruncated
-                    response["checkDiagnosticsTruncated"] <- jbool checkDiagnosticsTruncated
-
-                    response["customOperationsHint"] <-
-                        if customOperationsTruncated then
-                            jstr
-                                $"Returned %d{customOperationsArray.Count} of %d{customOperationsAll.Length} CustomOperation rows, bounded by maxResults=%d{maxResults} and the shared outline response budget."
-                        else
-                            null
-
-                    response["diagnosticsHint"] <-
-                        if parseDiagnosticsTruncated || checkDiagnosticsTruncated then
-                            jstr
-                                $"Returned %d{parseDiagnosticsArray.Count} of %d{parseDiagnosticsAll.Length} parse diagnostics and %d{checkDiagnosticsArray.Count} of %d{checkDiagnosticsAll.Length} check diagnostics. Use check(scope=\"file\") for a diagnostic-focused result."
-                        else
-                            null
-
-                    let responseTruncated =
-                        entriesWereTruncated
-                        || customOperationsTruncatedByBudget
-                        || parseDiagnosticsTruncatedByBudget
-                        || checkDiagnosticsTruncatedByBudget
-
-                    response["responseTruncatedByBudget"] <- jbool responseTruncated
-
-                    response["responseSizeHint"] <-
-                        if responseTruncated then
-                            jstr
-                                $"Variable-size outline arrays were truncated to keep the complete serialized response within %d{outlineShippedResponseCharBudget} characters. Full counts remain available in memberCounts, customOperationCount, parseDiagnosticCount, and checkDiagnosticCount."
-                        else
-                            null
-
-                updateBudgetMetadata ()
-
-                // The conservative per-node budget above avoids almost all retries. This
-                // exact final check measures the assembled root with its real indentation
-                // and metadata. Trim diagnostics first, then the auxiliary operation index,
-                // and only then structural entries. An impossible fixed-envelope overflow
-                // is still bounded by the compact typed fallback below.
-                let tryTrimOneArrayItem () =
-                    if checkDiagnosticsArray.Count > 0 then
-                        checkDiagnosticsArray.RemoveAt(checkDiagnosticsArray.Count - 1)
-                        checkDiagnosticsTruncatedByBudget <- true
-                        true
-                    elif parseDiagnosticsArray.Count > 0 then
+                    while renderedLength response > outlineShippedResponseCharBudget
+                          && parseDiagnosticsArray.Count > 0 do
                         parseDiagnosticsArray.RemoveAt(parseDiagnosticsArray.Count - 1)
-                        parseDiagnosticsTruncatedByBudget <- true
-                        true
-                    elif customOperationsArray.Count > 0 then
-                        customOperationsArray.RemoveAt(customOperationsArray.Count - 1)
-                        customOperationsTruncatedByBudget <- true
-                        true
-                    elif outEntriesArray.Count > 0 then
-                        outEntriesArray.RemoveAt(outEntriesArray.Count - 1)
-                        true
+                        updateAbortedBudgetMetadata ()
+
+                    if renderedLength response > outlineShippedResponseCharBudget then
+                        return
+                            jobj
+                                [ "status", jstr "aborted"
+                                  "errorCode", jstr "outline_response_budget_exceeded"
+                                  "message",
+                                  jstr
+                                      "The fixed outline response metadata exceeded its serialized-size ceiling after all variable arrays were removed."
+                                  "responseTruncatedByBudget", jbool true
+                                  "responseBudgetChars", jint outlineShippedResponseCharBudget ]
+                            :> JsonNode
                     else
-                        false
+                        return response :> JsonNode
+                | Some checkResults ->
+                    let includeLocal = args.includeLocal |> Option.defaultValue false
+                    let includePrivate = args.includePrivate |> Option.defaultValue true
+                    let summaryOnly = args.summaryOnly |> Option.defaultValue true
+                    let maxResults = args.maxResults |> Option.defaultValue 200
 
-                let mutable canTrim = true
+                    // Full, untruncated definition set (lightweight symbol uses — no node
+                    // building yet). memberCounts is derived from THIS so it reports true
+                    // per-kind totals, while only the truncated slice pays for signature
+                    // formatting — mirrors fcs_project_outline's count-vs-truncate split.
+                    let allUses =
+                        checkResults.GetAllUsesOfAllSymbolsInFile()
+                        |> Seq.filter _.IsFromDefinition
+                        |> Seq.filter (fun symbolUse -> includeLocal || not (isNoisyLocalSymbol symbolUse))
+                        |> Seq.distinctBy (fun symbolUse ->
+                            let r = symbolUse.Range
+                            symbolUse.Symbol.FullName, r.StartLine, r.StartColumn, r.EndLine, r.EndColumn)
+                        |> Seq.sortBy (fun symbolUse ->
+                            let r = symbolUse.Range
+                            r.StartLine, r.StartColumn)
+                        |> Seq.toArray
 
-                while renderedLength response > outlineShippedResponseCharBudget && canTrim do
-                    canTrim <- tryTrimOneArrayItem ()
+                    // memberCounts: kind → count over the FULL (untruncated) definition set,
+                    // so an agent sees true totals (e.g. "this 5k-line file has 320 functions")
+                    // even when summaryOnly drops signatures and maxResults caps the array.
+                    // Kind classification is cheap — no signature strings are formatted here.
+                    let memberCounts =
+                        allUses
+                        |> Array.countBy (fun symbolUse -> symbolKind symbolUse.Symbol)
+                        |> Array.sortBy fst
+                        |> Array.map (fun (kind, n) -> kind, jint n)
+                        |> Array.toList
+                        |> jobj
+
+                    // entries: only the surfaced slice is mapped to full nodes, so signature
+                    // formatting cost stays bounded by maxResults.
+                    let entries =
+                        allUses
+                        |> Array.truncate maxResults
+                        |> Array.map (fun symbolUse ->
+                            let attributes = attributesOfSymbol symbolUse.Symbol
+
+                            jobj
+                                [ "name", jstr symbolUse.Symbol.DisplayName
+                                  "fullName", jstrOrNull symbolUse.Symbol.FullName
+                                  "kind", jstr (symbolKind symbolUse.Symbol)
+                                  "accessibility", symbolAccessibility symbolUse.Symbol
+                                  "attributes", attributesToJson attributes
+                                  "range", rangeToJson symbolUse.Range
+                                  "signature", jstr (symbolTypeString symbolUse.Symbol)
+                                  "declarationRange", tryDeclarationRange symbolUse.Symbol ]
+                            :> JsonNode)
+
+                    // Computation-expression operation names live in
+                    // CustomOperationAttribute constructor arguments and are not implied by
+                    // the CLR/F# member name. Keep this compact index in BOTH summary modes,
+                    // so agents can answer "which operations does this builder declare?"
+                    // without requesting every signature from a large file.
+                    let customOperationsAll =
+                        allUses
+                        |> Array.choose (fun symbolUse ->
+                            let customOperation =
+                                attributesOfSymbol symbolUse.Symbol |> Array.tryFind isCustomOperationAttribute
+
+                            customOperation
+                            |> Option.map (fun attribute ->
+                                jobj
+                                    [ "operationName",
+                                      customOperationName attribute |> Option.map jstr |> Option.defaultValue null
+                                      "memberName", jstr symbolUse.Symbol.DisplayName
+                                      "fullName", jstrOrNull symbolUse.Symbol.FullName
+                                      "range", rangeToJson symbolUse.Range ]
+                                :> JsonNode))
+
+                    let containerKinds =
+                        [| "module"
+                           "record"
+                           "union"
+                           "class"
+                           "interface"
+                           "enum"
+                           "delegate"
+                           "namespace" |]
+
+                    let headersOf (fullEntries: JsonNode array) : JsonNode array =
+                        fullEntries
+                        |> Array.filter (fun e ->
+                            match e["kind"] with
+                            | null -> false
+                            | k -> containerKinds |> Array.contains (k.GetValue<string>()))
+                        |> Array.map (fun e ->
+                            jobj
+                                [ "name", e["name"].DeepClone()
+                                  "kind", e["kind"].DeepClone()
+                                  "fullName",
+                                  (match e["fullName"] with
+                                   | null -> null
+                                   | fn -> fn.DeepClone())
+                                  "attributes", e["attributes"].DeepClone()
+                                  "range",
+                                  (match e["range"] with
+                                   | null -> null
+                                   | r -> r.DeepClone()) ]
+                            :> JsonNode)
+
+                    let headerEntries = headersOf entries
+
+                    // The compact index is derived from the full symbol set so its total is
+                    // truthful, but the surfaced rows obey BOTH maxResults and the same
+                    // rendered-size budget as outline entries. Without this bound, a file
+                    // with hundreds of CustomOperation attributes could make summary mode
+                    // larger than the full outline guard was designed to permit.
+                    let requestedCustomOperations = customOperationsAll |> Array.truncate maxResults
+
+                    // #206: summaryOnly=false asked for full per-member signatures, but a
+                    // large file's full outline can still cross the shared response-char
+                    // budget (54KB/65KB outlines observed in the field — issue #100 batch 6)
+                    // even though maxResults already bounds entry COUNT; a handful of
+                    // signature-heavy entries is enough. Measure the would-be full payload
+                    // BEFORE committing to it and downgrade to the same header-only shape
+                    // summaryOnly=true produces, rather than ever emitting an over-budget
+                    // outline. Only measured when summaryOnly=false was actually requested —
+                    // an explicit summaryOnly=true request is already small by construction.
+                    // #206 review round 1 Imp-1 / round 2 N6: measured via the shared
+                    // `Types.isOverRenderedBudget` — same shipped serialization as
+                    // `responseCharBudget`'s comment describes, and it stops serializing
+                    // further entries the moment the budget is already crossed rather than
+                    // summing every one of `entries` (up to `maxResults`) regardless.
+                    let overBudget =
+                        not summaryOnly
+                        && isOverRenderedBudget responseCharBudget (Seq.append entries requestedCustomOperations)
+
+                    let downgradedToSummary = overBudget
+
+                    // summaryOnly (default) OR a budget downgrade: module/type headers with
+                    // name/kind/fullName/range only (no per-member signatures). Otherwise the
+                    // full per-member output requested.
+                    let surfacedEntryNodesAll =
+                        if summaryOnly || downgradedToSummary then
+                            headerEntries
+                        else
+                            entries
+
+                    // Allocate one shared node budget across every variable-size array.
+                    // Diagnostics used to sit outside this accounting, so a malformed file
+                    // with thousands of errors could exceed one megabyte even in summary mode.
+                    let surfacedEntryNodes, renderedAfterEntries, entriesTruncatedByBudget =
+                        takeWithinRenderedBudget responseCharBudget 0 surfacedEntryNodesAll
+
+                    let customOperations, renderedAfterOperations, customOperationsTruncatedByBudgetInitial =
+                        takeWithinRenderedBudget responseCharBudget renderedAfterEntries requestedCustomOperations
+
+                    let parseDiagnosticsAll = parseResults.Diagnostics |> Array.map diagnosticToJson
+
+                    let parseDiagnostics, renderedAfterParseDiagnostics, parseDiagnosticsTruncatedByBudgetInitial =
+                        takeWithinRenderedBudget responseCharBudget renderedAfterOperations parseDiagnosticsAll
+
+                    let checkDiagnosticsAll = checkResults.Diagnostics |> Array.map diagnosticToJson
+
+                    let checkDiagnostics, _, checkDiagnosticsTruncatedByBudgetInitial =
+                        takeWithinRenderedBudget responseCharBudget renderedAfterParseDiagnostics checkDiagnosticsAll
+
+                    let outEntriesArray = JsonArray(surfacedEntryNodes)
+                    let customOperationsArray = JsonArray(customOperations)
+                    let parseDiagnosticsArray = JsonArray(parseDiagnostics)
+                    let checkDiagnosticsArray = JsonArray(checkDiagnostics)
+
+                    let mutable customOperationsTruncatedByBudget =
+                        customOperationsTruncatedByBudgetInitial
+
+                    let mutable parseDiagnosticsTruncatedByBudget =
+                        parseDiagnosticsTruncatedByBudgetInitial
+
+                    let mutable checkDiagnosticsTruncatedByBudget =
+                        checkDiagnosticsTruncatedByBudgetInitial
+
+                    // Additive-only (#206): present exactly when the requested summaryOnly=false
+                    // was downgraded to headers because the full outline exceeded the budget —
+                    // absent on every other path, so a small file with summaryOnly=false is a
+                    // byte-for-byte unchanged response.
+                    let downgradeFields =
+                        if downgradedToSummary then
+                            let hint =
+                                $"Full outline for this file exceeds the ~%d{responseCharBudget}-char response budget; returning summary-level headers (name/kind/fullName/attributes/range, no signatures) instead. Narrow with a smaller maxResults (currently %d{maxResults}) so the full per-member signatures for that slice fit within budget."
+
+                            [ "downgradedToSummary", jbool true; "hint", jstr hint ]
+                        else
+                            []
+
+                    let response =
+                        jobj (
+                            [ "status", jstr "succeeded"
+                              "file", jstr path
+                              "optionsSource", jstr optionsSource
+                              "includePrivate", jbool includePrivate
+                              "includeLocal", jbool includeLocal
+                              "summaryOnly", jbool summaryOnly
+                              "count", jint entries.Length
+                              "totalDefinitionCount", jint allUses.Length
+                              "entriesComplete", jbool false
+                              "returnedEntryCount", jint outEntriesArray.Count
+                              "entriesTruncatedByBudget", jbool entriesTruncatedByBudget
+                              "memberCounts", memberCounts
+                              "entries", outEntriesArray :> JsonNode
+                              "customOperationCount", jint customOperationsAll.Length
+                              "customOperations", customOperationsArray :> JsonNode
+                              "customOperationsTruncated", jbool false
+                              "customOperationsTruncatedByBudget", jbool false
+                              "customOperationsHint", null ]
+                            @ downgradeFields
+                            @ [ "parseDiagnosticCount", jint parseDiagnosticsAll.Length
+                                "parseDiagnostics", parseDiagnosticsArray :> JsonNode
+                                "parseDiagnosticsTruncated", jbool false
+                                "checkDiagnosticCount", jint checkDiagnosticsAll.Length
+                                "checkDiagnostics", checkDiagnosticsArray :> JsonNode
+                                "checkDiagnosticsTruncated", jbool false
+                                "diagnosticsHint", null
+                                "responseTruncatedByBudget", jbool false
+                                "responseBudgetChars", jint outlineShippedResponseCharBudget
+                                "responseSizeHint", null ]
+                        )
+
+                    let updateBudgetMetadata () =
+                        let entriesWereTruncated = outEntriesArray.Count < surfacedEntryNodesAll.Length
+
+                        let customOperationsTruncated =
+                            customOperationsArray.Count < customOperationsAll.Length
+
+                        let parseDiagnosticsTruncated =
+                            parseDiagnosticsArray.Count < parseDiagnosticsAll.Length
+
+                        let checkDiagnosticsTruncated =
+                            checkDiagnosticsArray.Count < checkDiagnosticsAll.Length
+
+                        response["returnedEntryCount"] <- jint outEntriesArray.Count
+                        response["entriesTruncatedByBudget"] <- jbool entriesWereTruncated
+
+                        response["entriesComplete"] <-
+                            jbool (
+                                not summaryOnly
+                                && not downgradedToSummary
+                                && outEntriesArray.Count = allUses.Length
+                            )
+
+                        response["customOperationsTruncated"] <- jbool customOperationsTruncated
+                        response["customOperationsTruncatedByBudget"] <- jbool customOperationsTruncatedByBudget
+                        response["parseDiagnosticsTruncated"] <- jbool parseDiagnosticsTruncated
+                        response["checkDiagnosticsTruncated"] <- jbool checkDiagnosticsTruncated
+
+                        response["customOperationsHint"] <-
+                            if customOperationsTruncated then
+                                jstr
+                                    $"Returned %d{customOperationsArray.Count} of %d{customOperationsAll.Length} CustomOperation rows, bounded by maxResults=%d{maxResults} and the shared outline response budget."
+                            else
+                                null
+
+                        response["diagnosticsHint"] <-
+                            if parseDiagnosticsTruncated || checkDiagnosticsTruncated then
+                                jstr
+                                    $"Returned %d{parseDiagnosticsArray.Count} of %d{parseDiagnosticsAll.Length} parse diagnostics and %d{checkDiagnosticsArray.Count} of %d{checkDiagnosticsAll.Length} check diagnostics. Use check(scope=\"file\") for a diagnostic-focused result."
+                            else
+                                null
+
+                        let responseTruncated =
+                            entriesWereTruncated
+                            || customOperationsTruncatedByBudget
+                            || parseDiagnosticsTruncatedByBudget
+                            || checkDiagnosticsTruncatedByBudget
+
+                        response["responseTruncatedByBudget"] <- jbool responseTruncated
+
+                        response["responseSizeHint"] <-
+                            if responseTruncated then
+                                jstr
+                                    $"Variable-size outline arrays were truncated to keep the complete serialized response within %d{outlineShippedResponseCharBudget} characters. Full counts remain available in memberCounts, customOperationCount, parseDiagnosticCount, and checkDiagnosticCount."
+                            else
+                                null
+
                     updateBudgetMetadata ()
 
-                if renderedLength response > outlineShippedResponseCharBudget then
-                    return
-                        jobj
-                            [ "status", jstr "aborted"
-                              "errorCode", jstr "outline_response_budget_exceeded"
-                              "message",
-                              jstr
-                                  "The fixed outline response metadata exceeded its serialized-size ceiling after all variable arrays were removed."
-                              "responseTruncatedByBudget", jbool true
-                              "responseBudgetChars", jint outlineShippedResponseCharBudget ]
-                        :> JsonNode
-                else
-                    return response :> JsonNode
+                    // The conservative per-node budget above avoids almost all retries. This
+                    // exact final check measures the assembled root with its real indentation
+                    // and metadata. Trim diagnostics first, then the auxiliary operation index,
+                    // and only then structural entries. An impossible fixed-envelope overflow
+                    // is still bounded by the compact typed fallback below.
+                    let tryTrimOneArrayItem () =
+                        if checkDiagnosticsArray.Count > 0 then
+                            checkDiagnosticsArray.RemoveAt(checkDiagnosticsArray.Count - 1)
+                            checkDiagnosticsTruncatedByBudget <- true
+                            true
+                        elif parseDiagnosticsArray.Count > 0 then
+                            parseDiagnosticsArray.RemoveAt(parseDiagnosticsArray.Count - 1)
+                            parseDiagnosticsTruncatedByBudget <- true
+                            true
+                        elif customOperationsArray.Count > 0 then
+                            customOperationsArray.RemoveAt(customOperationsArray.Count - 1)
+                            customOperationsTruncatedByBudget <- true
+                            true
+                        elif outEntriesArray.Count > 0 then
+                            outEntriesArray.RemoveAt(outEntriesArray.Count - 1)
+                            true
+                        else
+                            false
+
+                    let mutable canTrim = true
+
+                    while renderedLength response > outlineShippedResponseCharBudget && canTrim do
+                        canTrim <- tryTrimOneArrayItem ()
+                        updateBudgetMetadata ()
+
+                    if renderedLength response > outlineShippedResponseCharBudget then
+                        return
+                            jobj
+                                [ "status", jstr "aborted"
+                                  "errorCode", jstr "outline_response_budget_exceeded"
+                                  "message",
+                                  jstr
+                                      "The fixed outline response metadata exceeded its serialized-size ceiling after all variable arrays were removed."
+                                  "responseTruncatedByBudget", jbool true
+                                  "responseBudgetChars", jint outlineShippedResponseCharBudget ]
+                            :> JsonNode
+                    else
+                        return response :> JsonNode
         }
+
+    member this.FileOutline(args: FcsFileOutlineArgs) : Task<JsonNode> =
+        this.FileOutlineCore(args, None, ignore)
 
     member this.ProjectSymbolUses(args: FcsProjectSymbolUsesArgs) : Task<JsonNode> =
         task {
@@ -5761,17 +6002,34 @@ type internal FcsBridge
                                 (fun () ->
                                     task {
                                         try
-                                            let! results = checker.ParseAndCheckProject(options) |> asTask
-                                            let uses = results.GetAllUsesOfAllSymbols()
-                                            let value = uses, results.Diagnostics
+                                            return!
+                                                projectUsesAdmission.TryRun(
+                                                    options.ProjectFileName,
+                                                    fun () ->
+                                                        task {
+                                                            let! value =
+                                                                match projectSweepWorkerOverride with
+                                                                | Some worker -> worker options.ProjectFileName
+                                                                | None ->
+                                                                    task {
+                                                                        let! results =
+                                                                            checker.ParseAndCheckProject(options)
+                                                                            |> asTask
 
-                                            // set_project may clear caches while this uncancellable
-                                            // FCS walk is still running. Do not repopulate a new
-                                            // generation with the old workspace's result.
-                                            if Volatile.Read(&projectUsesCacheGeneration) = generation then
-                                                projectUsesCache.Set(usesKey, value)
+                                                                        let uses = results.GetAllUsesOfAllSymbols()
+                                                                        return uses, results.Diagnostics
+                                                                    }
 
-                                            return value
+                                                            // set_project may clear caches while this
+                                                            // uncancellable FCS walk is still running. Do
+                                                            // not repopulate a new generation with the old
+                                                            // workspace's result.
+                                                            if Volatile.Read(&projectUsesCacheGeneration) = generation then
+                                                                projectUsesCache.Set(usesKey, value)
+
+                                                            return value
+                                                        }
+                                                )
                                         finally
                                             projectUsesInFlight.TryRemove(usesKey) |> ignore
                                     }),
@@ -5983,7 +6241,7 @@ type internal FcsBridge
             if projectsToSweep.Length = 0 then
                 let message =
                     projectResolutionError
-                    |> Option.defaultValue $"find could not resolve any .fsproj to sweep from: {sweepTarget}"
+                    |> Option.defaultValue $"find could not resolve any .fsproj to sweep from: %s{sweepTarget}"
 
                 return invalidArgs message
             else
@@ -6113,9 +6371,10 @@ type internal FcsBridge
             let mutable projectsAnalyzed = 0
             let mutable projectsFailed = 0
             let mutable projectsTimedOut = 0
+            let mutable projectsBusy = 0
 
             let locationKey (r: range) =
-                $"{normalizePath r.FileName}:{r.StartLine}:{r.StartColumn}:{r.EndLine}:{r.EndColumn}"
+                $"%s{normalizePath r.FileName}:%d{r.StartLine}:%d{r.StartColumn}:%d{r.EndLine}:%d{r.EndColumn}"
 
             // Per-project sweep. Sequential by design: parallel Ionide.ProjInfo option
             // resolution races on MSBuild's *.nuget.g.props for sibling projects that
@@ -6319,17 +6578,32 @@ type internal FcsBridge
                     projSw.Stop()
 
                     let timedOut = findFailureIsTimeout ex
+                    let busy = not timedOut && boundedCheckWorkFailureIsBusy ex
+
+                    let typedFailureFields =
+                        match ex with
+                        | SdkPreflight.SdkPinUnsatisfiable failure ->
+                                            [ ("blockingReason",
+                                               SdkPreflight.toBlockingReason failure.Pin failure.InstalledSdks) ]
+                        | _ -> []
 
                     if timedOut then
                         projectsTimedOut <- projectsTimedOut + 1
+                    elif busy then
+                        projectsBusy <- projectsBusy + 1
                     else
                         projectsFailed <- projectsFailed + 1
 
                     perProject.Add(
-                        jobj
+                        jobj (
                             [ "project", jstr projDisplay
                               "fsproj", jstr (normalizePath fsproj)
-                              "status", jstr (if timedOut then "timed_out" else "failed")
+                              "status",
+                              jstr (
+                                  if timedOut then "timed_out"
+                                  elif busy then "busy"
+                                  else "failed"
+                              )
                               "errorKind",
                               // #192: a per-project entry cannot become the whole
                               // response envelope, but it can still name the real
@@ -6337,13 +6611,18 @@ type internal FcsBridge
                               jstr (
                                   if timedOut then
                                       "timeout"
+                                  elif busy then
+                                      "fcs_worker_busy"
                                   else
                                       match ex with
                                       | SdkPreflight.SdkPinUnsatisfiable _ -> "sdk_not_found"
                                       | _ -> "project_failure"
                               )
+                              "retryable", jbool busy
                               "error", jstr ex.Message
                               "elapsedMs", jint (int projSw.ElapsedMilliseconds) ]
+                            @ typedFailureFields
+                        )
                         :> JsonNode
                     )
 
@@ -6405,7 +6684,11 @@ type internal FcsBridge
                 |> Array.length
 
             let projectsRequested = projectsToSweep.Length
-            let coverageComplete = projectsAnalyzed = projectsRequested
+            let coverageComplete =
+                projectsAnalyzed = projectsRequested
+                && projectsFailed = 0
+                && projectsTimedOut = 0
+                && projectsBusy = 0
 
             // HEADLINE: a positive site is always useful, but absence is conclusive
             // only when every requested FCS project completed. FSAC outcomes remain
@@ -6470,14 +6753,21 @@ type internal FcsBridge
                 match responseStatus with
                 | "partial" ->
                     Some
-                        $"Matches were found, but only {projectsAnalyzed}/{projectsRequested} requested project(s) were analyzed; the result set may be incomplete."
+                        $"Matches were found, but only %d{projectsAnalyzed}/%d{projectsRequested} requested project(s) were analyzed; the result set may be incomplete."
                 | "unknown" ->
                     Some
-                        $"Cannot confirm absence: only {projectsAnalyzed}/{projectsRequested} requested project(s) were analyzed ({projectsFailed} failed, {projectsTimedOut} timed out)."
+                        $"Cannot confirm absence: only %d{projectsAnalyzed}/%d{projectsRequested} requested project(s) were analyzed (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy)."
                 | _ -> None
 
             let pageSites =
                 sortedSites |> Array.skip (min pageOffset totalSites) |> Array.truncate pageSize
+
+            // Project coverage and response delivery are separate dimensions. A complete
+            // sweep can still return only one cursor page; in that case the caller has not
+            // received the complete site set yet. Cursor pages after the first also omit
+            // earlier sites even when `truncated=false` on the final page.
+            let resolutionComplete =
+                coverageComplete && pageOffset = 0 && pageSites.Length = totalSites
 
             let lineContextCache = System.Collections.Generic.Dictionary<string, string array>()
 
@@ -6594,14 +6884,15 @@ type internal FcsBridge
                       "projectsRequested", jint projectsRequested
                       "projectsAnalyzed", jint projectsAnalyzed
                       "projectsFailed", jint projectsFailed
-                      "projectsTimedOut", jint projectsTimedOut ]
+                      "projectsTimedOut", jint projectsTimedOut
+                      "projectsBusy", jint projectsBusy ]
                 :> JsonNode
 
             let resolution =
                 jobj
                     [ "matched", matchedNode
                       "outcome", jstr outcome
-                      "complete", jbool coverageComplete
+                      "complete", jbool resolutionComplete
                       "kindResolved", jstr kindResolved
                       "scopeResolved", jstr scopeResolved
                       "projectsSwept", jint projectsRequested
@@ -6609,6 +6900,7 @@ type internal FcsBridge
                       "projectsAnalyzed", jint projectsAnalyzed
                       "projectsFailed", jint projectsFailed
                       "projectsTimedOut", jint projectsTimedOut
+                      "projectsBusy", jint projectsBusy
                       "via", jstr via
                       "fcsSiteCount", jint totalSites
                       "fsacFallbackHits", jint fsacHits
@@ -6660,7 +6952,7 @@ type internal FcsBridge
                         if fieldSiteCount = 0 && not coverageComplete then
                             // Do not blame the caller's `kind` for an empty result the sweep
                             // never got far enough to produce — coverage is the real story.
-                            $"No field site was typed because the sweep is incomplete: {projectsAnalyzed} of {projectsRequested} project(s) were analyzed ({projectsFailed} failed, {projectsTimedOut} timed out). See coverage/message; re-run with a larger timeoutMs before reading anything into the empty result."
+                            $"No field site was typed because the sweep is incomplete: %d{projectsAnalyzed} of %d{projectsRequested} project(s) were analyzed (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy). See coverage/message; retry busy work or re-run with a larger timeoutMs before reading anything into the empty result."
                         elif fieldSiteCount = 0 then
                             // Advice must name a NEXT step the caller has not already taken.
                             // Telling a kind='auto'/'field' caller to "use kind='field' or
@@ -6672,17 +6964,17 @@ type internal FcsBridge
                                 | "position", _ ->
                                     "kind='position' resolves the symbol under the cursor and then sweeps it as kind='symbol', which never unions field sites. Re-run with kind='field' and the resolved name as query (echoed above as `query`)."
                                 | _, ("field" | "auto") ->
-                                    $"The query already unioned field sites — '{query}' simply matches no record field here. Check the declaring type name (find matches fields by their DECLARING type, not the field name), drop field='…' if it is over-restricting, or pass exact=false for a substring match on the type."
+                                    $"The query already unioned field sites — '%s{query}' simply matches no record field here. Check the declaring type name (find matches fields by their DECLARING type, not the field name), drop field='…' if it is over-restricting, or pass exact=false for a substring match on the type."
                                 | _ ->
                                     "Re-run with kind='field' (optionally with field='Name') or kind='auto', which union record-field sites; this kind does not."
 
-                            $"includeSiteTypes annotates record-field sites only, and this sweep produced none (kindResolved='{kindResolved}'). {recipe}"
+                            $"includeSiteTypes annotates record-field sites only, and this sweep produced none (kindResolved='%s{kindResolved}'). %s{recipe}"
                         else
                             let degradedClause =
                                 if degradedSites = 0 then
                                     "Every field site is typed."
                                 else
-                                    $"{degradedSites} of {fieldSiteCount} field sites could not be typed ({unresolvedSites} unresolved, {timedOutTypeSites} past the timeoutMs budget) and carry siteType: null."
+                                    $"%d{degradedSites} of %d{fieldSiteCount} field sites could not be typed (%d{unresolvedSites} unresolved, %d{timedOutTypeSites} past the timeoutMs budget) and carry siteType: null."
 
                             let multiClause =
                                 if multiTypedSites = 0 then
@@ -6794,17 +7086,17 @@ type internal FcsBridge
                         | true, Some path ->
                             $"find swept only this one project, and kept only sites in '{path}' — other files in this project, and all sibling projects, are not visible. {widenRecipe}"
                         | false, None ->
-                            $"find could not fully analyze this project ({projectsFailed} failed, {projectsTimedOut} timed out) — this response is incomplete; see coverage/message before trusting an absence of matches. Cross-project usages in sibling projects are also not visible. {widenRecipe}"
+                            $"find could not fully analyze this project (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy) — this response is incomplete; see coverage/message before trusting an absence of matches. Cross-project usages in sibling projects are also not visible. %s{widenRecipe}"
                         | false, Some path ->
-                            $"find could not fully analyze this project ({projectsFailed} failed, {projectsTimedOut} timed out) — this response is incomplete; see coverage/message before trusting an absence of matches. Sites, where present, are also filtered to '{path}'; other files in this project, and all sibling projects, are not visible. {widenRecipe}"
+                            $"find could not fully analyze this project (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy) — this response is incomplete; see coverage/message before trusting an absence of matches. Sites, where present, are also filtered to '%s{path}'; other files in this project, and all sibling projects, are not visible. %s{widenRecipe}"
 
                     [ ("scopeNote", jstr text) ]
                 else
                     let text =
                         if coverageComplete then
-                            $"find swept {projectsRequested} member projects of '{sweepTarget}'. {narrowRecipe}"
+                            $"find swept %d{projectsRequested} member projects of '%s{sweepTarget}'. %s{narrowRecipe}"
                         else
-                            $"find analyzed {projectsAnalyzed} of {projectsRequested} member projects of '{sweepTarget}' ({projectsFailed} failed, {projectsTimedOut} timed out) — this response is incomplete; see coverage/message before trusting an absence of matches. {narrowRecipe}"
+                            $"find analyzed %d{projectsAnalyzed} of %d{projectsRequested} member projects of '%s{sweepTarget}' (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy) — this response is incomplete; see coverage/message before trusting an absence of matches. %s{narrowRecipe}"
 
                     [ ("scopeNote", jstr text) ]
 
@@ -6823,6 +7115,7 @@ type internal FcsBridge
                   "projectsAnalyzed", jint projectsAnalyzed
                   "projectsFailed", jint projectsFailed
                   "projectsTimedOut", jint projectsTimedOut
+                  "projectsBusy", jint projectsBusy
                   "totalSites", jint totalSites
                   "matchedUseCount", jint totalSites
                   "breakdown", breakdown
@@ -6846,14 +7139,39 @@ type internal FcsBridge
     // is tagged with its nearest enclosing test ([<Fact>]/[<Theory>]/[<Test>]/testCase),
     // located by scanning the source lines upward. Shares ProjectSweepUses' (#131) per-project
     // use cache, so a `find` already run on the solution makes this nearly free.
-    member this.TestsForSymbol(args: FcsTestsForSymbolArgs) : Task<JsonNode> =
+    member this.TestsForSymbol(args: FcsTestsForSymbolArgs, ?activeProjectPath: string) : Task<JsonNode> =
         task {
             match ArgsValidation.requireNonBlank "symbolQuery" args.symbolQuery with
             | Error envelope -> return envelope
             | Ok query ->
 
             let exact = args.exact |> Option.defaultValue true
-            let maxResults = args.maxResults |> Option.defaultValue 100
+            let pageSize = args.maxResults |> Option.defaultValue 100
+            let sweepBudgetMs = args.timeoutMs |> Option.defaultValue 120000
+
+            let invalidArgs message =
+                jobj [ "status", jstr "invalid_args"; "message", jstr message ] :> JsonNode
+
+            let mutable validationError =
+                if pageSize < 1 || pageSize > 1000 then
+                    Some $"maxResults must be between 1 and 1000; got %d{pageSize}."
+                elif sweepBudgetMs < 0 then
+                    Some $"timeoutMs must be non-negative; got %d{sweepBudgetMs}."
+                else
+                    None
+
+            let mutable pageOffset = 0
+
+            match args.cursor with
+            | None -> ()
+            | Some cursorStr ->
+                match Cursor.tryDecode cursorStr with
+                | Ok payload -> pageOffset <- payload.offset
+                | Error reason -> validationError <- Some $"Invalid cursor: %s{reason}"
+
+            match validationError with
+            | Some message -> return invalidArgs message
+            | None ->
 
             // Resolve the sweep target like Find: explicit projectPath (Program.fs already
             // falls back to the active set_project), else the nearest .fsproj to args.path.
@@ -6875,43 +7193,160 @@ type internal FcsBridge
                     :> JsonNode
             | Some sweepTarget ->
 
-            // The test-coverage slice: sweep only the solution's TEST projects.
+            let sweepSw = System.Diagnostics.Stopwatch.StartNew()
+
+            let remainingBudget () =
+                TimeSpan.FromMilliseconds(
+                    max 0.0 (float sweepBudgetMs - sweepSw.Elapsed.TotalMilliseconds)
+                )
+
+            let ensureBudget () =
+                if remainingBudget () <= TimeSpan.Zero then
+                    raise (TimeoutException($"Overall tests_for_symbol budget of %d{sweepBudgetMs}ms was exhausted."))
+
+            let isFsproj (path: string) =
+                path.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase)
+
+            let isSolutionOrDirectory (path: string) =
+                Directory.Exists path
+                || path.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
+                || path.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
+
+            let pathComparison =
+                if OperatingSystem.IsWindows() then
+                    StringComparison.OrdinalIgnoreCase
+                else
+                    StringComparison.Ordinal
+
+            let isRequestedSourceProject =
+                isFsproj sweepTarget
+                && not (FsLangMcp.ProjectHealth.isTestProjectFile sweepTarget)
+
+            // Keep explicit projectPath as the requested SOURCE context, but use the
+            // separately supplied active solution for reverse test-project discovery.
+            // Program.fs passes bridge.CurrentProjectPath through this optional argument;
+            // without that separate channel an explicit .fsproj would erase set_project.
+            let activeSolutionContext =
+                if not isRequestedSourceProject then
+                    None
+                else
+                    activeProjectPath
+                    |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                    |> Option.map normalizePath
+                    |> Option.filter isSolutionOrDirectory
+                    |> Option.bind (fun activePath ->
+                        let sourceIsMember =
+                            SolutionParsing.listProjects activePath
+                            |> Array.exists (fun project ->
+                                String.Equals(normalizePath project, sweepTarget, pathComparison))
+
+                        if sourceIsMember then Some activePath else None)
+
+            let discoveryTarget =
+                activeSolutionContext |> Option.defaultValue sweepTarget
+
+            // The test-coverage slice: sweep only the discovery context's TEST projects.
+            // This intentionally sweeps every test project in the active solution: reverse
+            // ProjectReference filtering requires an additional evaluated-MSBuild pass and
+            // is not needed for correctness. Coverage reports the exact requested set.
             let testProjects =
-                SolutionParsing.listProjects sweepTarget
+                SolutionParsing.listProjects discoveryTarget
                 |> Array.filter FsLangMcp.ProjectHealth.isTestProjectFile
+
+            // A production .fsproj cannot reveal projects that reference it. In particular,
+            // without a separately supplied active solution, a zero-project result here is
+            // a discovery gap, not proof that no tests exist. A direct TEST .fsproj is
+            // discoverable and is swept normally.
+            let needsSolutionWidening =
+                isRequestedSourceProject && activeSolutionContext.IsNone
 
             // ── Enclosing-test detection (best-effort, textual) ──────────────────
             // Scan source lines upward from a use to the nearest test marker:
             //   • an Expecto label   → the quoted label string is the test name;
             //   • a test attribute   → the name of the let/member it decorates.
-            let findEnclosingTest (lines: string array) (useLine1: int) : string option =
+            // A candidate owns the use only until the next binding at the same or a
+            // shallower indentation. This prevents top-level fixture/setup code after a
+            // test from being attributed to the preceding test binding (#240).
+            let findEnclosingTest (lines: string array) (useLine1: int) : EnclosingTestIdentity option =
                 if lines.Length = 0 then
                     None
                 else
                     let startIdx = min (max 0 (useLine1 - 1)) (lines.Length - 1)
+
+                    let indentation (line: string) =
+                        let mutable count = 0
+                        let mutable index = 0
+
+                        while index < line.Length && (line[index] = ' ' || line[index] = '\t') do
+                            count <- count + (if line[index] = '\t' then 4 else 1)
+                            index <- index + 1
+
+                        count
+
+                    let candidateOwnsUse candidateLine candidateIndent =
+                        let mutable owns = true
+                        let mutable lineIndex = candidateLine + 1
+
+                        while owns && lineIndex <= startIdx do
+                            ensureBudget ()
+                            let line = lines[lineIndex]
+                            let binding = bindingNameRegex.Match line
+                            let expecto = expectoLabelRegex.Match line
+                            let scopeBoundary = enclosingTestScopeBoundaryRegex.IsMatch line
+
+                            if
+                                (binding.Success || expecto.Success || scopeBoundary)
+                                && indentation line <= candidateIndent
+                            then
+                                owns <- false
+
+                            lineIndex <- lineIndex + 1
+
+                        owns
+
                     let mutable result = None
                     let mutable i = startIdx
 
                     while result.IsNone && i >= 0 do
+                        ensureBudget ()
                         let labelMatch = expectoLabelRegex.Match lines[i]
 
-                        if labelMatch.Success then
-                            result <- Some labelMatch.Groups[1].Value
+                        if labelMatch.Success && candidateOwnsUse i (indentation lines[i]) then
+                            result <-
+                                Some
+                                    { Name = labelMatch.Groups[1].Value
+                                      StartLine = i + 1
+                                      StartColumn = labelMatch.Index + 1 }
                         elif testAttrRegex.IsMatch lines[i] then
                             // Scan downward from the attribute to the use for the decorated name.
                             let mutable j = i
-                            let mutable name = None
+                            let mutable binding = None
 
-                            while name.IsNone && j <= startIdx do
+                            while binding.IsNone && j <= startIdx do
+                                ensureBudget ()
                                 let bm = bindingNameRegex.Match lines[j]
 
                                 if bm.Success then
-                                    name <- Some(bm.Groups[1].Value.Trim('`'))
+                                    binding <-
+                                        Some(j, indentation lines[j], bm.Groups[1].Value.Trim('`'))
                                 else
                                     j <- j + 1
 
-                            result <- Some(name |> Option.defaultValue "<test>")
-                        else
+                            match binding with
+                            | Some(bindingLine, bindingIndent, name) when
+                                candidateOwnsUse bindingLine bindingIndent
+                                ->
+                                let bindingMatch = bindingNameRegex.Match lines[bindingLine]
+
+                                result <-
+                                    Some
+                                        { Name = name
+                                          StartLine = bindingLine + 1
+                                          StartColumn = bindingMatch.Index + 1 }
+                            | Some _
+                            | None -> ()
+
+                        if result.IsNone then
                             i <- i - 1
 
                     result
@@ -6942,30 +7377,69 @@ type internal FcsBridge
                        EndLine: int
                        EndCol: int
                        Project: string
-                       EnclosingTest: string option
+                       Fsproj: string
+                       EnclosingTest: EnclosingTestIdentity option
                        LineText: string |}
                  >()
 
-            // #100 review: count only test projects whose sweep succeeded (the catch below
-            // swallows load failures), so projectsScanned never over-reports coverage.
+            let perProject = ResizeArray<JsonNode>()
             let mutable scannedOk = 0
+            let mutable projectsFailed = 0
+            let mutable projectsTimedOut = 0
+            let mutable projectsBusy = 0
 
             for fsproj in testProjects do
+                let projSw = System.Diagnostics.Stopwatch.StartNew()
+                let projDisplay = Path.GetFileNameWithoutExtension fsproj
+
                 try
-                    let projDisplay = Path.GetFileNameWithoutExtension fsproj
-                    let! options, _ = this.ResolveFsprojOptions(fsproj)
+                    if remainingBudget () <= TimeSpan.Zero then
+                        raise (TimeoutException($"Overall tests_for_symbol budget of %d{sweepBudgetMs}ms was exhausted."))
 
-                    let usesKey = analysisSnapshotKey options
+                    let! options, _ =
+                        this.ResolveFsprojOptionsWithinBudget(fsproj, Some remainingBudget)
 
-                    let! allUses, _ = this.ProjectSweepUses(usesKey, options, 120000)
-                    scannedOk <- scannedOk + 1
+                    let! usesKey = resolveAnalysisSnapshotKey options (Some remainingBudget)
+
+                    if remainingBudget () <= TimeSpan.Zero then
+                        raise (TimeoutException($"Overall tests_for_symbol budget of %d{sweepBudgetMs}ms was exhausted."))
+
+                    // Preserve analysisSnapshotKey's cache-invalidation semantics after
+                    // moving the potentially expensive hash computation behind a bounded
+                    // single-flight task.
+                    commitAnalysisSnapshotKey options usesKey
+
+                    let remainingMs = int (Math.Ceiling((remainingBudget ()).TotalMilliseconds))
+
+                    if remainingMs <= 0 then
+                        raise (TimeoutException($"Overall tests_for_symbol budget of %d{sweepBudgetMs}ms was exhausted."))
+
+                    let projectSweepWaitMs =
+                        match testsForSymbolProjectSweepWaitMsOverride with
+                        | Some overrideWait -> max 1 (overrideWait remainingMs)
+                        | None -> remainingMs
+
+                    let! allUses, _ = this.ProjectSweepUses(usesKey, options, projectSweepWaitMs)
+
+                    if remainingBudget () <= TimeSpan.Zero then
+                        raise (TimeoutException($"Overall tests_for_symbol budget of %d{sweepBudgetMs}ms was exhausted."))
+
+                    let mutable matchedSites = 0
 
                     for u in allUses do
-                        if symbolMatches query exact u.Symbol then
+                        testsForSymbolSiteScanBeforeUseOverride |> Option.iter (fun hook -> hook ())
+                        ensureBudget ()
+                        // Definitions are declarations, not evidence that a test covers the
+                        // symbol. Keep only executable/reference sites (#240).
+                        if not u.IsFromDefinition && symbolMatches query exact u.Symbol then
+                            matchedSites <- matchedSites + 1
                             // FSharpSymbolUse is a struct: bind Range before reading fields (FS0052).
                             let r = u.Range
                             let file = normalizePath r.FileName
-                            let key = $"{file}:{r.StartLine}:{r.StartColumn}:{r.EndLine}:{r.EndColumn}"
+                            // One physical linked file may be compiled by several test
+                            // projects. Project identity is part of the coverage evidence.
+                            let fsprojIdentity = normalizePath fsproj
+                            let key = $"%s{fsprojIdentity}:%s{file}:%d{r.StartLine}:%d{r.StartColumn}:%d{r.EndLine}:%d{r.EndColumn}"
 
                             if not (siteByKey.ContainsKey key) then
                                 let lines = readLines file
@@ -6984,20 +7458,94 @@ type internal FcsBridge
                                        EndLine = r.EndLine
                                        EndCol = r.EndColumn
                                        Project = projDisplay
+                                       Fsproj = fsprojIdentity
                                        EnclosingTest = findEnclosingTest lines r.StartLine
                                        LineText = lineText |}
-                with _ ->
-                    // A test project that fails to resolve/check is skipped — the coverage
-                    // slice is best-effort, never a hard failure for one bad project.
-                    ()
+
+                    // A project is scanned only after every returned use has been
+                    // classified. If the deadline expires inside the site loop, the
+                    // same project must not appear in both scanned and timed-out buckets.
+                    scannedOk <- scannedOk + 1
+                    projSw.Stop()
+
+                    perProject.Add(
+                        jobj
+                            [ "project", jstr projDisplay
+                              "fsproj", jstr (normalizePath fsproj)
+                              "status", jstr "analyzed"
+                              "matchedSites", jint matchedSites
+                              "elapsedMs", jint (int projSw.ElapsedMilliseconds) ]
+                        :> JsonNode
+                    )
+                with ex ->
+                    projSw.Stop()
+                    // Preserve the actual no-queue admission outcome even if the
+                    // request's stopwatch crosses its deadline while the exception is
+                    // propagating. Busy is retryable; timeout is a different remedy.
+                    let busy = boundedCheckWorkFailureIsBusy ex
+
+                    let deadlineExpired =
+                        match testsForSymbolFailureDeadlineExpiredOverride with
+                        | Some probe -> probe ()
+                        | None -> remainingBudget () <= TimeSpan.Zero
+
+                    let timedOut = not busy && (findFailureIsTimeout ex || deadlineExpired)
+
+                    if timedOut then
+                        projectsTimedOut <- projectsTimedOut + 1
+                    elif busy then
+                        projectsBusy <- projectsBusy + 1
+                    else
+                        projectsFailed <- projectsFailed + 1
+
+                    perProject.Add(
+                        jobj
+                            [ "project", jstr projDisplay
+                              "fsproj", jstr (normalizePath fsproj)
+                              "status",
+                              jstr (
+                                  if timedOut then "timed_out"
+                                  elif busy then "busy"
+                                  else "failed"
+                              )
+                              "errorKind",
+                              jstr (
+                                  if timedOut then "timeout"
+                                  elif busy then "fcs_worker_busy"
+                                  else "project_failure"
+                              )
+                              "retryable", jbool busy
+                              "error", jstr ex.Message
+                              "elapsedMs", jint (int projSw.ElapsedMilliseconds) ]
+                        :> JsonNode
+                    )
+
+            sweepSw.Stop()
 
             let sortedSites =
                 siteByKey.Values
                 |> Seq.toArray
-                |> Array.sortBy (fun s -> s.File, s.StartLine, s.StartCol, s.EndLine, s.EndCol)
+                |> Array.sortBy (fun s -> s.File, s.StartLine, s.StartCol, s.EndLine, s.EndCol, s.Fsproj)
 
-            let totalTests = sortedSites.Length
-            let pageSites = sortedSites |> Array.truncate (max 0 maxResults)
+            let siteCount = sortedSites.Length
+
+            let uniqueTestCount =
+                sortedSites
+                |> Array.choose (fun site ->
+                    site.EnclosingTest
+                    |> Option.map (fun test ->
+                        site.Fsproj,
+                        site.File,
+                        test.StartLine,
+                        test.StartColumn,
+                        test.Name))
+                |> Array.distinct
+                |> Array.length
+
+            let pageSites =
+                sortedSites
+                |> Array.skip (min pageOffset siteCount)
+                |> Array.truncate pageSize
 
             let testToJson
                 (s:
@@ -7007,7 +7555,8 @@ type internal FcsBridge
                        EndLine: int
                        EndCol: int
                        Project: string
-                       EnclosingTest: string option
+                       Fsproj: string
+                       EnclosingTest: EnclosingTestIdentity option
                        LineText: string |})
                 =
                 // range carries coordinates only — `file` is the sibling field above, so it
@@ -7022,7 +7571,7 @@ type internal FcsBridge
 
                 let enclosing =
                     match s.EnclosingTest with
-                    | Some t -> jstr t
+                    | Some test -> jstr test.Name
                     | None -> null
 
                 jobj
@@ -7030,21 +7579,85 @@ type internal FcsBridge
                       "range", rangeNode
                       "enclosingTest", enclosing
                       "project", jstr s.Project
+                      "fsproj", jstr s.Fsproj
                       "lineText", jstr s.LineText ]
                 :> JsonNode
 
             let testNodes = pageSites |> Array.map testToJson
 
+            let coverageComplete =
+                not needsSolutionWidening
+                && scannedOk = testProjects.Length
+                && projectsFailed = 0
+                && projectsTimedOut = 0
+                && projectsBusy = 0
+
+            let status =
+                if coverageComplete then
+                    "succeeded"
+                elif siteCount > 0 then
+                    "partial"
+                else
+                    "unknown"
+
+            let outcome =
+                if siteCount > 0 then
+                    "matched"
+                elif coverageComplete then
+                    "not_found"
+                else
+                    "indeterminate"
+
+            let coverage =
+                jobj
+                    [ "complete", jbool coverageComplete
+                      "projectsRequested", jint testProjects.Length
+                      "projectsScanned", jint scannedOk
+                      "projectsFailed", jint projectsFailed
+                      "projectsTimedOut", jint projectsTimedOut
+                      "projectsBusy", jint projectsBusy ]
+                :> JsonNode
+
+            let messageFields =
+                if needsSolutionWidening then
+                    [ ("message",
+                       jstr
+                           $"'%s{sweepTarget}' is a non-test .fsproj and cannot reveal test projects that reference it. No active .sln/.slnx containing that source project was available as the separate discovery context. Call set_project with the containing solution, or pass its .sln/.slnx (or workspace directory) as projectPath, to widen tests_for_symbol coverage.") ]
+                elif not coverageComplete then
+                    [ ("message",
+                       jstr
+                           $"Only %d{scannedOk}/%d{testProjects.Length} requested test project(s) were scanned (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy). The test-site result is incomplete; retry busy work, increase timeoutMs, or fix the perProject errors before trusting zero.") ]
+                else
+                    []
+
+            let paginationFields =
+                Cursor.paginationFields "sites" siteCount pageOffset pageSize pageSites.Length
+
             return
                 jobj
-                    [ "status", jstr "succeeded"
-                      "symbol", jstr query
-                      "tests", JsonArray(testNodes) :> JsonNode
-                      "testCount", jint totalTests
-                      // scanned = test projects actually swept; requested = total found.
-                      // A gap means some failed to load and their tests were NOT considered.
-                      "projectsScanned", jint scannedOk
-                      "projectsRequested", jint testProjects.Length ]
+                    ([ "status", jstr status
+                       "outcome", jstr outcome
+                       "symbol", jstr query
+                       "requestedProjectPath", jstr sweepTarget
+                       "discoveryProjectPath", jstr discoveryTarget
+                       "usedActiveSolutionContext", jbool activeSolutionContext.IsSome
+                       "tests", JsonArray(testNodes) :> JsonNode
+                       // Compatibility: testCount historically counted reference sites.
+                       // uniqueTestCount is the additive distinct-enclosing-test metric.
+                       "testCount", jint siteCount
+                       "uniqueTestCount", jint uniqueTestCount
+                       "siteCount", jint siteCount
+                       "complete", jbool coverageComplete
+                       "coverage", coverage
+                       "projectsScanned", jint scannedOk
+                       "projectsRequested", jint testProjects.Length
+                       "projectsFailed", jint projectsFailed
+                       "projectsTimedOut", jint projectsTimedOut
+                       "projectsBusy", jint projectsBusy
+                       "perProject", JsonArray(perProject.ToArray()) :> JsonNode
+                       "sweepElapsedMs", jint (int sweepSw.ElapsedMilliseconds) ]
+                     @ messageFields
+                     @ paginationFields)
                 :> JsonNode
         }
 
@@ -7058,7 +7671,7 @@ type internal FcsBridge
     // the caller turns into verdict="unknown" rather than a confident clean.
     member private this.FreshProjectCheck
         (fsproj: string, remainingBudget: unit -> TimeSpan)
-        : Task<Result<FSharpDiagnostic array * string * string, string>> =
+        : Task<Result<FSharpDiagnostic array * string * string, CheckBlockingFailure>> =
         task {
             try
                 let! options, optionsSource =
@@ -7069,7 +7682,7 @@ type internal FcsBridge
                 // Check budget elapsed while it was running, do not launch a late FCS
                 // type-check after the original request has already returned unknown.
                 if remaining <= TimeSpan.Zero then
-                    return Error "timeout"
+                    return Error CheckTimedOut
                 else
                     // Hashing the full source/reference closure is synchronous and can
                     // be expensive. The single-flight worker remains admitted until the
@@ -7079,7 +7692,7 @@ type internal FcsBridge
                     let remainingAfterSnapshot = remainingBudget ()
 
                     if remainingAfterSnapshot <= TimeSpan.Zero then
-                        return Error "timeout"
+                        return Error CheckTimedOut
                     else
                         let workKey = $"{analysisProjectIdentity options}|{cacheKey}"
                         let generation = Volatile.Read(&freshProjectCheckGeneration)
@@ -7210,10 +7823,12 @@ type internal FcsBridge
                         let! result = work
                         return Ok result
             with
-            | :? OperationCanceledException
-            | :? TaskCanceledException
-            | :? TimeoutException -> return Error "timeout"
-            | ex -> return Error ex.Message
+            | :? OperationCanceledException as cancelled -> return Error(CheckCancelled cancelled.Message)
+            | :? TimeoutException -> return Error CheckTimedOut
+            | SdkPreflight.SdkPinUnsatisfiable failure -> return Error(CheckSdkNotFound failure)
+            | :? ProjectEvaluationBusyException as ex -> return Error(CheckBusy ex.Message)
+            | ex when boundedCheckWorkFailureIsBusy ex -> return Error(CheckBusy ex.Message)
+            | ex -> return Error(CheckProjectFailure ex.Message)
         }
 
     /// Deterministic reference-resolution probe over a project's resolved OtherOptions
@@ -7224,22 +7839,34 @@ type internal FcsBridge
     /// timed-out, or unloadable probe becomes an honest unknown Check verdict.
     member private this.ProbeReferenceResolution
         (fsproj: string, remainingBudget: unit -> TimeSpan)
-        : Task<Result<int * int, string>> =
+        : Task<Result<int * int, CheckBlockingFailure>> =
         task {
             try
                 let! options, _ =
                     this.ResolveFsprojOptionsWithinBudget(normalizePath fsproj, Some remainingBudget)
 
                 if remainingBudget () <= TimeSpan.Zero then
-                    return Error "timeout"
+                    return Error CheckTimedOut
                 else
-                    return!
+                    let! result =
                         runReferenceResolutionProbe
                             (referenceResolutionProbeKey options)
                             (Array.copy options.OtherOptions)
                             (Some remainingBudget)
+
+                    return
+                        match result with
+                        | Ok counts -> Ok counts
+                        | Error failure -> Error failure
             with ex ->
-                return Error ex.Message
+                return
+                    match ex with
+                    | SdkPreflight.SdkPinUnsatisfiable failure -> Error(CheckSdkNotFound failure)
+                    | :? OperationCanceledException as cancelled -> Error(CheckCancelled cancelled.Message)
+                    | :? TimeoutException -> Error CheckTimedOut
+                    | :? ProjectEvaluationBusyException as busy -> Error(CheckBusy busy.Message)
+                    | _ when boundedCheckWorkFailureIsBusy ex -> Error(CheckBusy ex.Message)
+                    | _ -> Error(CheckProjectFailure ex.Message)
         }
 
     /// Resolve the exact evaluated FCS SourceFiles covered by a fast check. This is
@@ -7262,12 +7889,46 @@ type internal FcsBridge
 
             let expected = System.Collections.Generic.HashSet<string>(comparer)
             let failures = ResizeArray<string>()
+            let blockingReasons = ResizeArray<JsonNode>()
             let contextFingerprints = ResizeArray<string>()
             let mutable deadlineExpired = false
 
+            let addBlockingReason (reason: JsonNode) =
+                let rendered = reason.ToJsonString()
+
+                if
+                    blockingReasons
+                    |> Seq.exists (fun existing ->
+                        String.Equals(existing.ToJsonString(), rendered, StringComparison.Ordinal))
+                    |> not
+                then
+                    blockingReasons.Add reason
+
+            let addGenericBlockingReason errorKind message retryable =
+                checkGenericBlockingReason errorKind message retryable |> addBlockingReason
+
+            let preserveBlockingReason (projectPath: string) (ex: exn) =
+                match ex with
+                | SdkPreflight.SdkPinUnsatisfiable failure ->
+                    let reason =
+                        SdkPreflight.toBlockingReason failure.Pin failure.InstalledSdks
+
+                    reason["projectPath"] <- jstr (normalizePath projectPath)
+                    addBlockingReason reason
+                | :? OperationCanceledException as cancelled ->
+                    addGenericBlockingReason "cancelled" cancelled.Message true
+                | :? TimeoutException as timeout -> addGenericBlockingReason "timeout" timeout.Message true
+                | :? ProjectEvaluationBusyException as busy ->
+                    addGenericBlockingReason "fcs_worker_busy" busy.Message true
+                | busy when boundedCheckWorkFailureIsBusy busy ->
+                    addGenericBlockingReason "fcs_worker_busy" busy.Message true
+                | failure -> addGenericBlockingReason "project_failure" failure.Message false
+
             let markDeadlineExpired description =
                 if not deadlineExpired then
-                    failures.Add($"Fast check expectation timed out while {description}.")
+                    let message = $"Fast check expectation timed out while {description}."
+                    failures.Add message
+                    addGenericBlockingReason "timeout" message true
 
                 deadlineExpired <- true
 
@@ -7345,10 +8006,20 @@ type internal FcsBridge
                     try
                         let fullPath = normalizePath path
                         let source = File.ReadAllText(fullPath)
+
+                        // Once a real owning project is discoverable, pass it explicitly.
+                        // ResolveProjectOptions deliberately falls back to script inference
+                        // only for genuinely projectless files; allowing that fallback here
+                        // used to erase sdk_not_found from the natural fast file-check path.
+                        let effectiveProjectPath =
+                            match args.projectPath with
+                            | Some project when project.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) ->
+                                Some(normalizePath project)
+                            | _ -> findNearestFsproj fullPath |> Option.map normalizePath
+
                         let! resolved =
-                            awaitWithinDeadline
-                                $"evaluating SourceFiles for '{fullPath}'"
-                                (fun () -> this.ResolveProjectOptions(fullPath, source, args.projectPath, None))
+                            awaitWithinDeadline $"evaluating SourceFiles for '{fullPath}'" (fun () ->
+                                this.ResolveProjectOptions(fullPath, source, effectiveProjectPath, None))
 
                         match resolved with
                         | Some(options, _) ->
@@ -7365,6 +8036,7 @@ type internal FcsBridge
                                 failures.Add($"File is not present in the evaluated SourceFiles: {fullPath}")
                         | None -> ()
                     with ex ->
+                        preserveBlockingReason path ex
                         failures.Add($"Could not evaluate SourceFiles for file scope: {ex.Message}")
                 | _ -> failures.Add("scope='file' requires a source path.")
 
@@ -7396,10 +8068,13 @@ type internal FcsBridge
                             | None -> ()
                         | Some(CheckTargetDiscoveryResult.Project None) ->
                             failures.Add("Could not resolve a project for the fast check.")
-                        | Some(CheckTargetDiscoveryResult.Busy reason) -> failures.Add(reason)
+                        | Some(CheckTargetDiscoveryResult.Busy reason) ->
+                            failures.Add reason
+                            addGenericBlockingReason "fcs_worker_busy" reason true
                         | None -> ()
                         | Some _ -> failures.Add("Project discovery returned an unexpected result.")
                     with ex ->
+                        preserveBlockingReason target ex
                         failures.Add($"Could not resolve/evaluate SourceFiles from '{target}': {ex.Message}")
                 | None -> failures.Add("Could not resolve a project for the fast check.")
 
@@ -7447,11 +8122,15 @@ type internal FcsBridge
                                         | Some(options, _) -> do! addProjectSources options
                                         | None -> ()
                                     with ex ->
+                                        preserveBlockingReason fsproj ex
                                         failures.Add($"Could not evaluate SourceFiles for '{fsproj}': {ex.Message}")
-                        | Some(CheckTargetDiscoveryResult.Busy reason) -> failures.Add(reason)
+                        | Some(CheckTargetDiscoveryResult.Busy reason) ->
+                            failures.Add reason
+                            addGenericBlockingReason "fcs_worker_busy" reason true
                         | None -> ()
                         | Some _ -> failures.Add("Workspace discovery returned an unexpected result.")
                     with ex ->
+                        preserveBlockingReason target ex
                         failures.Add($"Could not resolve workspace projects from '{target}': {ex.Message}")
                 | None -> failures.Add("Could not resolve a workspace for the fast check.")
 
@@ -7461,6 +8140,9 @@ type internal FcsBridge
                 expected
                 |> Seq.sortWith (fun left right -> comparer.Compare(left, right))
                 |> Seq.toArray
+
+            if failures.Count > 0 && blockingReasons.Count = 0 then
+                addGenericBlockingReason "project_failure" (String.concat " | " failures) false
 
             let contextFingerprint =
                 if failures.Count > 0 || contextFingerprints.Count = 0 then
@@ -7485,6 +8167,7 @@ type internal FcsBridge
                         None
                     else
                         Some(String.concat " | " failures)
+                  BlockingReasons = blockingReasons.ToArray()
                   FileGlob = if resolvedScope = "workspace" then args.fileGlob else None }
         }
 
@@ -7713,6 +8396,29 @@ type internal FcsBridge
             let overallDeadlineApplies = resolvedScope = "project" || resolvedScope = "workspace"
             let overallTimeoutReason = $"Check timed out after {timeoutMs}ms before analysis completed."
 
+            let genericBlockingReason errorKind message retryable =
+                checkGenericBlockingReason errorKind message retryable
+
+            let blockingFailureMessage failure =
+                match failure with
+                | CheckTimedOut -> overallTimeoutReason
+                | CheckCancelled message
+                | CheckBusy message
+                | CheckProjectFailure message -> message
+                | CheckSdkNotFound sdkFailure -> sdkFailure.Message
+
+            let blockingReasonFor failure =
+                match failure with
+                | CheckTimedOut -> genericBlockingReason "timeout" overallTimeoutReason true
+                | CheckCancelled message -> genericBlockingReason "cancelled" message true
+                | CheckBusy message -> genericBlockingReason "fcs_worker_busy" message true
+                | CheckProjectFailure message -> genericBlockingReason "project_failure" message false
+                | CheckSdkNotFound sdkFailure ->
+                    SdkPreflight.toBlockingReason sdkFailure.Pin sdkFailure.InstalledSdks
+
+            let blockingFields failure =
+                [ ("blockingReason", blockingReasonFor failure) ]
+
             let awaitWithinOverallBudget (start: unit -> Task<'T>) : Task<'T option> =
                 task {
                     let remaining = remainingCheckBudget ()
@@ -7759,6 +8465,7 @@ type internal FcsBridge
                   ContextFingerprint = None
                   Complete = false
                   FailureReason = Some reason
+                  BlockingReasons = [| genericBlockingReason "timeout" reason true |]
                   FileGlob = if resolvedScope = "workspace" then args.fileGlob else None }
 
             // A project verdict is intentionally narrow: FCS checks the selected
@@ -7868,6 +8575,14 @@ type internal FcsBridge
                     | Some reason -> reason
                     | None -> overallTimeoutReason
 
+                let discoveryFailure =
+                    match scopeDiscoveryFailure with
+                    | Some "timeout" -> CheckTimedOut
+                    | Some reason when reason.Contains("busy", StringComparison.OrdinalIgnoreCase) ->
+                        CheckBusy reason
+                    | Some reason -> CheckProjectFailure reason
+                    | None -> CheckTimedOut
+
                 return
                     build
                         "unknown"
@@ -7881,7 +8596,7 @@ type internal FcsBridge
                         [||]
                         [||]
                         (Some discoveryReason)
-                        [ ("projectsSwept", jint 0) ]
+                        ([ ("projectsSwept", jint 0) ] @ blockingFields discoveryFailure)
             // ── snippet: always FRESH (ignores speed); old ValidateSnippet logic ──
             | "snippet" ->
                 match args.snippet with
@@ -7992,6 +8707,12 @@ type internal FcsBridge
             | _ when speed = "fast" ->
                 // Resolve the requested coverage from evaluated FCS project options,
                 // then ask FSAC for a context-bound snapshot of exactly those files.
+                let unavailableFastSnapshot (expectation: CheckFsacExpectation) failure =
+                    CheckFsacSnapshot.unavailableWithBlockingReason
+                        expectation
+                        (blockingFailureMessage failure)
+                        (blockingReasonFor failure)
+
                 let expectationDeadline =
                     if overallDeadlineApplies then Some remainingCheckBudget else None
 
@@ -8042,11 +8763,18 @@ type internal FcsBridge
 
                 let! snap =
                     match fsacSnapshot with
+                    | _ when expectation.BlockingReasons.Length > 0 ->
+                        Task.FromResult(
+                            CheckFsacSnapshot.unavailable
+                                expectation
+                                (expectation.FailureReason
+                                 |> Option.defaultValue "Fast-check expectation is blocked by infrastructure preflight.")
+                        )
                     | Some thunk ->
                         task {
                             if overallDeadlineApplies && remainingCheckBudget () <= TimeSpan.Zero then
                                 markCheckDeadlineExpired ()
-                                return CheckFsacSnapshot.unavailable expectation overallTimeoutReason
+                                return unavailableFastSnapshot expectation CheckTimedOut
                             else
                                 try
                                     let work =
@@ -8067,7 +8795,7 @@ type internal FcsBridge
 
                                         if remaining <= TimeSpan.Zero then
                                             markCheckDeadlineExpired ()
-                                            return CheckFsacSnapshot.unavailable expectation overallTimeoutReason
+                                            return unavailableFastSnapshot expectation CheckTimedOut
                                         else
                                             try
                                                 let! completed = work.WaitAsync(remaining)
@@ -8084,19 +8812,30 @@ type internal FcsBridge
                                                 if deadlineExpired then
                                                     markCheckDeadlineExpired ()
 
-                                                    return
-                                                        CheckFsacSnapshot.unavailable
-                                                            expectation
-                                                            overallTimeoutReason
+                                                    return unavailableFastSnapshot expectation CheckTimedOut
                                                 else
                                                     return completed
                                             with :? TimeoutException ->
                                                 markCheckDeadlineExpired ()
-                                                return CheckFsacSnapshot.unavailable expectation overallTimeoutReason
+                                                return unavailableFastSnapshot expectation CheckTimedOut
                                     else
                                         return! work
-                                with ex ->
-                                    return CheckFsacSnapshot.unavailable expectation ex.Message
+                                with
+                                | SdkPreflight.SdkPinUnsatisfiable failure ->
+                                    return
+                                        CheckFsacSnapshot.unavailableWithBlockingReason
+                                            expectation
+                                            failure.Message
+                                            (SdkPreflight.toBlockingReason failure.Pin failure.InstalledSdks)
+                                | :? TimeoutException ->
+                                    return unavailableFastSnapshot expectation CheckTimedOut
+                                | :? OperationCanceledException as cancelled ->
+                                    return unavailableFastSnapshot expectation (CheckCancelled cancelled.Message)
+                                | :? ProjectEvaluationBusyException as busy ->
+                                    return unavailableFastSnapshot expectation (CheckBusy busy.Message)
+                                | busy when boundedCheckWorkFailureIsBusy busy ->
+                                    return unavailableFastSnapshot expectation (CheckBusy busy.Message)
+                                | ex -> return unavailableFastSnapshot expectation (CheckProjectFailure ex.Message)
                         }
                     | None ->
                         Task.FromResult(
@@ -8184,6 +8923,16 @@ type internal FcsBridge
                         snap.FailureReason
                         |> Option.orElse (Some "FSAC diagnostics coverage is incomplete.")
 
+                let fastBlockingReasons =
+                    Array.append expectation.BlockingReasons snap.BlockingReasons
+                    |> Array.distinctBy (fun reason -> reason.ToJsonString())
+
+                let fastBlockingFields =
+                    match fastBlockingReasons with
+                    | [||] -> []
+                        | [| one |] -> [ ("blockingReason", one.DeepClone()) ]
+                        | many -> [ ("blockingReasons", JsonArray(many |> Array.map _.DeepClone()) :> JsonNode) ]
+
                 // Surface the snapshot's diagnostics by the requested severity floor —
                 // LSP severity codes (1=Error … 4=Hint) line up with floorRank, so a node
                 // is emitted when 1 ≤ code ≤ floorRank. This is what makes
@@ -8249,6 +8998,32 @@ type internal FcsBridge
                         |> Seq.length
                     | _ -> 0
 
+                let fastResponseFields =
+                    [ "lspState", jstr (if snap.Ready then "ready" else "warming")
+                      "fsacStatus", jstr snap.Status
+                      "requestedProjectPath",
+                      (expectation.RequestedProjectPath |> Option.map jstr |> Option.defaultValue null)
+                      "fileGlob", (expectation.FileGlob |> Option.map jstr |> Option.defaultValue null)
+                      "contextMatched", jbool snap.ContextMatched
+                      "complete", jbool coverageComplete
+                      "expectationComplete", jbool expectation.Complete
+                      "expectedFileCount", jint snap.ExpectedFiles.Length
+                      "receivedFileCount", jint snap.ReceivedFiles.Length
+                      "missingFileCount", jint snap.MissingFiles.Length
+                      "staleFileCount", jint snap.StaleFiles.Length
+                      "expectedFiles", JsonArray(snap.ExpectedFiles |> Array.map jstr) :> JsonNode
+                      "receivedFiles", JsonArray(snap.ReceivedFiles |> Array.map jstr) :> JsonNode
+                      "missingFiles", JsonArray(snap.MissingFiles |> Array.map jstr) :> JsonNode
+                      "staleFiles", JsonArray(snap.StaleFiles |> Array.map jstr) :> JsonNode
+                      "sessionGeneration",
+                      (snap.SessionGeneration |> Option.map jint64 |> Option.defaultValue null)
+                      "mostRecentAnalyzedAt",
+                      (match snap.MostRecentAnalyzedAt with
+                       | Some timestamp -> jstr timestamp
+                       | None -> null)
+                      "analyzedFileCount", jint snap.AnalyzedFileCount ]
+                    @ fastBlockingFields
+
                 return
                     build
                         verdict
@@ -8262,26 +9037,7 @@ type internal FcsBridge
                         nodes
                         files
                         coverageReason
-                        [ "lspState", jstr (if snap.Ready then "ready" else "warming")
-                          "fsacStatus", jstr snap.Status
-                          "requestedProjectPath",
-                          (expectation.RequestedProjectPath |> Option.map jstr |> Option.defaultValue null)
-                          "fileGlob", (expectation.FileGlob |> Option.map jstr |> Option.defaultValue null)
-                          "contextMatched", jbool snap.ContextMatched
-                          "complete", jbool coverageComplete
-                          "expectationComplete", jbool expectation.Complete
-                          "expectedFileCount", jint snap.ExpectedFiles.Length
-                          "receivedFileCount", jint snap.ReceivedFiles.Length
-                          "missingFileCount", jint snap.MissingFiles.Length
-                          "staleFileCount", jint snap.StaleFiles.Length
-                          "expectedFiles", JsonArray(snap.ExpectedFiles |> Array.map jstr) :> JsonNode
-                          "receivedFiles", JsonArray(snap.ReceivedFiles |> Array.map jstr) :> JsonNode
-                          "missingFiles", JsonArray(snap.MissingFiles |> Array.map jstr) :> JsonNode
-                          "staleFiles", JsonArray(snap.StaleFiles |> Array.map jstr) :> JsonNode
-                          "sessionGeneration",
-                          (snap.SessionGeneration |> Option.map jint64 |> Option.defaultValue null)
-                          "mostRecentAnalyzedAt", (match snap.MostRecentAnalyzedAt with Some t -> jstr t | None -> null)
-                          "analyzedFileCount", jint snap.AnalyzedFileCount ]
+                        fastResponseFields
 
             | "file" ->
                 match args.path with
@@ -8292,59 +9048,146 @@ type internal FcsBridge
                         // Resolve options, invalidate THIS project, then re-check fresh so
                         // on-disk edits (incl. cross-file) are reflected — mirrors fcs_check_file.
                         let fullPath = normalizePath path
-                        let source = File.ReadAllText(fullPath)
-                        let sourceText = SourceText.ofString source
-                        let! projectOptions, optionsSource =
-                            this.ResolveProjectOptions(fullPath, source, args.projectPath, None)
 
-                        let projectResultsKey = analysisSnapshotKey projectOptions
-                        projectResultsCache.TryRemove(projectResultsKey) |> ignore
-                        checker.InvalidateConfiguration(projectOptions)
+                        let runTrustedFileCheck () =
+                            task {
+                                let source = File.ReadAllText(fullPath)
+                                let sourceText = SourceText.ofString source
+                                let! projectOptions, optionsSource =
+                                    this.ResolveProjectOptions(fullPath, source, args.projectPath, None)
 
-                        let! parseResults, checkAnswer =
-                            checker.ParseAndCheckFileInProject(fullPath, 0, sourceText, projectOptions) |> asTask
+                                let projectResultsKey = analysisSnapshotKey projectOptions
+                                projectResultsCache.TryRemove(projectResultsKey) |> ignore
+                                checker.InvalidateConfiguration(projectOptions)
 
-                        let checkedResults =
-                            match checkAnswer with
-                            | FSharpCheckFileAnswer.Succeeded results -> Some results
-                            | FSharpCheckFileAnswer.Aborted -> None
+                                let! parseResults, checkAnswer =
+                                    checker.ParseAndCheckFileInProject(fullPath, 0, sourceText, projectOptions)
+                                    |> asTask
 
-                        let checkDiagnostics =
-                            checkedResults
-                            |> Option.map (fun r -> r.Diagnostics)
-                            |> Option.defaultValue [||]
+                                let checkAnswer =
+                                    match trustedFileCheckAnswerOverride with
+                                    | Some overrideAnswer -> overrideAnswer checkAnswer
+                                    | None -> checkAnswer
 
-                        let allDiags = Array.append parseResults.Diagnostics checkDiagnostics
-                        let succeeded = checkedResults.IsSome
-                        let errorCount, warningCount = countDiagnosticsBySeverity allDiags
-                        let infoCount = countInfoDiagnostics allDiags
+                                let checkedResults =
+                                    match checkAnswer with
+                                    | FSharpCheckFileAnswer.Succeeded results -> Some results
+                                    | FSharpCheckFileAnswer.Aborted -> None
 
-                        let verdict, analyzed, reason =
-                            if not succeeded then
-                                "unknown", false, Some "Type checking was aborted; file verdict is indeterminate."
-                            elif errorCount > 0 then
-                                "errors", true, None
-                            else
-                                "clean", true, None
+                                let checkDiagnostics =
+                                    checkedResults
+                                    |> Option.map (fun r -> r.Diagnostics)
+                                    |> Option.defaultValue [||]
 
-                        let nodes, files = surfaceFcs allDiags
+                                let allDiags = Array.append parseResults.Diagnostics checkDiagnostics
+                                let succeeded = checkedResults.IsSome
+                                let errorCount, warningCount = countDiagnosticsBySeverity allDiags
+                                let infoCount = countInfoDiagnostics allDiags
 
-                        return
+                                let abortedReason =
+                                    "Type checking was aborted; file verdict is indeterminate."
+
+                                let blockingFailure =
+                                    if succeeded then
+                                        None
+                                    else
+                                        Some(CheckProjectFailure abortedReason)
+
+                                let verdict, analyzed, reason =
+                                    match blockingFailure with
+                                    | Some failure -> "unknown", false, Some(blockingFailureMessage failure)
+                                    | None when errorCount > 0 -> "errors", true, None
+                                    | None -> "clean", true, None
+
+                                let nodes, files = surfaceFcs allDiags
+
+                                let responseFields =
+                                    [ "projectFileName", jstr projectOptions.ProjectFileName
+                                      "optionsSource", jstr optionsSource
+                                      "projectsSwept", jint 1 ]
+                                    @ (blockingFailure
+                                       |> Option.map blockingFields
+                                       |> Option.defaultValue [])
+
+                                return
+                                    build
+                                        verdict
+                                        analyzed
+                                        "fcs"
+                                        (Some "fcs-reanalyze")
+                                        errorCount
+                                        warningCount
+                                        infoCount
+                                        allDiags.Length
+                                        nodes
+                                        files
+                                        reason
+                                        responseFields
+                            }
+
+                        let blockedTrustedFile failure =
+                            let message = blockingFailureMessage failure
+
                             build
-                                verdict
-                                analyzed
+                                "unknown"
+                                false
                                 "fcs"
                                 (Some "fcs-reanalyze")
-                                errorCount
-                                warningCount
-                                infoCount
-                                allDiags.Length
-                                nodes
-                                files
-                                reason
-                                [ "projectFileName", jstr projectOptions.ProjectFileName
-                                  "optionsSource", jstr optionsSource
-                                  "projectsSwept", jint 1 ]
+                                0
+                                0
+                                0
+                                0
+                                [||]
+                                [||]
+                                (Some $"File could not be analyzed: {message}")
+                                ([ ("projectsSwept", jint 1) ] @ blockingFields failure)
+
+                        let sdkDirectories =
+                            [ match args.projectPath with
+                              | Some project when
+                                  project.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase)
+                                  ->
+                                  yield Path.GetDirectoryName(normalizePath project)
+                              | _ -> ()
+
+                              match findNearestFsproj fullPath with
+                              | Some project -> yield Path.GetDirectoryName(normalizePath project)
+                              | None -> () ]
+                            |> List.distinct
+
+                        match SdkPreflight.check sdkDirectories with
+                        | SdkPreflight.SdkNotFound(pin, installedSdks) ->
+                            let failure = SdkPreflight.SdkNotFoundException(pin, installedSdks)
+
+                            return
+                                build
+                                    "unknown"
+                                    false
+                                    "fcs"
+                                    (Some "fcs-reanalyze")
+                                    0
+                                    0
+                                    0
+                                    0
+                                    [||]
+                                    [||]
+                                    (Some failure.Message)
+                                    ([ ("projectsSwept", jint 0) ]
+                                     @ blockingFields (CheckSdkNotFound failure))
+                        | SdkPreflight.Proceed ->
+                            try
+                                return! runTrustedFileCheck ()
+                            with
+                            | :? OperationCanceledException as cancelled ->
+                                return blockedTrustedFile (CheckCancelled cancelled.Message)
+                            | :? TimeoutException ->
+                                return blockedTrustedFile CheckTimedOut
+                            | :? ProjectEvaluationBusyException as busy ->
+                                return blockedTrustedFile (CheckBusy busy.Message)
+                            | busy when boundedCheckWorkFailureIsBusy busy ->
+                                return blockedTrustedFile (CheckBusy busy.Message)
+                            | ex ->
+                                return blockedTrustedFile (CheckProjectFailure ex.Message)
                 | _ -> return invalid "scope='file' requires 'path'."
 
             | "project" ->
@@ -8382,7 +9225,7 @@ type internal FcsBridge
                                 [||]
                                 [||]
                                 (Some overallTimeoutReason)
-                                [ ("projectsSwept", jint 0) ]
+                                ([ ("projectsSwept", jint 0) ] @ blockingFields CheckTimedOut)
                     | Some(CheckTargetDiscoveryResult.Busy reason) ->
                         return
                             build
@@ -8397,7 +9240,7 @@ type internal FcsBridge
                                 [||]
                                 [||]
                                 (Some reason)
-                                [ ("projectsSwept", jint 0) ]
+                                ([ ("projectsSwept", jint 0) ] @ blockingFields (CheckBusy reason))
                     | Some(CheckTargetDiscoveryResult.Project None) ->
                         return invalid $"check could not resolve a single .fsproj to check from: {target}"
                     | Some(CheckTargetDiscoveryResult.Project(Some proj)) ->
@@ -8413,7 +9256,7 @@ type internal FcsBridge
 
                         match boundedProbe with
                         | None
-                        | Some(Error "timeout") ->
+                        | Some(Error CheckTimedOut) ->
                             return
                                 build
                                     "unknown"
@@ -8427,8 +9270,10 @@ type internal FcsBridge
                                     [||]
                                     [||]
                                     (Some overallTimeoutReason)
-                                    [ ("projectsSwept", jint 0) ]
-                        | Some(Error reason) ->
+                                    ([ ("projectsSwept", jint 0) ] @ blockingFields CheckTimedOut)
+                        | Some(Error failure) ->
+                            let failureMessage = blockingFailureMessage failure
+
                             return
                                 build
                                     "unknown"
@@ -8441,8 +9286,8 @@ type internal FcsBridge
                                     0
                                     [||]
                                     [||]
-                                    (Some $"Reference resolution probe incomplete: {reason}")
-                                    [ ("projectsSwept", jint 0) ]
+                                    (Some $"Reference resolution probe incomplete: {failureMessage}")
+                                    ([ ("projectsSwept", jint 0) ] @ blockingFields failure)
                         | Some(Ok(refExisting, refTotal)) when
                             ReferenceResolution.looksUnrestored refExisting refTotal
                             ->
@@ -8472,10 +9317,10 @@ type internal FcsBridge
                                 awaitWithinOverallBudget (fun () ->
                                     this.FreshProjectCheck(proj, remainingCheckBudget))
 
-                            let result = boundedResult |> Option.defaultValue (Error "timeout")
+                            let result = boundedResult |> Option.defaultValue (Error CheckTimedOut)
 
                             match result with
-                            | Error "timeout" ->
+                            | Error CheckTimedOut ->
                                 return
                                     build
                                         "unknown"
@@ -8489,8 +9334,10 @@ type internal FcsBridge
                                         [||]
                                         [||]
                                         (Some overallTimeoutReason)
-                                        [ ("projectsSwept", jint 1) ]
-                            | Error msg ->
+                                        ([ ("projectsSwept", jint 1) ] @ blockingFields CheckTimedOut)
+                            | Error failure ->
+                                let message = blockingFailureMessage failure
+
                                 return
                                     build
                                         "unknown"
@@ -8503,8 +9350,8 @@ type internal FcsBridge
                                         0
                                         [||]
                                         [||]
-                                        (Some $"Project could not be analyzed: {msg}")
-                                        [ ("projectsSwept", jint 1) ]
+                                        (Some $"Project could not be analyzed: {message}")
+                                        ([ ("projectsSwept", jint 1) ] @ blockingFields failure)
                             | Ok(diags, projFileName, optionsSource) ->
                                 let errorCount, warningCount = countDiagnosticsBySeverity diags
                                 let infoCount = countInfoDiagnostics diags
@@ -8584,8 +9431,10 @@ type internal FcsBridge
                                 [||]
                                 [||]
                                 (Some overallTimeoutReason)
-                                [ ("projectsSwept", jint 0) ]
+                                ([ ("projectsSwept", jint 0) ] @ blockingFields CheckTimedOut)
                     elif targetDiscoveryBusy.IsSome then
+                        let busyReason = targetDiscoveryBusy.Value
+
                         return
                             build
                                 "unknown"
@@ -8599,7 +9448,7 @@ type internal FcsBridge
                                 [||]
                                 [||]
                                 targetDiscoveryBusy
-                                [ ("projectsSwept", jint 0) ]
+                                ([ ("projectsSwept", jint 0) ] @ blockingFields (CheckBusy busyReason))
                     elif projects.Length = 0 then
                         return invalid $"check could not resolve any .fsproj to check from: {target}"
                     else
@@ -8620,6 +9469,7 @@ type internal FcsBridge
                                       "fsproj", jstr (normalizePath proj)
                                       "error", jstr "timeout"
                                       "reason", jstr overallTimeoutReason
+                                      "blockingReason", blockingReasonFor CheckTimedOut
                                       "analyzed", jbool false ]
                                 :> JsonNode
                             )
@@ -8638,17 +9488,19 @@ type internal FcsBridge
 
                                 match boundedProbe with
                                 | None
-                                | Some(Error "timeout") ->
+                                | Some(Error CheckTimedOut) ->
                                     deadlineExhausted <- true
                                     addTimedOutProject proj
-                                | Some(Error reason) ->
+                                | Some(Error failure) ->
                                     failCount <- failCount + 1
+                                    let message = blockingFailureMessage failure
 
                                     perProject.Add(
                                         jobj
                                             [ "project", jstr (Path.GetFileNameWithoutExtension proj)
                                               "fsproj", jstr (normalizePath proj)
-                                              "error", jstr reason
+                                              "error", jstr message
+                                              "blockingReason", blockingReasonFor failure
                                               "analyzed", jbool false ]
                                         :> JsonNode
                                     )
@@ -8680,7 +9532,7 @@ type internal FcsBridge
 
                                     match boundedResult with
                                     | None
-                                    | Some(Error "timeout") ->
+                                    | Some(Error CheckTimedOut) ->
                                         deadlineExhausted <- true
                                         addTimedOutProject proj
                                     | Some(Ok(diags, _, _)) ->
@@ -8702,14 +9554,16 @@ type internal FcsBridge
                                                   "analyzed", jbool true ]
                                             :> JsonNode
                                         )
-                                    | Some(Error msg) ->
+                                    | Some(Error failure) ->
                                         failCount <- failCount + 1
+                                        let message = blockingFailureMessage failure
 
                                         perProject.Add(
                                             jobj
                                                 [ "project", jstr (Path.GetFileNameWithoutExtension proj)
                                                   "fsproj", jstr (normalizePath proj)
-                                                  "error", jstr msg
+                                                  "error", jstr message
+                                                  "blockingReason", blockingReasonFor failure
                                                   "analyzed", jbool false ]
                                             :> JsonNode
                                         )
@@ -9325,169 +10179,337 @@ type internal FcsBridge
                                     :> JsonNode
         }
 
-    member this.ProjectOutline(args: FcsProjectOutlineArgs) : Task<JsonNode> =
-        task {
-            let projectPath =
-                match args.projectPath with
-                | Some p when not (String.IsNullOrWhiteSpace p) -> normalizePath p
-                | _ ->
+    member internal this.ProjectOutlineWithinDeadline
+        (args: FcsProjectOutlineArgs, cancellationToken: CancellationToken, retainUntil: Task -> unit)
+        : Task<JsonNode> =
+        let timeoutMs = args.timeoutMs |> Option.defaultValue 60_000
+
+        let invalidTimeoutResult milliseconds =
+            jobj
+                [ "status", jstr "invalid_args"
+                  "errorKind", jstr "invalid_timeout"
+                  "message", jstr $"timeoutMs must be non-negative; got %d{milliseconds}."
+                  "timeoutMs", jint milliseconds ]
+            :> JsonNode
+
+        let zeroTimeoutResult () =
+            let issue =
+                jobj
+                    [ "phase", jstr "admission"
+                      "status", jstr "timed_out"
+                      "errorKind", jstr "project_outline_timeout"
+                      "message", jstr "The end-to-end project-outline deadline was already exhausted." ]
+                :> JsonNode
+
+            let coverage =
+                jobj
+                    [ "complete", jbool false
+                      "filesRequested", jint 0
+                      "filesScanned", jint 0
+                      "filesTimedOut", jint 0
+                      "filesFailed", jint 0
+                      "filesNotStarted", jint 0
+                      "phases",
+                      JsonArray([| jobj [ "phase", jstr "admission"; "status", jstr "timed_out" ] :> JsonNode |])
+                      :> JsonNode
+                      "issues", JsonArray([| issue |]) :> JsonNode
+                      "issuesReturned", jint 1
+                      "issuesTruncated", jbool false ]
+                :> JsonNode
+
+            jobj
+                [ "status", jstr "unknown"
+                  "errorKind", jstr "project_outline_timeout"
+                  "message", jstr "fcs_project_outline timed out before protected work started."
+                  "timeoutMs", jint 0
+                  "coverage", coverage
+                  "resultSetComplete", jbool false
+                  "truncated", jbool false
+                  "nextCursor", null
+                  "files", JsonArray() :> JsonNode ]
+            :> JsonNode
+
+        let run () =
+            task {
+                let deadline = System.Diagnostics.Stopwatch.StartNew()
+
+                let remainingMilliseconds () =
+                    max 0L (int64 timeoutMs - deadline.ElapsedMilliseconds) |> int
+
+                let ensureCanContinue () =
+                    cancellationToken.ThrowIfCancellationRequested()
+
+                    if remainingMilliseconds () <= 0 then
+                        raise (TimeoutException("The fcs_project_outline end-to-end deadline was exhausted."))
+
+                let awaitWithinDeadline (phase: string) (operation: Task<'T>) : Task<'T> =
+                    task {
+                        let mutable remaining = 0
+
+                        try
+                            // `operation` is already a hot task. Keep BOTH the pre-wait
+                            // deadline/cancellation check and WaitAsync inside this try: expiry
+                            // between task creation and this point must retain the actual worker.
+                            ensureCanContinue ()
+                            remaining <- remainingMilliseconds ()
+                            return! operation.WaitAsync(TimeSpan.FromMilliseconds(float remaining), cancellationToken)
+                        with
+                        | :? TimeoutException ->
+                            observeFault operation
+                            retainUntil (operation :> Task)
+
+                            return
+                                raise (
+                                    TimeoutException(
+                                        $"Project outline phase '%s{phase}' exceeded the remaining %d{remaining} ms deadline."
+                                    )
+                                )
+                        | :? OperationCanceledException ->
+                            observeFault operation
+                            retainUntil (operation :> Task)
+
+                            return raise (OperationCanceledException(cancellationToken))
+                    }
+
+                let projectPath =
+                    match args.projectPath with
+                    | Some p when not (String.IsNullOrWhiteSpace p) -> normalizePath p
+                    | _ ->
+                        invalidArg
+                            (nameof args.projectPath)
+                            "projectPath is required. Either pass it explicitly or call set_project first to establish a default."
+
+                if not (File.Exists projectPath) then
+                    invalidArg (nameof args.projectPath) $"Project file does not exist: %s{projectPath}"
+
+                // ── Decode cursor (fail fast on malformed input) ────────────────────
+                let pageOffset =
+                    match args.cursor with
+                    | None -> 0
+                    | Some cursorStr ->
+                        match Cursor.tryDecode cursorStr with
+                        | Ok payload -> payload.offset
+                        | Error reason -> invalidArg (nameof args.cursor) $"Invalid cursor: %s{reason}"
+
+                let workspaceRoot =
+                    args.workspacePath
+                    |> Option.map Path.GetFullPath
+                    |> Option.defaultValue (Path.GetDirectoryName(projectPath))
+
+                let doc =
+                    match tryReadProject projectPath with
+                    | Ok doc -> doc
+                    | Error reason -> raise (InvalidOperationException($"Project file cannot be read: %s{reason}"))
+
+                // ── Conservative defaults (issue #78) ───────────────────────────────
+                // maxFiles=50 and maxResultsPerFile=30 keep responses within typical
+                // 25k–50k token context windows on projects up to ~50 files / 10k LOC.
+                // Callers that previously relied on the effectively-unlimited behaviour
+                // must now opt in via explicit larger values or cursor pagination.
+                let pageSize = args.maxFiles |> Option.defaultValue 50
+
+                // pageSize=0 would emit empty pages with truncated=true and a nextCursor
+                // whose offset never advances — a non-terminating loop for cursor-following
+                // clients. Reject up front.
+                if pageSize < 1 then
+                    invalidArg (nameof args.maxFiles) $"maxFiles must be >= 1 (got {pageSize})"
+
+                let maxResultsPerFile = args.maxResultsPerFile |> Option.defaultValue 30
+
+                if maxResultsPerFile < 0 then
                     invalidArg
-                        (nameof args.projectPath)
-                        "projectPath is required. Either pass it explicitly or call set_project first to establish a default."
+                        (nameof args.maxResultsPerFile)
+                        $"maxResultsPerFile must be >= 0 (got {maxResultsPerFile})"
 
-            if not (File.Exists projectPath) then
-                invalidArg (nameof args.projectPath) $"Project file does not exist: %s{projectPath}"
+                let summaryOnly = args.summaryOnly |> Option.defaultValue true
 
-            // ── Decode cursor (fail fast on malformed input) ────────────────────
-            let pageOffset =
-                match args.cursor with
-                | None -> 0
-                | Some cursorStr ->
-                    match Cursor.tryDecode cursorStr with
-                    | Ok payload -> payload.offset
-                    | Error reason ->
-                        invalidArg (nameof args.cursor) $"Invalid cursor: %s{reason}"
+                // ── Build regex / substring matchers ───────────────────────────────
+                let filterRegex =
+                    match args.filter with
+                    | None -> None
+                    | Some pattern ->
+                        if pattern.Length > 1024 then
+                            invalidArg
+                                (nameof args.filter)
+                                $"filter pattern must not exceed 1024 characters (got {pattern.Length})"
 
-            let workspaceRoot =
-                args.workspacePath
-                |> Option.map Path.GetFullPath
-                |> Option.defaultValue (Path.GetDirectoryName(projectPath))
+                        try
+                            // NonBacktracking eliminates catastrophic-backtracking risk for
+                            // user-supplied patterns like (a+)+$. A 250ms timeout is a belt-
+                            // and-suspenders guard; NonBacktracking should never time out.
+                            let opts =
+                                System.Text.RegularExpressions.RegexOptions.NonBacktracking
+                                ||| System.Text.RegularExpressions.RegexOptions.IgnoreCase
 
-            let doc =
-                match tryReadProject projectPath with
-                | Ok doc -> doc
-                | Error reason -> raise (InvalidOperationException($"Project file cannot be read: %s{reason}"))
+                            Some(System.Text.RegularExpressions.Regex(pattern, opts, TimeSpan.FromMilliseconds 250.0))
+                        with ex ->
+                            invalidArg (nameof args.filter) $"Invalid filter regex: %s{ex.Message}"
 
-            // ── Conservative defaults (issue #78) ───────────────────────────────
-            // maxFiles=50 and maxResultsPerFile=30 keep responses within typical
-            // 25k–50k token context windows on projects up to ~50 files / 10k LOC.
-            // Callers that previously relied on the effectively-unlimited behaviour
-            // must now opt in via explicit larger values or cursor pagination.
-            let pageSize = args.maxFiles |> Option.defaultValue 50
+                let nameContains = args.nameContains |> Option.filter (fun lst -> not lst.IsEmpty)
 
-            // pageSize=0 would emit empty pages with truncated=true and a nextCursor
-            // whose offset never advances — a non-terminating loop for cursor-following
-            // clients. Reject up front.
-            if pageSize < 1 then
-                invalidArg (nameof args.maxFiles) $"maxFiles must be >= 1 (got {pageSize})"
+                // Returns true when the entry name / signature passes the filter.
+                let entryMatchesFilter (name: string) (signature: string) =
+                    let matchesRegex =
+                        match filterRegex with
+                        | None -> true
+                        | Some rx ->
+                            try
+                                rx.IsMatch(name) || rx.IsMatch(signature)
+                            with :? System.Text.RegularExpressions.RegexMatchTimeoutException ->
+                                false
 
-            let maxResultsPerFile = args.maxResultsPerFile |> Option.defaultValue 30
+                    let matchesNameContains =
+                        match nameContains with
+                        | None -> true
+                        | Some fragments ->
+                            fragments
+                            |> List.exists (fun fragment ->
+                                name.Contains(fragment, StringComparison.OrdinalIgnoreCase)
+                                || signature.Contains(fragment, StringComparison.OrdinalIgnoreCase))
 
-            if maxResultsPerFile < 0 then
-                invalidArg (nameof args.maxResultsPerFile) $"maxResultsPerFile must be >= 0 (got {maxResultsPerFile})"
-            let summaryOnly = args.summaryOnly |> Option.defaultValue true
+                    matchesRegex && matchesNameContains
 
-            // ── Build regex / substring matchers ───────────────────────────────
-            let filterRegex =
-                match args.filter with
-                | None -> None
-                | Some pattern ->
-                    if pattern.Length > 1024 then
-                        invalidArg (nameof args.filter) $"filter pattern must not exceed 1024 characters (got {pattern.Length})"
+                // ── Enumerate all project files (no MaxFiles cap here — we page manually) ─
+                // A direct test-project outline is already explicitly scoped to tests. Default
+                // inclusion must therefore keep its compile files; otherwise paths such as
+                // /tests/.../Tests.fs make the whole project look empty (#239). Callers may
+                // still opt out with includeTests=false.
+                let includeTests =
+                    args.includeTests
+                    |> Option.defaultValue (FsLangMcp.ProjectHealth.isTestProjectFile projectPath)
+
+                let filterOptions =
+                    { defaultFilterOptions Outline with
+                        IncludeGenerated = args.includeGeneratedFiles |> Option.defaultValue false
+                        IncludeTests = includeTests
+                        MaxFiles = None }
+
+                let files = compileFiles projectPath doc
+
+                // Sort deterministically by path so cursor offsets are stable.
+                let allFiles =
+                    filterProjectFiles workspaceRoot filterOptions files
+                    |> fun result ->
+                        { result with
+                            Included = result.Included |> List.sortBy (fun f -> f.Path) }
+
+                let fileEntries = ResizeArray<JsonNode>()
+
+                let filtersActive = filterRegex.IsSome || nameContains.IsSome
+
+                let unfilteredPageFiles =
+                    if filtersActive then
+                        []
+                    else
+                        allFiles.Included
+                        |> List.skip (min pageOffset allFiles.Included.Length)
+                        |> List.truncate pageSize
+
+                let filesRequested =
+                    if filtersActive then
+                        allFiles.Included.Length
+                    else
+                        unfilteredPageFiles.Length
+
+                let coverageIssueLimit = 50
+                let coverageIssues = ResizeArray<JsonNode>()
+                let mutable coverageIssueCount = 0
+                let mutable filesScanned = 0
+                let mutable filesTimedOut = 0
+                let mutable filesFailed = 0
+                let mutable terminalFailure: (string * string * string) option = None
+                let mutable optionsPhaseStatus = "not_started"
+
+                let addCoverageIssue (issue: JsonNode) =
+                    coverageIssueCount <- coverageIssueCount + 1
+
+                    if coverageIssues.Count < coverageIssueLimit then
+                        coverageIssues.Add issue
+
+                let mutable resolvedProjectOptions: (FSharpProjectOptions * string) option = None
+
+                // The test-only file-outline seam predates this deadline contract and deliberately
+                // bypasses real project evaluation. Production resolves the fsproj exactly once and
+                // shares that immutable FCS context across every file in the page/sweep.
+                match projectOutlineFileOutlineOverride with
+                | Some _ -> optionsPhaseStatus <- "bypassed_for_test"
+                | None ->
+                    let optionsRemainingBudget () =
+                        cancellationToken.ThrowIfCancellationRequested()
+                        TimeSpan.FromMilliseconds(float (remainingMilliseconds ()))
+
+                    let optionsOperation =
+                        this.ResolveFsprojOptionsActualWithinBudget(projectPath, optionsRemainingBudget)
 
                     try
-                        // NonBacktracking eliminates catastrophic-backtracking risk for
-                        // user-supplied patterns like (a+)+$. A 250ms timeout is a belt-
-                        // and-suspenders guard; NonBacktracking should never time out.
-                        let opts =
-                            System.Text.RegularExpressions.RegexOptions.NonBacktracking
-                            ||| System.Text.RegularExpressions.RegexOptions.IgnoreCase
+                        let! options = awaitWithinDeadline "project_options" optionsOperation
+                        resolvedProjectOptions <- Some options
+                        optionsPhaseStatus <- "complete"
+                    with
+                    | :? TimeoutException as ex ->
+                        optionsPhaseStatus <- "timed_out"
+                        terminalFailure <- Some("project_options", "timed_out", ex.Message)
 
-                        Some(
-                            System.Text.RegularExpressions.Regex(
-                                pattern,
-                                opts,
-                                TimeSpan.FromMilliseconds 250.0
-                            )
+                        addCoverageIssue (
+                            jobj
+                                [ "phase", jstr "project_options"
+                                  "status", jstr "timed_out"
+                                  "errorKind", jstr "project_options_timeout"
+                                  "message", jstr ex.Message ]
+                            :> JsonNode
                         )
-                    with ex ->
-                        invalidArg (nameof args.filter) $"Invalid filter regex: %s{ex.Message}"
+                    | :? OperationCanceledException as ex ->
+                        optionsPhaseStatus <- "cancelled"
+                        terminalFailure <- Some("project_options", "cancelled", ex.Message)
 
-            let nameContains =
-                args.nameContains
-                |> Option.filter (fun lst -> not lst.IsEmpty)
+                        addCoverageIssue (
+                            jobj
+                                [ "phase", jstr "project_options"
+                                  "status", jstr "cancelled"
+                                  "errorKind", jstr "project_outline_cancelled"
+                                  "message", jstr "Project outline was cancelled during project evaluation." ]
+                            :> JsonNode
+                        )
+                    | ex ->
+                        optionsPhaseStatus <- "failed"
+                        terminalFailure <- Some("project_options", "failed", ex.Message)
 
-            // Returns true when the entry name / signature passes the filter.
-            let entryMatchesFilter (name: string) (signature: string) =
-                let matchesRegex =
-                    match filterRegex with
-                    | None -> true
-                    | Some rx ->
-                        try
-                            rx.IsMatch(name) || rx.IsMatch(signature)
-                        with
-                        | :? System.Text.RegularExpressions.RegexMatchTimeoutException -> false
+                        addCoverageIssue (
+                            jobj
+                                [ "phase", jstr "project_options"
+                                  "status", jstr "failed"
+                                  "errorKind", jstr "project_options_failed"
+                                  "message", jstr ex.Message ]
+                            :> JsonNode
+                        )
 
-                let matchesNameContains =
-                    match nameContains with
-                    | None -> true
-                    | Some fragments ->
-                        fragments
-                        |> List.exists (fun fragment ->
-                            name.Contains(fragment, StringComparison.OrdinalIgnoreCase)
-                            || signature.Contains(fragment, StringComparison.OrdinalIgnoreCase))
+                let outlineArgs filePath : FcsFileOutlineArgs =
+                    { path = filePath
+                      text = None
+                      projectPath = Some projectPath
+                      projectOptions = None
+                      includePrivate = args.includePrivate
+                      includeLocal = Some false
+                      // Always request the full per-member output: ProjectOutline does
+                      // its own summaryOnly shaping + memberCounts over these entries,
+                      // so FileOutline's own summary default must NOT pre-collapse them.
+                      summaryOnly = Some false
+                      maxResults = None }
 
-                matchesRegex && matchesNameContains
+                let fileOutlineForProject args =
+                    match projectOutlineFileOutlineOverride with
+                    | Some overrideOutline -> overrideOutline args
+                    | None -> this.FileOutlineCore(args, resolvedProjectOptions, ensureCanContinue)
 
-            // ── Enumerate all project files (no MaxFiles cap here — we page manually) ─
-            let filterOptions =
-                { defaultFilterOptions Outline with
-                    IncludeGenerated = args.includeGeneratedFiles |> Option.defaultValue false
-                    IncludeTests = args.includeTests |> Option.defaultValue false
-                    MaxFiles = None }
-
-            let files = compileFiles projectPath doc
-
-            // Sort deterministically by path so cursor offsets are stable.
-            let allFiles =
-                filterProjectFiles workspaceRoot filterOptions files
-                |> fun result ->
-                    { result with
-                        Included = result.Included |> List.sortBy (fun f -> f.Path) }
-
-            let totalFileCount = allFiles.Included.Length
-
-            // ── Apply cursor offset then take pageSize ──────────────────────────
-            let pageFiles =
-                allFiles.Included
-                |> List.skip (min pageOffset totalFileCount)
-                |> List.truncate pageSize
-
-            let fileEntries = ResizeArray<JsonNode>()
-
-            for file in pageFiles do
-                // Fetch the full per-file outline (maxResults = None) so memberCounts
-                // can report the true totals. Truncation is applied below to the
-                // entries array only — the cap is a presentation concern, not a
-                // counting concern.
-                let! outline =
-                    this.FileOutline(
-                        { path = file.Path
-                          text = None
-                          projectPath = Some projectPath
-                          projectOptions = None
-                          includePrivate = args.includePrivate
-                          includeLocal = Some false
-                          // Always request the full per-member output: ProjectOutline does
-                          // its own summaryOnly shaping + memberCounts over these entries,
-                          // so FileOutline's own summary default must NOT pre-collapse them.
-                          summaryOnly = Some false
-                          maxResults = None }
-                    )
-
-                // Pull raw entries array (may be null if outline aborted).
-                let rawEntries: JsonNode array =
+                let rawEntriesOf (outline: JsonNode) : JsonNode array =
                     match outline["entries"] with
-                    | null -> [||]
-                    | entries ->
-                        match entries with
-                        | :? JsonArray as arr -> arr |> Seq.cast<JsonNode> |> Seq.toArray
-                        | _ -> [||]
+                    | :? JsonArray as arr -> arr |> Seq.cast<JsonNode> |> Seq.toArray
+                    | _ -> [||]
 
-                // Apply filter first, keep the unbounded post-filter set so memberCounts
-                // can report the true totals; then truncate for the entries array.
-                let postFilterEntries =
-                    if filterRegex.IsNone && nameContains.IsNone then
+                let postFilterEntriesOf (outline: JsonNode) =
+                    let rawEntries = rawEntriesOf outline
+
+                    if not filtersActive then
                         rawEntries
                     else
                         rawEntries
@@ -9504,100 +10526,473 @@ type internal FcsBridge
 
                             entryMatchesFilter name signature)
 
-                let filteredEntries = postFilterEntries |> Array.truncate maxResultsPerFile
+                let addFileEntry
+                    (file: FsLangMcp.ProjectFiles.ProjectFile)
+                    (outline: JsonNode)
+                    (postFilterEntries: JsonNode array)
+                    =
+                    let filteredEntries = postFilterEntries |> Array.truncate maxResultsPerFile
 
-                // summaryOnly: strip per-member signature detail, keep headers; counts
-                // surface as a top-level memberCounts map per file (issue #82).
-                let containerKinds =
-                    [| "module"; "record"; "union"; "class"; "interface"; "enum"; "delegate"; "namespace" |]
+                    // summaryOnly: strip per-member signature detail, keep headers; counts
+                    // surface as a top-level memberCounts map per file (issue #82).
+                    let containerKinds =
+                        [| "module"
+                           "record"
+                           "union"
+                           "class"
+                           "interface"
+                           "enum"
+                           "delegate"
+                           "namespace" |]
 
-                let outlineEntries: JsonNode =
-                    if summaryOnly then
-                        let topLevel =
-                            filteredEntries
-                            |> Array.filter (fun entry ->
+                    let outlineEntries: JsonNode =
+                        if summaryOnly then
+                            let topLevel =
+                                filteredEntries
+                                |> Array.filter (fun entry ->
+                                    match entry["kind"] with
+                                    | null -> false
+                                    | k -> containerKinds |> Array.contains (k.GetValue<string>()))
+
+                            let summaryNodes =
+                                topLevel
+                                |> Array.map (fun entry ->
+                                    jobj
+                                        [ "name", entry["name"].DeepClone()
+                                          "kind", entry["kind"].DeepClone()
+                                          "fullName",
+                                          (match entry["fullName"] with
+                                           | null -> null
+                                           | fn -> fn.DeepClone())
+                                          "range",
+                                          (match entry["range"] with
+                                           | null -> null
+                                           | r -> r.DeepClone()) ]
+                                    :> JsonNode)
+
+                            JsonArray(summaryNodes) :> JsonNode
+                        else
+                            // Deep-clone each entry to release ownership from the source
+                            // JsonArray returned by FileOutline — a JsonNode may only have
+                            // one parent, so re-parenting without cloning throws.
+                            JsonArray(filteredEntries |> Array.map (fun e -> e.DeepClone())) :> JsonNode
+
+                    // memberCounts: kind → count over the unbounded post-filter set, so the
+                    // map tells the agent how many of each kind the filter actually matched
+                    // — independent of maxResultsPerFile, which only caps the entries array.
+                    let memberCounts =
+                        let counts =
+                            postFilterEntries
+                            |> Array.choose (fun entry ->
                                 match entry["kind"] with
-                                | null -> false
-                                | k -> containerKinds |> Array.contains (k.GetValue<string>()))
+                                | null -> None
+                                | k -> Some(k.GetValue<string>()))
+                            |> Array.countBy id
+                            |> Array.sortBy fst
+                            |> Array.map (fun (kind, n) -> kind, jint n)
+                            |> Array.toList
 
-                        let summaryNodes =
-                            topLevel
-                            |> Array.map (fun entry ->
-                                jobj
-                                    [ "name", entry["name"].DeepClone()
-                                      "kind", entry["kind"].DeepClone()
-                                      "fullName",
-                                      (match entry["fullName"] with
-                                       | null -> null
-                                       | fn -> fn.DeepClone())
-                                      "range",
-                                      (match entry["range"] with
-                                       | null -> null
-                                       | r -> r.DeepClone()) ]
-                                :> JsonNode)
+                        jobj counts :> JsonNode
 
-                        JsonArray(summaryNodes) :> JsonNode
+                    let fileFields =
+                        [ "file", jstr file.Path
+                          "kind", jstr (if file.IsSignature then "signature" else "implementation")
+                          "outlineStatus", outline["status"].DeepClone()
+                          "entries", outlineEntries
+                          "memberCounts", memberCounts
+                          "count",
+                          (match outline["count"] with
+                           | null -> jint 0
+                           | count -> count.DeepClone()) ]
+
+                    fileEntries.Add(jobj fileFields :> JsonNode)
+
+                // Entry filters determine which FILES are in the result set, so they must run
+                // before maxFiles/cursor pagination (#238). The filtered path inspects every
+                // candidate once and retains only files with at least one matching entry. The
+                // common unfiltered path still outlines only the requested page.
+                let filteredOutlines =
+                    ResizeArray<FsLangMcp.ProjectFiles.ProjectFile * JsonNode * JsonNode array>()
+
+                // Keep the aggregate bounded even when a large project has many unavailable
+                // or truncated outlines. Counts cover every file; the issue rows are a sample.
+                let filterIssueLimit = 50
+                let filterIssues = ResizeArray<JsonNode>()
+                let mutable filterIssueCount = 0
+                let mutable filterAnalyzedFiles = 0
+                let mutable filterIncompleteFiles = 0
+                let mutable filterFailedFiles = 0
+
+                let addFilterIssue (issue: JsonNode) =
+                    filterIssueCount <- filterIssueCount + 1
+
+                    if filterIssues.Count < filterIssueLimit then
+                        filterIssues.Add issue
+
+                let outlineStatusOf (outline: JsonNode) =
+                    match outline["status"] with
+                    | null -> "unknown"
+                    | status -> status.GetValue<string>()
+
+                let outlineSucceeded status =
+                    String.Equals(status, "succeeded", StringComparison.OrdinalIgnoreCase)
+                    || String.Equals(status, "ok", StringComparison.OrdinalIgnoreCase)
+
+                let tryOutlineFile (file: FsLangMcp.ProjectFiles.ProjectFile) : Task<JsonNode option> =
+                    task {
+                        if terminalFailure.IsSome then
+                            return None
+                        else
+                            try
+                                ensureCanContinue ()
+                                let operation = fileOutlineForProject (outlineArgs file.Path)
+                                let! outline = awaitWithinDeadline "file_outline" operation
+                                let status = outlineStatusOf outline
+
+                                if outlineSucceeded status then
+                                    filesScanned <- filesScanned + 1
+                                else
+                                    filesFailed <- filesFailed + 1
+
+                                    addCoverageIssue (
+                                        jobj
+                                            [ "phase", jstr "file_outline"
+                                              "file", jstr file.Path
+                                              "status", jstr status
+                                              "errorKind", jstr "outline_unavailable"
+                                              "message",
+                                              (match outline["message"] with
+                                               | null -> null
+                                               | message -> message.DeepClone()) ]
+                                        :> JsonNode
+                                    )
+
+                                return Some outline
+                            with
+                            | :? TimeoutException as ex ->
+                                filesTimedOut <- filesTimedOut + 1
+                                terminalFailure <- Some("file_outline", "timed_out", ex.Message)
+
+                                addCoverageIssue (
+                                    jobj
+                                        [ "phase", jstr "file_outline"
+                                          "file", jstr file.Path
+                                          "status", jstr "timed_out"
+                                          "errorKind", jstr "file_outline_timeout"
+                                          "message", jstr ex.Message ]
+                                    :> JsonNode
+                                )
+
+                                return None
+                            | :? OperationCanceledException ->
+                                filesFailed <- filesFailed + 1
+                                terminalFailure <- Some("file_outline", "cancelled", "Project outline was cancelled.")
+
+                                addCoverageIssue (
+                                    jobj
+                                        [ "phase", jstr "file_outline"
+                                          "file", jstr file.Path
+                                          "status", jstr "cancelled"
+                                          "errorKind", jstr "project_outline_cancelled"
+                                          "message", jstr "Project outline was cancelled while this file was in flight." ]
+                                    :> JsonNode
+                                )
+
+                                return None
+                            | ex ->
+                                filesFailed <- filesFailed + 1
+
+                                addCoverageIssue (
+                                    jobj
+                                        [ "phase", jstr "file_outline"
+                                          "file", jstr file.Path
+                                          "status", jstr "failed"
+                                          "errorKind", jstr "file_outline_failed"
+                                          "message", jstr ex.Message ]
+                                    :> JsonNode
+                                )
+
+                                return None
+                    }
+
+                if filtersActive then
+                    let candidates = allFiles.Included |> List.toArray
+                    let mutable candidateIndex = 0
+
+                    while candidateIndex < candidates.Length && terminalFailure.IsNone do
+                        let file = candidates[candidateIndex]
+                        candidateIndex <- candidateIndex + 1
+                        let! outlineResult = tryOutlineFile file
+
+                        match outlineResult with
+                        | None -> ()
+                        | Some outline ->
+                            let outlineStatus = outlineStatusOf outline
+
+                            if outlineSucceeded outlineStatus then
+                                let postFilterEntries = postFilterEntriesOf outline
+
+                                if postFilterEntries.Length > 0 then
+                                    filteredOutlines.Add(file, outline, postFilterEntries)
+
+                                let entriesComplete =
+                                    match outline["entriesComplete"] with
+                                    | null -> false
+                                    | complete -> complete.GetValue<bool>()
+
+                                if entriesComplete then
+                                    filterAnalyzedFiles <- filterAnalyzedFiles + 1
+                                else
+                                    filterIncompleteFiles <- filterIncompleteFiles + 1
+
+                                    let returnedCount =
+                                        match outline["returnedEntryCount"] with
+                                        | null -> rawEntriesOf outline |> Array.length
+                                        | count -> count.GetValue<int>()
+
+                                    let totalCount =
+                                        match outline["totalDefinitionCount"] with
+                                        | null -> max returnedCount 1
+                                        | count -> count.GetValue<int>()
+
+                                    addFilterIssue (
+                                        jobj
+                                            [ "file", jstr file.Path
+                                              "status", jstr "incomplete"
+                                              "errorKind", jstr "outline_entries_incomplete"
+                                              "message",
+                                              jstr
+                                                  $"File outline returned %d{returnedCount} of %d{totalCount} definitions; filter matches beyond the returned entries remain unknown." ]
+                                        :> JsonNode
+                                    )
+                            else
+                                filterFailedFiles <- filterFailedFiles + 1
+
+                                addFilterIssue (
+                                    jobj
+                                        [ "file", jstr file.Path
+                                          "status", jstr outlineStatus
+                                          "errorKind", jstr "outline_unavailable"
+                                          "message",
+                                          (match outline["message"] with
+                                           | null -> null
+                                           | message -> message.DeepClone()) ]
+                                    :> JsonNode
+                                )
+
+                let totalFileCount =
+                    if filtersActive then
+                        filteredOutlines.Count
                     else
-                        // Deep-clone each entry to release ownership from the source
-                        // JsonArray returned by FileOutline — a JsonNode may only have
-                        // one parent, so re-parenting without cloning throws.
-                        JsonArray(filteredEntries |> Array.map (fun e -> e.DeepClone())) :> JsonNode
+                        allFiles.Included.Length
 
-                // memberCounts: kind → count over the unbounded post-filter set, so the
-                // map tells the agent how many of each kind the filter actually matched
-                // — independent of maxResultsPerFile, which only caps the entries array.
-                let memberCounts =
-                    let counts =
-                        postFilterEntries
-                        |> Array.choose (fun entry ->
-                            match entry["kind"] with
-                            | null -> None
-                            | k -> Some(k.GetValue<string>()))
-                        |> Array.countBy id
-                        |> Array.sortBy fst
-                        |> Array.map (fun (kind, n) -> kind, jint n)
-                        |> Array.toList
+                let mutable returnedFileCount = 0
 
-                    jobj counts :> JsonNode
+                if filtersActive then
+                    let page =
+                        filteredOutlines
+                        |> Seq.skip (min pageOffset totalFileCount)
+                        |> Seq.truncate pageSize
+                        |> Seq.toArray
 
-                let fileFields =
-                    [ "file", jstr file.Path
-                      "kind", jstr (if file.IsSignature then "signature" else "implementation")
-                      "outlineStatus", outline["status"].DeepClone()
-                      "entries", outlineEntries
-                      "memberCounts", memberCounts
-                      "count",
-                      (match outline["count"] with
-                       | null -> jint 0
-                       | count -> count.DeepClone()) ]
+                    returnedFileCount <- page.Length
 
-                fileEntries.Add(jobj fileFields :> JsonNode)
+                    for (file, outline, postFilterEntries) in page do
+                        addFileEntry file outline postFilterEntries
+                else
+                    let pageFiles = unfilteredPageFiles |> List.toArray
+                    let mutable pageIndex = 0
 
-            // ── Pagination envelope ─────────────────────────────────────────────
-            let paginationFields =
-                Cursor.paginationFields "files" totalFileCount pageOffset pageSize pageFiles.Length
+                    while pageIndex < pageFiles.Length && terminalFailure.IsNone do
+                        let file = pageFiles[pageIndex]
+                        pageIndex <- pageIndex + 1
+                        let! outlineResult = tryOutlineFile file
 
-            // Aggregate over ALL in-scope files, not just the current page: per-file
-            // outlineStatus errors can scroll past pagination, this cannot (#160).
-            // Filter-excluded entries (generated, obj/bin, tests) are deliberately not
-            // counted — absent-before-build is normal for them; the unfiltered view is
-            // project_health.missingFiles.
-            let unresolvedFiles =
-                allFiles.Included
-                |> List.map (fun f -> f.Path)
-                |> List.filter (File.Exists >> not)
+                        match outlineResult with
+                        | Some outline ->
+                            addFileEntry file outline (rawEntriesOf outline)
+                            returnedFileCount <- returnedFileCount + 1
+                        | None -> ()
 
-            let baseFields =
-                [ "status", jstr "ok"
-                  "projectPath", jstr projectPath
-                  "workspaceRoot", jstr workspaceRoot
-                  "summaryOnly", jbool summaryOnly
-                  "filterSummary", filterSummaryToJson allFiles :> JsonNode
-                  "unresolvedFiles", JsonArray(unresolvedFiles |> List.map jstr |> List.toArray) :> JsonNode
-                  "files", JsonArray(fileEntries.ToArray()) :> JsonNode ]
+                // ── Pagination envelope ─────────────────────────────────────────────
+                let rawPaginationFields =
+                    Cursor.paginationFields "files" totalFileCount pageOffset pageSize returnedFileCount
 
-            return jobj (baseFields @ paginationFields) :> JsonNode
-        }
+                let filesNotStarted =
+                    max 0 (filesRequested - filesScanned - filesTimedOut - filesFailed)
+
+                let operationalComplete =
+                    terminalFailure.IsNone
+                    && filesTimedOut = 0
+                    && filesFailed = 0
+                    && filesNotStarted = 0
+
+                let filterDiscoveryComplete =
+                    not filtersActive || (operationalComplete && filterIssueCount = 0)
+
+                let resultSetComplete = operationalComplete && filterDiscoveryComplete
+
+                let paginationFields =
+                    if not resultSetComplete then
+                        rawPaginationFields
+                        |> List.filter (fun (name, _) -> name <> "truncated" && name <> "nextCursor")
+                        |> fun fields ->
+                            fields
+                            @ [ "truncated", jbool true
+                                "nextCursor", null
+                                "totalEstimateIsLowerBound", jbool (filtersActive && not filterDiscoveryComplete)
+                                "paginationRestartRequired", jbool true ]
+                    else
+                        rawPaginationFields
+                        @ [ "totalEstimateIsLowerBound", jbool false
+                            "paginationRestartRequired", jbool false ]
+
+                // Aggregate over ALL in-scope files, not just the current page: per-file
+                // outlineStatus errors can scroll past pagination, this cannot (#160).
+                // Filter-excluded entries (generated, obj/bin, tests) are deliberately not
+                // counted — absent-before-build is normal for them; the unfiltered view is
+                // project_health.missingFiles.
+                let unresolvedFiles =
+                    allFiles.Included
+                    |> List.map (fun f -> f.Path)
+                    |> List.filter (File.Exists >> not)
+
+                let filterCoverage =
+                    if filtersActive then
+                        let complete = filterDiscoveryComplete
+                        let combinedIssues = ResizeArray<JsonNode>()
+
+                        let combinedIssueKeys =
+                            System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
+
+                        let addCombinedIssue (issue: JsonNode) =
+                            let value (name: string) =
+                                match issue[name] with
+                                | null -> ""
+                                | node -> node.ToJsonString()
+
+                            let fileKey = value "file"
+                            let statusKey = value "status"
+                            let key = $"%s{fileKey}|%s{statusKey}"
+
+                            if combinedIssueKeys.Add key && combinedIssues.Count < filterIssueLimit then
+                                combinedIssues.Add(issue.DeepClone())
+
+                        for issue in filterIssues do
+                            addCombinedIssue issue
+
+                        for issue in coverageIssues do
+                            addCombinedIssue issue
+
+                        let combinedIssueCount = combinedIssueKeys.Count
+
+                        let combinedIssuesTruncated =
+                            filterIssueCount > filterIssues.Count
+                            || coverageIssueCount > coverageIssues.Count
+                            || combinedIssueCount > combinedIssues.Count
+
+                        jobj
+                            [ "complete", jbool complete
+                              "filesRequested", jint allFiles.Included.Length
+                              "filesAnalyzed", jint filterAnalyzedFiles
+                              "filesIncomplete", jint filterIncompleteFiles
+                              "filesTimedOut", jint filesTimedOut
+                              "filesFailed", jint (max filterFailedFiles filesFailed)
+                              "filesNotStarted", jint filesNotStarted
+                              "matchingFiles", jint totalFileCount
+                              "matchingFilesIsLowerBound", jbool (not complete)
+                              "issues", JsonArray(combinedIssues.ToArray()) :> JsonNode
+                              "issuesReturned", jint combinedIssues.Count
+                              "issuesTruncated", jbool combinedIssuesTruncated
+                              "hint",
+                              (if complete then
+                                   null
+                               else
+                                   jstr
+                                       "Some file outlines were unavailable or did not return every definition, so totalEstimate.files and matchingFiles are lower bounds. Inspect filterCoverage.issues and run check before treating an absent match as exhaustive.") ]
+                        :> JsonNode
+                    else
+                        null
+
+                let filePhaseStatus =
+                    match terminalFailure with
+                    | Some("project_options", _, _) -> "not_started"
+                    | Some("file_outline", status, _) -> status
+                    | Some(_, status, _) -> status
+                    | None when filesFailed > 0 -> "partial"
+                    | None -> "complete"
+
+                let phases =
+                    JsonArray(
+                        [| jobj [ "phase", jstr "project_options"; "status", jstr optionsPhaseStatus ] :> JsonNode
+                           jobj
+                               [ "phase", jstr "file_outlines"
+                                 "status", jstr filePhaseStatus
+                                 "filesRequested", jint filesRequested
+                                 "filesScanned", jint filesScanned ]
+                           :> JsonNode |]
+                    )
+
+                let coverage =
+                    jobj
+                        [ "complete", jbool operationalComplete
+                          "filesRequested", jint filesRequested
+                          "filesScanned", jint filesScanned
+                          "filesTimedOut", jint filesTimedOut
+                          "filesFailed", jint filesFailed
+                          "filesNotStarted", jint filesNotStarted
+                          "phases", phases :> JsonNode
+                          "issues", JsonArray(coverageIssues.ToArray()) :> JsonNode
+                          "issuesReturned", jint coverageIssues.Count
+                          "issuesTruncated", jbool (coverageIssueCount > coverageIssues.Count) ]
+                    :> JsonNode
+
+                let responseStatus =
+                    if resultSetComplete then "ok"
+                    elif filesScanned > 0 then "partial"
+                    else "unknown"
+
+                let terminalFields =
+                    match terminalFailure with
+                    | None -> []
+                    | Some(phase, terminalStatus, message) ->
+                        let errorKind =
+                            match phase, terminalStatus with
+                            | "project_options", "timed_out" -> "project_options_timeout"
+                            | "project_options", "cancelled" -> "project_outline_cancelled"
+                            | "project_options", _ -> "project_options_failed"
+                            | "file_outline", "timed_out" -> "file_outline_timeout"
+                            | "file_outline", "cancelled" -> "project_outline_cancelled"
+                            | _ -> "project_outline_incomplete"
+
+                        [ "errorKind", jstr errorKind; "message", jstr message ]
+
+                let baseFields =
+                    [ "status", jstr responseStatus
+                      "projectPath", jstr projectPath
+                      "workspaceRoot", jstr workspaceRoot
+                      "summaryOnly", jbool summaryOnly
+                      "timeoutMs", jint timeoutMs
+                      "resultSetComplete", jbool resultSetComplete
+                      "coverage", coverage
+                      "filterCoverage", filterCoverage
+                      "filterSummary", filterSummaryToJson allFiles :> JsonNode
+                      "unresolvedFiles", JsonArray(unresolvedFiles |> List.map jstr |> List.toArray) :> JsonNode
+                      "files", JsonArray(fileEntries.ToArray()) :> JsonNode ]
+                    @ terminalFields
+
+                return jobj (baseFields @ paginationFields) :> JsonNode
+            }
+
+        if timeoutMs < 0 then
+            Task.FromResult(invalidTimeoutResult timeoutMs)
+        elif timeoutMs = 0 then
+            Task.FromResult(zeroTimeoutResult ())
+        else
+            run ()
+
+    member this.ProjectOutline(args: FcsProjectOutlineArgs) : Task<JsonNode> =
+        this.ProjectOutlineWithinDeadline(args, CancellationToken.None, ignore)
 
     /// Resolve project options + ensure ParseAndCheckProject results are available.
     /// Shared by referenced-assembly tools (F-3).
@@ -10931,6 +12326,11 @@ type internal FcsBridge
     member _.FreshProjectCheckMaxObservedConcurrency = freshProjectCheckAdmission.MaxObservedConcurrency
     member _.FreshProjectCheckInFlightCount = freshProjectChecksInFlight.Count
     member _.FreshProjectCheckInvalidationCount = Volatile.Read(&freshProjectCheckInvalidationCount)
+    member _.ProjectUsesActiveCount = projectUsesAdmission.ActiveCount
+    member _.ProjectUsesStartedCount = projectUsesAdmission.StartedCount
+    member _.ProjectUsesRejectedCount = projectUsesAdmission.RejectedCount
+    member _.ProjectUsesMaxObservedConcurrency = projectUsesAdmission.MaxObservedConcurrency
+    member _.ProjectUsesInFlightCount = projectUsesInFlight.Count
     member _.SnapshotComputationActiveCount = snapshotComputationAdmission.ActiveCount
     member _.SnapshotComputationStartedCount = snapshotComputationAdmission.StartedCount
     member _.SnapshotComputationRejectedCount = snapshotComputationAdmission.RejectedCount
@@ -11617,7 +13017,11 @@ type internal FcsBridge
     // RenamePreview probe is injected (mirrors Find's fsacProbe) so this FCS member stays
     // LSP-agnostic and degrades cleanly when FSAC is unavailable. Writes nothing.
     member this.RefactorImpact
-        (args: FcsRefactorImpactArgs, ?renamePreview: RenamePreviewArgs -> Task<JsonNode>)
+        (
+            args: FcsRefactorImpactArgs,
+            ?renamePreview: RenamePreviewArgs -> Task<JsonNode>,
+            ?activeProjectPath: string
+        )
         : Task<JsonNode> =
         task {
             // ── Defensive JsonNode readers (orchestrated payloads are always objects) ──
@@ -11686,6 +13090,48 @@ type internal FcsBridge
 
             let resolvedVia = if hasSymbol then "symbol" else "position"
 
+            // Keep an explicit production .fsproj as the requested/defining context,
+            // but let the workspace Find use the active containing solution. Otherwise
+            // RefactorImpact could find tests in sibling projects while simultaneously
+            // reporting a one-project blast radius for the same symbol.
+            let findProjectPath =
+                let requestedSourceProject =
+                    args.projectPath
+                    |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                    |> Option.map normalizePath
+                    |> Option.filter (fun path ->
+                        path.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase)
+                        && not (FsLangMcp.ProjectHealth.isTestProjectFile path))
+
+                let pathComparison =
+                    if OperatingSystem.IsWindows() then
+                        StringComparison.OrdinalIgnoreCase
+                    else
+                        StringComparison.Ordinal
+
+                let containingActiveWorkspace =
+                    match requestedSourceProject, activeProjectPath with
+                    | Some sourceProject, Some activePath when not (String.IsNullOrWhiteSpace activePath) ->
+                        let active = normalizePath activePath
+
+                        let isWorkspace =
+                            Directory.Exists active
+                            || active.EndsWith(".sln", StringComparison.OrdinalIgnoreCase)
+                            || active.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase)
+
+                        if
+                            isWorkspace
+                            && (SolutionParsing.listProjects active
+                                |> Array.exists (fun project ->
+                                    String.Equals(normalizePath project, sourceProject, pathComparison)))
+                        then
+                            Some active
+                        else
+                            None
+                    | _ -> None
+
+                containingActiveWorkspace |> Option.orElse args.projectPath
+
             // One Find call gives BOTH the cross-project blast radius AND (for a position
             // target) the resolved symbol name — Find echoes it back in `query`.
             let baseFind: FindArgs =
@@ -11707,7 +13153,7 @@ type internal FcsBridge
                   // #207: refactor_impact synthesises counts, not per-site rows — a
                   // per-site type column would be computed and then thrown away.
                   includeSiteTypes = None
-                  projectPath = args.projectPath
+                  projectPath = findProjectPath
                   maxResults = Some 1000
                   timeoutMs = None
                   cursor = None }
@@ -11746,6 +13192,19 @@ type internal FcsBridge
                 match findResult["resolution"] with
                 | null -> totalSites > 0
                 | res -> readBool res "matched" |> Option.defaultValue (totalSites > 0)
+
+            let findTruncated = readBool findResult "truncated" |> Option.defaultValue false
+
+            let findResolutionComplete =
+                match findResult["resolution"] with
+                | null -> not findTruncated
+                | resolution -> readBool resolution "complete" |> Option.defaultValue (not findTruncated)
+
+            // RefactorImpact requests the first 1000 rows. Counts are full, but the
+            // affected-file/project lists below are page-derived, so never present them
+            // as exhaustive when Find returned a cursor.
+            let findDeliveryComplete = findResolutionComplete && not findTruncated
+            let findNextCursor = readStr findResult "nextCursor"
 
             // ── Impact: files + projects the sites touch ─────────────────────────────
             let sites = arrayOf findResult "sites"
@@ -11808,15 +13267,42 @@ type internal FcsBridge
             // ── Tests that cover the symbol (always) ─────────────────────────────────
             let! testsResult =
                 this.TestsForSymbol
-                    { symbolQuery = resolvedName
-                      exact = Some true
-                      path = None
-                      text = None
-                      projectPath = args.projectPath
-                      maxResults = Some 100 }
+                    (
+                        { symbolQuery = resolvedName
+                          exact = Some true
+                          path = None
+                          text = None
+                          projectPath = args.projectPath
+                          maxResults = Some 100
+                          timeoutMs = None
+                          cursor = None },
+                        ?activeProjectPath = activeProjectPath
+                    )
 
             let testSites = arrayOf testsResult "tests"
+            let testStatus = readStr testsResult "status" |> Option.defaultValue "unknown"
+            let testOutcome = readStr testsResult "outcome" |> Option.defaultValue "indeterminate"
             let testCount = readInt testsResult "testCount" |> Option.defaultValue testSites.Length
+            let testSiteCount = readInt testsResult "siteCount" |> Option.defaultValue testSites.Length
+
+            let uniqueTestCount =
+                readInt testsResult "uniqueTestCount" |> Option.defaultValue testSites.Length
+
+            let testsTruncated = readBool testsResult "truncated" |> Option.defaultValue false
+            let testsNextCursor = readStr testsResult "nextCursor"
+
+            let testsCoverageNode =
+                match testsResult["coverage"] with
+                | null -> jobj [ ("complete", jbool false) ] :> JsonNode
+                | coverage -> coverage.DeepClone()
+
+            let testsCoverageComplete =
+                readBool testsCoverageNode "complete"
+                |> Option.orElseWith (fun () -> readBool testsResult "complete")
+                |> Option.defaultValue false
+
+            let testsDeliveryComplete = not testsTruncated
+            let testsComplete = testsCoverageComplete && testsDeliveryComplete
 
             let testNodes =
                 testSites
@@ -11860,15 +13346,18 @@ type internal FcsBridge
             // ── Public-API breaking surface (kind=signature|delete) ──────────────────
             let wantApi = kindResolved = "signature" || kindResolved = "delete"
             let mutable apiSurfaceNode: JsonNode option = None
-            let mutable apiIsPublic = false
+            let mutable apiIsPublic: bool option = None
+            let mutable apiComplete = not wantApi
 
             if wantApi then
                 match definingFsproj with
                 | None ->
+                    apiComplete <- false
                     apiSurfaceNode <-
                         Some(
                             jobj
-                                [ "isPublic", jbool false
+                                [ "complete", jbool false
+                                  "isPublic", null
                                   "affectedPublicMembers", JsonArray() :> JsonNode
                                   "note", jstr "could not resolve the defining project for the target" ]
                             :> JsonNode
@@ -11881,6 +13370,16 @@ type internal FcsBridge
                               namespaceFilter = None
                               maxResults = Some 1000
                               cursor = None }
+
+                    let apiStatus = readStr api "status" |> Option.defaultValue "unknown"
+                    let apiTruncated = readBool api "truncated" |> Option.defaultValue false
+                    let apiNextCursor = readStr api "nextCursor"
+                    let apiTruncatedByBudget = readBool api "truncatedByBudget" |> Option.defaultValue false
+                    let apiScanComplete =
+                        apiStatus = "ok"
+                        && not apiTruncated
+                        && not apiTruncatedByBudget
+                        && apiNextCursor.IsNone
 
                     let entities = arrayOf api "entities"
                     let affected = ResizeArray<JsonNode>()
@@ -11919,13 +13418,27 @@ type internal FcsBridge
                                 )
                             | _ -> ()
 
-                    apiIsPublic <- affected.Count > 0
+                    apiIsPublic <-
+                        if affected.Count > 0 then
+                            Some true
+                        elif apiScanComplete then
+                            Some false
+                        else
+                            None
+
+                    apiComplete <- apiScanComplete
 
                     apiSurfaceNode <-
                         Some(
                             jobj
-                                [ "isPublic", jbool apiIsPublic
+                                [ "status", jstr apiStatus
+                                  "complete", jbool apiComplete
+                                  "scanComplete", jbool apiScanComplete
+                                  "isPublic", (apiIsPublic |> Option.map jbool |> Option.defaultValue null)
                                   "project", jstr fsproj
+                                  "truncated", jbool apiTruncated
+                                  "truncatedByBudget", jbool apiTruncatedByBudget
+                                  "nextCursor", (apiNextCursor |> Option.map jstr |> Option.defaultValue null)
                                   "affectedPublicMembers", JsonArray(affected.ToArray()) :> JsonNode ]
                             :> JsonNode
                         )
@@ -11991,35 +13504,64 @@ type internal FcsBridge
             // ── verify: human-readable checklist distilled from the sections above ───
             let verify = ResizeArray<string>()
 
+            if not findDeliveryComplete then
+                verify.Add(
+                    $"impact rows are paginated: this report contains %d{sites.Length}/%d{totalSites} find site(s); follow find.nextCursor before treating file/project counts as exhaustive"
+                )
+
+            if not testsCoverageComplete then
+                verify.Add(
+                    "test coverage is incomplete or indeterminate — inspect tests.coverage/message and widen or retry before trusting zero"
+                )
+
+            if testsTruncated then
+                verify.Add(
+                    $"test rows are paginated: this report contains %d{testSites.Length}/%d{testSiteCount} site(s); follow fcs_tests_for_symbol with tests.nextCursor for the remainder"
+                )
+
             if (not matched) || totalSites = 0 then
                 verify.Add(
-                    $"no use sites found for '{resolvedName}' — it may be unused, dynamically referenced, or the name is wrong; double-check before changing it"
+                    $"no use sites found for '%s{resolvedName}' — it may be unused, dynamically referenced, or the name is wrong; double-check before changing it"
+                )
+            elif not findDeliveryComplete then
+                verify.Add(
+                    $"%d{totalSites} total site(s) matched, but this page cannot prove the complete file/project or cross-project breadth"
                 )
             elif crossProject then
                 let projectNamesStr = byProject |> Array.map fst |> String.concat ", "
 
                 verify.Add(
-                    $"{totalSites} cross-project site(s) across {projectCount} projects ({projectNamesStr}) — rebuild all affected projects"
+                    $"%d{totalSites} cross-project site(s) across %d{projectCount} projects (%s{projectNamesStr}) — rebuild all affected projects"
                 )
             else
-                verify.Add($"{totalSites} site(s) in {fileCount} file(s) within one project — re-check the project after the change")
+                verify.Add($"%d{totalSites} site(s) in %d{fileCount} file(s) within one project — re-check the project after the change")
 
-            if testCount > 0 then
+            if testSiteCount > 0 then
                 let namesStr =
                     if enclosingTestNames.Length > 0 then
                         enclosingTestNames |> Array.truncate 10 |> String.concat ", "
                     else
                         "(see tests list)"
 
-                verify.Add($"{testCount} test reference(s) cover '{resolvedName}' — run: {namesStr}")
+                verify.Add(
+                    $"%d{testSiteCount} test reference site(s) across %d{uniqueTestCount} enclosing test(s) cover '%s{resolvedName}' — run: %s{namesStr}"
+                )
 
             if wantApi then
-                if apiIsPublic then
+                if not apiComplete then
                     verify.Add(
-                        $"'{resolvedName}' is part of the public API surface — this is a BREAKING change; bump the minor version and update consumers"
+                        "public API evidence is incomplete — apiSurface.isPublic is indeterminate unless the target was already observed; follow apiSurface.nextCursor or narrow fcs_public_api before deciding the change is internal"
                     )
-                else
-                    verify.Add($"'{resolvedName}' is not on the public API surface — the change stays internal")
+
+                match apiIsPublic with
+                | Some true ->
+                    verify.Add(
+                        $"'%s{resolvedName}' is part of the public API surface — this is a BREAKING change; bump the minor version and update consumers"
+                    )
+                | Some false ->
+                    verify.Add($"'%s{resolvedName}' is not on the public API surface — the change stays internal")
+                | None ->
+                    verify.Add($"public API membership for '%s{resolvedName}' is indeterminate — do not treat it as internal")
 
             if kindResolved = "move" then
                 if compileProblemCount > 0 then
@@ -12040,7 +13582,7 @@ type internal FcsBridge
                     let renameTo = args.newName |> Option.defaultValue "?"
 
                     verify.Add(
-                        $"rename '{resolvedName}' -> '{renameTo}' touches {renameEdits} edit(s) in {renameFiles} file(s); `fcs_rename_preview` has the exact edit set"
+                        $"rename '%s{resolvedName}' -> '%s{renameTo}' touches %d{renameEdits} edit(s) in %d{renameFiles} file(s); `fcs_rename_preview` has the exact edit set"
                     )
                 else
                     verify.Add("rename preview unavailable (FSAC) — use the find sites as the edit set")
@@ -12064,18 +13606,45 @@ type internal FcsBridge
             let impactNode =
                 jobj
                     [ "totalSites", jint totalSites
+                      "returnedSites", jint sites.Length
+                      "complete", jbool findDeliveryComplete
+                      "truncated", jbool findTruncated
+                      "nextCursor", (findNextCursor |> Option.map jstr |> Option.defaultValue null)
+                      "fileCountIsLowerBound", jbool (not findDeliveryComplete)
+                      "projectCountIsLowerBound", jbool (not findDeliveryComplete)
                       "fileCount", jint fileCount
                       "projectCount", jint projectCount
-                      "crossProject", jbool crossProject
+                      "crossProjectKnown", jbool findDeliveryComplete
+                      "crossProject", (if findDeliveryComplete then jbool crossProject else null)
+                      "observedCrossProject", jbool crossProject
                       "sitesByProject", JsonArray(sitesByProjectNodes) :> JsonNode
                       "affectedFiles", JsonArray(affectedFiles |> Array.map jstr) :> JsonNode ]
                 :> JsonNode
 
             let testsNode =
-                jobj [ "count", jint testCount; "tests", JsonArray(testNodes) :> JsonNode ] :> JsonNode
+                jobj
+                    [ "status", jstr testStatus
+                      "outcome", jstr testOutcome
+                      "complete", jbool testsComplete
+                      "coverage", testsCoverageNode
+                      "message", (readStr testsResult "message" |> Option.map jstr |> Option.defaultValue null)
+                      // count remains the compatibility reference-site count.
+                      "count", jint testCount
+                      "siteCount", jint testSiteCount
+                      "uniqueCount", jint uniqueTestCount
+                      "uniqueTestCount", jint uniqueTestCount
+                      "returnedSites", jint testSites.Length
+                      "truncated", jbool testsTruncated
+                      "nextCursor", (testsNextCursor |> Option.map jstr |> Option.defaultValue null)
+                      "tests", JsonArray(testNodes) :> JsonNode ]
+                :> JsonNode
+
+            let reportComplete = findDeliveryComplete && testsComplete && apiComplete
+            let reportStatus = if reportComplete then "succeeded" else "partial"
 
             let baseProps =
-                [ "status", jstr "succeeded"
+                [ "status", jstr reportStatus
+                  "complete", jbool reportComplete
                   "target", targetNode
                   "kind", jstr kindResolved
                   "impact", impactNode

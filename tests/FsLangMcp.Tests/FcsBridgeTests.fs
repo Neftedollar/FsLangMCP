@@ -5,6 +5,7 @@ open System.IO
 open System.Threading
 open System.Threading.Tasks
 open FSharp.Compiler.CodeAnalysis
+open FSharp.Compiler.Diagnostics
 open FSharp.Compiler.Text
 open System.Text.Encodings.Web
 open System.Text.Json
@@ -150,6 +151,28 @@ let private writeProjectWithSource (root: string) (projectName: string) (source:
 
     sourcePath, projectPath
 
+let private admissionFindArgs (projectPath: string) (timeoutMs: int) : FindArgs =
+    { query = "value"
+      kind = Some "symbol"
+      scope = Some "project"
+      exact = Some true
+      ``member`` = None
+      field = None
+      path = None
+      line = None
+      word = None
+      occurrence = None
+      character = None
+      contextLines = Some 0
+      includeDeclaration = None
+      includeInfo = None
+      includePerProject = Some true
+      includeSiteTypes = None
+      projectPath = Some projectPath
+      maxResults = Some 10
+      timeoutMs = Some timeoutMs
+      cursor = None }
+
 [<Fact>]
 let ``project evaluation rejects distinct keys without queueing and admits retry after completion`` () : Task =
     task {
@@ -240,6 +263,104 @@ let ``project evaluation rejects distinct keys without queueing and admits retry
     }
 
 [<Fact>]
+let ``timed out project-use sweep retains actual-worker admission across distinct keys`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_project_uses_admission_{Guid.NewGuid():N}")
+        let firstStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let releaseFirst = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable workerStarts = 0
+
+        let controlledSweep
+            (_projectPath: string)
+            : Task<FSharpSymbolUse array * FSharpDiagnostic array> =
+            task {
+                let ordinal = Interlocked.Increment(&workerStarts)
+
+                if ordinal = 1 then
+                    firstStarted.TrySetResult(()) |> ignore
+                    do! releaseFirst.Task
+
+                return [||], [||]
+            }
+
+        let bridge =
+            FcsBridge(
+                freshProjectCheckConcurrencyOverride = 1,
+                projectSweepWorkerOverride = controlledSweep
+            )
+
+        try
+            let _, firstProject = writeSimpleProject root "FirstSweep" "value"
+            let _, secondProject = writeSimpleProject root "SecondSweep" "value"
+
+            // Pre-resolve MSBuild options so the short caller deadline exercises the
+            // ProjectSweepUses boundary rather than project evaluation.
+            let! firstSnapshot = bridge.GetEvaluatedProjectSnapshot(firstProject)
+            let! secondSnapshot = bridge.GetEvaluatedProjectSnapshot(secondProject)
+            Assert.True(Result.isOk firstSnapshot)
+            Assert.True(Result.isOk secondSnapshot)
+
+            let firstCaller = bridge.Find(admissionFindArgs firstProject 500)
+            do! firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            let sharedCaller = bridge.Find(admissionFindArgs firstProject 500)
+            let! firstResults =
+                Task.WhenAll([| firstCaller; sharedCaller |]).WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.All(firstResults, fun result -> Assert.Equal("unknown", result["status"].GetValue<string>()))
+            Assert.Equal(1, Volatile.Read(&workerStarts))
+            Assert.Equal(0L, bridge.ProjectUsesRejectedCount)
+            Assert.Equal(1, bridge.ProjectUsesActiveCount)
+            Assert.Equal(1, bridge.ProjectUsesInFlightCount)
+
+            // A different snapshot must be rejected while the timed-out caller's real
+            // FCS worker is still alive. Exact-key single-flight alone cannot prove this.
+            let! secondResult =
+                bridge.Find(admissionFindArgs secondProject 5_000).WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.Equal("unknown", secondResult["status"].GetValue<string>())
+            Assert.Equal(1, secondResult["projectsBusy"].GetValue<int>())
+            Assert.Equal(0, secondResult["projectsFailed"].GetValue<int>())
+            Assert.Equal(0, secondResult["projectsTimedOut"].GetValue<int>())
+
+            let coverage = secondResult["coverage"]
+            Assert.False(coverage["complete"].GetValue<bool>())
+            Assert.Equal(1, coverage["projectsBusy"].GetValue<int>())
+
+            let perProject = secondResult["perProject"] :?> JsonArray
+            Assert.Equal(1, perProject.Count)
+            let busyProject = perProject[0]
+            Assert.Equal("busy", busyProject["status"].GetValue<string>())
+            Assert.Equal("fcs_worker_busy", busyProject["errorKind"].GetValue<string>())
+            Assert.True(busyProject["retryable"].GetValue<bool>())
+            Assert.Equal(1, Volatile.Read(&workerStarts))
+            Assert.Equal(1L, bridge.ProjectUsesRejectedCount)
+            Assert.Equal(1, bridge.ProjectUsesMaxObservedConcurrency)
+
+            releaseFirst.TrySetResult(()) |> ignore
+
+            let settle = System.Diagnostics.Stopwatch.StartNew()
+
+            while
+                (bridge.ProjectUsesActiveCount <> 0 || bridge.ProjectUsesInFlightCount <> 0)
+                && settle.Elapsed < TimeSpan.FromSeconds(5.0)
+                do
+                do! Task.Delay(20)
+
+            Assert.Equal(0, bridge.ProjectUsesActiveCount)
+            Assert.Equal(0, bridge.ProjectUsesInFlightCount)
+
+            let! retry = bridge.Find(admissionFindArgs secondProject 5_000)
+            Assert.Equal("succeeded", retry["status"].GetValue<string>())
+            Assert.Equal(2, Volatile.Read(&workerStarts))
+            Assert.Equal(2L, bridge.ProjectUsesStartedCount)
+        finally
+            releaseFirst.TrySetResult(()) |> ignore
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
 let ``fcs_parse_and_check_file succeeds on valid F# snippet`` () : Task =
     task {
         let src =
@@ -290,7 +411,11 @@ let ``FcsBridge uses explicit fsproj projectPath without projectOptions`` () : T
         Assert.Equal(Path.GetFullPath(projectPath), result["projectFileName"].GetValue<string>())
         Assert.True(result["hasFullTypeCheckInfo"].GetValue<bool>())
         Assert.Equal(0, jsonArrayLength result["parseDiagnostics"])
-        Assert.Equal(0, jsonArrayLength result["checkDiagnostics"])
+        let checkDiagnosticsJson = result["checkDiagnostics"].ToJsonString()
+        Assert.True(
+            jsonArrayLength result["checkDiagnostics"] = 0,
+            $"Unexpected check diagnostics: %s{checkDiagnosticsJson}"
+        )
 
         let! cachedResult =
             bridge.ParseAndCheckFile(
@@ -769,7 +894,8 @@ let ``fcs_project_outline returns filtered per file outline`` () : Task =
                       summaryOnly = None
                       cursor = None
                       filter = None
-                      nameContains = None }
+                      nameContains = None
+                      timeoutMs = None }
                 )
 
             Assert.Equal("ok", result["status"].GetValue<string>())

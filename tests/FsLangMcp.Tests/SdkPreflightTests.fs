@@ -61,6 +61,16 @@ let private writeMinimalProject (directory: string) =
 let private lists (sdks: string list) = fun () -> Some sdks
 let private undeterminable: unit -> string list option = fun () -> None
 
+let private assertSdkEvidence (globalJsonPath: string) (node: JsonNode) =
+    Assert.Equal("sdk_not_found", node["errorKind"].GetValue<string>())
+    Assert.Equal(absentVersion, node["requestedSdkVersion"].GetValue<string>())
+    Assert.Equal("disable", node["rollForward"].GetValue<string>())
+    Assert.Equal(globalJsonPath, node["globalJsonPath"].GetValue<string>())
+    Assert.NotEmpty(node["installedSdks"].AsArray())
+    Assert.False(String.IsNullOrWhiteSpace(node["dotnetHostPath"].GetValue<string>()))
+    Assert.NotEmpty(node["sdkRoots"].AsArray())
+    Assert.Equal(2, node["remedies"].AsArray().Count)
+
 // ─── Verdict: the provable failure ────────────────────────────────────────────
 
 [<Fact>]
@@ -304,6 +314,16 @@ let ``dotnet --list-sdks output parses to bare version strings`` () =
     Assert.Equal<string list>([ "9.0.100"; "10.0.400" ], SdkPreflight.parseInstalledSdks stdout)
 
 [<Fact>]
+let ``dotnet --list-sdks output preserves distinct SDK roots`` () =
+    let stdout =
+        "9.0.100 [/usr/local/share/dotnet/sdk]\r\n10.0.400 [/Users/dev/.dotnet/sdk]\n10.0.401 [/Users/dev/.dotnet/sdk]\n"
+
+    Assert.Equal<string list>(
+        [ "/usr/local/share/dotnet/sdk"; "/Users/dev/.dotnet/sdk" ],
+        SdkPreflight.parseInstalledSdkRoots stdout
+    )
+
+[<Fact>]
 let ``the test host's own SDK set is enumerable`` () =
     // Guards the integration tests below: they only prove anything while the real
     // `dotnet --list-sdks` probe answers.
@@ -488,6 +508,134 @@ let ``set_project returns sdk_not_found and never starts fsautocomplete`` () : T
             Assert.True(bridge.FsacProcess.IsNone, "The pre-flight must reject before any FSAC process exists.")
             Assert.Equal(0L, bridge.SessionGeneration)
             Assert.True(bridge.CurrentProjectPath.IsNone, "A rejected set_project must not change the active context.")
+        finally
+            Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``set_project find and check preserve the same typed SDK blocking evidence`` () : Task =
+    task {
+        let root = tempRoot "cross-tool-contract"
+
+        try
+            writeGlobalJson root (pin absentVersion (Some "disable"))
+            let projectPath = writeMinimalProject root
+            let sourcePath = Path.Combine(root, "Library.fs")
+            let globalJsonPath = Path.Combine(root, "global.json")
+
+            use lsp =
+                new FsAutoCompleteBridge(fsacCommandOverride = $"missing-fsac-{Guid.NewGuid():N}")
+
+            let! selected =
+                lsp.SetProject(
+                    { projectPath = projectPath
+                      workspacePath = None
+                      restartLsp = Some true }
+                )
+
+            Assert.Equal("infrastructure_error", selected["status"].GetValue<string>())
+            assertSdkEvidence globalJsonPath selected
+
+            let fcs = FcsBridge()
+
+            let! found =
+                fcs.Find(
+                    { query = "answer"
+                      kind = Some "symbol"
+                      scope = Some "project"
+                      exact = Some true
+                      ``member`` = None
+                      field = None
+                      path = None
+                      line = None
+                      word = None
+                      occurrence = None
+                      character = None
+                      contextLines = Some 0
+                      includeDeclaration = Some true
+                      includeInfo = Some false
+                      includePerProject = Some true
+                      includeSiteTypes = Some false
+                      projectPath = Some projectPath
+                      maxResults = Some 10
+                      timeoutMs = Some 30_000
+                      cursor = None }
+                )
+
+            Assert.Equal("indeterminate", found["outcome"].GetValue<string>())
+            let findProject = found["perProject"].AsArray() |> Seq.exactlyOne
+            assertSdkEvidence globalJsonPath findProject["blockingReason"]
+
+            let baseCheck: CheckArgs =
+                { scope = Some "project"
+                  path = None
+                  snippet = None
+                  fileGlob = None
+                  mode = None
+                  speed = Some "trusted"
+                  severity = None
+                  projectPath = Some projectPath
+                  timeoutMs = Some 30_000 }
+
+            for speed in [ "trusted"; "fast" ] do
+                let! projectCheck = fcs.Check({ baseCheck with speed = Some speed })
+                Assert.Equal("succeeded", projectCheck["status"].GetValue<string>())
+                Assert.Equal("unknown", projectCheck["verdict"].GetValue<string>())
+                Assert.False(projectCheck["analyzed"].GetValue<bool>())
+                Assert.False(projectCheck["groundTruth"].GetValue<bool>())
+                assertSdkEvidence globalJsonPath projectCheck["blockingReason"]
+
+                let! fileCheck =
+                    fcs.Check(
+                        { baseCheck with
+                            scope = Some "file"
+                            path = Some sourcePath
+                            speed = Some speed }
+                    )
+
+                Assert.Equal("succeeded", fileCheck["status"].GetValue<string>())
+                Assert.Equal("unknown", fileCheck["verdict"].GetValue<string>())
+                Assert.False(fileCheck["analyzed"].GetValue<bool>())
+                Assert.False(fileCheck["groundTruth"].GetValue<bool>())
+                assertSdkEvidence globalJsonPath fileCheck["blockingReason"]
+
+            let! implicitFastFileCheck =
+                fcs.Check(
+                    { baseCheck with
+                        scope = Some "file"
+                        path = Some sourcePath
+                        speed = Some "fast"
+                        projectPath = None }
+                )
+
+            Assert.Equal("unknown", implicitFastFileCheck["verdict"].GetValue<string>())
+            Assert.True(implicitFastFileCheck["expectationComplete"].GetValue<bool>() |> not)
+            assertSdkEvidence globalJsonPath implicitFastFileCheck["blockingReason"]
+
+            let! workspaceCheck =
+                fcs.Check(
+                    { baseCheck with
+                        scope = Some "workspace"
+                        projectPath = Some root }
+                )
+
+            Assert.Equal("unknown", workspaceCheck["verdict"].GetValue<string>())
+            let workspaceProject = workspaceCheck["perProject"].AsArray() |> Seq.exactlyOne
+            Assert.False(workspaceProject["analyzed"].GetValue<bool>())
+            assertSdkEvidence globalJsonPath workspaceProject["blockingReason"]
+
+            let! fastWorkspaceCheck =
+                fcs.Check(
+                    { baseCheck with
+                        scope = Some "workspace"
+                        speed = Some "fast"
+                        projectPath = Some root }
+                )
+
+            Assert.Equal("unknown", fastWorkspaceCheck["verdict"].GetValue<string>())
+            assertSdkEvidence globalJsonPath fastWorkspaceCheck["blockingReason"]
+
+            Assert.Equal(0L, fcs.ProjectOptionsLoadCount)
         finally
             Directory.Delete(root, true)
     }

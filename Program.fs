@@ -112,15 +112,171 @@ let private runProjInfoAsync (path: string) : Task<JsonNode> =
                 )
     }
 
-let private runLimited (gate: SemaphoreSlim) (work: unit -> Task<JsonNode>) : Task<JsonNode> =
-    task {
-        do! gate.WaitAsync()
+let internal runLimitedWithTimeoutCore
+    (gate: SemaphoreSlim)
+    (cancellationToken: CancellationToken)
+    (timeoutMs: int option)
+    (onAdmitted: unit -> unit)
+    (work: int option -> Task<JsonNode>)
+    : Task<JsonNode> =
+    match timeoutMs with
+    | Some milliseconds when milliseconds < 0 ->
+        Task.FromResult(
+            jobj
+                [ "status", jstr "invalid_args"
+                  "errorKind", jstr "invalid_timeout"
+                  "message", jstr $"timeoutMs must be non-negative; got %d{milliseconds}."
+                  "timeoutMs", jint milliseconds ]
+            :> JsonNode
+        )
+    | _ ->
+        task {
+            let stopwatch = Stopwatch.StartNew()
+            let admissionTimeoutMs =
+                match timeoutMs with
+                | Some milliseconds -> milliseconds
+                | None -> Timeout.Infinite
 
-        try
-            return! work ()
-        finally
+            let mutable entered = false
+
+            try
+                let! admitted = gate.WaitAsync(admissionTimeoutMs, cancellationToken)
+
+                if not admitted then
+                    return
+                        jobj
+                            [ "status", jstr "timeout"
+                              "errorKind", jstr "fcs_admission_timeout"
+                              "message",
+                              jstr $"FCS admission timed out after %d{admissionTimeoutMs} ms before protected work started."
+                              "timeoutMs", jint admissionTimeoutMs
+                              "retryable", jbool true ]
+                        :> JsonNode
+                else
+                    entered <- true
+                    onAdmitted ()
+
+                    // Cancellation can race with a released slot. Once protected work starts it
+                    // owns the slot until its returned Task really completes; before that point a
+                    // cancelled waiter must never become a late starter.
+                    cancellationToken.ThrowIfCancellationRequested()
+
+                    let remainingTimeoutMs =
+                        match timeoutMs with
+                        | Some milliseconds ->
+                            let remaining = max 0L (int64 milliseconds - stopwatch.ElapsedMilliseconds)
+                            Some(int remaining)
+                        | None -> None
+
+                    return! work remainingTimeoutMs
+            finally
+                if entered then
+                    gate.Release() |> ignore
+        }
+
+let internal runLimitedWithTimeout
+    (gate: SemaphoreSlim)
+    (cancellationToken: CancellationToken)
+    (timeoutMs: int option)
+    (work: int option -> Task<JsonNode>)
+    : Task<JsonNode> =
+    runLimitedWithTimeoutCore gate cancellationToken timeoutMs ignore work
+
+/// Owns one admitted FCS slot while the response-producing task and any explicitly
+/// retained non-cancellable workers are still active. Retention must happen before
+/// the response task settles; ProjectOutline does that in the timeout/cancellation
+/// catch path that observed the underlying task still running.
+type internal ProtectedWorkLifetime(gate: SemaphoreSlim) =
+    let mutable pendingOwners = 1
+
+    let releaseOne () =
+        if Interlocked.Decrement(&pendingOwners) = 0 then
             gate.Release() |> ignore
-    }
+
+    member _.Retain(operation: Task) =
+        Interlocked.Increment(&pendingOwners) |> ignore
+
+        operation.ContinueWith(
+            (fun (completed: Task) ->
+                if completed.IsFaulted then
+                    completed.Exception |> ignore
+
+                releaseOne ()),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default
+        )
+        |> ignore
+
+    member _.CompleteResponseOwner() = releaseOne ()
+
+let internal runLimitedWithTimeoutRetainedCore
+    (gate: SemaphoreSlim)
+    (cancellationToken: CancellationToken)
+    (timeoutMs: int option)
+    (onAdmitted: unit -> unit)
+    (work: int option -> (Task -> unit) -> Task<JsonNode>)
+    : Task<JsonNode> =
+    match timeoutMs with
+    | Some milliseconds when milliseconds < 0 ->
+        Task.FromResult(
+            jobj
+                [ "status", jstr "invalid_args"
+                  "errorKind", jstr "invalid_timeout"
+                  "message", jstr $"timeoutMs must be non-negative; got %d{milliseconds}."
+                  "timeoutMs", jint milliseconds ]
+            :> JsonNode
+        )
+    | _ ->
+        task {
+            let stopwatch = Stopwatch.StartNew()
+            let admissionTimeoutMs = timeoutMs |> Option.defaultValue Timeout.Infinite
+            let mutable lifetime: ProtectedWorkLifetime option = None
+
+            try
+                let! admitted = gate.WaitAsync(admissionTimeoutMs, cancellationToken)
+
+                if not admitted then
+                    return
+                        jobj
+                            [ "status", jstr "timeout"
+                              "errorKind", jstr "fcs_admission_timeout"
+                              "message",
+                              jstr
+                                  $"FCS admission timed out after %d{admissionTimeoutMs} ms before protected work started."
+                              "timeoutMs", jint admissionTimeoutMs
+                              "retryable", jbool true ]
+                        :> JsonNode
+                else
+                    let admittedLifetime = ProtectedWorkLifetime(gate)
+                    lifetime <- Some admittedLifetime
+                    onAdmitted ()
+                    cancellationToken.ThrowIfCancellationRequested()
+
+                    let remainingTimeoutMs =
+                        timeoutMs
+                        |> Option.map (fun milliseconds ->
+                            max 0L (int64 milliseconds - stopwatch.ElapsedMilliseconds) |> int)
+
+                    return! work remainingTimeoutMs admittedLifetime.Retain
+            finally
+                lifetime |> Option.iter _.CompleteResponseOwner()
+        }
+
+let internal runLimitedWithTimeoutRetained
+    (gate: SemaphoreSlim)
+    (cancellationToken: CancellationToken)
+    (timeoutMs: int option)
+    (work: int option -> (Task -> unit) -> Task<JsonNode>)
+    : Task<JsonNode> =
+    runLimitedWithTimeoutRetainedCore gate cancellationToken timeoutMs ignore work
+
+let internal runLimited
+    (gate: SemaphoreSlim)
+    (cancellationToken: CancellationToken)
+    (work: unit -> Task<JsonNode>)
+    : Task<JsonNode> =
+    runLimitedWithTimeout gate cancellationToken None (fun _ -> work ())
 
 type internal RuntimeToolPin =
     { PackageId: string
@@ -505,8 +661,8 @@ let private mainCore argv =
                     TypedTool.define<CompletionArgs>
                         "textDocument_completion"
                         "Raw LSP proxy to fsautocomplete textDocument/completion. Exact-position IDE primitive; requires set_project first. line/character are 0-based. Pass 'text' for unsaved content. Avoid for free-form agent flows — completion is exact-position editor IO; for symbol semantics use fcs_symbol_at_word or find(kind=position) instead."
-                        (fun args (_ct: CancellationToken) ->
-                            toolResult (fun () -> runLimited lspGate (fun () -> bridge.Completion args)))
+                        (fun args (ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited lspGate ct (fun () -> bridge.Completion args)))
                     |> unwrapResult
                 )
 
@@ -514,12 +670,15 @@ let private mainCore argv =
                     TypedTool.define<CheckArgs>
                         "check"
                         "Fresh F# verdict for the active context. Bare check() returns clean|errors|unknown from an in-process type-check. Optional: scope, path, snippet, speed, severity. trusted (default) is fresh; fast uses cached FSAC. Counts reconcile: totalDiagnostics=errors+warnings+info. Project scope marks downstream consumers unchecked; workspace requires a solution or directory. Prefer for yes/no validation."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
+                            let timeoutMs = args.timeoutMs |> Option.defaultValue 60_000 |> Some
+
                             toolResult (fun () ->
-                                runLimited fcsGate (fun () ->
+                                runLimitedWithTimeout fcsGate ct timeoutMs (fun remainingTimeoutMs ->
+                                    let args = { args with timeoutMs = remainingTimeoutMs }
                                     Dispatcher.CheckDispatch.run fcsBridge bridge (Dispatcher.Check args))))
                     |> unwrapResult
                 )
@@ -528,9 +687,9 @@ let private mainCore argv =
                     TypedTool.define<SetProjectArgs>
                         "set_project"
                         "Initialize or switch the FSAC/LSP project context. Required before raw LSP proxies. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load and clears stale FCS analysis while retaining validated MSBuild project options. Response includes loadedProjects, readiness, restart intent, and whether a running FSAC process was actually replaced."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             toolResult (fun () ->
-                                runLimited lspGate (fun () -> setProjectAndRefresh args)))
+                                runLimited lspGate ct (fun () -> setProjectAndRefresh args)))
                     |> unwrapResult
                 )
 
@@ -538,7 +697,7 @@ let private mainCore argv =
                     TypedTool.define<ProjectHealthArgs>
                         "project_health"
                         "Fast read-only preflight for one F# project. Reports whether FsLangMCP can trust semantic tooling, project options availability, source file readability, analyzer setup, test project discovery, and current LSP readiness. projectPath is optional after set_project (falls back to the active project); pass it explicitly to inspect a different .fsproj/.sln/.slnx. Does not start/switch FSAC, run compile, or run tests."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
@@ -554,7 +713,7 @@ let private mainCore argv =
                                 getEvaluatedProjectSnapshot path |> Async.AwaitTask
 
                             toolResult (fun () ->
-                                runLimited fcsGate (fun () ->
+                                runLimited fcsGate ct (fun () ->
                                     createReport args snapshot evaluatedProject |> Async.StartAsTask)))
                     |> unwrapResult
                 )
@@ -563,7 +722,7 @@ let private mainCore argv =
                     TypedTool.define<FSharpProjectInspectArgs>
                         "fsharp_project_inspect"
                         "Read-only .fsproj inspection for agents. Prefer over textual reads of `.fsproj` — handles MSBuild evaluation correctly. Returns project identity, compile order, package/project references, signature/implementation pairing, and shared scan filtering summary. `projectPath` is optional after `set_project`. Does not build, restore, test, or edit files."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
@@ -571,7 +730,7 @@ let private mainCore argv =
                                 getEvaluatedProjectSnapshot path |> Async.AwaitTask
 
                             toolResult (fun () ->
-                                runLimited fcsGate (fun () ->
+                                runLimited fcsGate ct (fun () ->
                                     inspectProject args evaluatedProject |> Async.StartAsTask)))
                     |> unwrapResult
                 )
@@ -580,11 +739,11 @@ let private mainCore argv =
                     TypedTool.define<FcsReferencedSymbolsArgs>
                         "fcs_referenced_symbols"
                         "Substring search across the project's referenced assemblies (NuGet + framework) by DisplayName or FullName (case-insensitive). Prefer `fcs_nuget_types` when you already know the exact assembly name; use `find` for project-local symbols. Reports assembly, kind, accessibility, isObsolete. `includeNonPublic=true` for internals. Paginated; default 200, max 1000. First call triggers ParseAndCheckProject. Details: docs/tools-detailed.md#fcs_referenced_symbols."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.ReferencedSymbols args)))
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.ReferencedSymbols args)))
                     |> unwrapResult
                 )
 
@@ -592,11 +751,11 @@ let private mainCore argv =
                     TypedTool.define<FcsSuggestOpenArgs>
                         "fcs_suggest_open"
                         "Given an unresolved symbol name (FS0039), returns ranked `open` directive candidates — project-local first, then referenced assemblies. Use when an agent sees 'X is not defined' to get the right namespace instantly. Set includeReferences=false for project-only. Caveat: openPath is empty for global-namespace symbols; doesn't deduplicate the same name across multiple assemblies."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.SuggestOpen args)))
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.SuggestOpen args)))
                     |> unwrapResult
                 )
 
@@ -604,11 +763,11 @@ let private mainCore argv =
                     TypedTool.define<FcsNugetTypesArgs>
                         "fcs_nuget_types"
                         "Enumerate all types in one referenced assembly. `packageId` accepts the NuGet package id OR an assembly SimpleName it ships (exact, case-insensitive, never a prefix); the two often differ, and multi-assembly packages resolve fully. Prefer `fcs_referenced_symbols` for substring search across assemblies. Entry: displayName, fullName, kind, accessibility, isObsolete. Paginated; default 500, max 2000. A miss adds `hint` + `candidatePackages`. Details: docs/tools-detailed.md#fcs_nuget_types."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.NugetTypes args)))
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.NugetTypes args)))
                     |> unwrapResult
                 )
 
@@ -616,11 +775,11 @@ let private mainCore argv =
                     TypedTool.define<FcsNugetMembersArgs>
                         "fcs_nuget_members"
                         "Members of one type from a referenced assembly. packageId accepts a NuGet package id or assembly SimpleName; use fcs_nuget_types to discover names. Rows include signature and constraints, exact CLR accessibility when metadata is available, isAbstract, genericParameters, obsolete/XML docs. Protected API is included by default; includeNonPublic widens. Paginated (500 default, 2000 max); misses include routing hints. Details: docs/tools-detailed.md#fcs_nuget_members."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.NugetMembers args)))
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.NugetMembers args)))
                     |> unwrapResult
                 )
 
@@ -628,8 +787,8 @@ let private mainCore argv =
                     TypedTool.define<FcsFileOutlineArgs>
                         "fcs_file_outline"
                         "Compact outline for one F# file. Start with summaryOnly=true (default): container headers and attributes, member counts, CustomOperation index, and parse/check diagnostics. Those diagnostics are a per-file signal, not a project verdict. summaryOnly=false adds signatures/accessibility/attributes; oversized output downgrades to summary. Filters locals/noise by default. Use fcs_project_outline for a project or find(kind=\"symbol\") for search."
-                        (fun args (_ct: CancellationToken) ->
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.FileOutline args)))
+                        (fun args (ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.FileOutline args)))
                     |> unwrapResult
                 )
 
@@ -637,11 +796,11 @@ let private mainCore argv =
                     TypedTool.define<FcsMakeInternalVisibleArgs>
                         "fcs_make_internal_visible"
                         "Drop the `private` keyword from a declaration at `(line, character)`. Returns a non-destructive workspace edit `{ status, edits, appliedPreview, originalLineText }` — does NOT write the file. Use before tests need to call internals. Returns `{ status: 'no_action', reason }` on no symbol or no recognized modifier. Supported forms and Variant B status: docs/tools-detailed.md#fcs_make_internal_visible."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.MakeInternalVisible args)))
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.MakeInternalVisible args)))
                     |> unwrapResult
                 )
 
@@ -649,12 +808,15 @@ let private mainCore argv =
                     TypedTool.define<FindArgs>
                         "find"
         "F# semantic search across solution projects: definitions/references, field sites, and member calls. Bare find(query) returns compact sites; contextLines adds code. Narrow with kind (symbol|members|field|definition|position), scope, path, or projectPath. Member calls: kind=members + member=Name; query may be the member or declaring type. Field impact: kind=field + includeSiteTypes. FCS-resolved; scopeNote reports breadth."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
+                            let timeoutMs = args.timeoutMs |> Option.defaultValue 120_000 |> Some
+
                             toolResult (fun () ->
-                                runLimited fcsGate (fun () ->
+                                runLimitedWithTimeout fcsGate ct timeoutMs (fun remainingTimeoutMs ->
+                                    let args = { args with timeoutMs = remainingTimeoutMs }
                                     Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.Find args))))
                     |> unwrapResult
                 )
@@ -663,20 +825,84 @@ let private mainCore argv =
                     TypedTool.define<FcsSymbolAtWordArgs>
                         "fcs_symbol_at_word"
                         "Tolerant FCS symbol lookup for agent workflows. Accepts a line plus word/occurrence, finds the candidate span, and returns symbol identity, kind, type string, definition range, and optional documentation. Prefer over exact-position hover/type queries."
-                        (fun args (_ct: CancellationToken) ->
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.SymbolAtWord args)))
+                        (fun args (ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.SymbolAtWord args)))
                     |> unwrapResult
                 )
 
                 tool (
                     TypedTool.define<FcsProjectOutlineArgs>
                         "fcs_project_outline"
-                        "Agent-friendly whole-project structural overview over filtered compile files. Skips generated/build artifacts and returns compact per-file outlines; use `find` for symbol sites instead. `projectPath` is optional after `set_project` (falls back to the active project); pass it explicitly for a different .fsproj. Use `maxFiles`/`maxResultsPerFile` on large projects."
-                        (fun args (_ct: CancellationToken) ->
+                        "Whole-project structural overview over filtered compile files. Default timeoutMs=60000 covers queue admission, project evaluation, and file scans. Read status plus coverage before treating absence as exhaustive; incomplete filtered discovery emits no continuation cursor. Skips generated/build artifacts. Prefer find for symbol sites and fcs_file_outline for one file."
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.ProjectOutline args)))
+                            let timeoutMs = args.timeoutMs |> Option.defaultValue 60_000 |> Some
+
+                            toolResult (fun () ->
+                                task {
+                                    let! result =
+                                        runLimitedWithTimeoutRetained
+                                            fcsGate
+                                            ct
+                                            timeoutMs
+                                            (fun remainingTimeoutMs retainUntil ->
+                                                let args =
+                                                    { args with
+                                                        timeoutMs = remainingTimeoutMs }
+
+                                                fcsBridge.ProjectOutlineWithinDeadline(args, ct, retainUntil))
+
+                                    let isAdmissionTimeout =
+                                        match result["errorKind"] with
+                                        | null -> false
+                                        | kind -> kind.GetValue<string>() = "fcs_admission_timeout"
+
+                                    if isAdmissionTimeout then
+                                        let issue =
+                                            jobj
+                                                [ "phase", jstr "admission"
+                                                  "status", jstr "timed_out"
+                                                  "errorKind", jstr "fcs_admission_timeout"
+                                                  "message", result["message"].DeepClone() ]
+                                            :> JsonNode
+
+                                        return
+                                            jobj
+                                                [ "status", jstr "unknown"
+                                                  "errorKind", jstr "fcs_admission_timeout"
+                                                  "message", result["message"].DeepClone()
+                                                  "timeoutMs", jint (timeoutMs |> Option.defaultValue 60_000)
+                                                  "retryable", jbool true
+                                                  "resultSetComplete", jbool false
+                                                  "coverage",
+                                                  jobj
+                                                      [ "complete", jbool false
+                                                        "filesRequested", jint 0
+                                                        "filesScanned", jint 0
+                                                        "filesTimedOut", jint 0
+                                                        "filesFailed", jint 0
+                                                        "filesNotStarted", jint 0
+                                                        "phases",
+                                                        JsonArray(
+                                                            [| jobj
+                                                                   [ "phase", jstr "admission"
+                                                                     "status", jstr "timed_out" ]
+                                                               :> JsonNode |]
+                                                        )
+                                                        :> JsonNode
+                                                        "issues", JsonArray([| issue |]) :> JsonNode
+                                                        "issuesReturned", jint 1
+                                                        "issuesTruncated", jbool false ]
+                                                  :> JsonNode
+                                                  "truncated", jbool false
+                                                  "nextCursor", null
+                                                  "files", JsonArray() :> JsonNode ]
+                                            :> JsonNode
+                                    else
+                                        return result
+                                }))
                     |> unwrapResult
                 )
 
@@ -684,8 +910,8 @@ let private mainCore argv =
                     TypedTool.define<FcsSignatureHelpArgs>
                         "fcs_signature_help"
                         "Low-level exact-position FCS signature help. Returns overloads/parameters around a call site. line/character are 0-based. Pass projectPath/projectOptions and 'text' when available."
-                        (fun args (_ct: CancellationToken) ->
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.SignatureHelp args)))
+                        (fun args (ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.SignatureHelp args)))
                     |> unwrapResult
                 )
 
@@ -693,8 +919,8 @@ let private mainCore argv =
                     TypedTool.define<PositionArgs>
                         "fsharp_signature_data"
                         "Structured FSAC signature help via fsharp/signatureData. Requires set_project and an exact call-site position. Use this when FCS fallback is insufficient or when validating FSAC's current workspace view."
-                        (fun args (_ct: CancellationToken) ->
-                            toolResult (fun () -> runLimited lspGate (fun () -> bridge.SignatureData args)))
+                        (fun args (ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited lspGate ct (fun () -> bridge.SignatureData args)))
                     |> unwrapResult
                 )
 
@@ -702,8 +928,8 @@ let private mainCore argv =
                     TypedTool.define<FormattingArgs>
                         "textDocument_formatting"
                         "Raw LSP formatting proxy via fsautocomplete/Fantomas. Requires set_project first. Returns formatted text and edits; it does not write to disk. Pass 'text' for unsaved content."
-                        (fun args (_ct: CancellationToken) ->
-                            toolResult (fun () -> runLimited lspGate (fun () -> bridge.Formatting args)))
+                        (fun args (ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited lspGate ct (fun () -> bridge.Formatting args)))
                     |> unwrapResult
                 )
 
@@ -711,8 +937,8 @@ let private mainCore argv =
                     TypedTool.define<CodeActionArgs>
                         "textDocument_codeAction"
                         "Raw LSP codeAction proxy at an exact position with empty diagnostic context. Requires set_project first. Useful for debugging FSAC; prefer future diagnostics-to-fix workflows for agent repairs. Pass 'text' for unsaved content."
-                        (fun args (_ct: CancellationToken) ->
-                            toolResult (fun () -> runLimited lspGate (fun () -> bridge.CodeAction args)))
+                        (fun args (ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited lspGate ct (fun () -> bridge.CodeAction args)))
                     |> unwrapResult
                 )
 
@@ -720,8 +946,8 @@ let private mainCore argv =
                     TypedTool.define<RenameArgs>
                         "textDocument_rename"
                         "Raw LSP semantic rename at an exact position. Requires `set_project` first. Prefer over textual rename — handles shadowing and aliased opens safely. Returns raw WorkspaceEdit; needs a precise target. Pass `text` for unsaved content."
-                        (fun args (_ct: CancellationToken) ->
-                            toolResult (fun () -> runLimited lspGate (fun () -> bridge.Rename args)))
+                        (fun args (ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited lspGate ct (fun () -> bridge.Rename args)))
                     |> unwrapResult
                 )
 
@@ -729,7 +955,7 @@ let private mainCore argv =
                     TypedTool.define<FcsGetProjectOptionsArgs>
                         "fcs_get_project_options"
                         "Diagnostic helper: get FSharp compiler OtherOptions for a .fsproj via proj-info. projectPath is optional after set_project (falls back to the active project); pass it explicitly to inspect a different one."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let resolved =
                                 args.projectPath
                                 |> Option.orElse bridge.CurrentProjectPath
@@ -743,7 +969,7 @@ let private mainCore argv =
                                             "projectPath is required. Either pass it explicitly or call set_project first to establish a default."
                                     ))
                             | Some path ->
-                                toolResult (fun () -> runLimited fcsGate (fun () -> runProjInfoAsync path)))
+                                toolResult (fun () -> runLimited fcsGate ct (fun () -> runProjInfoAsync path)))
                     |> unwrapResult
                 )
 
@@ -751,11 +977,11 @@ let private mainCore argv =
                     TypedTool.define<FcsCheckCompileOrderArgs>
                         "fcs_check_compile_order"
                         "Detect F#'s file-ordering gotcha: a symbol used before the file that DEFINES it in <Compile> order reads as FS0039 'not defined' though it exists. Returns { symbol, definedIn, usedIn{file,compileIndex,range,lineText}, fix } so an agent reorders the .fsproj. Use when `check` reports FS0039 'X is not defined' to tell a compile-ORDER problem from a missing `open` (fcs_suggest_open handles that). projectPath optional after set_project; `symbol` narrows to one name."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.CheckCompileOrder args)))
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.CheckCompileOrder args)))
                     |> unwrapResult
                 )
 
@@ -771,8 +997,8 @@ let private mainCore argv =
                     TypedTool.define<DiagnosticFixesArgs>
                         "fcs_diagnostic_fixes"
                         "Fetch a file's diagnostics, then request code-action fixes for each and group them per diagnostic: range, severity, code, message, fixes [{title, kind, editSummary}], plus diagnosticCount/fixCount. Agent-friendly wrapper over raw textDocument_codeAction: supplies the diagnostic context the raw proxy leaves empty and groups the fixes. Requires set_project first. Pass line(+character) to narrow to one position, else all; pass text for unsaved content."
-                        (fun args (_ct: CancellationToken) ->
-                            toolResult (fun () -> runLimited lspGate (fun () -> bridge.DiagnosticFixes args)))
+                        (fun args (ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited lspGate ct (fun () -> bridge.DiagnosticFixes args)))
                     |> unwrapResult
                 )
 
@@ -796,23 +1022,30 @@ let private mainCore argv =
                     TypedTool.define<FcsExplainDiagnosticArgs>
                         "fcs_explain_diagnostic"
                         "Explain an F# compiler diagnostic in plain language with repair context: title, explanation, likelyCauses, repairHints, relatedTools. Pass `code` (\"FS0039\"), `errorNumber` (39), or path+line+character to auto-fetch it via FCS. Use this when `check` reports an FS error you need to turn into a fix — feed it check's errorNumberText. Curated map of ~25 common diagnostics; pass the raw `message` to enrich hints (FS0039 → fcs_suggest_open). Unknown codes return status=unknown_code."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.ExplainDiagnostic args)))
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.ExplainDiagnostic args)))
                     |> unwrapResult
                 )
 
                 tool (
                     TypedTool.define<FcsTestsForSymbolArgs>
                         "fcs_tests_for_symbol"
-                        "List the tests that likely cover a symbol. Sweeps the active solution's test projects (detected as project_health does — <IsTestProject> or an xunit/nunit/expecto ref), filters FCS symbol uses to test files, and tags each site with its enclosing test ([<Fact>]/[<Theory>]/[<Test>]/testCase). Use it for the test-coverage slice `find` lacks — find returns every use; this returns only test-file sites plus the enclosing test name. projectPath falls back to set_project."
-                        (fun args (_ct: CancellationToken) ->
-                            let args =
-                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+                        "Test-project references to a symbol, with enclosing test when safe. Prefer over find for test coverage; find returns all uses. Excludes definitions. Paginates with maxResults/cursor and uses one timeoutMs budget (120000 default). testCount/siteCount are reference sites; uniqueTestCount is distinct enclosing tests. Inspect coverage.complete and perProject before trusting zero. A production .fsproj reuses the active solution when available; otherwise an incomplete zero gives a widening hint."
+                        (fun args (ct: CancellationToken) ->
+                            let activeProjectPath = bridge.CurrentProjectPath
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.TestsForSymbol args)))
+                            let args =
+                                { args with projectPath = args.projectPath |> Option.orElse activeProjectPath }
+
+                            let timeoutMs = args.timeoutMs |> Option.defaultValue 120_000 |> Some
+
+                            toolResult (fun () ->
+                                runLimitedWithTimeout fcsGate ct timeoutMs (fun remainingTimeoutMs ->
+                                    let args = { args with timeoutMs = remainingTimeoutMs }
+                                    fcsBridge.TestsForSymbol(args, ?activeProjectPath = activeProjectPath))))
                     |> unwrapResult
                 )
 
@@ -820,8 +1053,8 @@ let private mainCore argv =
                     TypedTool.define<RenamePreviewArgs>
                         "fcs_rename_preview"
                         "Preview a semantic rename's full impact WITHOUT applying it — non-destructive, writes nothing. Runs the same FSAC machinery as `textDocument_rename` but returns edits grouped by file, each with originalLineText and previewLineText, plus totalEdits, fileCount, and a crossProject flag. Use it to inspect blast radius before `textDocument_rename` applies the change. Requires `set_project`. Returns `no_symbol` when the position has no renamable symbol. Pass `text` for unsaved buffers."
-                        (fun args (_ct: CancellationToken) ->
-                            toolResult (fun () -> runLimited lspGate (fun () -> bridge.RenamePreview args)))
+                        (fun args (ct: CancellationToken) ->
+                            toolResult (fun () -> runLimited lspGate ct (fun () -> bridge.RenamePreview args)))
                     |> unwrapResult
                 )
 
@@ -829,11 +1062,11 @@ let private mainCore argv =
                     TypedTool.define<FcsPublicApiArgs>
                         "fcs_public_api"
                         "Emit an F# project's public API surface: every public type and its public members with signatures, sorted stably by fullName then member name so two version snapshots diff cleanly. Prefer over `fcs_project_outline` for API-stability/breaking-change diffs — public-only (includeInternal=true adds internals), signature-complete, deterministic order. projectPath optional after set_project. Narrow with namespaceFilter (substring on FullName); paginated via maxResults + cursor."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.PublicApi args)))
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.PublicApi args)))
                     |> unwrapResult
                 )
 
@@ -841,13 +1074,19 @@ let private mainCore argv =
                     TypedTool.define<FcsRefactorImpactArgs>
                         "fcs_refactor_impact"
                         "Preview a change's blast radius + a verify checklist WITHOUT editing. Orchestrates find (cross-project use sites), fcs_tests_for_symbol, fcs_check_compile_order (kind=move) and fcs_public_api (kind=signature|delete, when public) into { target, impact, tests, compileOrder?, apiSurface?, verify[] }. Pass `symbol` or path+line+character; kind=rename|signature|move|delete|auto. Use before a rename/move/delete; prefer `fcs_rename_preview` for the exact edits, this for project-wide impact."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
+                            let activeProjectPath = bridge.CurrentProjectPath
+
                             let args =
-                                { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
+                                { args with projectPath = args.projectPath |> Option.orElse activeProjectPath }
 
                             toolResult (fun () ->
-                                runLimited fcsGate (fun () ->
-                                    fcsBridge.RefactorImpact(args, (fun rp -> bridge.RenamePreview rp)))))
+                                runLimited fcsGate ct (fun () ->
+                                    fcsBridge.RefactorImpact(
+                                        args,
+                                        (fun rp -> bridge.RenamePreview rp),
+                                        ?activeProjectPath = activeProjectPath
+                                    ))))
                     |> unwrapResult
                 )
 
@@ -855,11 +1094,11 @@ let private mainCore argv =
                     TypedTool.define<FcsSignatureStatusArgs>
                         "fcs_signature_status"
                         "Report the .fsi-vs-impl public-surface gap for one .fs WITHOUT editing: type-checks the impl with its sibling .fsi stripped, then diffs — members public in the impl but missing from the .fsi (silently hidden) → missingFromSig; .fsi entries with no impl match → staleInSig, each with a val/type signaturePreview. No .fsi? lists the would-be signature. Use for .fsi drift (members hidden/stale); prefer `fcs_public_api` for the whole public surface. projectPath falls back to set_project."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.SignatureStatus args)))
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.SignatureStatus args)))
                     |> unwrapResult
                 )
 
@@ -867,11 +1106,11 @@ let private mainCore argv =
                     TypedTool.define<FcsReviewScanArgs>
                         "fcs_review_scan"
                         "Scan F# source for review CANDIDATES from the untyped AST — spots to eyeball, not a linter. Categories: match_wildcard, try_with, raise_or_failwith, mutable_binding, blocking_call, cast_or_box, reflection, large_function. Target: `path` (one file) or `projectPath` (falls back to set_project); narrow with `categories`, cap with `maxResults`. Parse-only, writes nothing; candidates carry range, lineText, note, plus counts.byCategory. Missing compiled files → `unresolvedFiles`, status `partial`."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.ReviewScan args)))
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.ReviewScan args)))
                     |> unwrapResult
                 )
 
@@ -879,11 +1118,11 @@ let private mainCore argv =
                     TypedTool.define<FcsDeadCodeArgs>
                         "fcs_dead_code"
                         "List likely-unused F# symbols as cleanup candidates — a conservative cleanup pass (candidates, not deletions); use `find` to verify each candidate's real usage before removing. Sweeps the project (GetAllUsesOfAllSymbols) and flags private/internal value & function bindings whose only use is their own definition. Public is excluded (includePublic=true adds it); skips compiler-generated, [<EntryPoint>], overrides/interface impls, ctors. Always emits caveats. projectPath falls back to set_project."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.DeadCode args)))
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.DeadCode args)))
                     |> unwrapResult
                 )
 
@@ -891,11 +1130,11 @@ let private mainCore argv =
                     TypedTool.define<FcsCreateFilePlanArgs>
                         "fcs_create_file_plan"
                         "Plan WHERE a new .fs file belongs WITHOUT creating it — read-only, writes nothing. Loads the resolved <Compile> order, recommends an insertion index (right after `afterFile`, else namespace-neighbour/end), infers the namespace/module convention from neighbours, and emits the exact <Compile Include=...> edit plus a dependency note (a file may only reference EARLIER files). Use before adding an .fs file to pick the right <Compile> position; pair with `fcs_check_compile_order` after."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.CreateFilePlan args)))
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.CreateFilePlan args)))
                     |> unwrapResult
                 )
 
@@ -903,11 +1142,11 @@ let private mainCore argv =
                     TypedTool.define<FcsAnalyzerDiagnosticsArgs>
                         "fcs_analyzer_diagnostics"
                         "Report F# ANALYZER diagnostics (not compiler diagnostics), grouped: analyzersConfigured, analyzerPackages, diagnostics [{analyzer, code, severity, message, file, range}], counts {byAnalyzer, bySeverity}. Detects analyzer config like project_health, runs the fsharp-analyzers CLI when available, parses its SARIF; none configured → no_analyzers. Use to read analyzer DIAGNOSTICS; project_health reports whether analyzers are CONFIGURED. severity filters; projectPath falls back to set_project."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.AnalyzerDiagnostics args)))
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.AnalyzerDiagnostics args)))
                     |> unwrapResult
                 )
 
@@ -915,11 +1154,11 @@ let private mainCore argv =
                     TypedTool.define<FcsAnalyzerSetupPreviewArgs>
                         "fcs_analyzer_setup_preview"
                         "Plan what to add to enable F# analyzers WITHOUT applying it — read-only, writes nothing. Reads the .fsproj + Directory.Build.props/.targets + dotnet-tools.json, diffs current wiring against the required set: analyzer package refs + GeneratePathProperty, FSharp.Analyzers.Build, the FSharpAnalyzersOtherFlags property, a local fsharp-analyzers manifest. Emits each gap as an exact XML/JSON snippet + reason. Use this to set analyzers up; pair with fcs_analyzer_diagnostics to read diagnostics after."
-                        (fun args (_ct: CancellationToken) ->
+                        (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            toolResult (fun () -> runLimited fcsGate (fun () -> fcsBridge.AnalyzerSetupPreview args)))
+                            toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.AnalyzerSetupPreview args)))
                     |> unwrapResult
                 )
 
