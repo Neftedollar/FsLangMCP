@@ -4006,6 +4006,53 @@ type internal FcsBridge
               "before", JsonArray(before) :> JsonNode
               "after", JsonArray(after) :> JsonNode ]
 
+    let isDoubleBacktickIdentifier (value: string) =
+        not (isNull value)
+        && value.Length > 4
+        && value.StartsWith("``", StringComparison.Ordinal)
+        && value.EndsWith("``", StringComparison.Ordinal)
+
+    /// Return the length of the query suffix that spells this FCS source name.
+    /// FCS preserves double backticks in DisplayName, while callers naturally ask
+    /// for both the plain name and its double-backtick-delimited spelling. Compare
+    /// only the semantic identifier suffix; never scan source text or strip interior quotes.
+    let trySourceIdentifierSuffixLength comparison (sourceName: string) (query: string) =
+        if isNull sourceName || isNull query then
+            None
+        elif query.EndsWith(sourceName, comparison) then
+            Some sourceName.Length
+        elif isDoubleBacktickIdentifier sourceName then
+            let contentLength = sourceName.Length - 4
+
+            if
+                query.Length >= contentLength
+                && String.Compare(
+                    query,
+                    query.Length - contentLength,
+                    sourceName,
+                    2,
+                    contentLength,
+                    comparison
+                ) = 0
+            then
+                Some contentLength
+            else
+                None
+        else
+            let quotedLength = sourceName.Length + 4
+            let quotedStart = query.Length - quotedLength
+
+            if
+                quotedStart >= 0
+                && query[quotedStart] = '`'
+                && query[quotedStart + 1] = '`'
+                && query.EndsWith("``", StringComparison.Ordinal)
+                && String.Compare(query, quotedStart + 2, sourceName, 0, sourceName.Length, comparison) = 0
+            then
+                Some quotedLength
+            else
+                None
+
     let symbolMatches query exact (symbol: FSharpSymbol) =
         let displayName = symbol.DisplayName
         let fullName = symbol.FullName
@@ -4022,16 +4069,57 @@ type internal FcsBridge
             && fullName.Length > query.Length
             && fullName[fullName.Length - query.Length - 1] = '.'
 
+        // #267: GetAllUsesOfAllSymbols returns backtick-bound values and test methods
+        // with the delimiters in DisplayName/FullName. Match quoted and unquoted query
+        // spellings against that FCS identity, including a module-qualified final name.
+        // Qualifiers remain exact dot-delimited suffixes, so a punctuation near-miss
+        // cannot become a hit and duplicate source names continue to return every site.
+        let sourceNameMatch comparison =
+            match trySourceIdentifierSuffixLength comparison displayName query with
+            | None -> false
+            | Some suffixLength when suffixLength = query.Length -> true
+            | Some suffixLength when isNull fullName -> false
+            | Some suffixLength ->
+                let querySeparator = query.Length - suffixLength - 1
+                let fullDisplayStart = fullName.Length - displayName.Length
+
+                if
+                    querySeparator < 0
+                    || query[querySeparator] <> '.'
+                    || fullDisplayStart <= 0
+                    || not (fullName.EndsWith(displayName, StringComparison.Ordinal))
+                    || fullName[fullDisplayStart - 1] <> '.'
+                then
+                    false
+                else
+                    let queryQualifierLength = querySeparator
+                    let fullQualifierLength = fullDisplayStart - 1
+
+                    (fullQualifierLength = queryQualifierLength
+                     && String.Compare(fullName, 0, query, 0, queryQualifierLength, comparison) = 0)
+                    || (fullQualifierLength > queryQualifierLength
+                        && fullName[fullQualifierLength - queryQualifierLength - 1] = '.'
+                        && String.Compare(
+                            fullName,
+                            fullQualifierLength - queryQualifierLength,
+                            query,
+                            0,
+                            queryQualifierLength,
+                            comparison
+                        ) = 0)
+
         if exact then
             String.Equals(displayName, query, StringComparison.Ordinal)
             || String.Equals(fullName, query, StringComparison.Ordinal)
             || dottedSuffixMatch ()
+            || sourceNameMatch StringComparison.Ordinal
         else
             displayName.Contains(query, StringComparison.OrdinalIgnoreCase)
             || (if isNull fullName then
                     false
                 else
                     fullName.Contains(query, StringComparison.OrdinalIgnoreCase))
+            || sourceNameMatch StringComparison.OrdinalIgnoreCase
 
     let isIdentifierChar (ch: char) =
         Char.IsLetterOrDigit(ch) || ch = '_' || ch = '\'' || ch = '`'
@@ -10163,6 +10251,12 @@ type internal FcsBridge
         task {
             let speed = (args.speed |> Option.defaultValue "trusted").Trim().ToLowerInvariant()
             let mode = (args.mode |> Option.defaultValue "fs").Trim().ToLowerInvariant()
+            // v0.17.1 already appended snippets after SourceFiles. Keep that useful
+            // behavior as the explicit default while allowing callers to request the
+            // pre-project position when they need to model an early compile file.
+            let snippetPosition =
+                (args.snippetPosition |> Option.defaultValue "end").Trim().ToLowerInvariant()
+
             let severityFloor = (args.severity |> Option.defaultValue "error").Trim().ToLowerInvariant()
             let scopeRaw = (args.scope |> Option.defaultValue "auto").Trim().ToLowerInvariant()
             let timeoutMs = args.timeoutMs |> Option.defaultValue 60000
@@ -10199,6 +10293,8 @@ type internal FcsBridge
                 return invalid $"speed must be 'trusted' or 'fast' (got '{speed}')"
             elif mode <> "fs" && mode <> "fsi" then
                 return invalid $"mode must be 'fs' or 'fsi' (got '{mode}')"
+            elif snippetPosition <> "start" && snippetPosition <> "end" then
+                return invalid $"snippetPosition must be 'start' or 'end' (got '{snippetPosition}')"
             elif not (List.contains severityFloor severityNames) then
                 return invalid $"severity must be one of error|warning|information|hint|all (got '{severityFloor}')"
             elif not (List.contains scopeRaw [ "auto"; "file"; "project"; "workspace"; "snippet" ]) then
@@ -10563,7 +10659,7 @@ type internal FcsBridge
                         [||]
                         (Some discoveryReason)
                         ([ ("projectsSwept", jint 0) ] @ blockingFields discoveryFailure)
-            // ── snippet: always FRESH (ignores speed); old ValidateSnippet logic ──
+            // ── snippet: always FRESH (ignores speed); placement-aware validation ──
             | "snippet" ->
                 match args.snippet with
                 | Some snippetText when not (String.IsNullOrWhiteSpace snippetText) ->
@@ -10593,9 +10689,14 @@ type internal FcsBridge
                         try
                             File.WriteAllText(snippetFile, snippetText)
 
+                            let snippetSourceFiles =
+                                match snippetPosition with
+                                | "start" -> Array.append [| snippetFile |] options.SourceFiles
+                                | _ -> Array.append options.SourceFiles [| snippetFile |]
+
                             let modifiedOptions =
                                 { options with
-                                    SourceFiles = Array.append options.SourceFiles [| snippetFile |] }
+                                    SourceFiles = snippetSourceFiles }
 
                             let sourceText = SourceText.ofString snippetText
 
@@ -10659,6 +10760,7 @@ type internal FcsBridge
                                     [||] // synthetic temp file — no meaningful source path to surface
                                     reason
                                     [ "mode", jstr mode
+                                      "snippetPosition", jstr snippetPosition
                                       "projectFileName", jstr options.ProjectFileName
                                       "optionsSource", jstr optionsSource ]
                         finally
