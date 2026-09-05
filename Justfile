@@ -2,6 +2,7 @@ set shell := ["zsh", "-cu"]
 
 solution := "FsLangMcp.slnx"
 test_project := "tests/FsLangMcp.Tests/FsLangMcp.Tests.fsproj"
+docs_project := "docs/FsLangMcp.Docs.fsproj"
 tool_source := "nupkg"
 runtime_tool_path := ".runtime-tools"
 
@@ -36,6 +37,18 @@ test:
     dotnet test {{test_project}} --no-restore
 
 check: build test
+
+docs-restore:
+    dotnet restore {{docs_project}} --locked-mode
+
+docs-check: docs-restore
+    dotnet run --project {{docs_project}} --no-restore -- check --strict
+
+docs-build: docs-restore
+    dotnet run --project {{docs_project}} --no-restore -- build --strict
+
+docs-watch: docs-restore
+    dotnet run --project {{docs_project}} --no-restore -- watch
 
 # Drive the built server over real stdio against a project pinning an absent SDK
 # (#192 acceptance criterion). Skips itself when nothing is built yet.

@@ -1,0 +1,76 @@
+name: Documentation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'CHANGELOG.md'
+      - 'Directory.Build.props'
+      - 'Directory.Build.targets'
+      - 'Directory.Packages.props'
+      - 'NuGet.config'
+      - 'global.json'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'CHANGELOG.md'
+      - 'Directory.Build.props'
+      - 'Directory.Build.targets'
+      - 'Directory.Packages.props'
+      - 'NuGet.config'
+      - 'global.json'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.400'
+
+      - name: Restore documentation
+        run: dotnet restore docs/FsLangMcp.Docs.fsproj --locked-mode
+
+      - name: Check documentation
+        run: dotnet run --project docs/FsLangMcp.Docs.fsproj --no-restore --configuration Release -- check --strict
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.400'
+
+      - name: Restore documentation
+        run: dotnet restore docs/FsLangMcp.Docs.fsproj --locked-mode
+
+      - name: Build documentation
+        run: dotnet run --project docs/FsLangMcp.Docs.fsproj --no-restore --configuration Release -- build --strict
+
+      - name: Publish to GitHub Pages
+        run: dotnet run --project docs/FsLangMcp.Docs.fsproj --no-restore --configuration Release -- gh-pages

@@ -1,4 +1,10 @@
-# Troubleshooting
+---
+title: Troubleshooting
+description: Diagnose project loading, SDK pins, stale processes, incomplete results, and external tool failures.
+toc:
+  from: 2
+  to: 2
+---
 
 This page lists common failure modes by **what the user or agent sees**, with the remediation
 chain to follow. If your symptom isn't here, open an issue at

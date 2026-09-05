@@ -1,4 +1,7 @@
-# Why your AI agent shouldn't grep F#
+---
+title: Why your AI agent shouldn't grep F#
+description: Why text search fails on F# semantics, what compiler-resolved tools change, and what the measured evidence actually shows.
+---
 
 Your AI coding agent just grepped for a function name across an F# codebase.
 Here's everything that went wrong — and what it should have done instead.
@@ -226,9 +229,7 @@ the compiler's internals instead of the agent's goal.
 
 ```bash
 dotnet tool install -g FsLangMcp
-dotnet tool install -g fsautocomplete --version 0.83.0
-dotnet tool install -g ionide.projinfo.tool --version 0.74.2
-dotnet tool install -g fantomas --version 7.0.5
+fslangmcp --bootstrap-tools
 ```
 
 Add to your MCP client config:
@@ -241,8 +242,9 @@ Then `set_project` with your `.fsproj`/`.sln`, and start with `find` or `check`.
 
 A runnable two-project example — the cross-project `Order` case from this
 document, with exact response shapes — lives in
-[`../examples/`](../examples/README.md). Full setup and the complete tool
-reference are in the [README](../README.md).
+[quickstart examples](https://github.com/Neftedollar/FsLangMCP/tree/main/examples).
+Continue with [Getting started](getting-started.md) and the complete
+[Tools reference](tools-reference.md).
 
 FsLangMCP is MIT-licensed, targets .NET 10, and is early-stage and open to
 feedback: [github.com/Neftedollar/FsLangMCP](https://github.com/Neftedollar/FsLangMCP).
