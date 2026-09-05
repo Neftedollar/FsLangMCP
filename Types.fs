@@ -822,10 +822,13 @@ module internal FindResponseBudget =
                   "outcome", jstr "indeterminate"
                   "deliveryStatus", jstr "blocked"
                   "errorCode", jstr "find_response_exceeds_budget"
+                  "errorKind", jstr "find_response_exceeds_budget"
                   "message",
                   jstr
                       "The complete find result exceeded the hard production-serialized response ceiling. Caller-controlled details were omitted; retry with narrower inputs."
                   "retryable", jbool true
+                  "paginationRestartRequired", jbool true
+                  "retrySameCursor", jbool false
                   "responseTruncatedByBudget", jbool true
                   "responseBudgetChars", jint MaxSerializedChars
                   "responseSizeUnit", jstr SizeUnit

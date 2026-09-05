@@ -1105,8 +1105,7 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                   "character", { baseline with character = Some -1 }, "character"
                   "occurrence", { baseline with occurrence = Some -2 }, "occurrence"
                   "file-path", { baseline with scope = Some "file" }, "requires a non-empty path"
-                  "project-context", { baseline with scope = Some "project" }, "whole solution"
-                  "cursor", { baseline with cursor = Some "not-base64" }, "Invalid cursor" ]
+                  "project-context", { baseline with scope = Some "project" }, "whole solution" ]
 
             for (label, invalidArgs, expectedMessage) in cases do
                 let! result = bridge.Find(invalidArgs)
@@ -1117,6 +1116,13 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                 )
 
                 Assert.Contains(expectedMessage, gs result "message")
+
+            let! malformedCursor = bridge.Find({ baseline with cursor = Some "not-base64" })
+            Assert.Equal("invalid_cursor", gs malformedCursor "status")
+            Assert.Equal("cursor_malformed", gs malformedCursor "errorKind")
+            Assert.True(gb malformedCursor "paginationRestartRequired")
+            Assert.False(gb malformedCursor "retrySameCursor")
+            Assert.Empty(malformedCursor["sites"] :?> JsonArray)
         }
 
     [<Fact>]

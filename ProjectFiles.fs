@@ -536,6 +536,7 @@ module internal SolutionParsing =
     [<NoEquality; NoComparison>]
     type FindProjectDiscovery =
         { MemberProjectPaths: System.Collections.Generic.HashSet<string>
+          MemberProjectsInOrder: ResizeArray<string>
           LoadableProjects: ResizeArray<string>
           MissingProjects: ResizeArray<string> }
 
@@ -562,11 +563,14 @@ module internal SolutionParsing =
 
     let private emptyFindProjectDiscovery () =
         { MemberProjectPaths = System.Collections.Generic.HashSet<string>(projectPathComparer)
+          MemberProjectsInOrder = ResizeArray<string>()
           LoadableProjects = ResizeArray<string>()
           MissingProjects = ResizeArray<string>() }
 
     let private addFindProject (result: FindProjectDiscovery) (project: ProjectDiscovery) =
         if result.MemberProjectPaths.Add(project.ProjectPath) then
+            result.MemberProjectsInOrder.Add(project.ProjectPath)
+
             match project.Status with
             | ProjectDiscoveryStatus.Loadable -> result.LoadableProjects.Add(project.ProjectPath)
             | ProjectDiscoveryStatus.Missing -> result.MissingProjects.Add(project.ProjectPath)
@@ -760,6 +764,7 @@ module internal SolutionParsing =
                 | :? TimeoutException -> reraise ()
                 | _ ->
                     result.MemberProjectPaths.Clear()
+                    result.MemberProjectsInOrder.Clear()
                     result.LoadableProjects.Clear()
                     result.MissingProjects.Clear()
 
