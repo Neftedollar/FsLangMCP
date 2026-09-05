@@ -21,7 +21,7 @@ find { "query": "Ship", "kind": "members", "member": "Ship" }  // member call-si
 check { "scope": "file", "path": "/abs/path/Domain/Order.fs" }'><div class="nacara-code__body"><pre><code><span class="nacara-code__line">check {}                           // whole workspace, auto scope
 </span><span class="nacara-code__line">check { "scope": "file", "path": "/abs/path/Domain/Order.fs" }
 </span></code></pre><button class="nacara-code__copy" type="button" aria-label="Copy code"><svg class="nacara-code__copy-idle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V5a2 2 0 0 1 2-2h10" /></svg><svg class="nacara-code__copy-done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5" /></svg></button></div></figure><p><code>clean</code> is scoped to the current FCS/check profile. It is not proof that every build configuration is clean: optimized Release compilation can surface configuration-specific diagnostics such as FS3511. Before merge or release, run <code>dotnet build -c Release --warnaserror</code>.</p><h3 id="step-3-dig-deeper-as-needed">Step 3 — dig deeper as needed<a class="nacara-heading-anchor" href="#step-3-dig-deeper-as-needed" aria-label="Link to this section" data-pagefind-ignore></a></h3><p>Once you have a base signal from <code>find</code> and <code>check</code>, the other 33 tools let you go deeper: understand project structure (<code>fcs_project_outline</code>, <code>fcs_file_outline</code>), diagnose errors (<code>fcs_explain_diagnostic</code>, <code>fcs_suggest_open</code>), preview refactors (<code>fcs_rename_preview</code>, <code>fcs_refactor_impact</code>), scan for cleanup candidates (<code>fcs_dead_code</code>, <code>fcs_review_scan</code>), and more.</p><h3 id="minimal-session-example">Minimal session example<a class="nacara-heading-anchor" href="#minimal-session-example" aria-label="Link to this section" data-pagefind-ignore></a></h3><figure class="nacara-code" data-language="text" data-frame="code" data-source='1. set_project  {"projectPath": "/abs/path/MyApp.sln"}
-   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.17.0"
+   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.17.1"
 
 2. check  {}
    → verdict="clean"
@@ -34,7 +34,7 @@ check { "scope": "file", "path": "/abs/path/Domain/Order.fs" }'><div class="naca
 
 5. fcs_rename_preview  {"path": "/abs/path/Domain/Order.fs", "line": 12, "character": 5, "newName": "OrderIdentifier"}
    → edits grouped by file, totalEdits=7, crossProject=false'><div class="nacara-code__body"><pre><code><span class="nacara-code__line">1. set_project  {"projectPath": "/abs/path/MyApp.sln"}
-</span><span class="nacara-code__line">   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.17.0"
+</span><span class="nacara-code__line">   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.17.1"
 </span><span class="nacara-code__line">
 </span><span class="nacara-code__line">2. check  {}
 </span><span class="nacara-code__line">   → verdict="clean"
