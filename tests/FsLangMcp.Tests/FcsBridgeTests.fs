@@ -1802,6 +1802,47 @@ let ``find diagnostic shaping caps projection before budgeting and observes cont
                 Directory.Delete(root, true)
     }
 
+[<Fact>]
+let ``find source context streams each file once for many distant sites`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_context_scan_{Guid.NewGuid():N}")
+        let mutable fileScans = 0
+        let mutable lineReads = 0
+
+        let beforeResponseStep phase _ =
+            match phase with
+            | "line-context-file" -> fileScans <- fileScans + 1
+            | "line-context" -> lineReads <- lineReads + 1
+            | _ -> ()
+
+        let sourceLines =
+            [ yield "module SourceWindow"
+              yield "let value = 42"
+              for _ in 1..5000 -> "// a gap before the page's later matches"
+              for index in 1..100 -> $"let item{index} = value + {index}" ]
+
+        let bridge = FcsBridge(findResponseConstructionBeforeStepOverride = beforeResponseStep)
+
+        try
+            let _, projectPath = writeProjectWithSource root "SourceWindow" (String.concat "\n" sourceLines)
+            let! result =
+                bridge.Find(
+                    { admissionFindArgs projectPath 20_000 with
+                        contextLines = Some 8
+                        maxResults = Some 1000 }
+                )
+
+            Assert.True(result["status"].GetValue<string>() = "succeeded", renderToken result)
+            Assert.True(result["totalSites"].GetValue<int>() > 50)
+            Assert.Equal(1, fileScans)
+            Assert.InRange(lineReads, 5000, sourceLines.Length + 1)
+            Assert.NotEmpty(result["sites"].AsArray())
+            Assert.True(renderedLength result <= FindResponseBudget.MaxSerializedChars)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
 [<Theory>]
 [<InlineData("response-planning")>]
 [<InlineData("response-json-copy")>]

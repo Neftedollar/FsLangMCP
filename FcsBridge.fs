@@ -8061,65 +8061,82 @@ type internal FcsBridge
             if responseConstructionTimedOut then
                 requestedPageSites.Clear()
 
-            // Retain only the requested source window, then project a bounded snippet
-            // for each match's own columns. Reading and row construction share the deadline.
+            // Union this page's source windows before reading. Reopening a file for each
+            // site would rescan every earlier line O(sites * file length) and consume the
+            // bounded response allowance on large files. Each file is streamed once;
+            // only requested lines survive, and each site's own columns shape its snippet.
+            let appliedContextLines = min (max 0 contextLines) FindResponseBudget.MaxContextLines
+            let requestedSourceLines =
+                System.Collections.Generic.Dictionary<string, System.Collections.Generic.SortedSet<int>>(StringComparer.Ordinal)
+
+            let mutable sourceWindowIndex = 0
+
+            while sourceWindowIndex < requestedPageSites.Count && not responseConstructionTimedOut do
+                if responseStep "line-context-selection" sourceWindowIndex then
+                    let site = requestedPageSites[sourceWindowIndex]
+                    let filePath = normalizePath site.File
+                    let selected =
+                        match requestedSourceLines.TryGetValue(filePath) with
+                        | true, lines -> lines
+                        | false, _ ->
+                            let lines = System.Collections.Generic.SortedSet<int>()
+                            requestedSourceLines.Add(filePath, lines)
+                            lines
+
+                    let targetLine = max 1 site.StartLine
+
+                    for lineNumber in max 1 (targetLine - appliedContextLines) .. targetLine + appliedContextLines do
+                        selected.Add(lineNumber) |> ignore
+
+                    sourceWindowIndex <- sourceWindowIndex + 1
+
             let lineContextCache =
                 System.Collections.Generic.Dictionary<
-                    struct (string * int * int),
+                    string,
                     System.Collections.Generic.IReadOnlyDictionary<int, string>
-                 >()
+                 >(StringComparer.Ordinal)
 
-            let tryLineContextToJson filePath startLine startColumn endLine endColumn =
-                let appliedContextLines = min (max 0 contextLines) FindResponseBudget.MaxContextLines
-                let cacheKey = normalizePath filePath
-                let contextKey = struct (cacheKey, startLine, appliedContextLines)
+            use sourceFiles = (requestedSourceLines :> seq<_>).GetEnumerator()
+            let mutable sourceFileIndex = 0
 
-                let renderContext (lines: System.Collections.Generic.IReadOnlyDictionary<int, string>) =
-                    let mutable index = 0
-                    let mutable ready = true
+            while not responseConstructionTimedOut && sourceFiles.MoveNext() do
+                if responseStep "line-context-file" sourceFileIndex then
+                    let filePath = sourceFiles.Current.Key
+                    let requested = sourceFiles.Current.Value
+                    let lastLine = requested.Max
+                    let selected = System.Collections.Generic.Dictionary<int, string>()
 
-                    while ready && index < lines.Count do
-                        ready <- responseStep "line-context-json" index
-                        index <- index + 1
+                    if File.Exists filePath then
+                        use lines = File.ReadLines(filePath).GetEnumerator()
+                        let mutable lineNumber = 1
+                        let mutable reachedEnd = false
 
-                    if ready && responseStep "line-context-json-complete" index then
-                        Some(findLineContextToJson lines contextLines startLine startColumn endLine endColumn)
-                    else
-                        None
-
-                if not (responseStep "line-context" 0) then
-                    None
-                else
-                    match lineContextCache.TryGetValue(contextKey) with
-                    | true, cached -> renderContext cached
-                    | _ ->
-                        let selected = System.Collections.Generic.Dictionary<int, string>()
-                        let targetLine = max 1 startLine
-                        let firstLine = max 1 (targetLine - appliedContextLines)
-                        let lastLine = targetLine + appliedContextLines
-                        let mutable contextComplete = true
-
-                        if File.Exists cacheKey then
-                            use lines = File.ReadLines(cacheKey).GetEnumerator()
-                            let mutable lineNumber = 1
-                            let mutable reachedEnd = false
-
-                            while lineNumber <= lastLine && not reachedEnd && contextComplete do
-                                if not (responseStep "line-context" lineNumber) then
-                                    contextComplete <- false
-                                elif lines.MoveNext() then
-                                    if lineNumber >= firstLine then
+                        while lineNumber <= lastLine && not reachedEnd && not responseConstructionTimedOut do
+                            if responseStep "line-context" lineNumber then
+                                if lines.MoveNext() then
+                                    if requested.Contains(lineNumber) then
                                         selected.Add(lineNumber, lines.Current)
 
                                     lineNumber <- lineNumber + 1
                                 else
                                     reachedEnd <- true
 
-                        if not contextComplete then
-                            None
+                    lineContextCache.Add(filePath, selected)
+                    sourceFileIndex <- sourceFileIndex + 1
+
+            let tryLineContextToJson filePath startLine startColumn endLine endColumn =
+                if not (responseStep "line-context-json" startLine) then
+                    None
+                else
+                    match lineContextCache.TryGetValue(normalizePath filePath) with
+                    | true, lines ->
+                        let context = findLineContextToJson lines contextLines startLine startColumn endLine endColumn
+
+                        if responseStep "line-context-json-complete" startLine then
+                            Some context
                         else
-                            lineContextCache[contextKey] <- selected
-                            renderContext selected
+                            None
+                    | false, _ -> None
 
             // Canonical row projection: every field of one site is derived only from that site
             // and the request's content options. In particular, alternatives use deterministic
