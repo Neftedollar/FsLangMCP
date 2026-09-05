@@ -145,6 +145,39 @@ let ``workspace containment accepts the filesystem root (#241)`` () =
     Assert.Empty(filtered.Excluded)
 
 [<Fact>]
+let ``external linked files require both project-model policy and Link metadata (#256)`` () =
+    let externalRoot = Path.Combine(Path.GetTempPath(), "fslangmcp_unit_external")
+
+    let externalFile includePath link =
+        { projectFile includePath with
+            Path = Path.Combine(externalRoot, Path.GetFileName includePath)
+            Link = link }
+
+    let inside = projectFile "Program.fs"
+    let linkedCompile = externalFile "../Shared/Domain.fs" (Some "Domain.fs")
+    let unrelatedExternal = externalFile "../Shared/Unrelated.fs" None
+    let files = [ inside; linkedCompile; unrelatedExternal ]
+
+    let inspection =
+        filterProjectFiles
+            workspaceRoot
+            { defaultFilterOptions ProjectInspection with
+                IncludeExternalLinkedFiles = true }
+            files
+
+    Assert.Equal<ProjectFile>([ inside; linkedCompile ], inspection.Included)
+    Assert.Equal<ProjectFile * ExclusionReason>([ unrelatedExternal, OutsideWorkspace ], inspection.Excluded)
+
+    let review = filterProjectFiles workspaceRoot (defaultFilterOptions Review) files
+
+    Assert.Equal<ProjectFile>([ inside ], review.Included)
+
+    Assert.Equal<ProjectFile * ExclusionReason>(
+        [ linkedCompile, ExternalLinkedFile; unrelatedExternal, OutsideWorkspace ],
+        review.Excluded
+    )
+
+[<Fact>]
 let ``IncludeGenerated surfaces generated files even when they live under obj (#186)`` () =
     // Real generated sources live in obj/ (SDK writes App.AssemblyInfo.fs and
     // .NETCoreApp,…AssemblyAttributes.fs there), so the obj/bin gate must not
