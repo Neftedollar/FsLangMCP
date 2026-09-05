@@ -1,6 +1,7 @@
 namespace FsLangMcp.Tests
 
 open System
+open System.Collections.Concurrent
 open System.Collections.Generic
 open System.Globalization
 open System.IO
@@ -95,9 +96,10 @@ module internal TestTiming =
 
 /// Opt-in, append-free trace for CI recurrence forensics. Each event is flushed
 /// immediately so a killed testhost still leaves the last observed lifecycle
-/// transition in TestResults. Timestamps record when the xUnit message sink
-/// observes an event, not the instant the test body starts or finishes. Tracing
-/// must never change a test outcome.
+/// transition in TestResults. xUnit lifecycle timestamps are sink observations,
+/// not test-body start/finish times. Fixture/producer events are timestamped at
+/// their direct instrumentation call sites; timestampSemantics distinguishes
+/// these origins. Tracing must never change a test outcome.
 module internal TestRunTrace =
 
     [<NoComparison; NoEquality>]
@@ -137,7 +139,7 @@ module internal TestRunTrace =
              with _ ->
                  None)
 
-    let write (eventName: string) (fields: (string * string) list) =
+    let private writeWithOrigin timestampSemantics (eventName: string) (fields: (string * string) list) =
         try
             match writer.Value with
             | None -> ()
@@ -147,7 +149,7 @@ module internal TestRunTrace =
                 node["timestampUtc"] <-
                     JsonValue.Create(DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture))
 
-                node["timestampSemantics"] <- JsonValue.Create("xunit_message_sink_observation")
+                node["timestampSemantics"] <- JsonValue.Create<string>(timestampSemantics)
                 node["monotonicTimestamp"] <- JsonValue.Create(System.Diagnostics.Stopwatch.GetTimestamp())
                 node["processId"] <- JsonValue.Create(Environment.ProcessId)
                 node["managedThreadId"] <- JsonValue.Create(Environment.CurrentManagedThreadId)
@@ -159,6 +161,9 @@ module internal TestRunTrace =
                 lock writeGate (fun () -> output.WriteLine(node.ToJsonString()))
         with _ ->
             ()
+
+    let write eventName fields =
+        writeWithOrigin "direct_instrumentation" eventName fields
 
     let fixture eventName fixtureName root =
         write eventName [ "fixture", fixtureName; "root", root ]
@@ -231,6 +236,95 @@ module internal TestRunTrace =
                   CleanupFailure = cleanupFailure }
         }
 
+    /// Tracks request tasks and their real retained workers by object identity.
+    /// A tracked parent must register its children before it completes. Cleanup
+    /// drains queued observations, so callbacks arriving after cleanup begins are
+    /// included. Callers must register every request before starting cleanup.
+    type OwnedFixtureWork(fixtureName: string, root: string) =
+        let gate = obj ()
+        let producers = ResizeArray<Task>()
+        let pending = Queue<Task>()
+        let failures = ConcurrentQueue<Task * exn>()
+        let mutable cleanupStarted = false
+        let mutable drained = false
+        do fixture "fixture_init" fixtureName root
+
+        let track (producer: Task) =
+            lock gate (fun () ->
+                if drained then
+                    invalidOp "Cannot register fixture work after its producers were drained."
+
+                if not (producers |> Seq.exists (fun known -> Object.ReferenceEquals(known, producer))) then
+                    producers.Add producer
+                    let fields = [ "fixture", fixtureName; "root", root; "taskId", string producer.Id ]
+                    write "fixture_work_retained" fields
+
+                    let observe =
+                        task {
+                            try
+                                do! producer
+                                write "fixture_work_complete" fields
+                            with ex ->
+                                failures.Enqueue(producer, ex)
+                                write
+                                    "fixture_work_failed"
+                                    (fields @ [ "exceptionType", ex.GetType().FullName; "message", ex.Message ])
+                        }
+
+                    pending.Enqueue observe)
+
+        let cleanup =
+            lazy
+                (let drain =
+                     task {
+                         let takeNext () =
+                             lock gate (fun () ->
+                                 if pending.Count > 0 then
+                                     Some(pending.Dequeue())
+                                 else
+                                     drained <- true
+                                     None)
+
+                         let mutable next = takeNext ()
+
+                         while next.IsSome do
+                             do! next.Value
+                             next <- takeNext ()
+
+                         if not failures.IsEmpty then
+                             let errors = failures.ToArray() |> Array.map snd
+                             return raise (AggregateException("Owned fixture producers failed.", errors))
+                     }
+
+                 deferOwnedDirectoryUntilProducerCompletes fixtureName root drain)
+
+        member _.RetainUntil(producer: Task) = track producer
+
+        member _.TrackRequest(producer: Task<'T>) =
+            lock gate (fun () ->
+                if cleanupStarted then
+                    invalidOp "Cannot start a fixture request during cleanup."
+
+                track producer)
+
+            producer
+
+        member _.Producers = lock gate (fun () -> producers.ToArray())
+        member _.ProducerFailures = failures.ToArray()
+
+        member _.Cleanup() =
+            lock gate (fun () -> cleanupStarted <- true)
+            cleanup.Value
+
+        member this.CompleteCleanup() : Task =
+            task {
+                let! result = this.Cleanup()
+
+                match result.CleanupFailure with
+                | Some ex -> return raise ex
+                | None -> ()
+            }
+
     let private collectionName (message: ITestCollectionMessage) = message.TestCollection.DisplayName
 
     let private className (message: ITestClassMessage) = message.TestClass.Class.Name
@@ -246,6 +340,8 @@ module internal TestRunTrace =
           "messages", String.concat " | " message.Messages ]
 
     let recordMessage (message: IMessageSinkMessage) =
+        let write = writeWithOrigin "xunit_message_sink_observation"
+
         try
             match message with
             | :? ITestStarting as started ->
