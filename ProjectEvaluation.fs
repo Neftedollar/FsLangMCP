@@ -17,6 +17,23 @@ open Ionide.ProjInfo
 let InternalArgument = "--internal-project-evaluation-v1"
 
 [<Literal>]
+let internal StartupAuthorization = "fslangmcp-project-evaluation-start-v1"
+
+// Read only the fixed frame, never an unbounded ReadLine. A helper may have
+// started before its Windows job was attached, but cannot enter SDK/MSBuild
+// work until its parent has established containment and sent this frame.
+let internal requireStartupAuthorization (reader: TextReader) =
+    let reject () =
+        invalidOp "The project-evaluation helper requires parent startup authorization."
+
+    for expected in StartupAuthorization do
+        if reader.Read() <> int expected then
+            reject ()
+
+    if reader.Read() <> int '\n' then
+        reject ()
+
+[<Literal>]
 let private protocolVersion = 1
 
 [<Literal>]
@@ -183,6 +200,7 @@ let internal runHelper projectPath =
 
     try
         try
+            requireStartupAuthorization Console.In
             let fullPath = Path.GetFullPath(projectPath)
             let directory = Path.GetDirectoryName(fullPath)
             SdkPreflight.ensure [ directory ]
@@ -267,9 +285,10 @@ let internal loadProjectsAsync (projectPath: string) (ensureCanContinue: unit ->
         if String.IsNullOrWhiteSpace(assemblyPath) || not (File.Exists(assemblyPath)) then
             invalidOp "Unable to locate the project-evaluation helper assembly."
 
-        ProcessRunner.runAsyncWithOutputLimit
+        ProcessRunner.runAsyncWithOutputLimitAfterRequiredContainment
             (ProcessRunner.resolveDotnetHost ())
             [ assemblyPath; InternalArgument; Path.GetFullPath(projectPath) ]
+            StartupAuthorization
             (evaluationTimeout ())
             cancellationToken
             maximumResponseCharacters

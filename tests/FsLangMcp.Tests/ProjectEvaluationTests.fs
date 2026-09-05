@@ -26,6 +26,61 @@ let private emptyResponse () = ProjectEvaluation.encodeResponse projectPath Arra
 
 let private signal () = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
 
+[<Fact>]
+let ``helper requires the exact bounded parent authorization frame`` () =
+    for input in
+        [ ""
+          "wrong\n"
+          ProjectEvaluation.StartupAuthorization
+          ProjectEvaluation.StartupAuthorization + "\r\n"
+          ProjectEvaluation.StartupAuthorization + "extra\n" ] do
+        use reader = new StringReader(input)
+
+        let error =
+            Assert.Throws<InvalidOperationException>(fun () -> ProjectEvaluation.requireStartupAuthorization reader)
+
+        Assert.Contains("startup authorization", error.Message)
+
+    use accepted = new StringReader(ProjectEvaluation.StartupAuthorization + "\n")
+    ProjectEvaluation.requireStartupAuthorization accepted
+    Assert.Equal(-1, accepted.Read())
+
+[<Fact>]
+let ``helper rejects an unbounded wrong input without reading its remainder`` () =
+    let mutable charactersRead = 0
+
+    use endless =
+        { new TextReader() with
+            override _.Read() =
+                charactersRead <- charactersRead + 1
+                int 'x' }
+
+    Assert.Throws<InvalidOperationException>(fun () -> ProjectEvaluation.requireStartupAuthorization endless)
+    |> ignore
+
+    Assert.Equal(1, charactersRead)
+
+[<Fact>]
+let ``actual helper rejects missing authorization before inspecting project settings`` () : Task =
+    task {
+        let missingProject = Path.Combine(Path.GetTempPath(), "fslangmcp_no_project_" + Guid.NewGuid().ToString("N"), "Missing.fsproj")
+        let assemblyPath = typeof<ProcessRunner.ProcessOutput>.Assembly.Location
+
+        let! response =
+            ProcessRunner.runAsyncWithOutputLimitAfterRequiredContainment
+                (ProcessRunner.resolveDotnetHost ())
+                [ assemblyPath; ProjectEvaluation.InternalArgument; missingProject ]
+                "wrong-authorization"
+                (TimeSpan.FromSeconds(30.0))
+                CancellationToken.None
+                4096
+
+        Assert.Equal(1, response.ExitCode)
+        Assert.Equal("", response.StandardOutput)
+        Assert.Contains("requires parent startup authorization", response.StandardError)
+        Assert.DoesNotContain(missingProject, response.StandardError)
+    }
+
 let private isOwnedProcessLive (child: Process, startedAt: DateTime) =
     if OperatingSystem.IsWindows() then
         // The Process handle is opened while the owned child is still alive.
@@ -520,6 +575,12 @@ let ``actual helper and its descendant exit before cancelled evaluation returns`
 
             for pid in File.ReadAllLines(marker) |> Array.map Int32.Parse do
                 let childProc = Process.GetProcessById(pid)
+
+                if OperatingSystem.IsWindows() then
+                    // StartTime/HasExited alone use temporary Windows handles.
+                    // Open the retained handle while alive, before cancellation.
+                    Assert.False(childProc.SafeHandle.IsInvalid)
+
                 let owned = childProc, childProc.StartTime
                 ownedProcesses.Add(owned)
                 Assert.True(isOwnedProcessLive owned, "The test process must be alive before cancellation.")
