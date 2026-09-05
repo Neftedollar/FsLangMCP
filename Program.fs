@@ -801,7 +801,7 @@ let private mainCore argv =
                 tool (
                     TypedTool.define<CheckArgs>
                         "check"
-                        "Fresh F# verdict for the active context. Bare check() returns clean|errors|unknown from an in-process type-check. Optional: scope, path, snippet, speed, severity. trusted (default) is fresh; fast uses cached FSAC. Counts reconcile: totalDiagnostics=errors+warnings+info. Project scope marks downstream consumers unchecked; workspace requires a solution or directory. Prefer for yes/no validation."
+                        "Fresh F# verdict for the active context. Bare check() returns clean|errors|unknown from an in-process type-check. For scope=snippet, snippetPosition=start|end (default end) controls compile-order placement and is echoed; end sees all project sources. trusted is fresh; fast uses cached FSAC. Project scope marks downstream consumers unchecked; workspace requires a solution or directory."
                         (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }

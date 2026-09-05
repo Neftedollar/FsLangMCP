@@ -214,6 +214,7 @@ let private bareCheck: CheckArgs =
     { scope = None
       path = None
       snippet = None
+      snippetPosition = None
       fileGlob = None
       mode = None
       speed = None
@@ -1877,7 +1878,65 @@ type CheckTests(fx: CheckFixture) =
         }
 
     [<Fact>]
-    member _.``check(snippet) surfaces the caller's error without wrapper noise duplicates or temp paths (#187)`` () : Task =
+    member _.``default snippet placement is end and can consume a symbol from the final compile file``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            // Main.fs is the final <Compile> item in Probe.fsproj. v0.17.1 already
+            // appends snippets; #196 makes that compatible behavior explicit.
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        snippet = Some "module Probe.SnippetUsesFinal\n\nlet copied: int = Probe.Main.result\n"
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            Assert.Equal("clean", gs result "verdict")
+            Assert.Equal(0, gi result "errorCount")
+            Assert.Equal("end", gs result "snippetPosition")
+        }
+
+    [<Theory>]
+    [<InlineData("start", "start", "errors")>]
+    [<InlineData("end", "end", "clean")>]
+    [<InlineData(" END ", "end", "clean")>]
+    member _.``explicit snippet placement controls access to the final compile file``
+        (snippetPosition: string, effectivePosition: string, expectedVerdict: string)
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        snippet = Some "module Probe.SnippetPlacement\n\nlet copied: int = Probe.Main.result\n"
+                        snippetPosition = Some snippetPosition
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            Assert.Equal(expectedVerdict, gs result "verdict")
+            Assert.Equal(effectivePosition, gs result "snippetPosition")
+
+            let codes =
+                [ for diagnostic in result["diagnostics"] :?> JsonArray do
+                      yield diagnostic["errorNumberText"].GetValue<string>() ]
+
+            if effectivePosition = "start" then
+                Assert.Contains("FS0039", codes)
+            else
+                Assert.DoesNotContain("FS0039", codes)
+        }
+
+    [<Theory>]
+    [<InlineData("start")>]
+    [<InlineData("end")>]
+    member _.``snippet diagnostics stay caller-scoped for every placement (#187)``
+        (snippetPosition: string)
+        : Task =
         task {
             Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
             fx.ResetClean()
@@ -1889,10 +1948,12 @@ type CheckTests(fx: CheckFixture) =
                 bridge.Check(
                     { bareCheck with
                         snippet = Some "let x: int = \"nope\"\n"
+                        snippetPosition = Some snippetPosition
                         projectPath = Some fx.ProbeFsproj }
                 )
 
             Assert.Equal("errors", gs result "verdict")
+            Assert.Equal(snippetPosition, gs result "snippetPosition")
             let diags = result["diagnostics"] :?> JsonArray
 
             let codes =
@@ -1912,6 +1973,58 @@ type CheckTests(fx: CheckFixture) =
             // The caller never had a file; the harness temp path must not leak.
             for d in diags do
                 Assert.Equal("snippet", d["file"].GetValue<string>())
+        }
+
+    [<Theory>]
+    [<InlineData("start", "errors")>]
+    [<InlineData("end", "clean")>]
+    member _.``local snippet binding shadows an opened final-file binding when that binding is in scope``
+        (snippetPosition: string, expectedVerdict: string)
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        snippet =
+                            Some
+                                "module Probe.SnippetShadow\n\nopen Probe.Main\n\nlet result = \"local\"\nlet localLength: int = result.Length\n"
+                        snippetPosition = Some snippetPosition
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            Assert.Equal(expectedVerdict, gs result "verdict")
+            Assert.Equal(snippetPosition, gs result "snippetPosition")
+
+            let codes =
+                [ for diagnostic in result["diagnostics"] :?> JsonArray do
+                      yield diagnostic["errorNumberText"].GetValue<string>() ]
+
+            if snippetPosition = "start" then
+                Assert.Contains("FS0039", codes)
+                Assert.DoesNotContain("FS0001", codes)
+            else
+                Assert.Empty(codes)
+        }
+
+    [<Fact>]
+    member _.``invalid snippet placement is rejected``() : Task =
+        task {
+            let bridge = FcsBridge()
+
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        snippet = Some "let answer = 42\n"
+                        snippetPosition = Some "middle"
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            Assert.Equal("invalid_args", gs result "status")
+            Assert.Contains("snippetPosition", gs result "message")
         }
 
     [<Fact>]
