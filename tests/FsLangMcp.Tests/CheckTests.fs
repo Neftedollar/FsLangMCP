@@ -1976,6 +1976,79 @@ type CheckTests(fx: CheckFixture) =
         }
 
     [<Theory>]
+    [<InlineData("start")>]
+    [<InlineData("end")>]
+    member _.``snippet diagnostics exclude a pre-existing project error at every placement (#196)``
+        (snippetPosition: string)
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            try
+                File.WriteAllText(
+                    fx.MainFs,
+                    String.concat
+                        "\n"
+                        [ "module Probe.Main"
+                          ""
+                          "let projectOnly = missingProjectSymbol"
+                          "" ]
+                )
+
+                let! projectResult =
+                    bridge.Check(
+                        { bareCheck with
+                            path = Some fx.MainFs
+                            projectPath = Some fx.ProbeFsproj }
+                    )
+
+                Assert.Equal("errors", gs projectResult "verdict")
+
+                let projectCodes =
+                    [ for diagnostic in projectResult["diagnostics"] :?> JsonArray do
+                          yield diagnostic["errorNumberText"].GetValue<string>() ]
+
+                Assert.Contains("FS0039", projectCodes)
+
+                let! result =
+                    bridge.Check(
+                        { bareCheck with
+                            snippet =
+                                Some
+                                    "module Probe.SnippetOwnError\n\nlet snippetOnly: int = \"snippet-only\"\n"
+                            snippetPosition = Some snippetPosition
+                            projectPath = Some fx.ProbeFsproj }
+                    )
+
+                Assert.Equal("succeeded", gs result "status")
+                Assert.Equal("errors", gs result "verdict")
+                Assert.Equal(snippetPosition, gs result "snippetPosition")
+                Assert.Equal(1, gi result "errorCount")
+                Assert.Equal(1, gi result "totalDiagnostics")
+
+                let diagnostics = result["diagnostics"] :?> JsonArray
+                Assert.Equal(1, diagnostics.Count)
+                let diagnostic = diagnostics[0]
+
+                Assert.Equal("snippet", gs diagnostic "file")
+                Assert.Equal("FS0001", gs diagnostic "errorNumberText")
+
+                let message = gs diagnostic "message"
+                Assert.Contains("string", message)
+                Assert.Contains("int", message)
+                Assert.DoesNotContain("missingProjectSymbol", message)
+
+                let range = diagnostic["range"]
+                Assert.Equal(3, gi range "startLine")
+                Assert.Equal(3, gi range "endLine")
+                Assert.DoesNotContain(fx.MainFs, diagnostic.ToJsonString())
+            finally
+                fx.ResetClean()
+        }
+
+    [<Theory>]
     [<InlineData("start", "errors")>]
     [<InlineData("end", "clean")>]
     member _.``local snippet binding shadows an opened final-file binding when that binding is in scope``
