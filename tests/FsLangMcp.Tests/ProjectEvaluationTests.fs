@@ -26,6 +26,160 @@ let private emptyResponse () = ProjectEvaluation.encodeResponse projectPath Arra
 
 let private signal () = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
 
+let private isOwnedProcessLive (child: Process, startedAt: DateTime) =
+    if OperatingSystem.IsWindows() then
+        // The Process handle is opened while the owned child is still alive.
+        not child.HasExited
+    else
+        try
+            // Query native state before StartTime: Darwin refuses StartTime
+            // for a retained zombie even though its PID is still present.
+            let info = ProcessStartInfo("/bin/ps")
+            info.UseShellExecute <- false
+            info.RedirectStandardOutput <- true
+            info.ArgumentList.Add("-p")
+            info.ArgumentList.Add(string child.Id)
+            info.ArgumentList.Add("-o")
+            info.ArgumentList.Add("stat=")
+            use snapshot = Process.Start(info)
+
+            if not (snapshot.WaitForExit(5000)) then
+                snapshot.Kill()
+                failwith "The native process-state query did not complete."
+
+            let state = snapshot.StandardOutput.ReadToEnd().Trim()
+
+            if snapshot.ExitCode <> 0 && snapshot.ExitCode <> 1 then
+                failwith $"The native process-state query failed ({snapshot.ExitCode})."
+
+            if state.Length = 0 || state[0] = 'Z' || state[0] = 'X' then
+                false
+            else
+                // A non-child Unix zombie may report HasExited=false in .NET.
+                // Read native state once; no retry or grace period hides a live
+                // descendant. PID reuse is distinguished by the captured start time.
+                use confirmed = Process.GetProcessById(child.Id)
+                confirmed.StartTime = startedAt && not confirmed.HasExited
+        with :? ArgumentException ->
+            false
+
+[<Fact>]
+let ``owned process oracle rejects a live descendant and accepts an unreaped Unix zombie`` () =
+    if not (OperatingSystem.IsWindows()) then
+        let info = ProcessStartInfo("python3")
+        info.UseShellExecute <- false
+        info.RedirectStandardInput <- true
+        info.RedirectStandardOutput <- true
+        info.RedirectStandardError <- true
+        info.ArgumentList.Add("-c")
+        info.ArgumentList.Add(
+            "import os,signal,sys,subprocess,time\n"
+            + "pid=os.fork()\n"
+            + "if pid==0:\n signal.pause(); os._exit(0)\n"
+            + "print(pid,flush=True)\n"
+            + "sys.stdin.read(1); os.kill(pid,signal.SIGKILL)\n"
+            + "deadline=time.monotonic()+5\n"
+            + "while True:\n"
+            + " state=subprocess.check_output(['/bin/ps','-p',str(pid),'-o','stat='],text=True).strip()\n"
+            + " if state.startswith('Z'): break\n"
+            + " if time.monotonic()>deadline: raise RuntimeError('child did not terminate')\n"
+            + " time.sleep(.01)\n"
+            + "print('terminated-not-reaped',flush=True)\n"
+            + "sys.stdin.read(1); os.waitpid(pid,0)\n"
+        )
+
+        use owner = Process.Start(info)
+
+        try
+            let pid = owner.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10.0)).GetAwaiter().GetResult() |> Int32.Parse
+            use child = Process.GetProcessById(pid)
+            let owned = child, child.StartTime
+            Assert.True(isOwnedProcessLive owned, "The sleeping child must still count as live.")
+            owner.StandardInput.Write("x")
+            owner.StandardInput.Flush()
+            let state = owner.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10.0)).GetAwaiter().GetResult()
+
+            if isNull state then
+                failwith $"The controlled-zombie fixture failed: {owner.StandardError.ReadToEnd()}"
+
+            Assert.Equal("terminated-not-reaped", state)
+            Assert.False(isOwnedProcessLive owned, "An unreaped zombie has already terminated.")
+        finally
+            if not owner.HasExited then
+                owner.StandardInput.Write("xx")
+                owner.StandardInput.Flush()
+
+                if not (owner.WaitForExit(10000)) then
+                    owner.Kill(true)
+                    owner.WaitForExit()
+
+let private emptyProject () : Types.ProjectOptions =
+    { ProjectId = None
+      ProjectFileName = projectPath
+      TargetFramework = "net10.0"
+      SourceFiles = []
+      OtherOptions = []
+      ReferencedProjects = []
+      PackageReferences = []
+      LoadTime = DateTime.UnixEpoch
+      TargetPath = ""
+      TargetRefPath = None
+      ProjectOutputType = Types.ProjectOutputType.Library
+      ProjectSdkInfo =
+        { IsTestProject = false
+          Configuration = "Debug"
+          IsPackable = false
+          TargetFramework = "net10.0"
+          TargetFrameworkIdentifier = ".NETCoreApp"
+          TargetFrameworkVersion = "v10.0"
+          MSBuildAllProjects = []
+          MSBuildToolsVersion = "Current"
+          ProjectAssetsFile = ""
+          RestoreSuccess = true
+          Configurations = [ "Debug" ]
+          TargetFrameworks = [ "net10.0" ]
+          RunArguments = None
+          RunCommand = None
+          IsPublishable = None }
+      Items = []
+      Properties = []
+      CustomProperties = []
+      AllProperties = Map.empty
+      AllItems = Map.empty
+      Analyzers = [] }
+
+[<Theory>]
+[<InlineData(false)>]
+[<InlineData(true)>]
+let ``encoder rejects escaped oversized values and map keys before large allocations`` (largeKey: bool) =
+    let oversized = String('\u0416', 3 * 1024 * 1024)
+    let key, value = if largeKey then oversized, "value" else "LargeProperty", oversized
+    let projects = [| { emptyProject () with AllProperties = Map.ofList [ key, Set.singleton value ] } |]
+    // Warm reflection/converter caches before measuring only this synchronous
+    // encode call. The input is deliberately allocated outside the measurement.
+    ProjectEvaluation.encodeResponse projectPath [| emptyProject () |] |> ignore
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    let rejected =
+        try
+            ProjectEvaluation.encodeResponse projectPath projects |> ignore
+            false
+        with :? InvalidOperationException ->
+            true
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.True(rejected, "The escaped response must exceed the wire limit.")
+    Assert.True(allocated < 8L * 1024L * 1024L, $"Oversized encoding allocated {allocated} bytes before rejecting input.")
+
+[<Fact>]
+let ``encoder preserves escaping and surrogate pairs across bounded string segments`` () =
+    let value = String('a', 4095) + "\U0001F642\"\\\n\u0416" + String('b', 4096)
+    let row = { emptyProject () with AllProperties = Map.ofList [ "<&\"\u0416", Set.singleton value ] }
+    let encoded = ProjectEvaluation.encodeResponse projectPath [| row |]
+    let decoded = ProjectEvaluation.decodeResponse projectPath encoded
+    Assert.True([ row ] = decoded, "Chunked escaping changed the evaluated data.")
+    Assert.All(encoded, fun character -> Assert.True(int character < 128))
+
 [<Fact>]
 let ``helper envelope roundtrips an empty result and normalizes its project path`` () =
     let relativePath = Path.Combine(Path.GetDirectoryName(projectPath), ".", Path.GetFileName(projectPath))
@@ -284,7 +438,7 @@ let ``actual helper and its descendant exit before cancelled evaluation returns`
         let childScript = Path.Combine(root, "child.fsx")
         let expiredError = TimeoutException("all callers expired after the evaluation started")
         let mutable expired = 0
-        let ownedProcesses = ResizeArray<Process>()
+        let ownedProcesses = ResizeArray<Process * DateTime>()
         let escaped value = System.Security.SecurityElement.Escape(value)
 
         try
@@ -366,26 +520,28 @@ let ``actual helper and its descendant exit before cancelled evaluation returns`
 
             for pid in File.ReadAllLines(marker) |> Array.map Int32.Parse do
                 let childProc = Process.GetProcessById(pid)
-                ownedProcesses.Add(childProc)
-                Assert.False(childProc.HasExited, "The test process must be alive before cancellation.")
+                let owned = childProc, childProc.StartTime
+                ownedProcesses.Add(owned)
+                Assert.True(isOwnedProcessLive owned, "The test process must be alive before cancellation.")
 
             Assert.Equal(2, ownedProcesses.Count)
             Volatile.Write(&expired, 1)
             let! error = Assert.ThrowsAsync<TimeoutException>(fun () -> operation.WaitAsync(TimeSpan.FromSeconds(20.0)) :> Task)
             Assert.Same(expiredError, error)
 
-            for childProc in ownedProcesses do
-                // Awaiting this exact process handle avoids PID-reuse ambiguity.
-                // It must already be terminated when evaluation gives up its slot.
-                Assert.True(childProc.HasExited, $"Owned process {childProc.Id} survived evaluation cancellation.")
+            for childProc, startedAt in ownedProcesses do
+                Assert.False(
+                    isOwnedProcessLive (childProc, startedAt),
+                    $"Owned process {childProc.Id} survived evaluation cancellation."
+                )
         finally
             // Failure cleanup is restricted to handles recorded by this fixture.
             // Releasing the task also lets the helper finish if cancellation regressed.
             File.WriteAllText(release, "release")
 
-            for childProc in ownedProcesses do
+            for childProc, startedAt in ownedProcesses do
                 try
-                    if not childProc.HasExited then
+                    if isOwnedProcessLive (childProc, startedAt) then
                         childProc.Kill(true)
                 finally
                     childProc.Dispose()

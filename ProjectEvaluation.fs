@@ -1,9 +1,11 @@
 module internal FsLangMcp.ProjectEvaluation
 
 open System
+open System.Buffers
 open System.IO
+open System.Text
+open System.Text.Encodings.Web
 open System.Text.Json
-open System.Text.Json.Nodes
 open System.Text.Json.Serialization
 open System.Threading
 open System.Threading.Tasks
@@ -20,9 +22,97 @@ let private protocolVersion = 1
 [<Literal>]
 let private maximumResponseCharacters = 16 * 1024 * 1024
 
+let private responseTooLarge () =
+    invalidOp "The evaluated project-options response exceeded the 16 Mi-character protocol limit."
+
+// The default JSON encoder emits ASCII, so wire bytes and UTF-16 characters
+// coincide. Check the escaped size before the JSON writer rents token buffers.
+let private ensureStringFits (writer: Utf8JsonWriter) (value: string) =
+    let mutable remaining = int64 maximumResponseCharacters - writer.BytesCommitted - int64 writer.BytesPending - 2L
+
+    if int64 value.Length > remaining then
+        responseTooLarge ()
+
+    for character in value do
+        let size =
+            match character with
+            | '\\' | '\b' | '\f' | '\n' | '\r' | '\t' -> 2L
+            | _ when Char.IsSurrogate(character) -> 6L
+            | _ when JavaScriptEncoder.Default.WillEncode(int character) -> 6L
+            | _ -> 1L
+
+        remaining <- remaining - size
+
+        if remaining < 0L then
+            responseTooLarge ()
+
+type private BoundedStringConverter() =
+    inherit JsonConverter<string>()
+
+    override _.Read(reader, _, _) = reader.GetString()
+
+    override _.Write(writer, value, _) =
+        ensureStringFits writer value
+
+        if value.Length = 0 then
+            writer.WriteStringValue("")
+        else
+            // Segments also bound the writer's escaping/transcoding scratch space.
+            // .NET carries a split surrogate pair across segment boundaries.
+            let mutable offset = 0
+
+            while offset < value.Length do
+                let count = min 4096 (value.Length - offset)
+                writer.WriteStringValueSegment(value.AsSpan(offset, count), offset + count = value.Length)
+                writer.Flush()
+                offset <- offset + count
+
+type private BoundedResponseBuffer() =
+    let output = new MemoryStream()
+    let mutable scratch = Array.empty<byte>
+
+    let prepare sizeHint =
+        // Every data string (including map keys) is segmented to 4096 chars.
+        // Account for escaping (6x) and the writer's UTF-8 reservation (3x).
+        let maximumScratchBytes = 4096 * 6 * 3 + 1024
+        let required = max 8192 sizeHint
+
+        if required > maximumScratchBytes then
+            responseTooLarge ()
+
+        if scratch.Length < required then
+            scratch <- Array.zeroCreate required
+
+    member _.Response = Encoding.UTF8.GetString(output.GetBuffer(), 0, int output.Length)
+
+    interface IBufferWriter<byte> with
+        member _.Advance(count) =
+            if count < 0 || count > scratch.Length then
+                invalidArg (nameof count) "The JSON writer advanced outside its output buffer."
+
+            if int64 count > int64 maximumResponseCharacters - output.Length then
+                responseTooLarge ()
+
+            output.Write(scratch.AsSpan(0, count))
+
+        member _.GetMemory(sizeHint) =
+            prepare sizeHint
+            scratch.AsMemory()
+
+        member _.GetSpan(sizeHint) =
+            prepare sizeHint
+            scratch.AsSpan()
+
+    interface IDisposable with
+        member _.Dispose() = output.Dispose()
+
 let private jsonOptions =
     let options = JsonSerializerOptions(MaxDepth = 64)
-    options.Converters.Add(JsonFSharpConverter())
+    options.Converters.Add(BoundedStringConverter())
+    // Object-form map keys bypass custom string converters in the pinned F#
+    // serializer. Pair arrays preserve their data while applying the same bounded
+    // conversion to keys and values; this is an unreleased private wire format.
+    options.Converters.Add(JsonFSharpConverter(JsonFSharpOptions.Default().WithMapFormat(MapFormat.ArrayOfPairs)))
     options
 
 let private samePath left right =
@@ -35,16 +125,17 @@ let private samePath left right =
     String.Equals(Path.GetFullPath(left), Path.GetFullPath(right), comparison)
 
 let internal encodeResponse projectPath (projects: Types.ProjectOptions array) =
-    let envelope = JsonObject()
-    envelope["version"] <- JsonValue.Create(protocolVersion)
-    envelope["projectPath"] <- JsonValue.Create(Path.GetFullPath(projectPath))
-    envelope["projects"] <- JsonSerializer.SerializeToNode(projects, jsonOptions)
-    let serialized = envelope.ToJsonString(jsonOptions)
-
-    if serialized.Length > maximumResponseCharacters then
-        invalidOp "The evaluated project-options response exceeded the 16 Mi-character protocol limit."
-
-    serialized
+    use output = new BoundedResponseBuffer()
+    use writer = new Utf8JsonWriter(output, JsonWriterOptions(MaxDepth = 64))
+    writer.WriteStartObject()
+    writer.WriteNumber("version", protocolVersion)
+    writer.WritePropertyName("projectPath")
+    JsonSerializer.Serialize(writer, Path.GetFullPath(projectPath), jsonOptions)
+    writer.WritePropertyName("projects")
+    JsonSerializer.Serialize(writer, projects, jsonOptions)
+    writer.WriteEndObject()
+    writer.Flush()
+    output.Response
 
 let internal decodeResponse projectPath (text: string) =
     if String.IsNullOrWhiteSpace(text) || text.Length > maximumResponseCharacters then
