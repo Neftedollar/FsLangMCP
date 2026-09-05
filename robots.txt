@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://neftedollar.github.io/FsLangMCP/sitemap.xml
