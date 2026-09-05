@@ -226,8 +226,10 @@ type FindArgs =
       occurrence: int option
       /// 0-based column (LSP convention) for kind=position.
       character: int option
-      /// Source-context lines emitted per site. Default 0 — compact, one line per
-      /// site (lineText only, no before/after arrays). Pass > 0 for surrounding code.
+      /// Source-context lines requested per site. Default 0 — compact, one bounded
+      /// lineText snippet only. Positive values emit before/after, capped at 8 lines
+      /// per side; every returned source line is capped at 512 UTF-16 code units and
+      /// carries source-offset/truncation metadata.
       contextLines: int option
       /// Include declaration sites among results. Default true.
       includeDeclaration: bool option
@@ -245,8 +247,9 @@ type FindArgs =
       includeSiteTypes: bool option
       /// .fsproj / .sln / .slnx / directory to sweep. Falls back to active set_project.
       projectPath: string option
-      /// Maximum sites returned per page. Default 80; valid range 1..1000. The compact
-      /// payload stays under the MCP token ceiling; cursor pages the rest.
+      /// Maximum sites considered per page. Default 80; valid range 1..1000. The final
+      /// production-serialized response has a 60,000 UTF-16-code-unit hard ceiling, so
+      /// fewer sites may be delivered; nextCursor advances by delivered sites only.
       maxResults: int option
       /// Overall wall-clock budget in ms for the whole multi-project sweep. Default
       /// 120000 (120 s). Each project's FCS type-check is cancelled at the remaining
@@ -729,7 +732,7 @@ let toFileUri (path: string) =
 // `Types.fs` compiles before both in `FsLangMcp.fsproj`, and both already
 // `open FsLangMcp.Types` — one definition, nothing to duplicate or drift. `Tools.fs`'s
 // `renderToken` (every MCP tool response goes out through it) and `FcsBridge.fs`'s
-// `fcs_public_api` / `fcs_file_outline` response-size budgets MUST measure against the
+// `find` / `fcs_public_api` / `fcs_file_outline` response-size budgets MUST measure against the
 // exact same options, or a budget that believes it fits can still ship over the real
 // MCP token ceiling (#206 review round 1, Imp-1: a prior version had FcsBridge measure
 // with its own duplicate options, which round-1 fixed by duplicating `Tools.renderOpts`
@@ -748,6 +751,241 @@ let mcpRenderOptions =
 /// differ by ~1.46-1.48x (#206 review round 1, Imp-1).
 let renderedLength (node: JsonNode) : int =
     JsonSerializer.Serialize(node, mcpRenderOptions).Length
+
+/// Shared policy for `find` source snippets and its final, fully assembled response.
+/// The size unit is deliberately `System.String.Length`: UTF-16 code units in the
+/// exact indented JSON produced by `mcpRenderOptions` and shipped by `Tools.renderToken`.
+/// Keeping the planner here lets production shaping and focused tests call the same
+/// serializer without introducing a second set of JSON options.
+module internal FindResponseBudget =
+    [<Literal>]
+    let MaxSerializedChars = 60_000
+
+    [<Literal>]
+    let MaxSnippetChars = 512
+
+    [<Literal>]
+    let MaxContextLines = 8
+
+    [<Literal>]
+    let SizeUnit = "UTF-16 code units in production JSON"
+
+    /// Preserve the total row count while materializing only the bounded prefix that
+    /// can participate in response planning. Keep the cap ahead of `map`: individual
+    /// rows may contain large caller/project-controlled strings, so mapping an
+    /// unbounded tail and truncating afterwards defeats the response budget's memory
+    /// and latency bound even though those rows can never be returned.
+    let internal materializeCappedPrefix maxCount mapRow (rows: 'T array) =
+        if maxCount < 0 then
+            invalidArg (nameof maxCount) "prefix cap must be non-negative"
+
+        rows.Length, rows |> Array.truncate maxCount |> Array.map mapRow
+
+    type BoundedSnippet =
+        { Text: string
+          SourceStartColumn: int
+          SourceEndColumn: int
+          SourceLength: int
+          Truncated: bool }
+
+    [<RequireQualifiedAccess>]
+    type FitPlan =
+        | Fits of deliveredSites: int * deliveredDiagnostics: int * deliveredPerProject: int
+        | FirstSiteOverflow
+        | FixedMetadataOverflow
+
+    /// Apply the hard production ceiling to one fully formed find result, including
+    /// validation, position-resolution, project-discovery, deadline, and planned
+    /// success envelopes. The replacement deliberately contains no caller-controlled
+    /// data and is returned directly (never recursively guarded), so an oversized
+    /// error cannot produce another oversized error or a non-advancing cursor loop.
+    /// Keep this function reusable by both Find and any outer FindWithinDeadline path.
+    let guardFinalResponse (response: JsonNode) : JsonNode =
+        if renderedLength response <= MaxSerializedChars then
+            response
+        else
+            let recovery =
+                jobj
+                    [ "action", jstr "restart_with_narrower_find_request"
+                      "instruction",
+                      jstr
+                          "Restart find without a cursor, using shorter string/path arguments and narrower response-shaping options. Do not reuse a prior cursor after changing the query shape."
+                      "recommendedContextLines", jint 0
+                      "recommendedMaxResults", jint 1
+                      "recommendedIncludeInfo", jbool false
+                      "recommendedIncludePerProject", jbool false
+                      "reuseOriginalCursor", jbool false ]
+                :> JsonNode
+
+            jobj
+                [ "status", jstr "aborted"
+                  "outcome", jstr "indeterminate"
+                  "deliveryStatus", jstr "blocked"
+                  "errorCode", jstr "find_response_exceeds_budget"
+                  "message",
+                  jstr
+                      "The complete find result exceeded the hard production-serialized response ceiling. Caller-controlled details were omitted; retry with narrower inputs."
+                  "retryable", jbool true
+                  "responseTruncatedByBudget", jbool true
+                  "responseBudgetChars", jint MaxSerializedChars
+                  "responseSizeUnit", jstr SizeUnit
+                  "cursorAdvancedBy", jint 0
+                  "nextCursor", null
+                  "recovery", recovery ]
+            :> JsonNode
+
+    let private clampOffset length value =
+        max 0 (min length value)
+
+    /// Return one contiguous source slice centred on the semantic match whenever the
+    /// match itself fits. Offsets and lengths are UTF-16 columns, matching FCS/LSP and
+    /// `System.String`; slice boundaries are moved inward rather than splitting a
+    /// surrogate pair.
+    let boundedSnippet (focusStart: int) (focusEnd: int) (source: string) : BoundedSnippet =
+        let source = if isNull source then "" else source
+        let sourceLength = source.Length
+
+        if sourceLength <= MaxSnippetChars then
+            { Text = source
+              SourceStartColumn = 0
+              SourceEndColumn = sourceLength
+              SourceLength = sourceLength
+              Truncated = false }
+        else
+            let boundedFocusStart = clampOffset sourceLength focusStart
+            let boundedFocusEnd = max boundedFocusStart (clampOffset sourceLength focusEnd)
+            let focusLength = boundedFocusEnd - boundedFocusStart
+
+            let desiredStart =
+                if focusLength >= MaxSnippetChars then
+                    boundedFocusStart + focusLength / 2 - MaxSnippetChars / 2
+                else
+                    boundedFocusStart - (MaxSnippetChars - focusLength) / 2
+
+            let mutable sourceStart = clampOffset (sourceLength - MaxSnippetChars) desiredStart
+            let mutable sourceEnd = min sourceLength (sourceStart + MaxSnippetChars)
+
+            // JSON can encode isolated surrogates, but returning one would make the visible
+            // snippet disagree with its source offsets after consumer decoding. Keep every
+            // returned slice valid Unicode while retaining UTF-16 coordinate semantics.
+            if
+                sourceStart > 0
+                && sourceStart < sourceLength
+                && Char.IsLowSurrogate(source[sourceStart])
+                && Char.IsHighSurrogate(source[sourceStart - 1])
+            then
+                sourceStart <- sourceStart + 1
+
+            if
+                sourceEnd > sourceStart
+                && sourceEnd < sourceLength
+                && Char.IsHighSurrogate(source[sourceEnd - 1])
+                && Char.IsLowSurrogate(source[sourceEnd])
+            then
+                sourceEnd <- sourceEnd - 1
+
+            { Text = source.Substring(sourceStart, sourceEnd - sourceStart)
+              SourceStartColumn = sourceStart
+              SourceEndColumn = sourceEnd
+              SourceLength = sourceLength
+              Truncated = true }
+
+    /// Plan the largest in-order site prefix whose COMPLETE response fits. Diagnostics
+    /// and per-project detail remain intact unless even the first site (or a zero-site
+    /// response) cannot fit; only then are those secondary arrays reduced, with the
+    /// delivered counts returned for explicit truncation metadata. The callback must
+    /// build the exact production response for the requested prefix counts.
+    let planResponse
+        (budget: int)
+        (siteCount: int)
+        (diagnosticCount: int)
+        (perProjectCount: int)
+        (buildResponse: int -> int -> int -> JsonNode)
+        : FitPlan =
+        if budget <= 0 then
+            invalidArg (nameof budget) "response budget must be positive"
+
+        if siteCount < 0 || diagnosticCount < 0 || perProjectCount < 0 then
+            invalidArg "counts" "response section counts must be non-negative"
+
+        let fits sites diagnostics projects =
+            renderedLength (buildResponse sites diagnostics projects) <= budget
+
+        // Response size is monotone within a section prefix once the already-tested full
+        // response is known not to fit: each smaller candidate carries the same truncation
+        // metadata and differs only by an in-order array prefix. Probe that exact response
+        // logarithmically rather than serializing it once per removed row.
+        let largestFittingBelow upperExclusive probe =
+            let mutable low = 0
+            let mutable high = upperExclusive - 1
+            let mutable accepted = None
+
+            while low <= high do
+                let middle = low + (high - low) / 2
+
+                if probe middle then
+                    accepted <- Some middle
+                    low <- middle + 1
+                else
+                    high <- middle - 1
+
+            accepted
+
+        let minimumSites = if siteCount = 0 then 0 else 1
+        let mutable diagnostics = diagnosticCount
+        let mutable projects = perProjectCount
+        let mutable minimumFits = fits minimumSites diagnostics projects
+
+        if not minimumFits && diagnosticCount > 0 then
+            // Preserve the established priority: retain every per-project row if ANY
+            // diagnostics prefix can coexist with the minimum site prefix.
+            match
+                largestFittingBelow diagnosticCount (fun candidateDiagnostics ->
+                    fits minimumSites candidateDiagnostics projects)
+            with
+            | Some candidateDiagnostics ->
+                diagnostics <- candidateDiagnostics
+                minimumFits <- true
+            | None -> diagnostics <- 0
+
+        if not minimumFits && perProjectCount > 0 then
+            // No diagnostics prefix fits with full per-project detail. Match the old loop by
+            // dropping diagnostics completely, then retaining the largest project prefix.
+            match
+                largestFittingBelow perProjectCount (fun candidateProjects ->
+                    fits minimumSites diagnostics candidateProjects)
+            with
+            | Some candidateProjects ->
+                projects <- candidateProjects
+                minimumFits <- true
+            | None -> projects <- 0
+
+        if not minimumFits then
+            if siteCount > 0 && fits 0 diagnostics projects then
+                FitPlan.FirstSiteOverflow
+            else
+                FitPlan.FixedMetadataOverflow
+        elif siteCount = 0 then
+            FitPlan.Fits(0, diagnostics, projects)
+        elif fits siteCount diagnostics projects then
+            FitPlan.Fits(siteCount, diagnostics, projects)
+        else
+            // The full page did not fit, so every candidate considered here retains a
+            // continuation cursor; response size is monotone as the site prefix grows.
+            let mutable low = 1
+            let mutable high = siteCount - 1
+            let mutable accepted = 1
+
+            while low <= high do
+                let middle = low + (high - low) / 2
+
+                if fits middle diagnostics projects then
+                    accepted <- middle
+                    low <- middle + 1
+                else
+                    high <- middle - 1
+
+            FitPlan.Fits(accepted, diagnostics, projects)
 
 /// True as soon as the cumulative rendered length of `nodes` would exceed `budget`.
 /// Stops calling `renderedLength` (a real `JsonSerializer.Serialize` call) on further

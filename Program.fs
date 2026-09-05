@@ -851,7 +851,7 @@ let private mainCore argv =
                 tool (
                     TypedTool.define<FindArgs>
                         "find"
-        "F# semantic search across solution projects: definitions/references, field sites, and member calls. Bare find(query) returns compact sites; contextLines adds code. Narrow with kind (symbol|members|field|definition|position), scope, path, or projectPath. Member calls: kind=members + member=Name; query may be the member or declaring type. Field impact: kind=field + includeSiteTypes. FCS-resolved; scopeNote reports breadth."
+        "F# semantic search across solution projects: definitions/references, field sites, and member calls. Bare find(query) returns bounded snippets; contextLines adds up to 8 lines per side. Production JSON is capped at 60,000 UTF-16 code units, and cursors advance by delivered sites. Narrow with kind (symbol|members|field|definition|position), scope, path, or projectPath. Member calls: kind=members + member=Name. Field impact: kind=field + includeSiteTypes. scopeNote reports breadth."
                         (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }

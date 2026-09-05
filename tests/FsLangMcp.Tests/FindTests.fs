@@ -23,6 +23,7 @@ open System.Threading.Tasks
 open Xunit
 open Xunit.Abstractions
 open FsLangMcp.Types
+open FsLangMcp.Tools
 open FsLangMcp.FcsBridge
 open FsLangMcp.Dispatcher
 
@@ -2214,9 +2215,9 @@ type FindPositionTests(fx: ConfigFixture) =
             Assert.Contains("ConfigProbe.Beta.Config", plainNames)
         }
 
-// ── #207 review: one linked file, two projects, two different types ─────────────
+// ── #207 review: one linked file, several projects, different types ─────────────
 //
-// find de-duplicates sites by physical source location, so a `.fs` linked into two
+// find de-duplicates sites by physical source location, so a `.fs` linked into several
 // `.fsproj` files is swept once per project — and `#if` (or any other per-project type
 // context) can make the SAME range resolve to different field types. Before the fix the
 // last project swept overwrote the row outright: the payload reported ProjB's `string`,
@@ -2225,23 +2226,44 @@ type FindPositionTests(fx: ConfigFixture) =
 // The fixture needs no `dotnet build`: neither project references anything, so ProjInfo
 // resolves options on its own and the whole sweep is a couple of seconds.
 
+let private crowdedUses =
+    [ for index in 0..49 ->
+          $"let crowded{index:D2} value : CrowdedParcel = {{ CrowdedValue = value }}" ]
+
 let private linkedSharedFs =
     String.concat
         "\n"
-        [ "module Shared"
-          ""
-          "type Parcel ="
-          "    { Weight:"
-          "#if ALT"
-          "        string"
-          "#else"
-          "        int"
-          "#endif"
-          "    }"
-          ""
-          "// ONE physical site, compiled by BOTH projects — `int` in ProjA, `string` in ProjB."
-          "let create w = { Weight = w }"
-          "" ]
+        ([ "module Shared"
+           ""
+           "type Parcel ="
+           "    { Weight:"
+           "#if ALT_B"
+           "        string"
+           "#else"
+           "        int"
+           "#endif"
+           "    }"
+           ""
+           "// ONE physical site, compiled by every project — only ProjB differs."
+           "let create w = { Weight = w }"
+           ""
+           "type CrowdedParcel ="
+           "    { CrowdedValue:"
+           "#if ALT_B"
+           "        bool"
+           "#elif ALT_C"
+           "        byte"
+           "#elif ALT_D"
+           "        decimal"
+           "#elif ALT_E"
+           "        string"
+           "#else"
+           "        int"
+           "#endif"
+           "    }"
+           "" ]
+         @ crowdedUses
+         @ [ "" ])
 
 let private linkedProject (defineConstants: string option) =
     let defines =
@@ -2267,8 +2289,16 @@ type LinkedSourceFixture() =
         full
 
     let sharedSource = write "Shared/Shared.fs" linkedSharedFs
+    let projectB = "ProjBWithAnIntentionallyLongNameForCanonicalSiteSerialization"
+    let projectC = "ProjCWithAnIntentionallyLongNameForCanonicalSiteSerialization"
+    let projectD = "ProjDWithAnIntentionallyLongNameForCanonicalSiteSerialization"
+    let projectE = "ProjEWithAnIntentionallyLongNameForCanonicalSiteSerialization"
+
     do write "ProjA/ProjA.fsproj" (linkedProject None) |> ignore
-    do write "ProjB/ProjB.fsproj" (linkedProject (Some "ALT")) |> ignore
+    do write $"ProjB/{projectB}.fsproj" (linkedProject (Some "ALT_B")) |> ignore
+    do write $"ProjC/{projectC}.fsproj" (linkedProject (Some "ALT_C")) |> ignore
+    do write $"ProjD/{projectD}.fsproj" (linkedProject (Some "ALT_D")) |> ignore
+    do write $"ProjE/{projectE}.fsproj" (linkedProject (Some "ALT_E")) |> ignore
 
     let slnxPath =
         write
@@ -2277,11 +2307,20 @@ type LinkedSourceFixture() =
                 "\n"
                 [ "<Solution>"
                   "  <Project Path=\"ProjA/ProjA.fsproj\" />"
-                  "  <Project Path=\"ProjB/ProjB.fsproj\" />"
+                  $"  <Project Path=\"ProjB/{projectB}.fsproj\" />"
+                  $"  <Project Path=\"ProjC/{projectC}.fsproj\" />"
+                  $"  <Project Path=\"ProjD/{projectD}.fsproj\" />"
+                  $"  <Project Path=\"ProjE/{projectE}.fsproj\" />"
                   "</Solution>" ])
 
     member _.Slnx = slnxPath
     member _.SharedSource = sharedSource
+    member _.AlternativeProject = projectB
+
+    member _.CrowdedTargetLine =
+        linkedSharedFs.Split('\n')
+        |> Array.findIndex (fun line -> line.Contains("crowded20", StringComparison.Ordinal))
+        |> (+) 1
 
     interface IDisposable with
         member _.Dispose() =
@@ -2309,7 +2348,7 @@ type FindLinkedSourceTests(fx: LinkedSourceFixture) =
                 )
 
             Assert.Equal("succeeded", gs find "status")
-            Assert.Equal(2, gi find "projectsAnalyzed")
+            Assert.Equal(5, gi find "projectsAnalyzed")
 
             // De-duplication by physical location is intact: ONE row, not one per project.
             let sites = find["sites"] :?> JsonArray
@@ -2335,7 +2374,7 @@ type FindLinkedSourceTests(fx: LinkedSourceFixture) =
                 |> Seq.map (fun value -> value.GetValue<string>())
                 |> Seq.toList
 
-            Assert.Equal<string list>([ "ProjB" ], alternativeProjects)
+            Assert.Equal<string list>([ fx.AlternativeProject ], alternativeProjects)
             Assert.False(site.AsObject().ContainsKey("siteTypeAlternativesOmitted"))
 
             // Ledger: the row is still `typed` — the identity typed + degraded = fieldSites
@@ -2346,6 +2385,59 @@ type FindLinkedSourceTests(fx: LinkedSourceFixture) =
             Assert.Equal(0, gi ledger "degraded")
             Assert.Equal(1, gi ledger "typedDifferentlyByAnotherProject")
             Assert.Contains("resolved to DIFFERENT types", gs find "siteTypesNote")
+        }
+
+    [<Fact>]
+    member _.``#258: canonical site row is invariant across maxResults and page boundaries`` () : Task =
+        task {
+            let largeBridge = FcsBridge()
+
+            let request maxResults cursor =
+                { findArgs fx.Slnx "CrowdedParcel" with
+                    kind = Some "field"
+                    includeSiteTypes = Some true
+                    maxResults = Some maxResults
+                    cursor = cursor }
+
+            let! largePage = largeBridge.Find(request 1000 None)
+            Assert.Equal("succeeded", gs largePage "status")
+
+            let targetFromLargePage =
+                (largePage["sites"] :?> JsonArray)
+                |> Seq.find (fun site -> gi site["range"] "startLine" = fx.CrowdedTargetLine)
+
+            // Production fields required for per-project planning survive the canonical cap.
+            Assert.Equal("ProjA", gs targetFromLargePage "project")
+            Assert.NotNull(targetFromLargePage["siteTypeAlternatives"])
+            Assert.Equal(1, gi targetFromLargePage "siteTypeAlternativesOmitted")
+
+            let expectedRow = renderToken targetFromLargePage
+            let mutable cursor = None
+            let mutable targetFromSmallPages: JsonNode = null
+            let mutable pages = 0
+            let mutable sawBudgetBoundary = false
+            let smallBridge = FcsBridge(findResponseBudgetCharsOverride = 12_000)
+
+            while isNull targetFromSmallPages && (cursor.IsSome || pages = 0) do
+                Assert.True(pages < 50, "small-page traversal must terminate")
+                let! page = smallBridge.Find(request 7 cursor)
+                pages <- pages + 1
+                sawBudgetBoundary <- sawBudgetBoundary || page["sitesTruncatedByBudget"].GetValue<bool>()
+
+                targetFromSmallPages <-
+                    (page["sites"] :?> JsonArray)
+                    |> Seq.tryFind (fun site -> gi site["range"] "startLine" = fx.CrowdedTargetLine)
+                    |> Option.defaultValue null
+
+                cursor <-
+                    match page["nextCursor"] with
+                    | null -> None
+                    | value -> Some(value.GetValue<string>())
+
+            Assert.True(pages > 1, "regression must cross at least one maxResults boundary")
+            Assert.True(sawBudgetBoundary, "regression must also cross a serialized response-budget boundary")
+            Assert.NotNull(targetFromSmallPages)
+            Assert.Equal(expectedRow, renderToken targetFromSmallPages)
         }
 
     [<Fact>]
