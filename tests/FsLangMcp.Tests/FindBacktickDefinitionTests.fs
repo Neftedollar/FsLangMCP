@@ -25,9 +25,16 @@ let ``value with spaces + punctuation!`` = ordinaryName + 1
 
 module First =
     let ``ambiguous value!`` = 1
+    let ordinaryValue = 11
 
 module Second =
     let ``ambiguous value!`` = 2
+    let ordinaryValue = 22
+
+let ``value.with dots + punctuation!`` = 3
+
+type LookupMethods() =
+    member _.``method.with dots + punctuation!``() = 42
 """
     )
 
@@ -80,8 +87,40 @@ let private definitionSites (result: JsonNode) =
 
 let private assertDefinitionCount expected (result: JsonNode) =
     Assert.Equal("succeeded", result["status"].GetValue<string>())
+    Assert.True((result["coverage"]["complete"]).GetValue<bool>())
+    Assert.True(result["resultSetComplete"].GetValue<bool>())
+    Assert.True(result["projectDiagnosticsCountComplete"].GetValue<bool>())
+    Assert.Equal(0, result["projectDiagnosticsTotalCount"].GetValue<int>())
+    Assert.Equal(expected, (result["resolution"]["fcsSiteCount"]).GetValue<int>())
     Assert.Equal(expected, (result["breakdown"]["definitions"]).GetValue<int>())
     Assert.Equal(expected, definitionSites result |> Seq.length)
+
+// The expected identities and coordinates below are fixed by the fixture declarations,
+// independently of the compiler results and of find's name-matching implementation.
+let private assertDefinitions sourcePath expected (result: JsonNode) =
+    assertDefinitionCount (List.length expected) result
+
+    let actual =
+        definitionSites result
+        |> Seq.map (fun site ->
+            Assert.Equal(Path.GetFullPath(sourcePath), site["file"].GetValue<string>())
+            Assert.Equal("definition", site["kind"].GetValue<string>())
+            let range = site["range"]
+
+            site["symbolFullName"].GetValue<string>(),
+            range["startLine"].GetValue<int>(),
+            range["startColumn"].GetValue<int>(),
+            range["endLine"].GetValue<int>(),
+            range["endColumn"].GetValue<int>())
+        |> Seq.toArray
+
+    Assert.Equal<string * int * int * int * int>(List.toArray expected, actual)
+
+let private firstDefinition =
+    "BacktickLookupFixture.First.``ambiguous value!``", 7, 8, 7, 28
+
+let private secondDefinition =
+    "BacktickLookupFixture.Second.``ambiguous value!``", 11, 8, 11, 28
 
 [<Fact>]
 let ``find definition resolves quoted and unquoted FSharp source names exactly`` () : Task =
@@ -99,17 +138,6 @@ let ``find definition resolves quoted and unquoted FSharp source names exactly``
 
             let! ordinary = findDefinition bridge projectPath "ordinaryName"
             let! quotedOrdinary = findDefinition bridge projectPath "``ordinaryName``"
-            let! ambiguous = findDefinition bridge projectPath "ambiguous value!"
-
-            let! qualifiedUnquoted =
-                findDefinition bridge projectPath "First.ambiguous value!"
-
-            let! qualifiedQuoted =
-                findDefinition bridge projectPath "First.``ambiguous value!``"
-
-            let! caseInsensitiveUnquoted =
-                findDefinitionWithExact bridge projectPath false "VALUE WITH SPACES + PUNCTUATION!"
-
             let! genuineMiss =
                 findDefinition bridge projectPath "value with spaces + punctuation?"
 
@@ -117,24 +145,95 @@ let ``find definition resolves quoted and unquoted FSharp source names exactly``
             assertDefinitionCount 1 quotedBacktick
             assertDefinitionCount 1 ordinary
             assertDefinitionCount 1 quotedOrdinary
-            assertDefinitionCount 2 ambiguous
-            assertDefinitionCount 1 qualifiedUnquoted
-            assertDefinitionCount 1 qualifiedQuoted
-            assertDefinitionCount 1 caseInsensitiveUnquoted
             assertDefinitionCount 0 genuineMiss
             Assert.Equal("not_found", genuineMiss["outcome"].GetValue<string>())
 
-            for result in
-                [ unquotedBacktick
-                  quotedBacktick
-                  ordinary
-                  quotedOrdinary
-                  ambiguous
-                  qualifiedUnquoted
-                  qualifiedQuoted
-                  caseInsensitiveUnquoted ] do
+            for result in [ unquotedBacktick; quotedBacktick; ordinary; quotedOrdinary ] do
                 for site in definitionSites result do
                     Assert.Equal(Path.GetFullPath(sourcePath), site["file"].GetValue<string>())
+
+            for query, expected in
+                [ "ambiguous value!", [ firstDefinition; secondDefinition ]
+                  "``ambiguous value!``", [ firstDefinition; secondDefinition ]
+                  "First.ambiguous value!", [ firstDefinition ]
+                  "First.``ambiguous value!``", [ firstDefinition ]
+                  "Second.ambiguous value!", [ secondDefinition ]
+                  "Second.``ambiguous value!``", [ secondDefinition ]
+                  "BacktickLookupFixture.First.ambiguous value!", [ firstDefinition ]
+                  "BacktickLookupFixture.Second.``ambiguous value!``", [ secondDefinition ] ] do
+                let! result = findDefinition bridge projectPath query
+                assertDefinitions sourcePath expected result
+        finally
+            if Directory.Exists(root) then
+                Directory.Delete(root, true)
+    }
+
+[<Theory>]
+[<InlineData("fIrSt.AMBIGUOUS VALUE!", "BacktickLookupFixture.First.``ambiguous value!``", 7, 28)>]
+[<InlineData("fIrSt.``ORDINARYVALUE``", "BacktickLookupFixture.First.ordinaryValue", 8, 21)>]
+let ``find non-exact qualified source-name equivalence is case insensitive``
+    (query: string, fullName: string, line: int, endColumn: int)
+    : Task =
+    task {
+        let root, sourcePath, projectPath = writeLookupProject ()
+
+        try
+            let bridge = FcsBridge()
+            // Neither mixed-case query is a substring of the FCS display/full name
+            // on v0.17.1: these require the new source-name equivalence branch.
+            let! result = findDefinitionWithExact bridge projectPath false query
+            assertDefinitions sourcePath [ fullName, line, 8, line, endColumn ] result
+        finally
+            if Directory.Exists(root) then
+                Directory.Delete(root, true)
+    }
+
+[<Theory>]
+[<InlineData("value.with dots + punctuation!", "BacktickLookupFixture", 14, 4, 38)>]
+[<InlineData("method.with dots + punctuation!", "BacktickLookupFixture.LookupMethods", 17, 13, 48)>]
+let ``find definitions preserve dots and punctuation inside value and method names``
+    (name: string, qualifier: string, line: int, startColumn: int, endColumn: int)
+    : Task =
+    task {
+        let root, sourcePath, projectPath = writeLookupProject ()
+
+        try
+            let bridge = FcsBridge()
+            let fullName = $"{qualifier}.``{name}``"
+            let expected = [ fullName, line, startColumn, line, endColumn ]
+
+            for query in [ name; $"``{name}``"; $"{qualifier}.{name}"; fullName ] do
+                let! result = findDefinition bridge projectPath query
+                assertDefinitions sourcePath expected result
+        finally
+            if Directory.Exists(root) then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find source-name equivalence rejects wrong and truncated qualifiers`` () : Task =
+    task {
+        let root, sourcePath, projectPath = writeLookupProject ()
+
+        try
+            let bridge = FcsBridge()
+
+            for exact, query in
+                [ true, "Missing.ambiguous value!"
+                  true, "irst.ambiguous value!"
+                  true, "NotFirst.``ambiguous value!``"
+                  true, "First.ambiguous value?"
+                  true, "Missing.value.with dots + punctuation!"
+                  true, "with dots + punctuation!"
+                  true, "Methods.method.with dots + punctuation!"
+                  true, "Missing.LookupMethods.``method.with dots + punctuation!``"
+                  true, "LookupMethods.method.with dots + punctuation?"
+                  false, "iRsT.AMBIGUOUS VALUE!"
+                  false, "MISSING.``ORDINARYVALUE``" ] do
+                let! result = findDefinitionWithExact bridge projectPath exact query
+                assertDefinitions sourcePath [] result
+                Assert.Equal("not_found", result["outcome"].GetValue<string>())
+                Assert.False((result["resolution"]["matched"]).GetValue<bool>())
         finally
             if Directory.Exists(root) then
                 Directory.Delete(root, true)
