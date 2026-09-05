@@ -418,11 +418,261 @@ type internal FindFsacProbeResult =
     | Failed of reason: string
     | Unavailable of reason: string
 
+/// One monotonic request deadline shared by Program.fs admission and every find phase.
+/// Semantic work stops early enough to leave a small, explicit allowance for constructing
+/// the typed response. The optional signal is a deterministic test seam: production expiry
+/// is always derived from Stopwatch's monotonic clock.
+type internal FindRequestDeadline
+    (timeoutMs: int, ?semanticExpirySignal: Task, ?responseExpirySignal: Task) =
+    let elapsed = System.Diagnostics.Stopwatch.StartNew()
+
+    let responseAllowanceMs =
+        if timeoutMs <= 0 then
+            0
+        else
+            min 250 (max 1 (timeoutMs / 20))
+
+    let semanticBudgetMs = max 0 (timeoutMs - responseAllowanceMs)
+    let mutable semanticExpired = if semanticBudgetMs = 0 then 1 else 0
+    let mutable responseStartedAt: TimeSpan option = None
+
+    let remainingFrom budgetMs =
+        let remaining = TimeSpan.FromMilliseconds(float budgetMs) - elapsed.Elapsed
+        if remaining <= TimeSpan.Zero then TimeSpan.Zero else remaining
+
+    member _.TimeoutMs = timeoutMs
+    member _.ResponseAllowanceMs = responseAllowanceMs
+    member _.ElapsedMilliseconds = int elapsed.ElapsedMilliseconds
+    member _.SemanticExpirySignal = semanticExpirySignal
+    member _.ResponseExpirySignal = responseExpirySignal
+
+    member _.MarkSemanticExpired() =
+        Interlocked.Exchange(&semanticExpired, 1) |> ignore
+
+    member _.RemainingSemanticBudget() =
+        let signalled =
+            semanticExpirySignal
+            |> Option.exists _.IsCompleted
+
+        if Volatile.Read(&semanticExpired) <> 0 || signalled then
+            TimeSpan.Zero
+        else
+            remainingFrom semanticBudgetMs
+
+    member _.BeginResponseConstruction() =
+        if responseStartedAt.IsNone then
+            responseStartedAt <- Some elapsed.Elapsed
+
+    member _.RemainingResponseBudget() =
+        let signalled =
+            responseExpirySignal
+            |> Option.exists _.IsCompleted
+
+        if signalled then
+            TimeSpan.Zero
+        else
+            let overallRemaining = remainingFrom timeoutMs
+
+            match responseStartedAt with
+            | None -> TimeSpan.Zero
+            | Some startedAt ->
+                let allowanceRemaining =
+                    TimeSpan.FromMilliseconds(float responseAllowanceMs) - (elapsed.Elapsed - startedAt)
+
+                let boundedAllowance =
+                    if allowanceRemaining <= TimeSpan.Zero then
+                        TimeSpan.Zero
+                    else
+                        allowanceRemaining
+
+                if overallRemaining <= boundedAllowance then overallRemaining else boundedAllowance
+
+    member this.SemanticExpired = this.RemainingSemanticBudget() <= TimeSpan.Zero
+    member this.ResponseExpired = this.RemainingResponseBudget() <= TimeSpan.Zero
+
+exception private FindProjectNotStartedException
+
+[<RequireQualifiedAccess>]
+type private FindTargetDiscoveryResult =
+    | Paths of string array
+    | Projects of SolutionParsing.ProjectDiscovery array
+
+[<RequireQualifiedAccess>]
+module internal FindDeadlineResponse =
+
+    let private phaseNode phase status =
+        jobj [ "phase", jstr phase; "status", jstr status ] :> JsonNode
+
+    let private knownProjectsBeforeDiscovery (args: FindArgs) =
+        args.projectPath
+        |> Option.filter (String.IsNullOrWhiteSpace >> not)
+        |> Option.map normalizePath
+        |> Option.filter (fun path -> path.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase))
+        |> Option.toArray
+
+    /// Typed response used when the shared request deadline expires before find has a
+    /// discovered project set. An explicit .fsproj is already known without filesystem
+    /// discovery and is therefore reported as not_started; a solution/directory remains
+    /// unknown rather than being scanned after expiry merely to improve accounting.
+    let beforeDiscovery
+        (args: FindArgs)
+        (deadline: FindRequestDeadline)
+        (phase: string)
+        (phaseStatus: string)
+        (errorKind: string)
+        (message: string)
+        : JsonNode =
+        let kind = (args.kind |> Option.defaultValue "auto").Trim().ToLowerInvariant()
+        let scope = (args.scope |> Option.defaultValue "auto").Trim().ToLowerInvariant()
+        let exact = args.exact |> Option.defaultValue true
+        let projects = knownProjectsBeforeDiscovery args
+        let projectsRequested = projects.Length
+        let projectsNotStarted = projectsRequested
+
+        let perProject =
+            projects
+            |> Array.map (fun project ->
+                jobj
+                    [ "project", jstr (Path.GetFileNameWithoutExtension project)
+                      "fsproj", jstr project
+                      "status", jstr "not_started"
+                      "errorKind", jstr "deadline_not_started"
+                      "retryable", jbool true
+                      "error", jstr message
+                      "elapsedMs", jint 0 ]
+                :> JsonNode)
+
+        let admissionStatus =
+            if phase = "admission" then phaseStatus else "complete"
+
+        let positionStatus =
+            if phase = "position_resolution" then
+                phaseStatus
+            elif phase = "admission" then
+                "not_started"
+            elif kind = "position" then
+                "complete"
+            else
+                "not_needed"
+
+        let targetDiscoveryStatus =
+            if phase = "target_discovery" then
+                phaseStatus
+            else
+                "not_started"
+
+        let phases =
+            JsonArray(
+                [| phaseNode "admission" admissionStatus
+                   phaseNode "position_resolution" positionStatus
+                   phaseNode "target_discovery" targetDiscoveryStatus
+                   phaseNode "project_sweep" "not_started"
+                   phaseNode "fsac_fallback" "not_started"
+                   phaseNode "response_construction" "complete" |]
+            )
+            :> JsonNode
+
+        let coverage =
+            jobj
+                [ "complete", jbool false
+                  "projectsRequested", jint projectsRequested
+                  "projectsAnalyzed", jint 0
+                  "projectsFailed", jint 0
+                  "projectsMissing", jint 0
+                  "projectsTimedOut", jint 0
+                  "projectsBusy", jint 0
+                  "projectsNotStarted", jint projectsNotStarted
+                  "phases", phases ]
+            :> JsonNode
+
+        let kindResolved = if kind = "position" then "position" else kind
+
+        let scopeResolved =
+            if projectsRequested = 1 then
+                if scope = "file" then "file" else "project"
+            elif scope = "workspace" then
+                "workspace"
+            else
+                scope
+
+        let resolution =
+            jobj
+                [ "matched", null
+                  "outcome", jstr "indeterminate"
+                  "complete", jbool false
+                  "kindResolved", jstr kindResolved
+                  "scopeResolved", jstr scopeResolved
+                  "projectsSwept", jint 0
+                  "projectsRequested", jint projectsRequested
+                  "projectsAnalyzed", jint 0
+                  "projectsFailed", jint 0
+                  "projectsMissing", jint 0
+                  "projectsTimedOut", jint 0
+                  "projectsBusy", jint 0
+                  "projectsNotStarted", jint projectsNotStarted
+                  "via", jstr "deadline"
+                  "fcsSiteCount", jint 0
+                  "fsacFallbackHits", jint 0
+                  "fsacFallbackState", jstr "not_started"
+                  "fsacFallbackReason", jstr message ]
+            :> JsonNode
+
+        jobj
+            [ "status", jstr "unknown"
+              "errorKind", jstr errorKind
+              "message", jstr message
+              "timeoutMs", jint deadline.TimeoutMs
+              "responseConstructionAllowanceMs", jint deadline.ResponseAllowanceMs
+              "outcome", jstr "indeterminate"
+              "query", jstr args.query
+              "kind", jstr kind
+              "kindResolved", jstr kindResolved
+              "scope", jstr scope
+              "exact", jbool exact
+              "resolution", resolution
+              "coverage", coverage
+              "projectsSwept", jint 0
+              "projectsRequested", jint projectsRequested
+              "projectsAnalyzed", jint 0
+              "projectsFailed", jint 0
+              "projectsMissing", jint 0
+              "projectsTimedOut", jint 0
+              "projectsBusy", jint 0
+              "projectsNotStarted", jint projectsNotStarted
+              "totalSites", jint 0
+              "matchedUseCount", jint 0
+              "breakdown",
+              jobj
+                  [ "definitions", jint 0
+                    "references", jint 0
+                    "fieldSetLiteral", jint 0
+                    "fieldSetUpdate", jint 0
+                    "fieldSetMutation", jint 0
+                    "fieldPattern", jint 0
+                    "fieldRead", jint 0
+                    "memberUsages", jint 0 ]
+              :> JsonNode
+              "sites", JsonArray() :> JsonNode
+              "perProject", JsonArray(perProject) :> JsonNode
+              "sweepElapsedMs", jint deadline.ElapsedMilliseconds
+              "projectDiagnostics", JsonArray() :> JsonNode
+              "resultSetComplete", jbool false
+              "truncated", jbool false
+              "nextCursor", null
+              "totalEstimate", jobj [ "sites", jint 0 ] :> JsonNode
+              "totalEstimateIsLowerBound", jbool true
+              "paginationRestartRequired", jbool true
+              "scopeNote",
+              jstr
+                  $"find timed out during {phase}; no later semantic phase was started. Retry with a larger timeoutMs after any retained worker completes." ]
+        :> JsonNode
+
 let rec private findFailureIsTimeout (ex: exn) =
     match ex with
     | :? TimeoutException -> true
-    // Find has no caller cancellation token today, so cancellation observed
-    // inside its budgeted sweep is a timeout-equivalent incomplete result.
+    // A worker can report cancellation without the caller token being cancelled;
+    // that remains timeout-equivalent. FindWithinDeadline propagates an actual
+    // caller cancellation before invoking this classifier.
     | :? OperationCanceledException -> true
     | :? AggregateException as aggregate ->
         aggregate.Flatten().InnerExceptions |> Seq.exists findFailureIsTimeout
@@ -1967,6 +2217,7 @@ type internal CheckBlockingFailure =
 
 let rec private boundedCheckWorkFailureIsBusy (ex: exn) =
     match ex with
+    | :? ProjectEvaluationBusyException -> true
     | :? BoundedCheckWorkBusyException -> true
     | :? AggregateException as aggregate ->
         aggregate.Flatten().InnerExceptions |> Seq.exists boundedCheckWorkFailureIsBusy
@@ -2389,10 +2640,15 @@ type internal FcsBridge
         ?testsForSymbolProjectSweepWaitMsOverride: (int -> int),
         ?projectOutlineFileOutlineOverride: (FcsFileOutlineArgs -> Task<JsonNode>),
         ?checkFastSnapshotDeadlineExpiredOverride: (unit -> bool),
+        ?findPositionResolutionBeforeComputeOverride: (unit -> Task),
+        ?findTargetDiscoveryBeforeComputeOverride: (string -> Task),
+        ?findDeadlineSignalOverride: (unit -> Task),
+        ?findResponseDeadlineSignalOverride: (unit -> Task),
+        ?findResponseConstructionBeforeStartOverride: (unit -> Task),
         // #207: test-only seam for find's PER-SITE siteType deadline. The production check
-        // is `sweepSw.ElapsedMilliseconds >= sweepBudgetMs`, which cannot be driven from a
-        // test without a clock: timeoutMs=0 is exhausted BEFORE the sweep, so it fails the
-        // whole project and yields no sites at all. This override makes the reachable
+        // reads the shared FindRequestDeadline, which cannot target one site deterministically
+        // without a seam: timeoutMs=0 is exhausted BEFORE the sweep and yields no sites.
+        // This override makes the reachable
         // degraded arm (a large solution whose budget expires between a project's sweep
         // returning and its site loop finishing) deterministically testable.
         ?findSiteTypeDeadlineExpiredOverride: (unit -> bool),
@@ -2483,6 +2739,23 @@ type internal FcsBridge
 
     let checkTargetDiscoveriesInFlight =
         ConcurrentDictionary<string, Lazy<Task<CheckTargetDiscoveryResult>>>()
+
+    // Find has the same uncancellable boundaries as Check, plus position resolution.
+    // Exact-key retries share the active Lazy; distinct keys are rejected immediately.
+    // Caller/deadline expiry never releases these slots before the real worker settles.
+    let findPositionResolutionAdmission =
+        BoundedCheckWorkAdmission("find position resolution", freshProjectCheckCapacity)
+
+    let findPositionResolutionsInFlight =
+        ConcurrentDictionary<string, Lazy<Task<Result<string, JsonNode>>>>()
+
+    let findTargetDiscoveryAdmission = BoundedCheckWorkAdmission("find target discovery", 1)
+
+    let findTargetDiscoveriesInFlight =
+        ConcurrentDictionary<string, Lazy<Task<FindTargetDiscoveryResult>>>()
+
+    let mutable findPositionResolutionComputeCount = 0L
+    let mutable findTargetDiscoveryComputeCount = 0L
 
     let referenceResolutionProbeAdmission =
         BoundedCheckWorkAdmission("reference resolution probe", 1)
@@ -2631,6 +2904,124 @@ type internal FcsBridge
                                 )
                             )
             }
+
+    let findPositionResolutionKey (args: FindArgs) =
+        let frame (value: string) = $"{value.Length}:{value}"
+
+        let valueOrEmpty value =
+            value
+            |> Option.defaultValue ""
+
+        let intOrEmpty value =
+            value
+            |> Option.map string
+            |> Option.defaultValue ""
+
+        String.Concat(
+            frame (valueOrEmpty args.projectPath),
+            frame (valueOrEmpty args.path),
+            frame (intOrEmpty args.line),
+            frame (valueOrEmpty args.word),
+            frame (intOrEmpty args.occurrence),
+            frame (intOrEmpty args.character)
+        )
+
+    let runFindPositionResolution
+        (args: FindArgs)
+        (remainingBudget: unit -> TimeSpan)
+        (work: unit -> Task<Result<string, JsonNode>>)
+        : Task<Result<string, JsonNode>> =
+        let key = findPositionResolutionKey args
+
+        let ensureBudget () =
+            if remainingBudget () <= TimeSpan.Zero then
+                raise (TimeoutException("The find position-resolution budget was exhausted."))
+
+        let pending =
+            findPositionResolutionsInFlight.GetOrAdd(
+                key,
+                fun _ ->
+                    Lazy<Task<Result<string, JsonNode>>>(
+                        (fun () ->
+                            task {
+                                try
+                                    return!
+                                        findPositionResolutionAdmission.TryRun(
+                                            key,
+                                            fun () ->
+                                                task {
+                                                    do! Task.Yield()
+                                                    ensureBudget ()
+
+                                                    match findPositionResolutionBeforeComputeOverride with
+                                                    | Some beforeCompute -> do! beforeCompute ()
+                                                    | None -> ()
+
+                                                    ensureBudget ()
+                                                    Interlocked.Increment(&findPositionResolutionComputeCount)
+                                                    |> ignore
+                                                    return! work ()
+                                                }
+                                        )
+                                finally
+                                    findPositionResolutionsInFlight.TryRemove(key) |> ignore
+                            }),
+                        LazyThreadSafetyMode.ExecutionAndPublication
+                    )
+            )
+
+        let operation = pending.Value
+        observeFault operation
+        operation
+
+    let runFindTargetDiscovery
+        (phase: string)
+        (target: string)
+        (remainingBudget: unit -> TimeSpan)
+        (work: unit -> FindTargetDiscoveryResult)
+        : Task<FindTargetDiscoveryResult> =
+        let key = checkDiscoveryKey $"find-{phase}" target None
+
+        let ensureBudget () =
+            if remainingBudget () <= TimeSpan.Zero then
+                raise (TimeoutException($"The find {phase} budget was exhausted."))
+
+        let pending =
+            findTargetDiscoveriesInFlight.GetOrAdd(
+                key,
+                fun _ ->
+                    Lazy<Task<FindTargetDiscoveryResult>>(
+                        (fun () ->
+                            task {
+                                try
+                                    return!
+                                        findTargetDiscoveryAdmission.TryRun(
+                                            key,
+                                            fun () ->
+                                                task {
+                                                    do! Task.Yield()
+                                                    ensureBudget ()
+
+                                                    match findTargetDiscoveryBeforeComputeOverride with
+                                                    | Some beforeCompute -> do! beforeCompute phase
+                                                    | None -> ()
+
+                                                    ensureBudget ()
+                                                    Interlocked.Increment(&findTargetDiscoveryComputeCount)
+                                                    |> ignore
+                                                    return work ()
+                                                }
+                                        )
+                                finally
+                                    findTargetDiscoveriesInFlight.TryRemove(key) |> ignore
+                            }),
+                        LazyThreadSafetyMode.ExecutionAndPublication
+                    )
+            )
+
+        let operation = pending.Value
+        observeFault operation
+        operation
 
     let resolveSingleCheckProject
         (target: string)
@@ -3601,9 +3992,10 @@ type internal FcsBridge
         observeFault operation
         operation
 
-    let resolveAnalysisSnapshotKey
+    let resolveAnalysisSnapshotKeyCore
         (projectOptions: FSharpProjectOptions)
         (remainingBudget: (unit -> TimeSpan) option)
+        (waitWithinBudget: bool)
         : Task<string> =
         let workKey = snapshotComputationKey projectOptions
 
@@ -3643,15 +4035,28 @@ type internal FcsBridge
         let operation = pending.Value
         observeFault operation
 
-        match remainingBudget with
-        | Some getRemaining ->
+        match remainingBudget, waitWithinBudget with
+        | _, false -> operation
+        | Some getRemaining, true ->
             let remaining = getRemaining ()
 
             if remaining <= TimeSpan.Zero then
                 Task.FromException<string>(TimeoutException("Analysis snapshot budget was exhausted."))
             else
                 operation.WaitAsync(remaining)
-        | None -> operation
+        | None, true -> operation
+
+    let resolveAnalysisSnapshotKey
+        (projectOptions: FSharpProjectOptions)
+        (remainingBudget: (unit -> TimeSpan) option)
+        =
+        resolveAnalysisSnapshotKeyCore projectOptions remainingBudget true
+
+    let resolveAnalysisSnapshotKeyActual
+        (projectOptions: FSharpProjectOptions)
+        (remainingBudget: unit -> TimeSpan)
+        =
+        resolveAnalysisSnapshotKeyCore projectOptions (Some remainingBudget) false
 
     let commitAnalysisSnapshotKey (projectOptions: FSharpProjectOptions) (key: string) =
         let projectIdentity = analysisProjectIdentity projectOptions
@@ -5920,7 +6325,9 @@ type internal FcsBridge
     // synchronous symbol resolution to ResolvePositionInFile. Keeping this task {}
     // free of nested match-over-task-result branches makes it statically compilable
     // (FS3511 fix — same technique as ProjectSweepUses).
-    member private this.ResolveQueryAtPosition(args: FindArgs) : Task<Result<string, JsonNode>> =
+    member private this.ResolveQueryAtPosition
+        (args: FindArgs, ensureCanContinue: unit -> unit)
+        : Task<Result<string, JsonNode>> =
         task {
             match args.path with
             | None ->
@@ -5954,8 +6361,17 @@ type internal FcsBridge
                     match validateSourcePath "find" None path with
                     | Some err -> return Error err
                     | None ->
+                        ensureCanContinue ()
+
                         let! _, source, _, _, _, checkedResults =
-                            this.PrepareCheckContext(path, None, args.projectPath, None)
+                            this.PrepareCheckContextCore(
+                                path,
+                                None,
+                                args.projectPath,
+                                None,
+                                None,
+                                ensureCanContinue
+                            )
 
                         return this.ResolvePositionInFile(path, line, source, checkedResults, args)
         }
@@ -5982,11 +6398,12 @@ type internal FcsBridge
     // enumeration + diagnostics, keyed by the shared analysis content snapshot. Kept in its own method
     // so Find's per-project loop awaits a plain Task instead of nesting a task CE
     // (which is not statically compilable under Release optimization → FS3511).
-    // The caller waits through a hard Task.WaitAsync boundary. FCS does not expose
-    // cancellation for GetAllUsesOfAllSymbols once the synchronous walk starts, so
-    // the underlying task may finish later; projectUsesInFlight deduplicates retries.
-    member private _.ProjectSweepUses
-        (usesKey: string, options: FSharpProjectOptions, timeoutMs: int)
+    // FCS does not expose cancellation for GetAllUsesOfAllSymbols once the synchronous
+    // walk starts. Find races the actual task so its outer admission lifetime can retain
+    // the real worker; legacy callers use the timeout wrapper below. In both cases
+    // projectUsesInFlight deduplicates retries.
+    member private _.ProjectSweepUsesActual
+        (usesKey: string, options: FSharpProjectOptions)
         : Task<FSharpSymbolUse array * FSharpDiagnostic array> =
         task {
             match projectUsesCache.TryGet(usesKey) with
@@ -6039,20 +6456,101 @@ type internal FcsBridge
 
                 let work = pending.Value
                 observeFault work
-
-                try
-                    return! work.WaitAsync(TimeSpan.FromMilliseconds(float (max 1 timeoutMs)))
-                with :? TimeoutException ->
-                    return
-                        raise (
-                            TimeoutException(
-                                $"FCS sweep of '{Path.GetFileNameWithoutExtension options.ProjectFileName}' timed out after %d{timeoutMs}ms (cold cache or very large project). Run `dotnet build` to warm it, retry, or raise timeoutMs."
-                            )
-                        )
+                return! work
         }
 
-    member this.Find(args: FindArgs, ?fsacProbe: string -> Task<FindFsacProbeResult>) : Task<JsonNode> =
+    member private this.ProjectSweepUses
+        (usesKey: string, options: FSharpProjectOptions, timeoutMs: int)
+        : Task<FSharpSymbolUse array * FSharpDiagnostic array> =
         task {
+            let work = this.ProjectSweepUsesActual(usesKey, options)
+
+            try
+                return! work.WaitAsync(TimeSpan.FromMilliseconds(float (max 1 timeoutMs)))
+            with :? TimeoutException ->
+                return
+                    raise (
+                        TimeoutException(
+                            $"FCS sweep of '{Path.GetFileNameWithoutExtension options.ProjectFileName}' timed out after %d{timeoutMs}ms (cold cache or very large project). Run `dotnet build` to warm it, retry, or raise timeoutMs."
+                        )
+                    )
+        }
+
+    member internal this.FindWithinDeadline
+        (
+            args: FindArgs,
+            deadline: FindRequestDeadline,
+            cancellationToken: CancellationToken,
+            retainUntil: Task -> unit,
+            fsacProbe: (string -> Task<FindFsacProbeResult>) option
+        )
+        : Task<JsonNode> =
+        task {
+            let ensureCanStart phase =
+                cancellationToken.ThrowIfCancellationRequested()
+
+                if deadline.SemanticExpired then
+                    deadline.MarkSemanticExpired()
+                    raise (TimeoutException($"The find deadline was exhausted before {phase} started."))
+
+            let awaitWithinDeadline
+                (phase: string)
+                (retainIncompleteOperation: bool)
+                (operation: Task<'T>)
+                : Task<'T> =
+                task {
+                    let remaining = deadline.RemainingSemanticBudget()
+
+                    if remaining <= TimeSpan.Zero then
+                        deadline.MarkSemanticExpired()
+                        observeFault operation
+
+                        if not operation.IsCompleted then
+                            if retainIncompleteOperation then
+                                retainUntil (operation :> Task)
+
+                        return raise (TimeoutException($"The find deadline was exhausted during {phase}."))
+                    else
+                        use deadlineWaitCancellation =
+                            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+
+                        let timeout = Task.Delay(remaining, deadlineWaitCancellation.Token)
+
+                        let contenders =
+                            match deadline.SemanticExpirySignal with
+                            | Some signal -> [| operation :> Task; timeout; signal |]
+                            | None -> [| operation :> Task; timeout |]
+
+                        let! winner = Task.WhenAny contenders
+                        deadlineWaitCancellation.Cancel()
+
+                        let operationWon =
+                            Object.ReferenceEquals(winner, operation :> Task)
+                            && not deadline.SemanticExpired
+                            && not cancellationToken.IsCancellationRequested
+
+                        if operationWon then
+                            return! operation
+                        else
+                            observeFault operation
+
+                            if not operation.IsCompleted then
+                                if retainIncompleteOperation then
+                                    retainUntil (operation :> Task)
+
+                            // Cancellation may be observed while an admitted MSBuild/FCS
+                            // operation is already uncancellable. Register its real task
+                            // with the outer lifetime before propagating cancellation, or
+                            // Program.fs would release the shared slot too early.
+                            deadline.MarkSemanticExpired()
+                            cancellationToken.ThrowIfCancellationRequested()
+
+                            return raise (TimeoutException($"The find deadline was exhausted during {phase}."))
+                }
+
+            let incompleteBeforeDiscovery phase phaseStatus errorKind message =
+                FindDeadlineResponse.beforeDiscovery args deadline phase phaseStatus errorKind message
+
             match ArgsValidation.requireNonBlank "query" args.query with
             | Error _ ->
                 return
@@ -6078,11 +6576,11 @@ type internal FcsBridge
             // #207: opt-in per-site field types. Off by default — resolving and formatting
             // a type for every site is FCS work the common `find` call has no use for.
             let includeSiteTypes = args.includeSiteTypes |> Option.defaultValue false
-            // #100 hang fix: `find` must ALWAYS return. timeoutMs is the overall
-            // wall-clock budget for the whole multi-project sweep (default 120s);
-            // each project's FCS sweep is cancelled at the remaining budget, and
-            // projects past the deadline are skipped with a perProject error entry.
-            let sweepBudgetMs = args.timeoutMs |> Option.defaultValue 120000
+            // #255: timeoutMs is one end-to-end monotonic budget (default 120s), shared
+            // with outer admission and every resolution/discovery/FCS/fallback phase.
+            // Semantic work reserves a bounded allowance for constructing typed evidence;
+            // projects not begun before the cutoff are reported separately.
+            let requestTimeoutMs = args.timeoutMs |> Option.defaultValue 120000
             // Default page size keeps the compact payload well under the MCP token
             // ceiling on a cap-case hit. Each site is now serialized ONCE — the flat
             // `sites` list — after the grouped definitions/references/fieldSites/
@@ -6129,8 +6627,8 @@ type internal FcsBridge
                     Some $"maxResults must be between 1 and 1000; got %d{pageSize}."
                 elif contextLines < 0 then
                     Some $"contextLines must be non-negative; got %d{contextLines}."
-                elif sweepBudgetMs < 0 then
-                    Some $"timeoutMs must be non-negative; got %d{sweepBudgetMs}."
+                elif requestTimeoutMs < 0 then
+                    Some $"timeoutMs must be non-negative; got %d{requestTimeoutMs}."
                 elif args.line |> Option.exists (fun value -> value < 0) then
                     Some "line must be non-negative (0-based)."
                 elif args.character |> Option.exists (fun value -> value < 0) then
@@ -6161,9 +6659,52 @@ type internal FcsBridge
                     | Some message -> return Error(invalidArgs message)
                     | None ->
                         if kind = "position" then
-                            return! this.ResolveQueryAtPosition(args)
+                            try
+                                ensureCanStart "position resolution"
+
+                                let operation =
+                                    runFindPositionResolution
+                                        args
+                                        deadline.RemainingSemanticBudget
+                                        (fun () ->
+                                            this.ResolveQueryAtPosition(
+                                                args,
+                                                fun () -> ensureCanStart "position resolution"
+                                            ))
+
+                                let! result = awaitWithinDeadline "position resolution" true operation
+                                return result
+                            with
+                            | :? TimeoutException as ex ->
+                                return
+                                    Error(
+                                        incompleteBeforeDiscovery
+                                            "position_resolution"
+                                            "timed_out"
+                                            "find_timeout"
+                                            ex.Message
+                                    )
+                            | :? BoundedCheckWorkBusyException as ex ->
+                                return
+                                    Error(
+                                        incompleteBeforeDiscovery
+                                            "position_resolution"
+                                            "busy"
+                                            "fcs_worker_busy"
+                                            ex.Message
+                                    )
                         else
-                            return Ok query0
+                            if deadline.SemanticExpired then
+                                return
+                                    Error(
+                                        incompleteBeforeDiscovery
+                                            "admission"
+                                            "timed_out"
+                                            "find_timeout"
+                                            "The find end-to-end deadline was already exhausted."
+                                    )
+                            else
+                                return Ok query0
                 }
 
             match queryResult with
@@ -6172,16 +6713,65 @@ type internal FcsBridge
 
             let kindResolved = if kind = "position" then "symbol" else kind
 
-            // Resolve the sweep target: explicit projectPath (already falls back to the
-            // active set_project in Program.fs), else the nearest .fsproj to args.path.
-            let sweepTargetOpt =
+            // Resolve the sweep target inside the same deadline. The nearest-project
+            // filesystem walk is admitted single-flight work, never a synchronous prelude.
+            let explicitSweepTarget =
                 args.projectPath
                 |> Option.filter (String.IsNullOrWhiteSpace >> not)
                 |> Option.map normalizePath
-                |> Option.orElseWith (fun () -> args.path |> Option.bind findNearestFsproj |> Option.map normalizePath)
 
-            match sweepTargetOpt with
-            | None ->
+            let! sweepTargetResult =
+                task {
+                    match explicitSweepTarget with
+                    | Some target -> return Ok(Some target)
+                    | None ->
+                        match args.path |> Option.filter (String.IsNullOrWhiteSpace >> not) with
+                        | None -> return Ok None
+                        | Some path ->
+                            try
+                                ensureCanStart "nearest-project discovery"
+
+                                let operation =
+                                    runFindTargetDiscovery
+                                        "nearest-project"
+                                        path
+                                        deadline.RemainingSemanticBudget
+                                        (fun () ->
+                                            findNearestFsproj path
+                                            |> Option.map normalizePath
+                                            |> Option.toArray
+                                            |> FindTargetDiscoveryResult.Paths)
+
+                                let! discovered = awaitWithinDeadline "nearest-project discovery" true operation
+
+                                match discovered with
+                                | FindTargetDiscoveryResult.Paths paths -> return Ok(Array.tryHead paths)
+                                | FindTargetDiscoveryResult.Projects _ ->
+                                    return raise (InvalidOperationException("Unexpected find discovery result."))
+                            with
+                            | :? TimeoutException as ex ->
+                                return
+                                    Error(
+                                        incompleteBeforeDiscovery
+                                            "target_discovery"
+                                            "timed_out"
+                                            "find_timeout"
+                                            ex.Message
+                                    )
+                            | :? BoundedCheckWorkBusyException as ex ->
+                                return
+                                    Error(
+                                        incompleteBeforeDiscovery
+                                            "target_discovery"
+                                            "busy"
+                                            "fcs_worker_busy"
+                                            ex.Message
+                                    )
+                }
+
+            match sweepTargetResult with
+            | Error envelope -> return envelope
+            | Ok None ->
                 return
                     jobj
                         [ "status", jstr "invalid_args"
@@ -6189,9 +6779,52 @@ type internal FcsBridge
                           jstr
                               "find needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first." ]
                     :> JsonNode
-            | Some sweepTarget ->
+            | Ok(Some sweepTarget) ->
 
-            let projectDiscovery = SolutionParsing.discoverProjects sweepTarget
+            let! projectDiscoveryResult =
+                task {
+                    try
+                        ensureCanStart "project discovery"
+
+                        let operation =
+                            runFindTargetDiscovery
+                                "projects"
+                                sweepTarget
+                                deadline.RemainingSemanticBudget
+                                (fun () ->
+                                    SolutionParsing.discoverProjects sweepTarget
+                                    |> FindTargetDiscoveryResult.Projects)
+
+                        let! discovery = awaitWithinDeadline "project discovery" true operation
+
+                        match discovery with
+                        | FindTargetDiscoveryResult.Projects projects -> return Ok projects
+                        | FindTargetDiscoveryResult.Paths _ ->
+                            return raise (InvalidOperationException("Unexpected find discovery result."))
+                    with
+                    | :? TimeoutException as ex ->
+                        return
+                            Error(
+                                incompleteBeforeDiscovery
+                                    "target_discovery"
+                                    "timed_out"
+                                    "find_timeout"
+                                    ex.Message
+                            )
+                    | :? BoundedCheckWorkBusyException as ex ->
+                        return
+                            Error(
+                                incompleteBeforeDiscovery
+                                    "target_discovery"
+                                    "busy"
+                                    "fcs_worker_busy"
+                                    ex.Message
+                            )
+                }
+
+            match projectDiscoveryResult with
+            | Error envelope -> return envelope
+            | Ok projectDiscovery ->
 
             let memberProjects =
                 projectDiscovery |> Array.map SolutionParsing.projectPath
@@ -6221,6 +6854,66 @@ type internal FcsBridge
             // sweeps every member project of the solution.
             let mutable projectResolutionError = None
 
+            let mutable scopedProjectEarlyResponse: JsonNode option = None
+
+            let! scopedProject =
+                task {
+                    if
+                        (scope = "file" || scope = "project")
+                        && not (sweepTarget.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase))
+                    then
+                        match args.path |> Option.filter (String.IsNullOrWhiteSpace >> not) with
+                        | None -> return None
+                        | Some path ->
+                            try
+                                ensureCanStart "scoped-project discovery"
+
+                                let operation =
+                                    runFindTargetDiscovery
+                                        "scoped-project"
+                                        path
+                                        deadline.RemainingSemanticBudget
+                                        (fun () ->
+                                            findNearestFsproj path
+                                            |> Option.map normalizePath
+                                            |> Option.toArray
+                                            |> FindTargetDiscoveryResult.Paths)
+
+                                let! projects = awaitWithinDeadline "scoped-project discovery" true operation
+
+                                match projects with
+                                | FindTargetDiscoveryResult.Paths paths -> return Array.tryHead paths
+                                | FindTargetDiscoveryResult.Projects _ ->
+                                    return raise (InvalidOperationException("Unexpected find discovery result."))
+                            with
+                            | :? TimeoutException as ex ->
+                                scopedProjectEarlyResponse <-
+                                    Some(
+                                        incompleteBeforeDiscovery
+                                            "target_discovery"
+                                            "timed_out"
+                                            "find_timeout"
+                                            ex.Message
+                                    )
+
+                                return None
+                            | :? BoundedCheckWorkBusyException as ex ->
+                                scopedProjectEarlyResponse <-
+                                    Some(
+                                        incompleteBeforeDiscovery
+                                            "target_discovery"
+                                            "busy"
+                                            "fcs_worker_busy"
+                                            ex.Message
+                                    )
+
+                                return None
+                    elif sweepTarget.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
+                        return Some sweepTarget
+                    else
+                        return None
+                }
+
             let projectsToSweep =
                 match scope with
                 | "file"
@@ -6231,7 +6924,7 @@ type internal FcsBridge
                         if sweepTarget.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
                             Some sweepTarget
                         else
-                            args.path |> Option.bind findNearestFsproj
+                            scopedProject
 
                     match single with
                     | Some project when isMemberProject project -> [| normalizePath project |]
@@ -6265,11 +6958,14 @@ type internal FcsBridge
                             None)
 
             if projectsToSweep.Length = 0 && missingProjects.Length = 0 then
-                let message =
-                    projectResolutionError
-                    |> Option.defaultValue $"find could not resolve any .fsproj to sweep from: %s{sweepTarget}"
+                match scopedProjectEarlyResponse with
+                | Some envelope -> return envelope
+                | None ->
+                    let message =
+                        projectResolutionError
+                        |> Option.defaultValue $"find could not resolve any .fsproj to sweep from: %s{sweepTarget}"
 
-                return invalidArgs message
+                    return invalidArgs message
             else
 
             // ── Matching predicates (stable-string, cross-compilation-safe) ───────
@@ -6398,13 +7094,21 @@ type internal FcsBridge
             let mutable projectsFailed = 0
             let mutable projectsTimedOut = 0
             let mutable projectsBusy = 0
+            let mutable projectsNotStarted = 0
+            let mutable stopStartingProjects = false
             let projectsMissing = missingProjects.Length
 
             let coverageFailureSummary () =
+                let notStarted =
+                    if projectsNotStarted = 0 then
+                        ""
+                    else
+                        $", %d{projectsNotStarted} not started"
+
                 if projectsMissing = 0 then
-                    $"%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy"
+                    $"%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy%s{notStarted}"
                 else
-                    $"%d{projectsFailed} failed, %d{projectsMissing} missing, %d{projectsTimedOut} timed out, %d{projectsBusy} busy"
+                    $"%d{projectsFailed} failed, %d{projectsMissing} missing, %d{projectsTimedOut} timed out, %d{projectsBusy} busy%s{notStarted}"
 
             for missingProject in missingProjects do
                 let normalizedProject = normalizePath missingProject
@@ -6434,16 +7138,23 @@ type internal FcsBridge
                 let projDisplay = Path.GetFileNameWithoutExtension fsproj
 
                 try
-                    let remainingBeforeLoad = sweepBudgetMs - int sweepSw.ElapsedMilliseconds
+                    if stopStartingProjects || deadline.SemanticExpired then
+                        stopStartingProjects <- true
+                        raise FindProjectNotStartedException
 
-                    if remainingBeforeLoad <= 0 then
-                        raise (TimeoutException($"Overall find budget of %d{sweepBudgetMs}ms was exhausted."))
+                    ensureCanStart $"project-options resolution for '{projDisplay}'"
 
-                    let optionsTask = this.ResolveFsprojOptions(fsproj)
-                    observeFault optionsTask
+                    let optionsTask =
+                        this.ResolveFsprojOptionsActualWithinBudget(
+                            fsproj,
+                            deadline.RemainingSemanticBudget
+                        )
 
                     let! options, _ =
-                        optionsTask.WaitAsync(TimeSpan.FromMilliseconds(float remainingBeforeLoad))
+                        awaitWithinDeadline
+                            $"project-options resolution for '{projDisplay}'"
+                            true
+                            optionsTask
 
                     // issue #131/#168 P1-07: memoize the whole-symbol-use enumeration by
                     // the shared content-addressed analysis snapshot. A cache HIT skips BOTH
@@ -6455,14 +7166,25 @@ type internal FcsBridge
                     // own method (ProjectSweepUses) so this outer state machine stays
                     // statically compilable under Release optimization (a nested task CE
                     // inside the loop trips FS3511).
-                    let usesKey = analysisSnapshotKey options
-                    // #100: overall wall-clock budget across the whole sweep. Each project
-                    // gets whatever remains; once exhausted, `max 1` makes the next project's
-                    // type-check cancel almost immediately and land in the catch branch as a
-                    // timeout error entry — so a huge/cold solution returns partial instead of
-                    // blocking the caller forever.
-                    let remainingMs = max 1 (sweepBudgetMs - int sweepSw.ElapsedMilliseconds)
-                    let! allUses, projDiagnostics = this.ProjectSweepUses(usesKey, options, remainingMs)
+                    ensureCanStart $"snapshot computation for '{projDisplay}'"
+
+                    let snapshotTask =
+                        resolveAnalysisSnapshotKeyActual options deadline.RemainingSemanticBudget
+
+                    let! usesKey =
+                        awaitWithinDeadline
+                            $"snapshot computation for '{projDisplay}'"
+                            true
+                            snapshotTask
+
+                    commitAnalysisSnapshotKey options usesKey
+                    ensureCanStart $"FCS sweep for '{projDisplay}'"
+
+                    let sweepOperation = this.ProjectSweepUsesActual(usesKey, options)
+
+                    let! allUses, projDiagnostics =
+                        awaitWithinDeadline $"FCS sweep for '{projDisplay}'" true sweepOperation
+
                     aggregatedDiagnostics.AddRange(projDiagnostics)
 
                     // Per-file record-field form classifier (literal vs with-update).
@@ -6524,7 +7246,7 @@ type internal FcsBridge
                     let siteTypeDeadlineExpired () =
                         match findSiteTypeDeadlineExpiredOverride with
                         | Some hook -> hook ()
-                        | None -> int sweepSw.ElapsedMilliseconds >= sweepBudgetMs
+                        | None -> deadline.SemanticExpired
 
                     let resolveSiteType (symbolUse: FSharpSymbolUse) =
                         if not includeSiteTypes then
@@ -6583,21 +7305,46 @@ type internal FcsBridge
 
                     // Field/member sites first so their richer kind wins over a generic
                     // "reference" tag when a non-exact name-match overlaps the same range.
+                    let mutable classificationExpired = false
+
+                    let canClassifyNext () =
+                        if classificationExpired || deadline.SemanticExpired then
+                            classificationExpired <- true
+                            false
+                        else
+                            true
+
                     if wantField then
-                        for u in allUses do
+                        let mutable fieldIndex = 0
+
+                        while fieldIndex < allUses.Length && canClassifyNext () do
+                            let u = allUses[fieldIndex]
+
                             if not u.IsFromDefinition && isQueriedField u then
                                 fieldCount <- fieldCount + 1
                                 let siteType, typeStatus = resolveSiteType u
                                 add u (fieldKind u) true siteType typeStatus
 
+                            fieldIndex <- fieldIndex + 1
+
                     if wantMember then
-                        for u in allUses do
+                        let mutable memberIndex = 0
+
+                        while memberIndex < allUses.Length && canClassifyNext () do
+                            let u = allUses[memberIndex]
+
                             if not u.IsFromDefinition && isQueriedMember u then
                                 memberCount <- memberCount + 1
                                 add u "member-usage" true null null
 
+                            memberIndex <- memberIndex + 1
+
                     if wantName then
-                        for u in allUses do
+                        let mutable nameIndex = 0
+
+                        while nameIndex < allUses.Length && canClassifyNext () do
+                            let u = allUses[nameIndex]
+
                             if symbolMatches query exact u.Symbol then
                                 let passDefsOnly = (not wantDefsOnly) || u.IsFromDefinition
                                 let passDecl = wantDefsOnly || includeDeclaration || not u.IsFromDefinition
@@ -6606,6 +7353,17 @@ type internal FcsBridge
                                     nameCount <- nameCount + 1
                                     let k = if u.IsFromDefinition then "definition" else "reference"
                                     add u k false null null
+
+                            nameIndex <- nameIndex + 1
+
+                    if classificationExpired then
+                        deadline.MarkSemanticExpired()
+
+                        raise (
+                            TimeoutException(
+                                $"The find deadline was exhausted while classifying FCS sites for '{projDisplay}'."
+                            )
+                        )
 
                     projSw.Stop()
                     projectsAnalyzed <- projectsAnalyzed + 1
@@ -6624,8 +7382,29 @@ type internal FcsBridge
                     )
 
                     perProjectKeep.Add(nameCount > 0 || fieldCount > 0 || memberCount > 0)
-                with ex ->
+                with
+                | FindProjectNotStartedException ->
                     projSw.Stop()
+                    projectsNotStarted <- projectsNotStarted + 1
+
+                    perProject.Add(
+                        jobj
+                            [ "project", jstr projDisplay
+                              "fsproj", jstr (normalizePath fsproj)
+                              "status", jstr "not_started"
+                              "errorKind", jstr "deadline_not_started"
+                              "retryable", jbool true
+                              "error",
+                              jstr
+                                  "The end-to-end find deadline expired before this project started."
+                              "elapsedMs", jint 0 ]
+                        :> JsonNode
+                    )
+
+                    perProjectKeep.Add(true)
+                | ex ->
+                    projSw.Stop()
+                    cancellationToken.ThrowIfCancellationRequested()
 
                     let timedOut = findFailureIsTimeout ex
                     let busy = not timedOut && boundedCheckWorkFailureIsBusy ex
@@ -6639,6 +7418,7 @@ type internal FcsBridge
 
                     if timedOut then
                         projectsTimedOut <- projectsTimedOut + 1
+                        stopStartingProjects <- deadline.SemanticExpired
                     elif busy then
                         projectsBusy <- projectsBusy + 1
                     else
@@ -6744,22 +7524,38 @@ type internal FcsBridge
                 && projectsMissing = 0
                 && projectsTimedOut = 0
                 && projectsBusy = 0
+                && projectsNotStarted = 0
 
             // HEADLINE: a positive site is always useful, but absence is conclusive
             // only when every requested FCS project completed. FSAC outcomes remain
             // typed so not-ready/mismatch/failure cannot masquerade as zero hits.
             let fcsMatched = totalSites > 0
 
+            let mutable fsacFallbackTimedOut = false
+
             let! fsacProbeResult =
                 task {
                     if fcsMatched then
                         return FindFsacProbeResult.Unavailable "not_needed"
+                    elif deadline.SemanticExpired then
+                        fsacFallbackTimedOut <- true
+
+                        return
+                            FindFsacProbeResult.Unavailable
+                                "The end-to-end find deadline expired before the zero-hit FSAC fallback started."
                     else
                         match fsacProbe with
                         | Some probe ->
                             try
-                                return! probe query
-                            with ex ->
+                                ensureCanStart "the zero-hit FSAC fallback"
+                                let operation = probe query
+                                return! awaitWithinDeadline "the zero-hit FSAC fallback" false operation
+                            with
+                            | :? TimeoutException as ex ->
+                                fsacFallbackTimedOut <- true
+                                return FindFsacProbeResult.Unavailable ex.Message
+                            | ex ->
+                                cancellationToken.ThrowIfCancellationRequested()
                                 return FindFsacProbeResult.Failed ex.Message
                         | None ->
                             return FindFsacProbeResult.Unavailable "No FSAC probe was supplied."
@@ -6773,13 +7569,17 @@ type internal FcsBridge
                 | FindFsacProbeResult.NotReady reason -> 0, "not_ready", Some reason
                 | FindFsacProbeResult.ContextMismatch reason -> 0, "context_mismatch", Some reason
                 | FindFsacProbeResult.Failed reason -> 0, "failed", Some reason
+                | _ when fsacFallbackTimedOut ->
+                    0,
+                    "timed_out",
+                    Some "The zero-hit FSAC fallback did not complete inside find's shared deadline."
                 | FindFsacProbeResult.Unavailable "not_needed" -> 0, "not_needed", None
                 | FindFsacProbeResult.Unavailable reason -> 0, "unavailable", Some reason
 
             let matched: bool option =
                 if fcsMatched || fsacHits > 0 then
                     Some true
-                elif coverageComplete then
+                elif coverageComplete && not fsacFallbackTimedOut then
                     Some false
                 else
                     None
@@ -6791,7 +7591,7 @@ type internal FcsBridge
                 | None -> "indeterminate"
 
             let responseStatus =
-                if coverageComplete then
+                if coverageComplete && not fsacFallbackTimedOut then
                     "succeeded"
                 elif matched = Some true then
                     "partial"
@@ -6801,6 +7601,7 @@ type internal FcsBridge
             let via =
                 if fcsMatched then "fcs-multiproject-sweep"
                 elif fsacHits > 0 then "fsac-symbol-index"
+                elif fsacFallbackTimedOut then "incomplete-fsac-fallback"
                 elif coverageComplete then "none"
                 else "incomplete-fcs-sweep"
 
@@ -6812,19 +7613,56 @@ type internal FcsBridge
                     Some
                         $"Matches were found, but only %d{projectsAnalyzed}/%d{projectsRequested} requested project(s) were analyzed; the result set may be incomplete."
                 | "unknown" ->
-                    Some
-                        $"Cannot confirm absence: only %d{projectsAnalyzed}/%d{projectsRequested} requested project(s) were analyzed (%s{failureSummary})."
+                    if fsacFallbackTimedOut then
+                        Some
+                            "Cannot confirm absence: the FCS sweep returned zero sites, but the zero-hit FSAC fallback did not complete inside the shared deadline."
+                    else
+                        Some
+                            $"Cannot confirm absence: only %d{projectsAnalyzed}/%d{projectsRequested} requested project(s) were analyzed (%s{failureSummary})."
                 | _ -> None
 
-            let pageSites =
-                sortedSites |> Array.skip (min pageOffset totalSites) |> Array.truncate pageSize
+            // Semantic work stops before the overall deadline and leaves a fixed,
+            // documented allowance for this phase. A test-only asynchronous seam can
+            // deterministically occupy that allowance; production construction remains
+            // synchronous and checks the monotonic response deadline between bounded rows.
+            deadline.BeginResponseConstruction()
+            let mutable responseConstructionTimedOut = deadline.ResponseExpired
 
-            // Project coverage and response delivery are separate dimensions. A complete
-            // sweep can still return only one cursor page; in that case the caller has not
-            // received the complete site set yet. Cursor pages after the first also omit
-            // earlier sites even when `truncated=false` on the final page.
-            let resolutionComplete =
-                coverageComplete && pageOffset = 0 && pageSites.Length = totalSites
+            match findResponseConstructionBeforeStartOverride with
+            | Some beforeStart when not responseConstructionTimedOut ->
+                let operation = beforeStart ()
+                observeFault operation
+                let remaining = deadline.RemainingResponseBudget()
+
+                if remaining <= TimeSpan.Zero then
+                    responseConstructionTimedOut <- true
+                else
+                    use responseWaitCancellation =
+                        CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+
+                    let contenders =
+                        match deadline.ResponseExpirySignal with
+                        | Some signal -> [| operation; Task.Delay(remaining, responseWaitCancellation.Token); signal |]
+                        | None -> [| operation; Task.Delay(remaining, responseWaitCancellation.Token) |]
+
+                    let! winner =
+                        Task.WhenAny(contenders)
+
+                    responseWaitCancellation.Cancel()
+
+                    if Object.ReferenceEquals(winner, operation) then
+                        do! operation
+                        responseConstructionTimedOut <- deadline.ResponseExpired
+                    else
+                        cancellationToken.ThrowIfCancellationRequested()
+                        responseConstructionTimedOut <- true
+            | _ -> ()
+
+            let requestedPageSites =
+                if responseConstructionTimedOut then
+                    [||]
+                else
+                    sortedSites |> Array.skip (min pageOffset totalSites) |> Array.truncate pageSize
 
             let lineContextCache = System.Collections.Generic.Dictionary<string, string array>()
 
@@ -6909,20 +7747,56 @@ type internal FcsBridge
             // counts. The grouped definitions/references/fieldSites/memberSites buckets
             // were dropped — they re-emitted every site a second time and doubled the
             // payload (the reason the default page cap had been forced down to 40).
-            let siteNodes = pageSites |> Array.map siteToJson
+            let siteNodeBuffer = ResizeArray<JsonNode>()
+            let mutable responseSiteIndex = 0
+
+            while
+                responseSiteIndex < requestedPageSites.Length
+                && not responseConstructionTimedOut
+                do
+                if deadline.ResponseExpired then
+                    responseConstructionTimedOut <- true
+                else
+                    siteNodeBuffer.Add(siteToJson requestedPageSites[responseSiteIndex])
+                    responseSiteIndex <- responseSiteIndex + 1
+
+            if deadline.ResponseExpired then
+                responseConstructionTimedOut <- true
+
+            let pageSites = requestedPageSites |> Array.truncate siteNodeBuffer.Count
+            let siteNodes = siteNodeBuffer.ToArray()
+
+            // Project coverage and response delivery are separate dimensions. A complete
+            // sweep can still return only one cursor page; in that case the caller has not
+            // received the complete site set yet. Cursor pages after the first also omit
+            // earlier sites even when `truncated=false` on the final page.
+            let mutable resolutionComplete =
+                coverageComplete
+                && not fsacFallbackTimedOut
+                && not responseConstructionTimedOut
+                && pageOffset = 0
+                && pageSites.Length = totalSites
 
             // Aggregated diagnostics across swept projects: Error always (so callers can
             // detect broken projects even on zero hits), Warning/Info gated by includeInfo.
             let diagNodes =
-                aggregatedDiagnostics.ToArray()
-                |> Array.filter (fun d ->
-                    d.Severity = FSharpDiagnosticSeverity.Error
-                    || (includeInfo
-                        && (d.Severity = FSharpDiagnosticSeverity.Warning
-                            || d.Severity = FSharpDiagnosticSeverity.Hidden
-                            || d.Severity = FSharpDiagnosticSeverity.Info)))
-                |> Array.truncate 200
-                |> Array.map diagnosticToJson
+                if responseConstructionTimedOut || deadline.ResponseExpired then
+                    responseConstructionTimedOut <- true
+                    [||]
+                else
+                    aggregatedDiagnostics.ToArray()
+                    |> Array.filter (fun d ->
+                        d.Severity = FSharpDiagnosticSeverity.Error
+                        || (includeInfo
+                            && (d.Severity = FSharpDiagnosticSeverity.Warning
+                                || d.Severity = FSharpDiagnosticSeverity.Hidden
+                                || d.Severity = FSharpDiagnosticSeverity.Info)))
+                    |> Array.truncate 200
+                    |> Array.map diagnosticToJson
+
+            if deadline.ResponseExpired then
+                responseConstructionTimedOut <- true
+                resolutionComplete <- false
 
             let scopeResolved =
                 if projectsSwept <= 1 then
@@ -6936,6 +7810,42 @@ type internal FcsBridge
                 | None -> null
 
             let coverage =
+                let projectSweepStatus =
+                    if coverageComplete then
+                        "complete"
+                    elif projectsTimedOut > 0 && deadline.SemanticExpired then
+                        "timed_out"
+                    else
+                        "partial"
+
+                let fsacFallbackPhaseStatus =
+                    if fcsMatched then
+                        "not_needed"
+                    elif fsacFallbackTimedOut then
+                        "timed_out"
+                    else
+                        "complete"
+
+                let phases =
+                    JsonArray(
+                        [| jobj
+                               [ "phase", jstr "position_resolution"
+                                 "status", jstr (if kind = "position" then "complete" else "not_needed") ]
+                           :> JsonNode
+                           jobj [ "phase", jstr "target_discovery"; "status", jstr "complete" ] :> JsonNode
+                           jobj [ "phase", jstr "project_sweep"; "status", jstr projectSweepStatus ] :> JsonNode
+                           jobj
+                               [ "phase", jstr "fsac_fallback"
+                                 "status", jstr fsacFallbackPhaseStatus ]
+                           :> JsonNode
+                           jobj
+                               [ "phase", jstr "response_construction"
+                                 "status",
+                                 jstr (if responseConstructionTimedOut then "timed_out" else "complete") ]
+                           :> JsonNode |]
+                    )
+                    :> JsonNode
+
                 jobj
                     [ "complete", jbool coverageComplete
                       "projectsRequested", jint projectsRequested
@@ -6943,7 +7853,9 @@ type internal FcsBridge
                       "projectsFailed", jint projectsFailed
                       "projectsMissing", jint projectsMissing
                       "projectsTimedOut", jint projectsTimedOut
-                      "projectsBusy", jint projectsBusy ]
+                      "projectsBusy", jint projectsBusy
+                      "projectsNotStarted", jint projectsNotStarted
+                      "phases", phases ]
                 :> JsonNode
 
             let resolution =
@@ -6960,6 +7872,7 @@ type internal FcsBridge
                       "projectsMissing", jint projectsMissing
                       "projectsTimedOut", jint projectsTimedOut
                       "projectsBusy", jint projectsBusy
+                      "projectsNotStarted", jint projectsNotStarted
                       "via", jstr via
                       "fcsSiteCount", jint totalSites
                       "fsacFallbackHits", jint fsacHits
@@ -6988,7 +7901,7 @@ type internal FcsBridge
             // equal `fieldSites`, so a caller can tell "every site carries its type" from
             // "some rows are blank" without diffing the sites array.
             let siteTypesFields =
-                if not includeSiteTypes then
+                if responseConstructionTimedOut || not includeSiteTypes then
                     []
                 else
                     let summary =
@@ -7054,7 +7967,19 @@ type internal FcsBridge
                     [ ("siteTypes", summary); ("siteTypesNote", jstr note) ]
 
             let paginationFields =
-                Cursor.paginationFields "sites" totalSites pageOffset pageSize pageSites.Length
+                let fields =
+                    Cursor.paginationFields "sites" totalSites pageOffset pageSize pageSites.Length
+
+                if responseConstructionTimedOut then
+                    fields
+                    |> List.filter (fun (name, _) -> name <> "truncated" && name <> "nextCursor")
+                    |> fun kept ->
+                        kept
+                        @ [ "truncated", jbool true
+                            "nextCursor", null
+                            "paginationRestartRequired", jbool true ]
+                else
+                    fields
 
             // F5 (#100): drop per-project entries that matched nothing and didn't error —
             // on a large solution they are one-noise-line-per-project that dwarfs a small
@@ -7065,7 +7990,9 @@ type internal FcsBridge
                 | _ -> false
 
             let perProjectField =
-                if includePerProject then
+                if responseConstructionTimedOut then
+                    []
+                elif includePerProject then
                     let kept =
                         Seq.zip perProject perProjectKeep
                         |> Seq.choose (fun (node, keep) -> if keep then Some node else None)
@@ -7098,9 +8025,22 @@ type internal FcsBridge
                     []
 
             let completenessFields =
-                completenessMessage
-                |> Option.map (fun message -> [ ("message", jstr message) ])
-                |> Option.defaultValue []
+                if responseConstructionTimedOut then
+                    [ ("errorKind", jstr "find_response_timeout")
+                      ("message",
+                       jstr
+                           "Semantic analysis completed, but find's reserved response-construction allowance expired; retry after narrowing maxResults/contextLines.") ]
+                elif projectsTimedOut > 0 || projectsNotStarted > 0 || fsacFallbackTimedOut then
+                    [ ("errorKind", jstr "find_timeout")
+                      ("message",
+                       completenessMessage
+                       |> Option.defaultValue
+                           "The end-to-end find deadline expired before all semantic work completed."
+                       |> jstr) ]
+                else
+                    completenessMessage
+                    |> Option.map (fun message -> [ ("message", jstr message) ])
+                    |> Option.defaultValue []
 
             // #193: a top-level (never buried in perProject) recall-vs-speed guardrail on
             // every response, naming the ACTUAL sweep outcome rather than the requested
@@ -7124,9 +8064,8 @@ type internal FcsBridge
             // wording. Separately, scope='file' has a SECOND blind spot beyond siblings:
             // the one project that IS swept has its sites additionally post-filtered to a
             // single file (see `allSites` above), so the single-project note names that too.
-            let scopeNoteField =
+            let buildScopeNoteField () =
                 let failureSummary = coverageFailureSummary ()
-
                 let widenRecipe =
                     "To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'."
 
@@ -7169,8 +8108,20 @@ type internal FcsBridge
 
                     [ ("scopeNote", jstr text) ]
 
+            let scopeNoteField =
+                if responseConstructionTimedOut then [] else buildScopeNoteField ()
+
+            let finalResponseStatus =
+                if responseConstructionTimedOut then
+                    if matched = Some true then "partial" else "unknown"
+                else
+                    responseStatus
+
             let baseFields =
-                [ "status", jstr responseStatus
+                [ "status", jstr finalResponseStatus
+                  "timeoutMs", jint deadline.TimeoutMs
+                  "responseConstructionAllowanceMs", jint deadline.ResponseAllowanceMs
+                  "elapsedMs", jint deadline.ElapsedMilliseconds
                   "outcome", jstr outcome
                   "query", jstr query
                   "kind", jstr kind
@@ -7186,10 +8137,12 @@ type internal FcsBridge
                   "projectsMissing", jint projectsMissing
                   "projectsTimedOut", jint projectsTimedOut
                   "projectsBusy", jint projectsBusy
+                  "projectsNotStarted", jint projectsNotStarted
                   "totalSites", jint totalSites
                   "matchedUseCount", jint totalSites
                   "breakdown", breakdown
-                  "sites", JsonArray(siteNodes) :> JsonNode ]
+                  "sites", JsonArray(siteNodes) :> JsonNode
+                  "resultSetComplete", jbool resolutionComplete ]
                 @ completenessFields
                 @ perProjectField
                 @ [ "sweepElapsedMs", jint (int sweepSw.ElapsedMilliseconds)
@@ -7200,6 +8153,43 @@ type internal FcsBridge
 
             return jobj (baseFields @ paginationFields) :> JsonNode
         }
+
+    member this.Find(args: FindArgs, ?fsacProbe: string -> Task<FindFsacProbeResult>) : Task<JsonNode> =
+        let timeoutMs = args.timeoutMs |> Option.defaultValue 120_000
+
+        if timeoutMs < 0 then
+            // Keep argument validation in the shared core; the deadline itself accepts
+            // only a non-negative duration.
+            let deadline = FindRequestDeadline(0)
+
+            this.FindWithinDeadline(
+                args,
+                deadline,
+                CancellationToken.None,
+                ignore,
+                fsacProbe
+            )
+        else
+            let expirySignal = findDeadlineSignalOverride |> Option.map (fun signal -> signal ())
+
+            let responseExpirySignal =
+                findResponseDeadlineSignalOverride
+                |> Option.map (fun signal -> signal ())
+
+            let deadline =
+                FindRequestDeadline(
+                    timeoutMs,
+                    ?semanticExpirySignal = expirySignal,
+                    ?responseExpirySignal = responseExpirySignal
+                )
+
+            this.FindWithinDeadline(
+                args,
+                deadline,
+                CancellationToken.None,
+                ignore,
+                fsacProbe
+            )
 
     // ── fcs_tests_for_symbol (#60): the test-coverage slice of `find` ───────────
     // Reuses the multi-project sweep machinery, but keeps ONLY the test projects of the
@@ -12422,6 +13412,16 @@ type internal FcsBridge
         | _ -> None
 
     member _.CheckProjectDiscoveryFallbackCount = Volatile.Read(&checkProjectDiscoveryFallbackCount)
+    member _.FindPositionResolutionActiveCount = findPositionResolutionAdmission.ActiveCount
+    member _.FindPositionResolutionStartedCount = findPositionResolutionAdmission.StartedCount
+    member _.FindPositionResolutionRejectedCount = findPositionResolutionAdmission.RejectedCount
+    member _.FindPositionResolutionInFlightCount = findPositionResolutionsInFlight.Count
+    member _.FindPositionResolutionComputeCount = Volatile.Read(&findPositionResolutionComputeCount)
+    member _.FindTargetDiscoveryActiveCount = findTargetDiscoveryAdmission.ActiveCount
+    member _.FindTargetDiscoveryStartedCount = findTargetDiscoveryAdmission.StartedCount
+    member _.FindTargetDiscoveryRejectedCount = findTargetDiscoveryAdmission.RejectedCount
+    member _.FindTargetDiscoveryInFlightCount = findTargetDiscoveriesInFlight.Count
+    member _.FindTargetDiscoveryComputeCount = Volatile.Read(&findTargetDiscoveryComputeCount)
 
     /// Pure deterministic seam for verifying collision-free discovery key framing.
     member _.CheckDiscoveryKeyForTest(scope: string, target: string, path: string option) =

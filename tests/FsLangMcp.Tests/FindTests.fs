@@ -883,7 +883,7 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
         }
 
     [<Fact>]
-    member _.``#207: an empty typed result on an incomplete sweep blames coverage, not the caller's kind``() : Task =
+    member _.``#207: an already-expired typed find blames the deadline not the caller's kind``() : Task =
         task {
             Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
             let bridge = FcsBridge()
@@ -901,10 +901,12 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                 )
 
             Assert.Equal("unknown", gs find "status")
-            Assert.Equal(0, gi find["siteTypes"] "fieldSites")
+            Assert.Equal("find_timeout", gs find "errorKind")
+            Assert.Null(find["siteTypes"])
+            Assert.Null(find["siteTypesNote"])
 
-            let note = gs find "siteTypesNote"
-            Assert.Contains("sweep is incomplete", note)
+            let note = gs find "scopeNote"
+            Assert.Contains("timed out during admission", note)
             Assert.Contains("timeoutMs", note)
             Assert.DoesNotContain("Use kind='field'", note)
         }
@@ -1169,9 +1171,13 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
 
                 Assert.Equal("unknown", gs result "status")
                 Assert.Equal(1, gi result "projectsRequested")
+                Assert.Equal(0, gi result "projectsSwept")
+                Assert.Equal(0, gi result "projectsMissing")
+                Assert.Equal(1, gi result "projectsNotStarted")
                 let perProject = result["perProject"].AsArray()
                 Assert.Single(perProject) |> ignore
                 Assert.Equal(Path.GetFullPath(fx.DomainFsproj), gs perProject[0] "fsproj")
+                Assert.Equal("not_started", gs perProject[0] "status")
                 Assert.False(
                     String.Equals(
                         Path.GetFullPath(outsideProject),
@@ -1180,14 +1186,8 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                     )
                 )
 
-                // #193 round 2: this is scope='file' AND incomplete coverage at once — the
-                // note must combine both honestly: it cannot claim the project was "swept"
-                // (it timed out), and it must still name the file-level filter, not just the
-                // sibling-project blind spot.
-                Assert.Equal(
-                    $"find could not fully analyze this project (0 failed, 1 timed out, 0 busy) — this response is incomplete; see coverage/message before trusting an absence of matches. Sites, where present, are also filtered to '{Path.GetFullPath(outsideSource)}'; other files in this project, and all sibling projects, are not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.",
-                    gs result "scopeNote"
-                )
+                Assert.Contains("timed out during admission", gs result "scopeNote")
+                Assert.Contains("no later semantic phase was started", gs result "scopeNote")
             finally
                 if Directory.Exists outsideRoot then
                     Directory.Delete(outsideRoot, true)
@@ -1374,7 +1374,7 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
         }
 
     [<Fact>]
-    member _.``#193 round 2: a single-project sweep with incomplete coverage and no file filter combines both honestly``
+    member _.``#193 round 2: an expired single-project request reports the project as not started``
         ()
         : Task =
         task {
@@ -1396,15 +1396,18 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
 
             Assert.Equal("unknown", gs find "status")
             Assert.Equal(1, gi find "projectsRequested")
+            Assert.Equal(0, gi find "projectsSwept")
+            Assert.Equal(0, gi find "projectsMissing")
             Assert.Equal(0, gi find "projectsAnalyzed")
             Assert.Equal(0, gi find "projectsFailed")
-            Assert.Equal(1, gi find "projectsTimedOut")
+            Assert.Equal(0, gi find "projectsTimedOut")
             Assert.Equal(0, gi find "projectsBusy")
+            Assert.Equal(1, gi find "projectsNotStarted")
 
-            Assert.Equal(
-                "find could not fully analyze this project (0 failed, 1 timed out, 0 busy) — this response is incomplete; see coverage/message before trusting an absence of matches. Cross-project usages in sibling projects are also not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.",
-                gs find "scopeNote"
-            )
+            let perProject = find["perProject"].AsArray()
+            Assert.Single(perProject) |> ignore
+            Assert.Equal("not_started", gs perProject[0] "status")
+            Assert.Contains("timed out during admission", gs find "scopeNote")
         }
 
     [<Fact>]
@@ -1607,7 +1610,7 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
         }
 
     [<Fact>]
-    member _.``P1-01 exhausted find budget classifies every skipped project as timed out``() : Task =
+    member _.``P1-01 exhausted find budget skips discovery and all later work``() : Task =
         task {
             Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
             let bridge = FcsBridge()
@@ -1621,28 +1624,28 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                 )
 
             Assert.Equal("unknown", gs result "status")
+            Assert.Equal("find_timeout", gs result "errorKind")
             Assert.Equal("indeterminate", gs result "outcome")
             Assert.Null(result["resolution"]["matched"])
-            Assert.Equal(3, gi result "projectsRequested")
+            Assert.Equal(0, gi result "projectsRequested")
+            Assert.Equal(0, gi result "projectsSwept")
+            Assert.Equal(0, gi result "projectsMissing")
             Assert.Equal(0, gi result "projectsAnalyzed")
             Assert.Equal(0, gi result "projectsFailed")
-            Assert.Equal(3, gi result "projectsTimedOut")
+            Assert.Equal(0, gi result "projectsTimedOut")
             Assert.Equal(0, gi result "projectsBusy")
+            Assert.Equal(0, gi result "projectsNotStarted")
+            Assert.Equal(0L, bridge.FindTargetDiscoveryStartedCount)
+            Assert.Equal(0L, bridge.ProjectOptionsLoadCount)
+            Assert.Equal(0L, bridge.ProjectUsesStartedCount)
 
-            let perProject = result["perProject"].AsArray()
-            Assert.Equal(3, perProject.Count)
+            let perProject = (result["perProject"]).AsArray()
+            Assert.Empty(perProject)
 
-            for project in perProject do
-                Assert.Equal("timed_out", gs project "status")
-                Assert.Equal("timeout", gs project "errorKind")
-
-            // #193 round 2: this response's coverage is INCOMPLETE (0 of 3 analyzed) —
-            // scopeNote must say so honestly ("analyzed 0 of 3") rather than claiming
-            // "find swept 3 member projects", which would overstate work that never ran.
-            Assert.Equal(
-                $"find analyzed 0 of 3 member projects of '{Path.GetFullPath(fx.Slnx)}' (0 failed, 3 timed out, 0 busy) — this response is incomplete; see coverage/message before trusting an absence of matches. To narrow to just one project (faster, but misses cross-project usages), pass its .fsproj as projectPath.",
-                gs result "scopeNote"
-            )
+            let phases = (result["coverage"]["phases"]).AsArray()
+            Assert.Equal("timed_out", gs (phases[0]) "status")
+            Assert.Equal("not_started", gs (phases[2]) "status")
+            Assert.Contains("no later semantic phase was started", gs result "scopeNote")
         }
 
     [<Fact>]
