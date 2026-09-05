@@ -26,6 +26,7 @@
     <Compile Include="FcsBridgeTests.fs" />
     <Compile Include="OutlinePaginationTests.fs" />
     <Compile Include="CursorPropertyTests.fs" />
+    <Compile Include="FindCursorV2Tests.fs" />
     <Compile Include="OutlineE2ETests.fs" />
     <Compile Include="SymbolPaginationTests.fs" />
     <Compile Include="ToolDescriptionSchemaTests.fs" />
