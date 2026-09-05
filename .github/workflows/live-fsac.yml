@@ -273,6 +273,22 @@ jobs:
       - name: Prove real project reloads reclaim MSBuild threads
         run: python scripts/project-evaluation-soak.py --tool-path "${{ runner.temp }}/fslangmcp-runtime-tools" --server "${{ env.FSLANGMCP_LIVE_SERVER }}" --iterations 12
 
+      # The installed-package soak proves the successful path. Exercise failure,
+      # cancellation, required startup authorization and descendant drainage on
+      # each real OS as well, especially Windows job attachment/query behavior.
+      - name: Test contained project-evaluation lifecycle on this OS (#150)
+        shell: pwsh
+        run: |
+          dotnet restore tests/FsLangMcp.Tests/FsLangMcp.Tests.fsproj --locked-mode
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not restore the contained-lifecycle tests."
+          }
+          dotnet test tests/FsLangMcp.Tests/FsLangMcp.Tests.fsproj `
+            --configuration Release `
+            --no-restore `
+            --filter "FullyQualifiedName~ProcessRunnerTests|FullyQualifiedName~ProjectEvaluationTests" `
+            -- RunConfiguration.TreatNoTestsAsError=true
+
       # The xunit suite otherwise runs on ubuntu only (ci.yml, publish.yml), so nothing
       # exercised the NuGet packageId -> assembly map against REAL Windows paths: the
       # `%USERPROFILE%\.nuget\packages` root and backslash-separated `-r:` options. This runs
