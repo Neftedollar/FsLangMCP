@@ -315,8 +315,7 @@ let ``generic project evaluation failure stays distinct from sdk_not_found`` () 
             Directory.Delete(root, true)
     }
 
-[<Fact>]
-let ``auto scope discovery obeys the overall timeout before options start`` () : Task =
+let private runAutoScopeDiscoveryDeadlineTest () : Task =
     task {
         let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_scope_deadline_{Guid.NewGuid():N}")
         let discoveryStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -360,6 +359,15 @@ let ``auto scope discovery obeys the overall timeout before options start`` () :
             Assert.Equal(1, bridge.CheckTargetDiscoveryActiveCount)
             Assert.Equal(1, bridge.CheckTargetDiscoveryInFlightCount)
 
+            let discoveryCompletion =
+                bridge.TryGetCheckTargetDiscoveryCompletionForTest("auto-scope", root, None)
+                |> Option.defaultWith (fun () -> failwith "The auto-scope discovery worker was not observable.")
+
+            Assert.False(
+                discoveryCompletion.IsCompleted,
+                "The caller deadline must not masquerade as discovery-worker completion."
+            )
+
             // An exact-key retry must share the still-running scan rather than start
             // another abandoned directory walk.
             let! sameTarget =
@@ -401,13 +409,10 @@ let ``auto scope discovery obeys the overall timeout before options start`` () :
 
             releaseDiscovery.TrySetResult(()) |> ignore
 
-            let settle = Stopwatch.StartNew()
-            let discoveryStillRunning () =
-                bridge.CheckTargetDiscoveryActiveCount <> 0
-                || bridge.CheckTargetDiscoveryInFlightCount <> 0
-
-            while discoveryStillRunning () && settle.Elapsed < TimeSpan.FromSeconds(5.0) do
-                do! Task.Delay(10)
+            try
+                do! discoveryCompletion.WaitAsync(TimeSpan.FromSeconds(5.0))
+            with :? TimeoutException when discoveryCompletion.IsCompleted ->
+                ()
 
             Assert.Equal(0, bridge.CheckTargetDiscoveryActiveCount)
             Assert.Equal(0, bridge.CheckTargetDiscoveryInFlightCount)
@@ -600,6 +605,12 @@ let ``trusted workspace overall timeout skips later project loaders`` () : Task 
 
 [<CollectionDefinition("FsLangMcp check worker isolation", DisableParallelization = true)>]
 type CheckWorkerIsolationCollection() = class end
+
+[<Collection("FsLangMcp check worker isolation")>]
+type CheckAutoScopeDiscoveryTests() =
+    [<Fact>]
+    member _.``auto scope discovery obeys the overall timeout before options start``() : Task =
+        runAutoScopeDiscoveryDeadlineTest ()
 
 // Several tests deliberately hold and release the process-wide FCS admission
 // gates. Running unrelated FCS fixtures beside them turns scheduler pressure
