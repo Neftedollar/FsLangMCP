@@ -4006,6 +4006,53 @@ type internal FcsBridge
               "before", JsonArray(before) :> JsonNode
               "after", JsonArray(after) :> JsonNode ]
 
+    let isDoubleBacktickIdentifier (value: string) =
+        not (isNull value)
+        && value.Length > 4
+        && value.StartsWith("``", StringComparison.Ordinal)
+        && value.EndsWith("``", StringComparison.Ordinal)
+
+    /// Return the length of the query suffix that spells this FCS source name.
+    /// FCS preserves double backticks in DisplayName, while callers naturally ask
+    /// for both the plain name and its double-backtick-delimited spelling. Compare
+    /// only the semantic identifier suffix; never scan source text or strip interior quotes.
+    let trySourceIdentifierSuffixLength comparison (sourceName: string) (query: string) =
+        if isNull sourceName || isNull query then
+            None
+        elif query.EndsWith(sourceName, comparison) then
+            Some sourceName.Length
+        elif isDoubleBacktickIdentifier sourceName then
+            let contentLength = sourceName.Length - 4
+
+            if
+                query.Length >= contentLength
+                && String.Compare(
+                    query,
+                    query.Length - contentLength,
+                    sourceName,
+                    2,
+                    contentLength,
+                    comparison
+                ) = 0
+            then
+                Some contentLength
+            else
+                None
+        else
+            let quotedLength = sourceName.Length + 4
+            let quotedStart = query.Length - quotedLength
+
+            if
+                quotedStart >= 0
+                && query[quotedStart] = '`'
+                && query[quotedStart + 1] = '`'
+                && query.EndsWith("``", StringComparison.Ordinal)
+                && String.Compare(query, quotedStart + 2, sourceName, 0, sourceName.Length, comparison) = 0
+            then
+                Some quotedLength
+            else
+                None
+
     let symbolMatches query exact (symbol: FSharpSymbol) =
         let displayName = symbol.DisplayName
         let fullName = symbol.FullName
@@ -4022,16 +4069,57 @@ type internal FcsBridge
             && fullName.Length > query.Length
             && fullName[fullName.Length - query.Length - 1] = '.'
 
+        // #267: GetAllUsesOfAllSymbols returns backtick-bound values and test methods
+        // with the delimiters in DisplayName/FullName. Match quoted and unquoted query
+        // spellings against that FCS identity, including a module-qualified final name.
+        // Qualifiers remain exact dot-delimited suffixes, so a punctuation near-miss
+        // cannot become a hit and duplicate source names continue to return every site.
+        let sourceNameMatch comparison =
+            match trySourceIdentifierSuffixLength comparison displayName query with
+            | None -> false
+            | Some suffixLength when suffixLength = query.Length -> true
+            | Some suffixLength when isNull fullName -> false
+            | Some suffixLength ->
+                let querySeparator = query.Length - suffixLength - 1
+                let fullDisplayStart = fullName.Length - displayName.Length
+
+                if
+                    querySeparator < 0
+                    || query[querySeparator] <> '.'
+                    || fullDisplayStart <= 0
+                    || not (fullName.EndsWith(displayName, StringComparison.Ordinal))
+                    || fullName[fullDisplayStart - 1] <> '.'
+                then
+                    false
+                else
+                    let queryQualifierLength = querySeparator
+                    let fullQualifierLength = fullDisplayStart - 1
+
+                    (fullQualifierLength = queryQualifierLength
+                     && String.Compare(fullName, 0, query, 0, queryQualifierLength, comparison) = 0)
+                    || (fullQualifierLength > queryQualifierLength
+                        && fullName[fullQualifierLength - queryQualifierLength - 1] = '.'
+                        && String.Compare(
+                            fullName,
+                            fullQualifierLength - queryQualifierLength,
+                            query,
+                            0,
+                            queryQualifierLength,
+                            comparison
+                        ) = 0)
+
         if exact then
             String.Equals(displayName, query, StringComparison.Ordinal)
             || String.Equals(fullName, query, StringComparison.Ordinal)
             || dottedSuffixMatch ()
+            || sourceNameMatch StringComparison.Ordinal
         else
             displayName.Contains(query, StringComparison.OrdinalIgnoreCase)
             || (if isNull fullName then
                     false
                 else
                     fullName.Contains(query, StringComparison.OrdinalIgnoreCase))
+            || sourceNameMatch StringComparison.OrdinalIgnoreCase
 
     let isIdentifierChar (ch: char) =
         Char.IsLetterOrDigit(ch) || ch = '_' || ch = '\'' || ch = '`'
