@@ -337,6 +337,9 @@ let private classifyFile (workspaceRoot: string) (options: ScanFilterOptions) (f
     // trailing separators; trimming a root turns it into an empty/drive-relative path.
     let fullWorkspaceRoot = Path.GetFullPath(workspaceRoot)
     let fullPath = Path.GetFullPath(path)
+    // Only callers that explicitly opt into project-model linked inputs may
+    // cross the workspace boundary. Directory/review scans keep this flag off.
+    let externalLinkedFileAllowed = options.IncludeExternalLinkedFiles && file.Link.IsSome
 
     if not (isFsFile path) then Some UnsupportedExtension
     elif hasSegment ".git" path then Some GitDirectory
@@ -357,7 +360,7 @@ let private classifyFile (workspaceRoot: string) (options: ScanFilterOptions) (f
         if options.IncludeObjBin then None else Some ObjOrBinDirectory
     elif isTestSource path && not options.IncludeTests then Some TestSource
     elif file.Link.IsSome && not options.IncludeExternalLinkedFiles then Some ExternalLinkedFile
-    elif not (isWithinWorkspace fullWorkspaceRoot fullPath) then Some OutsideWorkspace
+    elif not (isWithinWorkspace fullWorkspaceRoot fullPath) && not externalLinkedFileAllowed then Some OutsideWorkspace
     else None
 
 let internal filterProjectFiles workspaceRoot options files =
