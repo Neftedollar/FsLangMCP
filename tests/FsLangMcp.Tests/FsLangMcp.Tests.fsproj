@@ -31,6 +31,7 @@
     <Compile Include="ToolDescriptionSchemaTests.fs" />
     <Compile Include="FieldSiteTypesTests.fs" />
     <Compile Include="FindTests.fs" />
+    <Compile Include="FindBacktickDefinitionTests.fs" />
     <Compile Include="FindResponseBudgetTests.fs" />
     <Compile Include="TestsForSymbolTests.fs" />
     <Compile Include="CompileOrderTests.fs" />
