@@ -1,0 +1,75 @@
+# FsLangMCP — Full LLM Context
+
+FsLangMCP is an MCP stdio server that gives AI coding agents semantic access to F# projects through the F# Compiler Service (FCS) and FsAutoComplete (FSAC). It is designed to replace text-only navigation with compiler-resolved definitions, references, member call sites, record-field usage, diagnostics, refactoring previews, and project structure.
+
+Canonical documentation: https://neftedollar.com/FsLangMCP/
+Repository: https://github.com/Neftedollar/FsLangMCP
+NuGet: https://www.nuget.org/packages/FsLangMcp/
+
+## Author
+
+- [Roman Melnikov (Neftedollar)](https://neftedollar.com/)
+
+## Install
+
+```bash
+dotnet tool install -g FsLangMcp
+fslangmcp --bootstrap-tools
+```
+
+Bootstrap installs or downgrades FSAC, Ionide.ProjInfo, and Fantomas to the exact versions reviewed for the installed FsLangMCP release. It also creates the `dotnet-fantomas` alias required by FSAC formatting.
+
+## MCP configuration
+
+```json
+{
+  "mcpServers": {
+    "fslangmcp": { "command": "fslangmcp" }
+  }
+}
+```
+
+The server can also preload a project with `fslangmcp --project /absolute/path/to/App.fsproj`. Without that option, call `set_project` once at the beginning of the session.
+
+## Core semantic loop
+
+1. `set_project` binds a `.fsproj`, `.sln`, `.slnx`, or project directory and reports LSP, project-options, and symbol-index readiness.
+2. `find` resolves definitions, references, member call sites, record-field sites, and positions across the requested scope.
+3. `check` returns one `clean`, `errors`, or `unknown` verdict for a file, project, workspace, or snippet.
+
+Use `find` and `check` as the primary entry points. The remaining tools provide file and project outlines, compile-order inspection, symbol information, diagnostics and code actions, rename previews, refactor impact, dead-code scans, test discovery, formatting, and runtime health.
+
+## Search completeness
+
+`find` separates two kinds of completeness:
+
+- `coverage.complete=true` means every requested project was analyzed.
+- `resolution.complete=true` means the current response contains the complete site set from offset zero.
+
+A paginated or capped response is not exhaustive even when the project sweep completed. Follow `nextCursor` while `truncated=true` and reconcile collected sites with `totalEstimate.sites`.
+
+An incomplete zero is reported as indeterminate rather than a confident absence. Inspect the per-project ledger and any FSAC fallback state before treating a miss as proof that a symbol does not exist.
+
+## Check boundary
+
+A `clean` result covers the compiler options represented by the current FCS/check profile. It does not prove that every build configuration is clean; optimized Release compilation can expose configuration-specific diagnostics. Before merge or release, run:
+
+```bash
+dotnet build -c Release --warnaserror
+```
+
+## Documentation map
+
+- Getting started: https://neftedollar.com/FsLangMCP/guide/getting-started/
+- MCP client configuration: https://neftedollar.com/FsLangMCP/guide/configuration/
+- Troubleshooting: https://neftedollar.com/FsLangMCP/guide/troubleshooting/
+- Tools reference: https://neftedollar.com/FsLangMCP/tools/reference/
+- Detailed tool mechanics: https://neftedollar.com/FsLangMCP/tools/details/
+- Why semantic F# matters: https://neftedollar.com/FsLangMCP/concepts/why-semantic-fsharp/
+- Release notes: https://neftedollar.com/FsLangMCP/changelog/releases/
+
+## Agent integration
+
+Repository integration guide: https://github.com/Neftedollar/FsLangMCP/blob/main/AGENT_INTEGRATION.md
+
+For semantic questions about existing F# source, prefer FsLangMCP over grep. Text search remains appropriate for non-F# configuration and documentation files.

@@ -74,6 +74,13 @@ let theme =
     |> Theme.favIcon "/favicon.svg"
     |> Theme.headExtra
         [
+            Html.link
+                [
+                    prop.custom ("rel", "alternate")
+                    prop.custom ("type", "text/plain")
+                    prop.custom ("href", $"%s{SiteBaseUrl}llms.txt")
+                    prop.custom ("title", "LLMs.txt")
+                ]
             metaProperty "og:image" $"%s{SiteOrigin}%s{SiteBaseUrl}og.png"
             metaProperty "og:image:width" "1280"
             metaProperty "og:image:height" "640"
