@@ -82,7 +82,9 @@ per-section fields report cuts. `lineText` and each `before`/`after` entry carry
 source-column offsets while `range` remains the exact full-source semantic range. If the next site
 still cannot fit after optional metadata rows are removed, `status="aborted"` with
 `errorCode="find_site_exceeds_response_budget"` returns a typed retry recipe and `nextCursor=null`;
-the server never emits a zero-progress continuation cursor.
+the server never emits a zero-progress continuation cursor. `recovery.sameCursorRetry` allows only
+an identity-preserving `maxResults` reduction; `recovery.changedIdentityRetry` requires
+`restart_without_cursor` before changing context, metadata, query, scope, project, path, or position.
 
 ---
 

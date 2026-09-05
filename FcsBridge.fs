@@ -7399,17 +7399,45 @@ type internal FcsBridge
                           "fsacFallbackReason", null ]
                     :> JsonNode
 
-                let recovery =
+                // Cursor v2 excludes maxResults from query identity, but includes the
+                // other response-shaping inputs below. Keep the two recovery choices
+                // structurally separate so a client cannot combine scope/path narrowing
+                // with the old continuation offset and silently skip a new result prefix.
+                let canRetrySameCursor = pageOffset > 0 && pageSize > 1
+
+                let sameCursorRetry =
                     jobj
-                        [ "action", jstr "retry_with_narrower_find_response"
-                          "instruction",
-                          jstr
-                              "Retry the same request (and the original cursor, if this was a continuation) with contextLines=0, includeInfo=false, includePerProject=false, and maxResults=1; narrow projectPath/scope if the blocked row itself is still too large."
-                          "recommendedContextLines", jint 0
+                        [ "allowed", jbool canRetrySameCursor
+                          "action", jstr "retry_same_cursor"
+                          "requiresUnchangedResultIdentity", jbool true
+                          "allowedChangedInputs", JsonArray([| jstr "maxResults" |]) :> JsonNode
                           "recommendedMaxResults", jint 1
+                          "reuseOriginalCursor", jbool canRetrySameCursor ]
+                    :> JsonNode
+
+                let changedIdentityRetry =
+                    jobj
+                        [ "action", jstr "restart_without_cursor"
+                          "requiredBeforeChangingResultIdentity", jbool true
+                          "recommendedContextLines", jint 0
                           "recommendedIncludeInfo", jbool false
                           "recommendedIncludePerProject", jbool false
-                          "reuseOriginalCursor", jbool (pageOffset > 0) ]
+                          "recommendedMaxResults", jint 1
+                          "reuseOriginalCursor", jbool false ]
+                    :> JsonNode
+
+                let recovery =
+                    jobj
+                        [ "action", jstr "choose_cursor_safe_retry"
+                          "instruction",
+                          jstr
+                              "For a continuation, reuse the original cursor only with every result-identity input unchanged and only maxResults reduced. Before changing contextLines, includeInfo, includePerProject, query, kind, exact, member, field, scope, projectPath, path, line, character, word, occurrence, includeDeclaration, or includeSiteTypes, restart without a cursor."
+                          // Safe default for clients that do not understand the two
+                          // conditional branches below: never blindly reuse the cursor.
+                          "reuseOriginalCursor", jbool false
+                          "reuseOriginalCursorCondition", jstr "unchanged_result_identity_max_results_only"
+                          "sameCursorRetry", sameCursorRetry
+                          "changedIdentityRetry", changedIdentityRetry ]
                     :> JsonNode
 
                 jobj
@@ -7447,8 +7475,8 @@ type internal FcsBridge
                       "pageSize", jint pageSize
                       "cursorAdvancedBy", jint 0
                       "truncated", jbool (pageOffset < totalSites)
-                      // Never emit a non-advancing cursor: recovery requires changing
-                      // response-shaping arguments before reusing the original cursor.
+                      // Never emit a non-advancing cursor. Recovery either retries the
+                      // caller-held cursor with identity unchanged, or restarts without it.
                       "nextCursor", null
                       "totalEstimate", (jobj [ ("sites", jint totalSites) ] :> JsonNode)
                       "blockedSiteIndex",

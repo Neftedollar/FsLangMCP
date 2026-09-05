@@ -528,6 +528,75 @@ type FindResponseBudgetIntegrationTests(fixture: FindBudgetFixture) =
             Assert.Equal(2, resultResolution["projectsRequested"].GetValue<int>())
             Assert.Equal(1, resultResolution["projectsMissing"].GetValue<int>())
             Assert.Equal("project", resultResolution["scopeResolved"].GetValue<string>())
-            Assert.NotNull(result["recovery"])
+            let recovery = result["recovery"]
+            Assert.False(recovery["reuseOriginalCursor"].GetValue<bool>())
+
+            Assert.Equal(
+                "unchanged_result_identity_max_results_only",
+                recovery["reuseOriginalCursorCondition"].GetValue<string>()
+            )
+
+            let sameCursorRetry = recovery["sameCursorRetry"]
+            Assert.False(sameCursorRetry["allowed"].GetValue<bool>())
+            Assert.True(sameCursorRetry["requiresUnchangedResultIdentity"].GetValue<bool>())
+            let changedIdentityRetry = recovery["changedIdentityRetry"]
+            Assert.Equal("restart_without_cursor", changedIdentityRetry["action"].GetValue<string>())
+            Assert.True(changedIdentityRetry["requiredBeforeChangingResultIdentity"].GetValue<bool>())
+            Assert.False(changedIdentityRetry["reuseOriginalCursor"].GetValue<bool>())
             Assert.True(renderToken(result).Length <= tinyBudget)
+        }
+
+    [<Fact>]
+    member _.``continuation overflow allows same cursor only for identity-neutral shaping`` () : Task =
+        task {
+            Assert.True(
+                fixture.BuildExitCode = 0,
+                $"Budget fixture build failed ({fixture.BuildExitCode}):\n{fixture.BuildLog}"
+            )
+
+            let tinyBudget = 6_000
+            let bridge = FcsBridge(findResponseBudgetCharsOverride = tinyBudget)
+            let continuation = encode 1
+
+            let! result =
+                bridge.Find(
+                    { findArgs fixture (Some continuation) with
+                        maxResults = Some 1000
+                        scope = Some "workspace"
+                        projectPath = Some fixture.SolutionPath }
+                )
+
+            Assert.Equal("find_site_exceeds_response_budget", result["errorCode"].GetValue<string>())
+            Assert.Equal(1, result["pageOffset"].GetValue<int>())
+            Assert.Equal(0, result["cursorAdvancedBy"].GetValue<int>())
+            Assert.Null(result["nextCursor"])
+
+            let recovery = result["recovery"]
+            Assert.False(recovery["reuseOriginalCursor"].GetValue<bool>())
+            let sameCursorRetry = recovery["sameCursorRetry"]
+            Assert.True(sameCursorRetry["allowed"].GetValue<bool>())
+            Assert.True(sameCursorRetry["requiresUnchangedResultIdentity"].GetValue<bool>())
+            Assert.True(sameCursorRetry["reuseOriginalCursor"].GetValue<bool>())
+            let allowedChangedInputs = sameCursorRetry["allowedChangedInputs"] :?> JsonArray
+            Assert.Equal(1, allowedChangedInputs.Count)
+            Assert.Equal("maxResults", allowedChangedInputs[0].GetValue<string>())
+
+            let changedIdentityRetry = recovery["changedIdentityRetry"]
+            Assert.Equal("restart_without_cursor", changedIdentityRetry["action"].GetValue<string>())
+            Assert.True(changedIdentityRetry["requiredBeforeChangingResultIdentity"].GetValue<bool>())
+            Assert.False(changedIdentityRetry["reuseOriginalCursor"].GetValue<bool>())
+            Assert.True(renderToken(result).Length <= tinyBudget)
+
+            let! alreadyMinimal =
+                bridge.Find(
+                    { findArgs fixture (Some continuation) with
+                        maxResults = Some 1
+                        scope = Some "workspace"
+                        projectPath = Some fixture.SolutionPath }
+                )
+
+            let minimalRecovery = alreadyMinimal["recovery"]
+            let minimalSameCursorRetry = minimalRecovery["sameCursorRetry"]
+            Assert.False(minimalRecovery["reuseOriginalCursor"].GetValue<bool>())
+            Assert.False(minimalSameCursorRetry["allowed"].GetValue<bool>())
         }

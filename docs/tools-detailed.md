@@ -201,9 +201,12 @@ inside a delivered site.
 If one bounded site still cannot fit, the tool returns `status="aborted"`,
 `deliveryStatus="blocked"`, and `errorCode="find_site_exceeds_response_budget"`, with scalar
 coverage/match ledgers preserved and a `recovery` recipe. `nextCursor` is deliberately `null` and
-`cursorAdvancedBy=0`; retry the original request/cursor only after narrowing context, metadata,
-or scope. Fixed metadata overflow uses `find_metadata_exceeds_response_budget` under the same
-non-looping contract.
+`cursorAdvancedBy=0`. For a continuation, `recovery.sameCursorRetry` permits the caller-held cursor
+only when every result-identity input is unchanged and only identity-neutral `maxResults` is
+reduced. The top-level `reuseOriginalCursor=false` is the safe default. Changing context/metadata
+shaping, query/kind/member/field, scope/projectPath/path, position, or any other identity input
+requires `recovery.changedIdentityRetry.action="restart_without_cursor"` before narrowing. Fixed
+metadata overflow uses `find_metadata_exceeds_response_budget` under the same non-looping contract.
 
 ### kind and scope
 
