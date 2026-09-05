@@ -146,10 +146,16 @@ the same canonical stream or gets `cursor_stale`; semantic cache atomicity is a
 separate correctness concern. The implementation must not publish a cursor until
 the complete pre-pagination stream and coverage ledger are available.
 
-Partial sweeps may return useful positive sites and a cursor. Their coverage ledger
-is part of the snapshot. If a retry later analyzes an additional project, the old
-cursor becomes stale and the caller restarts from page zero instead of mixing the
-partial and expanded streams.
+In particular, an initial request whose deadline leaves any project `timed_out` or
+`not_started` may return useful positive sites and the honest partial coverage
+ledger, but it returns `nextCursor = null`. The caller repeats the request without
+a cursor and with a larger `timeoutMs`; otherwise rows beyond the returned page
+could become permanently unreachable.
+
+A completed sweep may still contain stable negative coverage such as `missing` or
+`failed` and may paginate that fully known stream. If a later retry gains additional
+project evidence, snapshot validation makes the old cursor stale and the caller
+restarts from page zero instead of mixing the old and expanded streams.
 
 ### Page-invariant canonical rows
 
@@ -209,7 +215,10 @@ For a continuation request:
 5. A snapshot mismatch returns `cursor_stale`.
 6. Reject an offset beyond the current site count as `cursor_out_of_range`.
 7. Apply #258's production-serializer response budget and slice the page.
-8. Generate the next v2 cursor at `offset + deliveredSiteCount`.
+8. Generate the next v2 cursor at `offset + deliveredSiteCount` only when the
+   sweep completed without deadline-induced `timed_out`/`not_started` coverage and
+   more canonical rows remain. A deadline-truncated initial response never mints a
+   cursor.
 
 A rejected continuation returns the following common envelope, but its
 `errorKind` and message are failure-specific:
@@ -340,7 +349,11 @@ adds installation lifecycle without solving result-stream consistency.
 - controlled mid-sweep mutation followed by continuation, proving either identical
   stream reproduction or a typed stale/incomplete result, never mixed sites;
 - missing declared `.sln` and `.slnx` members before any cursor is issued;
-- partial sweep followed by newly available project evidence;
+- an initial deadline-truncated sweep with positive sites and additional rows: it
+  returns honest `timed_out`/`not_started` coverage but no cursor; repeating the
+  original request with a larger deadline can return the complete stream;
+- a completed sweep with stable negative project coverage followed by newly
+  available project evidence: its previously issued cursor becomes stale;
 - continuation timeout, then retry of the same cursor with a larger `timeoutMs`;
 - continuation timeout during cold `kind="position"` resolution, before any sweep,
   then retry of the same cursor with a larger `timeoutMs`;
@@ -359,6 +372,9 @@ adds installation lifecycle without solving result-stream consistency.
   consistency rather than serving as a result cache.
 - A result or coverage change forces a restart from page zero, which is explicit
   and safe but may repeat work.
+- A deadline-truncated initial sweep cannot be paginated; it may return useful
+  sites, but continuation requires restarting the original request with a larger
+  deadline.
 - The cursor payload grows by two SHA-256 values while remaining small and bounded.
 - Other tools keep their legacy cursor contract in v0.18.0.
 - #165, #255, and #258 must land before implementation.
