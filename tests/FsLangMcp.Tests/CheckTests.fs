@@ -1216,6 +1216,15 @@ type CheckTests(fx: CheckFixture) =
                 Assert.Equal(evaluationsBefore, bridge.ProjectEvaluationStartedCount)
                 Assert.Equal(0L, bridge.ProjectTypeCheckStartCount)
 
+                let discoveryCompletion =
+                    bridge.TryGetCheckTargetDiscoveryCompletionForTest("nearest-project", fx.MainFs, None)
+                    |> Option.defaultWith (fun () -> failwith "The nearest-project discovery worker was not observable.")
+
+                Assert.False(
+                    discoveryCompletion.IsCompleted,
+                    "The caller deadline must not masquerade as discovery-worker completion."
+                )
+
                 let! samePath =
                     bridge.Check(
                         { bareCheck with
@@ -1231,10 +1240,10 @@ type CheckTests(fx: CheckFixture) =
                 Assert.Equal(1L, bridge.CheckTargetDiscoveryStartedCount)
                 releaseNearest.TrySetResult(()) |> ignore
 
-                let settle = Stopwatch.StartNew()
-
-                while bridge.CheckTargetDiscoveryInFlightCount <> 0 && settle.Elapsed < TimeSpan.FromSeconds(2.0) do
-                    do! Task.Delay(10)
+                try
+                    do! discoveryCompletion.WaitAsync(TimeSpan.FromSeconds(5.0))
+                with :? TimeoutException when discoveryCompletion.IsCompleted ->
+                    ()
 
                 Assert.Equal(0, bridge.CheckTargetDiscoveryInFlightCount)
                 Assert.Equal(evaluationsBefore, bridge.ProjectEvaluationStartedCount)
@@ -1303,19 +1312,29 @@ type CheckTests(fx: CheckFixture) =
                 do! fallbackReached.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
                 let! result = checkTask.WaitAsync(TimeSpan.FromSeconds(2.0))
 
+                let discoveryCompletion =
+                    bridge.TryGetCheckTargetDiscoveryCompletionForTest("project", projectDirectory, None)
+                    |> Option.defaultWith (fun () -> failwith "The project discovery worker was not observable.")
+
                 Assert.Equal("unknown", gs result "verdict")
                 Assert.False(gb result "analyzed")
                 Assert.False(releaseFallback.Task.IsCompleted)
+                Assert.False(
+                    discoveryCompletion.IsCompleted,
+                    "The caller deadline must not masquerade as discovery-worker completion."
+                )
                 Assert.Equal(0L, bridge.CheckProjectDiscoveryFallbackCount)
                 Assert.Equal(evaluationsBefore, bridge.ProjectEvaluationStartedCount)
                 Assert.Equal(0L, bridge.ProjectTypeCheckStartCount)
-            finally
+
                 releaseFallback.TrySetResult(()) |> ignore
 
-            let settle = Stopwatch.StartNew()
-
-            while bridge.CheckTargetDiscoveryInFlightCount <> 0 && settle.Elapsed < TimeSpan.FromSeconds(2.0) do
-                do! Task.Delay(10)
+                try
+                    do! discoveryCompletion.WaitAsync(TimeSpan.FromSeconds(5.0))
+                with :? TimeoutException when discoveryCompletion.IsCompleted ->
+                    ()
+            finally
+                releaseFallback.TrySetResult(()) |> ignore
 
             Assert.Equal(0, bridge.CheckTargetDiscoveryInFlightCount)
             Assert.Equal(0L, bridge.CheckProjectDiscoveryFallbackCount)
