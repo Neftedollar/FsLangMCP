@@ -331,41 +331,46 @@ let ``ProjectOutline with alternation filter 'Timer|Channel' matches both types`
             if Directory.Exists(root) then Directory.Delete(root, true)
     }
 
-// ─── H. Evil pattern — must complete in << 1 s (DoS regression guard) ────────
+// ─── H. Evil pattern — structural DoS regression guard ──────────────────────
 
 [<Fact>]
-let ``ProjectOutline with catastrophic-backtracking pattern completes in under 1 second`` () : System.Threading.Tasks.Task =
+let ``ProjectOutline uses a bounded non-backtracking regex for hostile filters`` () : System.Threading.Tasks.Task =
     task {
         let projectPath, root = createFixtureProject ()
         let bridge = FcsBridge()
 
         try
+            let hostileFilter = ProjectOutlineFilter.compile "(a+)+$"
+            let hostileOptions = hostileFilter.Options
+
+            Assert.Equal(
+                System.Text.RegularExpressions.RegexOptions.NonBacktracking,
+                hostileOptions &&& System.Text.RegularExpressions.RegexOptions.NonBacktracking
+            )
+
+            Assert.Equal(
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase,
+                hostileOptions &&& System.Text.RegularExpressions.RegexOptions.IgnoreCase
+            )
+
+            Assert.Equal(TimeSpan.FromMilliseconds(250.0), hostileFilter.MatchTimeout)
+
             // Warm up FCS: parse the project once without a filter so that
-            // projectResultsCache is populated.  FCS cold-start (JIT + project
-            // compilation) easily takes 1–2 s and must not be charged to the
-            // regex-guard measurement.
+            // projectResultsCache is populated. The watchdog below detects a real
+            // hang; it is deliberately not a host-performance assertion.
             let! _ = bridge.ProjectOutline({ defaultArgs projectPath with maxFiles = Some 100 })
 
             // (a+)+$ is the canonical catastrophic-backtracking pattern.
             // Against a long-ish string without NonBacktracking this would hang.
-            // The FCS cache is warm, so only regex work is timed here.
-            let sw = System.Diagnostics.Stopwatch.StartNew()
-
             let! result =
                 bridge.ProjectOutline(
                     { defaultArgs projectPath with
                         maxFiles = Some 100
                         filter = Some "(a+)+$" }
                 )
-
-            sw.Stop()
+                |> fun work -> work.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(10.0)))
 
             Assert.Equal("ok", result["status"].GetValue<string>())
-            // NonBacktracking makes the regex portion instant; assert well under 1 s.
-            Assert.True(
-                sw.Elapsed.TotalSeconds < 1.0,
-                $"Pattern (a+)+$ took {sw.Elapsed.TotalMilliseconds:F0}ms — NonBacktracking not applied?"
-            )
         finally
             if Directory.Exists(root) then Directory.Delete(root, true)
     }

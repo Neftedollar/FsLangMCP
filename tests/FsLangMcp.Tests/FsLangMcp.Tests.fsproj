@@ -12,6 +12,7 @@
 
   <ItemGroup>
     <Compile Include="VerifyModuleInitializer.fs" />
+    <Compile Include="TestHostTrace.fs" />
     <Compile Include="StartupTests.fs" />
     <Compile Include="RuntimeStatusTests.fs" />
     <Compile Include="TypesToolsTests.fs" />
