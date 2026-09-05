@@ -6191,7 +6191,18 @@ type internal FcsBridge
                     :> JsonNode
             | Some sweepTarget ->
 
-            let memberProjects = SolutionParsing.listProjects sweepTarget
+            let projectDiscovery = SolutionParsing.discoverProjects sweepTarget
+
+            let memberProjects =
+                projectDiscovery |> Array.map SolutionParsing.projectPath
+
+            let loadableMemberProjects =
+                projectDiscovery
+                |> Array.choose (fun project ->
+                    if SolutionParsing.isLoadable project then
+                        Some(SolutionParsing.projectPath project)
+                    else
+                        None)
 
             let sourcePathComparison =
                 if OperatingSystem.IsWindows() then
@@ -6236,9 +6247,24 @@ type internal FcsBridge
                                 $"scope='%s{scope}' requires projectPath to be a single .fsproj or path to resolve to one member project; a whole solution cannot be used as a single-project scope."
 
                         [||]
-                | _ -> memberProjects
+                | _ -> loadableMemberProjects
 
-            if projectsToSweep.Length = 0 then
+            // Narrow file/project searches intentionally cover one selected project.
+            // Workspace/auto searches retain every missing declared solution member as
+            // a typed discovery failure while only real files enter the FCS loop.
+            let missingProjects =
+                match scope with
+                | "file"
+                | "project" -> [||]
+                | _ ->
+                    projectDiscovery
+                    |> Array.choose (fun project ->
+                        if SolutionParsing.isMissing project then
+                            Some(SolutionParsing.projectPath project)
+                        else
+                            None)
+
+            if projectsToSweep.Length = 0 && missingProjects.Length = 0 then
                 let message =
                     projectResolutionError
                     |> Option.defaultValue $"find could not resolve any .fsproj to sweep from: %s{sweepTarget}"
@@ -6372,6 +6398,30 @@ type internal FcsBridge
             let mutable projectsFailed = 0
             let mutable projectsTimedOut = 0
             let mutable projectsBusy = 0
+            let projectsMissing = missingProjects.Length
+
+            let coverageFailureSummary () =
+                if projectsMissing = 0 then
+                    $"%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy"
+                else
+                    $"%d{projectsFailed} failed, %d{projectsMissing} missing, %d{projectsTimedOut} timed out, %d{projectsBusy} busy"
+
+            for missingProject in missingProjects do
+                let normalizedProject = normalizePath missingProject
+
+                perProject.Add(
+                    jobj
+                        [ "project", jstr (Path.GetFileNameWithoutExtension normalizedProject)
+                          "fsproj", jstr normalizedProject
+                          "status", jstr "missing"
+                          "errorKind", jstr "project_not_found"
+                          "retryable", jbool false
+                          "error", jstr $"Declared solution member does not exist: %s{normalizedProject}"
+                          "elapsedMs", jint 0 ]
+                    :> JsonNode
+                )
+
+                perProjectKeep.Add(true)
 
             let locationKey (r: range) =
                 $"%s{normalizePath r.FileName}:%d{r.StartLine}:%d{r.StartColumn}:%d{r.EndLine}:%d{r.EndColumn}"
@@ -6683,10 +6733,15 @@ type internal FcsBridge
                 |> Array.filter (fun s -> not (List.isEmpty s.TypeAlternatives))
                 |> Array.length
 
-            let projectsRequested = projectsToSweep.Length
+            // Declared coverage and actual semantic sweep breadth are intentionally
+            // separate. Missing solution members count as requested evidence, but they
+            // never enter the FCS loop and therefore must not inflate projectsSwept.
+            let projectsSwept = projectsToSweep.Length
+            let projectsRequested = projectsSwept + projectsMissing
             let coverageComplete =
                 projectsAnalyzed = projectsRequested
                 && projectsFailed = 0
+                && projectsMissing = 0
                 && projectsTimedOut = 0
                 && projectsBusy = 0
 
@@ -6750,13 +6805,15 @@ type internal FcsBridge
                 else "incomplete-fcs-sweep"
 
             let completenessMessage =
+                let failureSummary = coverageFailureSummary ()
+
                 match responseStatus with
                 | "partial" ->
                     Some
                         $"Matches were found, but only %d{projectsAnalyzed}/%d{projectsRequested} requested project(s) were analyzed; the result set may be incomplete."
                 | "unknown" ->
                     Some
-                        $"Cannot confirm absence: only %d{projectsAnalyzed}/%d{projectsRequested} requested project(s) were analyzed (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy)."
+                        $"Cannot confirm absence: only %d{projectsAnalyzed}/%d{projectsRequested} requested project(s) were analyzed (%s{failureSummary})."
                 | _ -> None
 
             let pageSites =
@@ -6868,7 +6925,7 @@ type internal FcsBridge
                 |> Array.map diagnosticToJson
 
             let scopeResolved =
-                if projectsToSweep.Length <= 1 then
+                if projectsSwept <= 1 then
                     if scope = "file" then "file" else "project"
                 else
                     "workspace"
@@ -6884,6 +6941,7 @@ type internal FcsBridge
                       "projectsRequested", jint projectsRequested
                       "projectsAnalyzed", jint projectsAnalyzed
                       "projectsFailed", jint projectsFailed
+                      "projectsMissing", jint projectsMissing
                       "projectsTimedOut", jint projectsTimedOut
                       "projectsBusy", jint projectsBusy ]
                 :> JsonNode
@@ -6895,10 +6953,11 @@ type internal FcsBridge
                       "complete", jbool resolutionComplete
                       "kindResolved", jstr kindResolved
                       "scopeResolved", jstr scopeResolved
-                      "projectsSwept", jint projectsRequested
+                      "projectsSwept", jint projectsSwept
                       "projectsRequested", jint projectsRequested
                       "projectsAnalyzed", jint projectsAnalyzed
                       "projectsFailed", jint projectsFailed
+                      "projectsMissing", jint projectsMissing
                       "projectsTimedOut", jint projectsTimedOut
                       "projectsBusy", jint projectsBusy
                       "via", jstr via
@@ -6950,9 +7009,11 @@ type internal FcsBridge
 
                     let note =
                         if fieldSiteCount = 0 && not coverageComplete then
+                            let failureSummary = coverageFailureSummary ()
+
                             // Do not blame the caller's `kind` for an empty result the sweep
                             // never got far enough to produce — coverage is the real story.
-                            $"No field site was typed because the sweep is incomplete: %d{projectsAnalyzed} of %d{projectsRequested} project(s) were analyzed (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy). See coverage/message; retry busy work or re-run with a larger timeoutMs before reading anything into the empty result."
+                            $"No field site was typed because the sweep is incomplete: %d{projectsAnalyzed} of %d{projectsRequested} project(s) were analyzed (%s{failureSummary}). See coverage/message; retry busy work or re-run with a larger timeoutMs before reading anything into the empty result."
                         elif fieldSiteCount = 0 then
                             // Advice must name a NEXT step the caller has not already taken.
                             // Telling a kind='auto'/'field' caller to "use kind='field' or
@@ -7050,9 +7111,9 @@ type internal FcsBridge
             // scope='workspace' + the SAME .fsproj projectPath would re-sweep the identical
             // one project and mistakenly believe it now had cross-project coverage. The only
             // thing that actually changes what gets swept is what sweepTarget resolves to
-            // (a .fsproj vs. a .sln/.slnx/directory) — so this note reports on projectsRequested
-            // (the real outcome), independent of which `scope` argument led there, and the
-            // widening/narrowing recipe below names the argument that actually works.
+            // (a .fsproj vs. a .sln/.slnx/directory). Missing declared solution members are
+            // coverage failures, not semantic sweeps, so this note uses projectsSwept for
+            // breadth and projectsRequested/projectsMissing for completeness.
             //
             // Round 2 (post-re-review): the note must never overstate coverage. This same
             // code path is reached by `partial`/`unknown` responses too (e.g. the
@@ -7064,13 +7125,19 @@ type internal FcsBridge
             // the one project that IS swept has its sites additionally post-filtered to a
             // single file (see `allSites` above), so the single-project note names that too.
             let scopeNoteField =
+                let failureSummary = coverageFailureSummary ()
+
                 let widenRecipe =
                     "To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'."
 
                 let narrowRecipe =
                     "To narrow to just one project (faster, but misses cross-project usages), pass its .fsproj as projectPath."
 
-                if projectsRequested <= 1 then
+                if projectsSwept = 0 then
+                    [ ("scopeNote",
+                       jstr
+                           $"find swept no projects: %d{projectsMissing} declared solution member(s) are missing. This response is incomplete; restore those projects or pass a loadable .fsproj before trusting an absence of matches.") ]
+                elif projectsSwept = 1 then
                     let filterPath =
                         if scope = "file" then
                             match args.path with
@@ -7085,18 +7152,20 @@ type internal FcsBridge
                             $"find swept only this one project — cross-project usages in sibling projects are not visible. {widenRecipe}"
                         | true, Some path ->
                             $"find swept only this one project, and kept only sites in '{path}' — other files in this project, and all sibling projects, are not visible. {widenRecipe}"
+                        | false, None when projectsAnalyzed = projectsSwept && projectsMissing > 0 ->
+                            $"find swept only this one loadable project, but %d{projectsMissing} declared solution member(s) are missing and were not swept. This response is incomplete; restore them before trusting an absence of matches. Cross-project usages in other siblings are not visible. %s{widenRecipe}"
                         | false, None ->
-                            $"find could not fully analyze this project (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy) — this response is incomplete; see coverage/message before trusting an absence of matches. Cross-project usages in sibling projects are also not visible. %s{widenRecipe}"
+                            $"find could not fully analyze this project (%s{failureSummary}) — this response is incomplete; see coverage/message before trusting an absence of matches. Cross-project usages in sibling projects are also not visible. %s{widenRecipe}"
                         | false, Some path ->
-                            $"find could not fully analyze this project (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy) — this response is incomplete; see coverage/message before trusting an absence of matches. Sites, where present, are also filtered to '%s{path}'; other files in this project, and all sibling projects, are not visible. %s{widenRecipe}"
+                            $"find could not fully analyze this project (%s{failureSummary}) — this response is incomplete; see coverage/message before trusting an absence of matches. Sites, where present, are also filtered to '%s{path}'; other files in this project, and all sibling projects, are not visible. %s{widenRecipe}"
 
                     [ ("scopeNote", jstr text) ]
                 else
                     let text =
                         if coverageComplete then
-                            $"find swept %d{projectsRequested} member projects of '%s{sweepTarget}'. %s{narrowRecipe}"
+                            $"find swept %d{projectsSwept} member projects of '%s{sweepTarget}'. %s{narrowRecipe}"
                         else
-                            $"find analyzed %d{projectsAnalyzed} of %d{projectsRequested} member projects of '%s{sweepTarget}' (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy) — this response is incomplete; see coverage/message before trusting an absence of matches. %s{narrowRecipe}"
+                            $"find analyzed %d{projectsAnalyzed} of %d{projectsRequested} member projects of '%s{sweepTarget}' (%s{failureSummary}) — this response is incomplete; see coverage/message before trusting an absence of matches. %s{narrowRecipe}"
 
                     [ ("scopeNote", jstr text) ]
 
@@ -7110,10 +7179,11 @@ type internal FcsBridge
                   "exact", jbool exact
                   "resolution", resolution
                   "coverage", coverage
-                  "projectsSwept", jint projectsRequested
+                  "projectsSwept", jint projectsSwept
                   "projectsRequested", jint projectsRequested
                   "projectsAnalyzed", jint projectsAnalyzed
                   "projectsFailed", jint projectsFailed
+                  "projectsMissing", jint projectsMissing
                   "projectsTimedOut", jint projectsTimedOut
                   "projectsBusy", jint projectsBusy
                   "totalSites", jint totalSites

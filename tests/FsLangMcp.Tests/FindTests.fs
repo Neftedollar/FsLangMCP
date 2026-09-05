@@ -188,6 +188,26 @@ let private partialSlnx =
           "  <Project Path=\"Broken/Broken.fsproj\" />"
           "</Solution>" ]
 
+let private solutionContents (extension: string) (members: string list) =
+    if extension = ".slnx" then
+        [ "<Solution>"
+          yield! members |> List.map (fun path -> $"  <Project Path=\"{path}\" />")
+          "</Solution>" ]
+        |> String.concat "\n"
+    else
+        let projectTypeGuid = "{F2A71F9B-5D33-465A-A702-920D77279786}"
+
+        [ "Microsoft Visual Studio Solution File, Format Version 12.00"
+          yield!
+              members
+              |> List.mapi (fun index path ->
+                  let windowsPath = path.Replace('/', '\\')
+                  let projectGuid = $"{{00000000-0000-0000-0000-{index:D12}}}"
+                  $"Project(\"{projectTypeGuid}\") = \"Project{index}\", \"{windowsPath}\", \"{projectGuid}\"\nEndProject")
+          "Global"
+          "EndGlobal" ]
+        |> String.concat "\n"
+
 // ── Class fixture: written + built ONCE, shared by every test in the class ───────
 
 type FindFixture() =
@@ -216,7 +236,38 @@ type FindFixture() =
     // be interpreted as a zero-match project.
     do write "Broken/Broken.fsproj" "<Project><ItemGroup>" |> ignore
     let slnxPath = write "FindSolution.slnx" slnx
+    let slnPath =
+        write
+            "FindSolution.sln"
+            (solutionContents
+                ".sln"
+                [ "Domain/Domain.fsproj"; "Stubs/Stubs.fsproj"; "App/App.fsproj" ])
+
     let partialSlnxPath = write "PartialFindSolution.slnx" partialSlnx
+
+    let missingMemberSlnxPath =
+        write
+            "MissingMemberFindSolution.slnx"
+            (solutionContents ".slnx" [ "Domain/Domain.fsproj"; "Missing/Missing.fsproj" ])
+
+    let missingMemberSlnPath =
+        write
+            "MissingMemberFindSolution.sln"
+            (solutionContents ".sln" [ "Domain/Domain.fsproj"; "Missing/Missing.fsproj" ])
+
+    let allMissingSlnxPath =
+        write
+            "AllMissingFindSolution.slnx"
+            (solutionContents
+                ".slnx"
+                [ "MissingOne/MissingOne.fsproj"; "MissingTwo/MissingTwo.fsproj" ])
+
+    let allMissingSlnPath =
+        write
+            "AllMissingFindSolution.sln"
+            (solutionContents
+                ".sln"
+                [ "MissingOne/MissingOne.fsproj"; "MissingTwo/MissingTwo.fsproj" ])
 
     // dotnet build is ground truth and also produces Domain.dll so per-project FCS
     // sweeps resolve the cross-project TraderRole reference. -m:1 serializes MSBuild
@@ -257,8 +308,13 @@ type FindFixture() =
     do buildSw.Stop()
 
     member _.Root = root
+    member _.Sln = slnPath
     member _.Slnx = slnxPath
     member _.PartialSlnx = partialSlnxPath
+    member _.MissingMemberSln = missingMemberSlnPath
+    member _.MissingMemberSlnx = missingMemberSlnxPath
+    member _.AllMissingSln = allMissingSlnPath
+    member _.AllMissingSlnx = allMissingSlnxPath
     member _.DomainFsproj = domainFsproj
     member _.DomainFs = domainSource
     member _.ImpactFs = impactSource
@@ -1373,6 +1429,112 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
             Assert.Equal(0, gi find "projectsTimedOut")
             Assert.Equal("none", gs resolution "via")
             Assert.Equal(3, gi resolution "projectsSwept")
+        }
+
+    [<Theory>]
+    [<InlineData(".sln")>]
+    [<InlineData(".slnx")>]
+    member _.``find counts declared solution members and keeps missing projects as typed coverage failures``
+        (extension: string)
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit %d{fx.BuildExitCode}):\n%s{fx.BuildLog}")
+
+            let allPresentPath, oneMissingPath, allMissingPath =
+                if extension = ".sln" then
+                    fx.Sln, fx.MissingMemberSln, fx.AllMissingSln
+                else
+                    fx.Slnx, fx.MissingMemberSlnx, fx.AllMissingSlnx
+
+            let bridge = FcsBridge()
+
+            // No declared member exists, so no project-options/FCS work may start.
+            let! allMissing =
+                bridge.Find(
+                    { findArgs allMissingPath "ZzzNoSuchSymbol_AllMissing" with
+                        includePerProject = Some false }
+                )
+
+            Assert.Equal("unknown", gs allMissing "status")
+            Assert.Equal("indeterminate", gs allMissing "outcome")
+            Assert.Null(allMissing["resolution"]["matched"])
+            Assert.False(gb allMissing["coverage"] "complete")
+            Assert.Equal(0, gi allMissing "projectsSwept")
+            Assert.Equal(2, gi allMissing "projectsRequested")
+            Assert.Equal(0, gi allMissing "projectsAnalyzed")
+            Assert.Equal(0, gi allMissing "projectsFailed")
+            Assert.Equal(2, gi allMissing "projectsMissing")
+            Assert.Equal(0L, bridge.ProjectOptionsLoadCount)
+
+            let allMissingProjects = allMissing["perProject"].AsArray()
+            Assert.Equal(2, allMissingProjects.Count)
+
+            for project in allMissingProjects do
+                Assert.Equal("missing", gs project "status")
+                Assert.Equal("project_not_found", gs project "errorKind")
+                Assert.False(File.Exists(gs project "fsproj"))
+
+            // A positive match in the surviving independent project remains useful,
+            // but the missing sibling keeps the site set explicitly incomplete.
+            let! positive = bridge.Find(findArgs oneMissingPath "TraderRole")
+
+            Assert.Equal("partial", gs positive "status")
+            Assert.Equal("matched", gs positive "outcome")
+            Assert.True(gb positive["resolution"] "matched")
+            Assert.True((gi positive "totalSites" > 0))
+            Assert.False(gb positive["coverage"] "complete")
+            Assert.Equal(1, gi positive "projectsSwept")
+            Assert.Equal(2, gi positive "projectsRequested")
+            Assert.Equal(1, gi positive "projectsAnalyzed")
+            Assert.Equal(0, gi positive "projectsFailed")
+            Assert.Equal(1, gi positive "projectsMissing")
+            Assert.Equal("project", gs positive["resolution"] "scopeResolved")
+            Assert.Equal(1, gi positive["resolution"] "projectsSwept")
+
+            let missingEntry =
+                positive["perProject"].AsArray()
+                |> Seq.find (fun project -> gs project "status" = "missing")
+
+            Assert.Equal("project_not_found", gs missingEntry "errorKind")
+
+            // The same incomplete membership cannot prove a zero result.
+            let! incompleteZero = bridge.Find(findArgs oneMissingPath "ZzzNoSuchSymbol_DeclaredMissing")
+
+            Assert.Equal("unknown", gs incompleteZero "status")
+            Assert.Equal("indeterminate", gs incompleteZero "outcome")
+            Assert.Null(incompleteZero["resolution"]["matched"])
+            Assert.Equal(2, gi incompleteZero "projectsRequested")
+            Assert.Equal(1, gi incompleteZero "projectsAnalyzed")
+            Assert.Equal(1, gi incompleteZero "projectsMissing")
+
+            // Intentional project scope remains narrow: a missing sibling outside the
+            // selected project's coverage must not poison this explicitly limited result.
+            let! narrowed =
+                bridge.Find(
+                    { findArgs oneMissingPath "TraderRole" with
+                        scope = Some "project"
+                        path = Some fx.DomainFs }
+                )
+
+            Assert.Equal("succeeded", gs narrowed "status")
+            Assert.True(gb narrowed["coverage"] "complete")
+            Assert.Equal(1, gi narrowed "projectsSwept")
+            Assert.Equal(1, gi narrowed "projectsRequested")
+            Assert.Equal(1, gi narrowed "projectsAnalyzed")
+            Assert.Equal(0, gi narrowed "projectsMissing")
+
+            // Control: every declared member exists and is analyzed, so zero is conclusive.
+            let! allPresent = bridge.Find(findArgs allPresentPath "ZzzNoSuchSymbol_AllPresent")
+
+            Assert.Equal("succeeded", gs allPresent "status")
+            Assert.Equal("not_found", gs allPresent "outcome")
+            Assert.False(gb allPresent["resolution"] "matched")
+            Assert.True(gb allPresent["coverage"] "complete")
+            Assert.Equal(3, gi allPresent "projectsSwept")
+            Assert.Equal(3, gi allPresent "projectsRequested")
+            Assert.Equal(3, gi allPresent "projectsAnalyzed")
+            Assert.Equal(0, gi allPresent "projectsMissing")
+            Assert.Equal("workspace", gs allPresent["resolution"] "scopeResolved")
         }
 
     [<Fact>]
