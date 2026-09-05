@@ -19,6 +19,43 @@ type internal ProcessOutput =
 let private cleanupTimeout = TimeSpan.FromSeconds(5.0)
 let private defaultOutputLimitCharacters = 4 * 1024 * 1024
 
+[<Literal>]
+let private MaximumStartupAuthorizationBytes = 4 * 1024
+
+type internal RequiredContainmentFailure =
+    { Stage: string
+      NativeErrorCode: int option }
+
+let private requiredContainmentFailureMessage (failure: RequiredContainmentFailure) =
+    match failure.NativeErrorCode with
+    | Some error ->
+        $"Required process containment setup failed at {failure.Stage} (native error {error}); startup authorization was not sent."
+    | None ->
+        $"Required process containment setup failed at {failure.Stage}; startup authorization was not sent."
+
+type internal RequiredProcessContainmentException(failure: RequiredContainmentFailure) =
+    inherit InvalidOperationException(requiredContainmentFailureMessage failure)
+
+    member _.Stage = failure.Stage
+    member _.NativeErrorCode = failure.NativeErrorCode
+
+[<NoEquality; NoComparison>]
+type internal RequiredContainmentTestHooks =
+    { ForcedSetupFailure: RequiredContainmentFailure option
+      BeforeAuthorization: (unit -> Task) option }
+
+type private StandardInputPolicy =
+    | NoInput
+    | ReleaseAfterRequiredContainment of startLine: string
+
+type internal ContainmentRequirement =
+    | BestEffort
+    | Required
+
+type private ContainmentSetupStatus =
+    | Established
+    | Unavailable of RequiredContainmentFailure
+
 let private outputLimitFromEnvironment () =
     match Environment.GetEnvironmentVariable("FSLANGMCP_PROCESS_OUTPUT_LIMIT_CHARS") with
     | value when not (String.IsNullOrWhiteSpace value) ->
@@ -238,7 +275,7 @@ let private unixProcessGroupHasLiveMembers groupId =
         let result = kill(-groupId, 0)
         result = 0 || Marshal.GetLastPInvokeError() <> 3
 
-let private windowsJobHasActiveProcesses handle =
+let private tryWindowsJobHasActiveProcesses handle =
     let mutable information = Unchecked.defaultof<JobObjectBasicAccountingInformation>
 
     let queried =
@@ -250,13 +287,23 @@ let private windowsJobHasActiveProcesses handle =
             0n
         )
 
-    if not queried then
-        let error = Marshal.GetLastPInvokeError()
+    if queried then
+        Ok(information.ActiveProcesses <> 0u)
+    else
+        Error(Marshal.GetLastPInvokeError())
+
+let private windowsJobHasActiveProcesses handle =
+    match tryWindowsJobHasActiveProcesses handle with
+    | Ok hasActiveProcesses -> hasActiveProcesses
+    | Error error ->
         raise (Win32Exception(error, $"Unable to query Windows job membership (error {error})."))
 
-    information.ActiveProcesses <> 0u
-
-type internal ProcessContainment private (childProcess: Process, unixProcessGroup: int option, windowsJob: nativeint option) =
+type internal ProcessContainment private (
+    childProcess: Process,
+    unixProcessGroup: int option,
+    windowsJob: nativeint option,
+    setupStatus: ContainmentSetupStatus
+) =
     let mutable disposed = false
     let mutable terminationRequested = false
     let mutable terminationDrained = false
@@ -288,6 +335,11 @@ type internal ProcessContainment private (childProcess: Process, unixProcessGrou
         | None, None -> $"process {childProcessId}"
 
     member _.Process = childProcess
+
+    member internal _.RequiredContainmentFailure =
+        match setupStatus with
+        | Established -> None
+        | Unavailable failure -> Some failure
 
     member _.Terminate() =
         terminationRequested <- true
@@ -376,8 +428,26 @@ type internal ProcessContainment private (childProcess: Process, unixProcessGrou
 
                 childProcess.Dispose()
 
-    static member Start(startInfo: ProcessStartInfo, preference: UnixSessionWrapperPreference) =
+    static member private SetupFailure(stage: string, nativeErrorCode: int option) =
+        Unavailable
+            { Stage = stage
+              NativeErrorCode = nativeErrorCode }
+
+    static member Start(
+        startInfo: ProcessStartInfo,
+        preference: UnixSessionWrapperPreference,
+        requirement: ContainmentRequirement
+    ) =
         let wrappedInUnixSession = configureUnixSessionWrapper preference startInfo
+
+        if not (OperatingSystem.IsWindows()) && requirement = Required && not wrappedInUnixSession then
+            raise (
+                RequiredProcessContainmentException(
+                    { Stage = "Unix.ConfigureSessionWrapper"
+                      NativeErrorCode = None }
+                )
+            )
+
         let childProcess = new Process(StartInfo = startInfo)
 
         if not (childProcess.Start()) then
@@ -392,14 +462,23 @@ type internal ProcessContainment private (childProcess: Process, unixProcessGrou
             else
                 None
 
-        let windowsJob =
+        let windowsJob, setupStatus =
             if not (OperatingSystem.IsWindows()) then
-                None
+                let status =
+                    if wrappedInUnixSession then
+                        Established
+                    else
+                        ProcessContainment.SetupFailure("Unix.ConfigureSessionWrapper", None)
+
+                None, status
             else
                 let handle = CreateJobObject(0n, null)
 
                 if handle = 0n then
-                    None
+                    let error = Marshal.GetLastPInvokeError()
+
+                    None,
+                    ProcessContainment.SetupFailure("Windows.CreateJobObject", Some error)
                 else
                     let mutable info = Unchecked.defaultof<JobObjectExtendedLimitInformation>
                     info.BasicLimitInformation.LimitFlags <- JobObjectLimitKillOnJobClose
@@ -412,19 +491,55 @@ type internal ProcessContainment private (childProcess: Process, unixProcessGrou
                             uint32 (Marshal.SizeOf<JobObjectExtendedLimitInformation>())
                         )
 
-                    if configured && AssignProcessToJobObject(handle, childProcess.Handle) then
-                        Some handle
-                    else
+                    if not configured then
+                        let error = Marshal.GetLastPInvokeError()
                         CloseHandle(handle) |> ignore
-                        None
 
-        new ProcessContainment(childProcess, unixProcessGroup, windowsJob)
+                        None,
+                        ProcessContainment.SetupFailure("Windows.SetInformationJobObject", Some error)
+                    elif not (AssignProcessToJobObject(handle, childProcess.Handle)) then
+                        let error = Marshal.GetLastPInvokeError()
+                        CloseHandle(handle) |> ignore
+
+                        None,
+                        ProcessContainment.SetupFailure("Windows.AssignProcessToJobObject", Some error)
+                    else
+                        match requirement with
+                        | BestEffort -> Some handle, Established
+                        | Required ->
+                            match tryWindowsJobHasActiveProcesses handle with
+                            | Ok true -> Some handle, Established
+                            | Ok false ->
+                                TerminateJobObject(handle, 1u) |> ignore
+                                CloseHandle(handle) |> ignore
+
+                                None,
+                                ProcessContainment.SetupFailure("Windows.VerifyJobMembership", None)
+                            | Error error ->
+                                TerminateJobObject(handle, 1u) |> ignore
+                                CloseHandle(handle) |> ignore
+
+                                None,
+                                ProcessContainment.SetupFailure(
+                                    "Windows.QueryInformationJobObject",
+                                    Some error
+                                )
+
+        new ProcessContainment(childProcess, unixProcessGroup, windowsJob, setupStatus)
 
 let internal startContainedProcess (startInfo: ProcessStartInfo) =
-    ProcessContainment.Start(startInfo, UnixSessionWrapperPreference.Automatic)
+    ProcessContainment.Start(
+        startInfo,
+        UnixSessionWrapperPreference.Automatic,
+        ContainmentRequirement.BestEffort
+    )
 
-let private startContainedProcessWithPreference preference (startInfo: ProcessStartInfo) =
-    ProcessContainment.Start(startInfo, preference)
+let private startContainedProcessWithPreference
+    preference
+    requirement
+    (startInfo: ProcessStartInfo)
+    =
+    ProcessContainment.Start(startInfo, preference, requirement)
 
 let internal terminateContainedProcess (containment: ProcessContainment) = containment.Terminate()
 
@@ -538,6 +653,29 @@ let private terminate
                 )
     }
 
+let private validateStartupAuthorization (startLine: string) =
+    if String.IsNullOrWhiteSpace(startLine) then
+        invalidArg (nameof startLine) "Process startup authorization must not be blank."
+
+    if startLine.IndexOfAny([| '\r'; '\n' |]) >= 0 then
+        invalidArg (nameof startLine) "Process startup authorization must be exactly one line."
+
+    if Encoding.UTF8.GetByteCount(startLine) > MaximumStartupAuthorizationBytes then
+        invalidArg
+            (nameof startLine)
+            $"Process startup authorization must not exceed {MaximumStartupAuthorizationBytes} UTF-8 bytes."
+
+let private writeStartupAuthorizationAsync
+    (proc: Process)
+    (startLine: string)
+    (cancellationToken: CancellationToken)
+    =
+    task {
+        let frame = Encoding.UTF8.GetBytes(startLine + "\n")
+        do! proc.StandardInput.BaseStream.WriteAsync(frame.AsMemory(), cancellationToken).AsTask()
+        do! proc.StandardInput.BaseStream.FlushAsync(cancellationToken)
+    }
+
 let private runAsyncWithOutputLimitCore
     (fileName: string)
     (args: string seq)
@@ -545,6 +683,8 @@ let private runAsyncWithOutputLimitCore
     (cancellationToken: CancellationToken)
     (outputLimitCharacters: int)
     (unixSessionWrapperPreference: UnixSessionWrapperPreference)
+    (standardInputPolicy: StandardInputPolicy)
+    (requiredContainmentTestHooks: RequiredContainmentTestHooks option)
     : Task<ProcessOutput> =
     task {
         if String.IsNullOrWhiteSpace(fileName) then
@@ -556,12 +696,24 @@ let private runAsyncWithOutputLimitCore
         if outputLimitCharacters <= 0 then
             invalidArg (nameof outputLimitCharacters) "Process output limit must be positive."
 
+        match standardInputPolicy with
+        | NoInput -> ()
+        | ReleaseAfterRequiredContainment startLine -> validateStartupAuthorization startLine
+
         let psi = ProcessStartInfo()
         psi.FileName <- fileName
         psi.UseShellExecute <- false
         psi.RedirectStandardOutput <- true
         psi.RedirectStandardError <- true
         psi.CreateNoWindow <- true
+
+        let containmentRequirement =
+            match standardInputPolicy with
+            | NoInput -> BestEffort
+            | ReleaseAfterRequiredContainment _ ->
+                psi.RedirectStandardInput <- true
+                psi.StandardInputEncoding <- UTF8Encoding(false)
+                Required
 
         for arg in args do
             psi.ArgumentList.Add(arg)
@@ -571,7 +723,9 @@ let private runAsyncWithOutputLimitCore
         // the containment cleanup below bounds that case but cannot make launch atomic.
         cancellationToken.ThrowIfCancellationRequested()
 
-        use containment = startContainedProcessWithPreference unixSessionWrapperPreference psi
+        use containment =
+            startContainedProcessWithPreference unixSessionWrapperPreference containmentRequirement psi
+
         let proc = containment.Process
 
         // Start both reads before waiting. Reading either stream synchronously first can
@@ -584,10 +738,44 @@ let private runAsyncWithOutputLimitCore
         let! executionResult =
             task {
                 try
+                    match standardInputPolicy with
+                    | NoInput -> ()
+                    | ReleaseAfterRequiredContainment startLine ->
+                        try
+                            let forcedSetupFailure =
+                                requiredContainmentTestHooks
+                                |> Option.bind _.ForcedSetupFailure
+
+                            match forcedSetupFailure |> Option.orElse containment.RequiredContainmentFailure with
+                            | Some failure -> raise (RequiredProcessContainmentException failure)
+                            | None ->
+                                match requiredContainmentTestHooks |> Option.bind _.BeforeAuthorization with
+                                | Some beforeAuthorization ->
+                                    do! beforeAuthorization().WaitAsync(timeoutCts.Token)
+                                | None -> ()
+
+                                // Required containment is established, but cancellation can
+                                // win before the authorization frame reaches the helper.
+                                cancellationToken.ThrowIfCancellationRequested()
+
+                                do!
+                                    writeStartupAuthorizationAsync
+                                        proc
+                                        startLine
+                                        timeoutCts.Token
+                        finally
+                            // Closing stdin is part of every authorized-launch outcome:
+                            // success sends one frame then EOF; failure/cancellation sends
+                            // EOF without leaving a writable handle behind.
+                            try
+                                proc.StandardInput.Close()
+                            with _ ->
+                                ()
+
                     // The same linked token and CancelAfter deadline covers process exit AND
-                    // both redirected-pipe drains. Waiting for the parent alone is insufficient:
-                    // a grandchild may keep an inherited stdout/stderr handle open after the
-                    // parent exits (#164).
+                    // startup authorization, both redirected-pipe drains, and process exit.
+                    // Waiting for the parent alone is insufficient: a grandchild may keep an
+                    // inherited stdout/stderr handle open after the parent exits (#164).
                     do! proc.WaitForExitAsync(timeoutCts.Token)
                     let! stdout, stdoutTruncated = stdoutTask.WaitAsync(timeoutCts.Token)
                     let! stderr, stderrTruncated = stderrTask.WaitAsync(timeoutCts.Token)
@@ -653,6 +841,50 @@ let internal runAsyncWithOutputLimit
         cancellationToken
         outputLimitCharacters
         UnixSessionWrapperPreference.Automatic
+        NoInput
+        None
+
+/// Starts a controlled helper behind required process containment, then sends
+/// exactly one UTF-8 authorization line terminated by a literal LF. On Unix the
+/// managed wrapper establishes setsid(2) before it starts the helper, so the
+/// buffered authorization cannot let that helper run first. This ordering is a
+/// helper protocol, not a sandbox for untrusted descendants.
+let internal runAsyncWithOutputLimitAfterRequiredContainment
+    (fileName: string)
+    (args: string seq)
+    (startLine: string)
+    (timeout: TimeSpan)
+    (cancellationToken: CancellationToken)
+    (outputLimitCharacters: int)
+    : Task<ProcessOutput> =
+    runAsyncWithOutputLimitCore
+        fileName
+        args
+        timeout
+        cancellationToken
+        outputLimitCharacters
+        UnixSessionWrapperPreference.Managed
+        (ReleaseAfterRequiredContainment startLine)
+        None
+
+let internal runAsyncWithOutputLimitAfterRequiredContainmentForTest
+    (fileName: string)
+    (args: string seq)
+    (startLine: string)
+    (timeout: TimeSpan)
+    (cancellationToken: CancellationToken)
+    (outputLimitCharacters: int)
+    (testHooks: RequiredContainmentTestHooks)
+    : Task<ProcessOutput> =
+    runAsyncWithOutputLimitCore
+        fileName
+        args
+        timeout
+        cancellationToken
+        outputLimitCharacters
+        UnixSessionWrapperPreference.Managed
+        (ReleaseAfterRequiredContainment startLine)
+        (Some testHooks)
 
 let internal runAsyncWithManagedUnixSessionWrapper
     (fileName: string)
@@ -667,6 +899,8 @@ let internal runAsyncWithManagedUnixSessionWrapper
         cancellationToken
         (outputLimitFromEnvironment ())
         UnixSessionWrapperPreference.Managed
+        NoInput
+        None
 
 let internal runUnixSessionWrapper (fileName: string) (args: string array) =
     if OperatingSystem.IsWindows() then

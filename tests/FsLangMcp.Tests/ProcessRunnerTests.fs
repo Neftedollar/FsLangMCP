@@ -120,6 +120,47 @@ Environment.Exit(%d{exitCode})
 
     parentScript, childScript
 
+let private authorizationProbeScript expectedAuthorization readyPath authorizedPath =
+    let escapedExpectedAuthorization = escapeVerbatimString expectedAuthorization
+    let escapedAuthorizedPath = authorizedPath |> Path.GetFullPath |> escapeVerbatimString
+
+    let readyStatement =
+        match readyPath with
+        | Some path ->
+            let escapedPath = path |> Path.GetFullPath |> escapeVerbatimString
+            $"File.WriteAllText(@\"%s{escapedPath}\", \"ready\")"
+        | None -> "()"
+
+    tempScript
+        $"""
+open System
+open System.IO
+open System.Text
+
+let expectedAuthorization = @"%s{escapedExpectedAuthorization}"
+let authorizedPath = @"%s{escapedAuthorizedPath}"
+%s{readyStatement}
+
+let received = StringBuilder()
+let mutable complete = false
+
+while not complete && received.Length <= 4096 do
+    let value = Console.In.Read()
+
+    if value < 0 then
+        complete <- true
+    else
+        let character = char value
+        received.Append(character) |> ignore
+        complete <- character = '\n'
+
+let actual = received.ToString()
+Console.Out.Write(actual.Replace("\r", "<CR>").Replace("\n", "<LF>"))
+
+if actual = expectedAuthorization + "\n" then
+    File.WriteAllText(authorizedPath, "authorized")
+"""
+
 [<Fact>]
 let ``Runner rejects caller cancellation before entering the process launch path`` () : Task =
     task {
@@ -136,6 +177,188 @@ let ``Runner rejects caller cancellation before entering the process launch path
 
         let! error = Assert.ThrowsAnyAsync<OperationCanceledException>(fun () -> operation :> Task)
         Assert.Equal(cancellation.Token, error.CancellationToken)
+    }
+
+[<Fact>]
+let ``Required containment writes one literal-LF authorization frame`` () : Task =
+    task {
+        let authorization = "fslangmcp-test-start-v1"
+        let id = Guid.NewGuid().ToString("N")
+        let authorizedPath = Path.Combine(Path.GetTempPath(), $"fslangmcp_authorized_%s{id}.marker")
+        let script = authorizationProbeScript authorization None authorizedPath
+
+        try
+            let! result =
+                runAsyncWithOutputLimitAfterRequiredContainment
+                    "dotnet"
+                    [ "fsi"; "--exec"; script ]
+                    authorization
+                    (TimeSpan.FromSeconds(30.0))
+                    CancellationToken.None
+                    1024
+
+            Assert.Equal(0, result.ExitCode)
+            Assert.Equal($"%s{authorization}<LF>", result.StandardOutput)
+            Assert.DoesNotContain("<CR>", result.StandardOutput)
+            Assert.True(File.Exists(authorizedPath), "The exact authorization frame was not accepted.")
+        finally
+            File.Delete(script)
+            File.Delete(authorizedPath)
+    }
+
+[<Fact>]
+let ``Required containment validates authorization before process launch`` () : Task =
+    task {
+        let id = Guid.NewGuid().ToString("N")
+        let executable = $"fslangmcp-must-not-launch-%s{id}"
+
+        let invalidAuthorizations =
+            [ null
+              ""
+              " "
+              "authorization\rtrailer"
+              "authorization\ntrailer"
+              String('a', 4097)
+              String('é', 2049) ]
+
+        for authorization in invalidAuthorizations do
+            let operation =
+                runAsyncWithOutputLimitAfterRequiredContainment
+                    executable
+                    Seq.empty
+                    authorization
+                    (TimeSpan.FromSeconds(30.0))
+                    CancellationToken.None
+                    1024
+
+            let! error = Assert.ThrowsAsync<ArgumentException>(fun () -> operation :> Task)
+            Assert.Equal("startLine", error.ParamName)
+    }
+
+[<Fact>]
+let ``Required containment failure sends no authorization and reports its stage`` () : Task =
+    task {
+        let authorization = "fslangmcp-test-start-v1"
+        let id = Guid.NewGuid().ToString("N")
+        let authorizedPath = Path.Combine(Path.GetTempPath(), $"fslangmcp_denied_%s{id}.marker")
+        let script = authorizationProbeScript authorization None authorizedPath
+
+        let hooks =
+            { ForcedSetupFailure =
+                Some
+                    { Stage = "Test.ForcedUnavailable"
+                      NativeErrorCode = Some 1234 }
+              BeforeAuthorization =
+                Some(fun () ->
+                    Task.FromException(
+                        InvalidOperationException("Authorization branch ran after required setup failed.")
+                    )) }
+
+        try
+            let operation =
+                runAsyncWithOutputLimitAfterRequiredContainmentForTest
+                    "dotnet"
+                    [ "fsi"; "--exec"; script ]
+                    authorization
+                    (TimeSpan.FromSeconds(30.0))
+                    CancellationToken.None
+                    1024
+                    hooks
+
+            let! error =
+                Assert.ThrowsAsync<RequiredProcessContainmentException>(fun () -> operation :> Task)
+
+            Assert.Equal("Test.ForcedUnavailable", error.Stage)
+            Assert.Equal(Some 1234, error.NativeErrorCode)
+            Assert.Contains("startup authorization was not sent", error.Message)
+            Assert.False(File.Exists(authorizedPath), "Authorization reached a helper without containment.")
+        finally
+            File.Delete(script)
+            File.Delete(authorizedPath)
+    }
+
+[<Fact>]
+let ``Cancellation after containment but before authorization sends only EOF`` () : Task =
+    task {
+        let authorization = "fslangmcp-test-start-v1"
+        let id = Guid.NewGuid().ToString("N")
+        let readyPath = Path.Combine(Path.GetTempPath(), $"fslangmcp_ready_%s{id}.marker")
+        let authorizedPath = Path.Combine(Path.GetTempPath(), $"fslangmcp_canceled_%s{id}.marker")
+        let script = authorizationProbeScript authorization (Some readyPath) authorizedPath
+        let containmentEstablished = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let releaseAuthorization = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        use cancellation = new CancellationTokenSource()
+
+        let hooks =
+            { ForcedSetupFailure = None
+              BeforeAuthorization =
+                Some(fun () ->
+                    containmentEstablished.TrySetResult(()) |> ignore
+                    releaseAuthorization.Task :> Task) }
+
+        try
+            let operation =
+                runAsyncWithOutputLimitAfterRequiredContainmentForTest
+                    "dotnet"
+                    [ "fsi"; "--exec"; script ]
+                    authorization
+                    (TimeSpan.FromSeconds(30.0))
+                    cancellation.Token
+                    1024
+                    hooks
+
+            do! containmentEstablished.Task.WaitAsync(TimeSpan.FromSeconds(10.0))
+            let! helperReachedInputGate = waitForFile readyPath
+
+            if not helperReachedInputGate then
+                cancellation.Cancel()
+                releaseAuthorization.TrySetResult(()) |> ignore
+
+            Assert.True(helperReachedInputGate, "The helper did not reach its input gate.")
+            cancellation.Cancel()
+            releaseAuthorization.TrySetResult(()) |> ignore
+
+            let! error = Assert.ThrowsAnyAsync<OperationCanceledException>(fun () -> operation :> Task)
+            Assert.Equal(cancellation.Token, error.CancellationToken)
+            Assert.False(File.Exists(authorizedPath), "Cancellation still authorized the helper.")
+        finally
+            cancellation.Cancel()
+            releaseAuthorization.TrySetResult(()) |> ignore
+            File.Delete(script)
+            File.Delete(readyPath)
+            File.Delete(authorizedPath)
+    }
+
+[<Fact>]
+let ``Required containment deadline includes the pre-authorization barrier`` () : Task =
+    task {
+        let authorization = "fslangmcp-test-start-v1"
+        let id = Guid.NewGuid().ToString("N")
+        let authorizedPath = Path.Combine(Path.GetTempPath(), $"fslangmcp_deadline_%s{id}.marker")
+        let script = authorizationProbeScript authorization None authorizedPath
+        let neverRelease = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let hooks =
+            { ForcedSetupFailure = None
+              BeforeAuthorization = Some(fun () -> neverRelease.Task :> Task) }
+
+        try
+            let operation =
+                runAsyncWithOutputLimitAfterRequiredContainmentForTest
+                    "dotnet"
+                    [ "fsi"; "--exec"; script ]
+                    authorization
+                    (TimeSpan.FromMilliseconds(500.0))
+                    CancellationToken.None
+                    1024
+                    hooks
+
+            let! error = Assert.ThrowsAsync<TimeoutException>(fun () -> operation :> Task)
+            Assert.Contains("timed out", error.Message)
+            Assert.False(File.Exists(authorizedPath), "A timed-out authorization barrier released the helper.")
+        finally
+            File.Delete(script)
+            File.Delete(authorizedPath)
     }
 
 [<Fact>]
