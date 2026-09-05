@@ -175,6 +175,13 @@ reduced with explicit returned/total/truncation fields so pagination can still p
 cursor offset is always `pageOffset + returnedSiteCount`; `cursorAdvancedBy` exposes the same
 increment. Count-capped and budget-capped pages therefore compose without skips.
 
+Metadata and site prefix counts are selected with logarithmic binary searches, not by removing one
+row and reserializing repeatedly. Every probe still builds the complete candidate response and
+measures it with the production serializer; no byte, token, or per-row size estimate decides what
+fits. Diagnostics retain priority over per-project detail exactly as before: the planner first
+keeps the largest diagnostics prefix that fits with all project rows, and only when none fits does
+it drop diagnostics and search the project prefix.
+
 Each site is projected to a canonical JSON row before that planner runs. Its `project`, source
 snippet metadata, and deterministic per-site `siteTypeAlternatives` projection do not depend on
 cursor offset, `maxResults`, neighbouring rows, or remaining response budget. The planner may

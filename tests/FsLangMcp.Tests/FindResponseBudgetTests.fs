@@ -173,6 +173,110 @@ let ``planner measures sites diagnostics and per-project metadata with the produ
     | result -> Assert.Fail($"expected a fitting bounded plan, got {result}")
 
 [<Fact>]
+let ``planner worst-case metadata trimming probe count is bounded`` () =
+    let mutable probes = 0
+
+    let build siteCount diagnosticCount projectCount =
+        probes <- probes + 1
+        let metadataCount = diagnosticCount + projectCount
+
+        jobj
+            [ "sites", JsonArray(Array.init siteCount (fun _ -> jstr "site")) :> JsonNode
+              "metadataCount", jint metadataCount
+              "metadata",
+              jstr (
+                  if metadataCount = 0 then
+                      ""
+                  else
+                      String.replicate 600 "x"
+              ) ]
+        :> JsonNode
+
+    let result = FindResponseBudget.planResponse 500 1 200 1_000 build
+
+    match result with
+    | FindResponseBudget.FitPlan.Fits(1, 0, 0) -> ()
+    | other -> Assert.Fail($"expected all optional metadata to be trimmed, got {other}")
+
+    // The pre-fix loop made 2,403 full production-serialization probes here: two for every
+    // removed metadata row plus a final site check. Binary prefix search has a deterministic
+    // logarithmic bound for these counts (1 initial + 7 diagnostics + 10 projects + 1 site).
+    Assert.True(probes <= 19, $"expected at most 19 serialized probes, got {probes}")
+
+    probes <- 0
+
+    match FindResponseBudget.planResponse 500 1_000 200 1_000 build with
+    | FindResponseBudget.FitPlan.Fits(deliveredSites, 0, 0) ->
+        Assert.InRange(deliveredSites, 1, 999)
+    | other -> Assert.Fail($"expected a bounded site prefix after metadata trimming, got {other}")
+
+    // maxResults is capped at 1,000. Adding its logarithmic site-prefix search keeps the
+    // complete production-shaped worst case below 30 full serializations.
+    Assert.True(probes <= 30, $"expected at most 30 serialized probes, got {probes}")
+
+[<Fact>]
+let ``logarithmic planner matches the former linear prefix policy across serialized thresholds`` () =
+    let sites = repeatedNodes "site" 5 140
+    let diagnostics = repeatedNodes "diagnostic" 4 170
+    let projects = repeatedNodes "project" 3 190
+
+    let build siteCount diagnosticCount projectCount =
+        let truncated =
+            siteCount < sites.Length
+            || diagnosticCount < diagnostics.Length
+            || projectCount < projects.Length
+
+        jobj
+            [ "sites", jsonArrayPrefix sites siteCount
+              "projectDiagnostics", jsonArrayPrefix diagnostics diagnosticCount
+              "perProject", jsonArrayPrefix projects projectCount
+              "responseTruncatedByBudget", jbool truncated
+              "responseSizeHint",
+              (if truncated then
+                   jstr (String.replicate 250 "h")
+               else
+                   null) ]
+        :> JsonNode
+
+    let bruteForce budget =
+        let fits siteCount diagnosticCount projectCount =
+            renderedLength (build siteCount diagnosticCount projectCount) <= budget
+
+        let minimumSites = 1
+        let mutable diagnosticCount = diagnostics.Length
+        let mutable projectCount = projects.Length
+        let mutable minimumFits = fits minimumSites diagnosticCount projectCount
+
+        while not minimumFits && diagnosticCount > 0 do
+            diagnosticCount <- diagnosticCount - 1
+            minimumFits <- fits minimumSites diagnosticCount projectCount
+
+        while not minimumFits && projectCount > 0 do
+            projectCount <- projectCount - 1
+            minimumFits <- fits minimumSites diagnosticCount projectCount
+
+        if not minimumFits then
+            if fits 0 diagnosticCount projectCount then
+                FindResponseBudget.FitPlan.FirstSiteOverflow
+            else
+                FindResponseBudget.FitPlan.FixedMetadataOverflow
+        else
+            let mutable deliveredSites = sites.Length
+
+            while deliveredSites > minimumSites && not (fits deliveredSites diagnosticCount projectCount) do
+                deliveredSites <- deliveredSites - 1
+
+            FindResponseBudget.FitPlan.Fits(deliveredSites, diagnosticCount, projectCount)
+
+    for budget in 100..37..4_000 do
+        let expected = bruteForce budget
+
+        let actual =
+            FindResponseBudget.planResponse budget sites.Length diagnostics.Length projects.Length build
+
+        Assert.Equal(expected, actual)
+
+[<Fact>]
 let ``planner returns a typed first-site overflow instead of a zero-progress page`` () =
     let build siteCount _ _ =
         jobj

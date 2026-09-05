@@ -860,32 +860,57 @@ module FindResponseBudget =
         let fits sites diagnostics projects =
             renderedLength (buildResponse sites diagnostics projects) <= budget
 
+        // Response size is monotone within a section prefix once the already-tested full
+        // response is known not to fit: each smaller candidate carries the same truncation
+        // metadata and differs only by an in-order array prefix. Probe that exact response
+        // logarithmically rather than serializing it once per removed row.
+        let largestFittingBelow upperExclusive probe =
+            let mutable low = 0
+            let mutable high = upperExclusive - 1
+            let mutable accepted = None
+
+            while low <= high do
+                let middle = low + (high - low) / 2
+
+                if probe middle then
+                    accepted <- Some middle
+                    low <- middle + 1
+                else
+                    high <- middle - 1
+
+            accepted
+
         let minimumSites = if siteCount = 0 then 0 else 1
         let mutable diagnostics = diagnosticCount
         let mutable projects = perProjectCount
-        let mutable minimumFits = false
-        let mutable keepPlanning = true
+        let mutable minimumFits = fits minimumSites diagnostics projects
 
-        while keepPlanning do
-            let fixedFits = fits 0 diagnostics projects
+        if not minimumFits && diagnosticCount > 0 then
+            // Preserve the established priority: retain every per-project row if ANY
+            // diagnostics prefix can coexist with the minimum site prefix.
+            match
+                largestFittingBelow diagnosticCount (fun candidateDiagnostics ->
+                    fits minimumSites candidateDiagnostics projects)
+            with
+            | Some candidateDiagnostics ->
+                diagnostics <- candidateDiagnostics
+                minimumFits <- true
+            | None -> diagnostics <- 0
 
-            minimumFits <-
-                if minimumSites = 0 then
-                    fixedFits
-                else
-                    fits minimumSites diagnostics projects
-
-            if minimumFits then
-                keepPlanning <- false
-            elif diagnostics > 0 then
-                diagnostics <- diagnostics - 1
-            elif projects > 0 then
-                projects <- projects - 1
-            else
-                keepPlanning <- false
+        if not minimumFits && perProjectCount > 0 then
+            // No diagnostics prefix fits with full per-project detail. Match the old loop by
+            // dropping diagnostics completely, then retaining the largest project prefix.
+            match
+                largestFittingBelow perProjectCount (fun candidateProjects ->
+                    fits minimumSites diagnostics candidateProjects)
+            with
+            | Some candidateProjects ->
+                projects <- candidateProjects
+                minimumFits <- true
+            | None -> projects <- 0
 
         if not minimumFits then
-            if fits 0 diagnostics projects then
+            if siteCount > 0 && fits 0 diagnostics projects then
                 FitPlan.FirstSiteOverflow
             else
                 FitPlan.FixedMetadataOverflow
