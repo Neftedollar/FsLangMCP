@@ -164,8 +164,7 @@ let tryDecode (cursor: string) : Result<CursorPayload, string> =
     | Error reason -> Error reason
     | Ok bytes ->
         try
-            let json = Encoding.UTF8.GetString(bytes)
-            use doc = JsonDocument.Parse(json)
+            use doc = JsonDocument.Parse(ReadOnlyMemory<byte>(bytes))
             let root = doc.RootElement
 
             // TryGetProperty throws InvalidOperationException unless the root is an
@@ -184,6 +183,9 @@ let tryDecode (cursor: string) : Result<CursorPayload, string> =
                 | Ok _ -> Error "legacy cursor payload must contain exactly the 'offset' property"
         with
         | :? JsonException as ex -> Error $"cursor payload is not valid JSON: {ex.Message}"
+        // JsonDocument accepts escaped lone surrogates; accessing such a property
+        // name throws InvalidOperationException rather than JsonException.
+        | :? InvalidOperationException -> Error "cursor JSON strings must contain valid Unicode"
 
 // ─── Find v2 cursor and identity helpers ──────────────────────────────────────
 
@@ -197,8 +199,7 @@ let tryDecodeFind (cursor: string) : Result<FindCursorV2, FindCursorDecodeError>
     | Error reason -> findDecodeError FindCursorDecodeErrorKind.Malformed reason
     | Ok bytes ->
         try
-            let json = Encoding.UTF8.GetString(bytes)
-            use doc = JsonDocument.Parse(json)
+            use doc = JsonDocument.Parse(ReadOnlyMemory<byte>(bytes))
             let root = doc.RootElement
 
             if root.ValueKind <> JsonValueKind.Object then
@@ -226,7 +227,13 @@ let tryDecodeFind (cursor: string) : Result<FindCursorV2, FindCursorDecodeError>
                         let query = root.GetProperty("query")
                         let snapshot = root.GetProperty("snapshot")
 
-                        match version.ValueKind, version.TryGetInt32() with
+                        // TryGetInt32 still throws on non-number JSON kinds. Guard
+                        // before calling it, not in a tuple pattern evaluated eagerly.
+                        let numericVersion =
+                            if version.ValueKind = JsonValueKind.Number then version.TryGetInt32()
+                            else false, 0
+
+                        match version.ValueKind, numericVersion with
                         | JsonValueKind.Number, (true, value) when value <> 2 ->
                             findDecodeError
                                 FindCursorDecodeErrorKind.UnsupportedVersion
@@ -267,6 +274,8 @@ let tryDecodeFind (cursor: string) : Result<FindCursorV2, FindCursorDecodeError>
         with
         | :? JsonException as ex ->
             findDecodeError FindCursorDecodeErrorKind.Malformed $"find cursor payload is not valid JSON: {ex.Message}"
+        | :? InvalidOperationException ->
+            findDecodeError FindCursorDecodeErrorKind.Malformed "find cursor JSON strings must contain valid Unicode"
 
 let private writeStringOption (writer: Utf8JsonWriter) (value: string option) =
     writer.WriteStartArray()

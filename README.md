@@ -266,6 +266,10 @@ deadline-incomplete continuations return no sites with `retrySameCursor=true`. `
 similarly exposes expected/received/missing/stale file coverage and never turns an
 incomplete empty snapshot into `clean`.
 
+For capped linked-field type alternatives, `siteTypeAlternativesOmitted` reports how many
+alternatives were omitted and `siteTypeAlternativesOffset` identifies the first omitted index.
+These per-site values are independent of page size and response budget.
+
 LSP positions (`line`, `character`) are **0-based**.
 
 ## Development Commands

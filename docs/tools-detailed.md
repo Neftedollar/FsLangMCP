@@ -208,6 +208,13 @@ This recomputation retains no per-cursor result state and puts no plaintext quer
 diagnostic, or source text in the token. The hash is a consistency identity, not an authorization
 mechanism and not a claim that FCS observed an atomic filesystem snapshot.
 
+For position requests, the identity binds the actual resolved symbol's assembly, declaration/
+signature locations, and untruncated semantic type/signature, not just its name. Retyping a call
+to select another overload therefore invalidates the cursor even if every site row is identical.
+A removed identifier or line is stale; unavailable type checking returns incomplete validation.
+The same-cursor retry route also applies to deadline expiry during final page planning and
+serialization, after the snapshot hash has already matched.
+
 Continuation failures are typed and never return sites:
 
 | `errorKind` | Caller action |
@@ -404,7 +411,9 @@ are absent/zero on a normal single-project sweep.
 **Why it is bounded and page-invariant.** Unlike `siteType`, the alternatives column grows with the
 number of projects a linked file is compiled by. Deterministic per-site limits keep it bounded in
 cardinality: at most 3 distinct types per row and 3 projects per type. The remainder becomes
-`siteTypeAlternativesOmitted` on the row and `projectsOmitted` on the entry. These limits depend
+`siteTypeAlternativesOmitted` on the row and `projectsOmitted` on the entry. A capped row also
+records `siteTypeAlternativesOffset`, the zero-based index of the first omitted alternative
+(not a separate cursor or an input parameter). These limits depend
 only on the site's sorted alternatives, so the same site serializes identically at different
 `maxResults` and page boundaries. `siteTypes.alternativesTruncatedRows` counts delivered rows that
 hit either cap, and the `siteTypesNote` says so. The final 60,000-unit response guard handles total

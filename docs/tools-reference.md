@@ -58,6 +58,8 @@ response-budget boundaries; anything left out is reported as
 `siteTypeAlternativesOmitted` / `projectsOmitted` / `siteTypes.alternativesTruncatedRows`, never
 dropped silently. The response budget can omit only a suffix of complete canonical site rows. See
 `docs/tools-detailed.md`.
+`siteTypeAlternativesOffset` records the first omitted alternative's zero-based index when capped;
+it is metadata, not a separate continuation input.
 
 **Changed in v0.16.0:** `field-set-mutation` (`x.Field <- v`) and `field-pattern`
 (`| { Field = x } ->`) are new kinds — both used to be reported as `field-read`, mislabeling a

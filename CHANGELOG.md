@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plus SHA-256 identities, retain no per-cursor server state, and make no atomic-filesystem-
   snapshot claim. This wire-contract change **must ship in the next minor release**; the #259
   integration lane intentionally does not change the product version.
+- Cursor validation rejects nonnumeric JSON versions and invalid Unicode without throwing, preserves same-cursor
+  retries through final response serialization, and binds position cursors to the selected
+  overload's semantic identity. Removed position targets restart as stale; unavailable resolution
+  retries without delivering a page. Saturated linked-type alternatives expose their omitted
+  offset. Regression coverage includes full alternating-budget linked-row traversal, stable
+  failure recovery with identical sites, and refreshed diagnostics beyond the response prefix.
 
 ## [0.17.1] - 2026-09-05
 

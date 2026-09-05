@@ -33,6 +33,7 @@
     <Compile Include="FieldSiteTypesTests.fs" />
     <Compile Include="FindTests.fs" />
     <Compile Include="FindCursorIntegrationTests.fs" />
+    <Compile Include="FindCursorReviewTests.fs" />
     <Compile Include="FindResponseBudgetTests.fs" />
     <Compile Include="TestsForSymbolTests.fs" />
     <Compile Include="CompileOrderTests.fs" />
