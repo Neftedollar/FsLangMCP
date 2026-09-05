@@ -156,7 +156,7 @@ A deadline-partial response that contains positive sites has this explicit wire
 state:
 
 ```text
-status = "succeeded"
+status = "partial"
 deliveryStatus = "partial"
 coverage.complete = false
 resolution.complete = false
