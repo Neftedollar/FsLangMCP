@@ -506,8 +506,12 @@ module internal FindDeadlineResponse =
     let private knownProjectsBeforeDiscovery (args: FindArgs) =
         args.projectPath
         |> Option.filter (String.IsNullOrWhiteSpace >> not)
-        |> Option.map normalizePath
         |> Option.filter (fun path -> path.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase))
+        |> Option.map (fun path ->
+            try
+                normalizePath path
+            with _ ->
+                path)
         |> Option.toArray
 
     /// Typed response used when the shared request deadline expires before find has a
@@ -532,8 +536,14 @@ module internal FindDeadlineResponse =
         let perProject =
             projects
             |> Array.map (fun project ->
+                let projectName =
+                    try
+                        Path.GetFileNameWithoutExtension project
+                    with _ ->
+                        project
+
                 jobj
-                    [ "project", jstr (Path.GetFileNameWithoutExtension project)
+                    [ "project", jstr projectName
                       "fsproj", jstr project
                       "status", jstr "not_started"
                       "errorKind", jstr "deadline_not_started"
@@ -2645,6 +2655,7 @@ type internal FcsBridge
         ?findDeadlineSignalOverride: (unit -> Task),
         ?findResponseDeadlineSignalOverride: (unit -> Task),
         ?findResponseConstructionBeforeStartOverride: (unit -> Task),
+        ?findResponseConstructionBeforeStepOverride: (string -> int -> unit),
         // #207: test-only seam for find's PER-SITE siteType deadline. The production check
         // reads the shared FindRequestDeadline, which cannot target one site deterministically
         // without a seam: timeoutMs=0 is exhausted BEFORE the sweep and yields no sites.
@@ -6843,6 +6854,14 @@ type internal FcsBridge
                 else
                     StringComparison.Ordinal
 
+            let fileScopePath =
+                if scope = "file" then
+                    args.path
+                    |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                    |> Option.map normalizePath
+                else
+                    None
+
             let isMemberProject (candidate: string) =
                 let fullCandidate = normalizePath candidate
 
@@ -7257,51 +7276,60 @@ type internal FcsBridge
 
                     let add (symbolUse: FSharpSymbolUse) (siteKind: string) (overwrite: bool) (siteType: string) (typeStatus: string) =
                         let r = symbolUse.Range
-                        let key = locationKey r
+                        let normalizedFile = normalizePath r.FileName
 
-                        if overwrite || not (siteByKey.ContainsKey key) then
-                            // #207 review: kind precedence still lets a later pass overwrite the
-                            // row, but a TYPE another project already resolved for this same
-                            // physical site is never silently replaced — a linked .fs swept by
-                            // several projects can resolve the field differently in each. The
-                            // first resolved type keeps the `siteType` column AND the project
-                            // label that produced it (otherwise the row would report one
-                            // project's name beside another project's type); the rest are kept
-                            // as alternatives. Without includeSiteTypes every SiteType is null,
-                            // so this reduces exactly to the previous last-writer-wins behaviour.
-                            // `typeStatus` is non-null ONLY on a field-pass row under
-                            // includeSiteTypes, so the merge is confined to field-vs-field
-                            // across projects. A member pass overwriting the same range still
-                            // nulls the type exactly as before — otherwise a member-usage row
-                            // could carry a type and break `typed + degraded = fieldSites`.
-                            let keptType, keptStatus, keptProject, alternatives =
-                                match siteByKey.TryGetValue key with
-                                | true, prior when not (isNull prior.SiteType) && not (isNull typeStatus) ->
-                                    prior.SiteType,
-                                    prior.TypeStatus,
-                                    prior.Project,
-                                    FieldSiteTypes.mergeAlternatives
-                                        prior.SiteType
-                                        siteType
-                                        projDisplay
-                                        prior.TypeAlternatives
-                                | _ -> siteType, typeStatus, projDisplay, []
+                        let withinRequestedFile =
+                            match fileScopePath with
+                            | Some requestedFile ->
+                                String.Equals(normalizedFile, requestedFile, sourcePathComparison)
+                            | None -> true
 
-                            siteByKey[key] <-
-                                {| File = normalizePath r.FileName
-                                   StartLine = r.StartLine
-                                   StartCol = r.StartColumn
-                                   EndLine = r.EndLine
-                                   EndCol = r.EndColumn
-                                   Kind = siteKind
-                                   Project = keptProject
-                                   FullName =
-                                    (match symbolUse.Symbol.FullName with
-                                     | null -> null
-                                     | s -> s)
-                                   SiteType = keptType
-                                   TypeStatus = keptStatus
-                                   TypeAlternatives = alternatives |}
+                        if withinRequestedFile then
+                            let key = locationKey r
+
+                            if overwrite || not (siteByKey.ContainsKey key) then
+                                // #207 review: kind precedence still lets a later pass overwrite the
+                                // row, but a TYPE another project already resolved for this same
+                                // physical site is never silently replaced — a linked .fs swept by
+                                // several projects can resolve the field differently in each. The
+                                // first resolved type keeps the `siteType` column AND the project
+                                // label that produced it (otherwise the row would report one
+                                // project's name beside another project's type); the rest are kept
+                                // as alternatives. Without includeSiteTypes every SiteType is null,
+                                // so this reduces exactly to the previous last-writer-wins behaviour.
+                                // `typeStatus` is non-null ONLY on a field-pass row under
+                                // includeSiteTypes, so the merge is confined to field-vs-field
+                                // across projects. A member pass overwriting the same range still
+                                // nulls the type exactly as before — otherwise a member-usage row
+                                // could carry a type and break `typed + degraded = fieldSites`.
+                                let keptType, keptStatus, keptProject, alternatives =
+                                    match siteByKey.TryGetValue key with
+                                    | true, prior when not (isNull prior.SiteType) && not (isNull typeStatus) ->
+                                        prior.SiteType,
+                                        prior.TypeStatus,
+                                        prior.Project,
+                                        FieldSiteTypes.mergeAlternatives
+                                            prior.SiteType
+                                            siteType
+                                            projDisplay
+                                            prior.TypeAlternatives
+                                    | _ -> siteType, typeStatus, projDisplay, []
+
+                                siteByKey[key] <-
+                                    {| File = normalizedFile
+                                       StartLine = r.StartLine
+                                       StartCol = r.StartColumn
+                                       EndLine = r.EndLine
+                                       EndCol = r.EndColumn
+                                       Kind = siteKind
+                                       Project = keptProject
+                                       FullName =
+                                        (match symbolUse.Symbol.FullName with
+                                         | null -> null
+                                         | s -> s)
+                                       SiteType = keptType
+                                       TypeStatus = keptStatus
+                                       TypeAlternatives = alternatives |}
 
                     // Field/member sites first so their richer kind wins over a generic
                     // "reference" tag when a non-exact name-match overlaps the same range.
@@ -7448,7 +7476,7 @@ type internal FcsBridge
                                       | SdkPreflight.SdkPinUnsatisfiable _ -> "sdk_not_found"
                                       | _ -> "project_failure"
                               )
-                              "retryable", jbool busy
+                              "retryable", jbool (timedOut || busy)
                               "error", jstr ex.Message
                               "elapsedMs", jint (int projSw.ElapsedMilliseconds) ]
                             @ typedFailureFields
@@ -7459,59 +7487,6 @@ type internal FcsBridge
                     perProjectKeep.Add(true)
 
             sweepSw.Stop()
-
-            // scope=file post-filters to args.path's file (still type-checked in-project).
-            let allSites0 = siteByKey.Values |> Seq.toArray
-
-            let allSites =
-                if scope = "file" then
-                    match args.path with
-                    | Some p when not (String.IsNullOrWhiteSpace p) ->
-                        let pf = normalizePath p
-                        allSites0 |> Array.filter (fun s -> String.Equals(s.File, pf, sourcePathComparison))
-                    | _ -> allSites0
-                else
-                    allSites0
-
-            let sortedSites =
-                allSites
-                |> Array.sortBy (fun s -> s.File, s.StartLine, s.StartCol, s.EndLine, s.EndCol, s.Kind)
-
-            let countKind (k: string) =
-                sortedSites |> Array.filter (fun s -> s.Kind = k) |> Array.length
-
-            let defCount = countKind "definition"
-            let refCount = countKind "reference"
-            let fLit = countKind "field-set-literal"
-            let fUpd = countKind "field-set-update"
-            let fMut = countKind "field-set-mutation"
-            let fPat = countKind "field-pattern"
-            let fRead = countKind "field-read"
-            let memCount = countKind "member-usage"
-            let totalSites = sortedSites.Length
-
-            // #207: counted over the FULL matched set (post scope=file filter), not just the
-            // returned page, so "3 of 40 sites could not be typed" stays true across paging.
-            let fieldSiteCount = fLit + fUpd + fMut + fPat + fRead
-
-            let countTypeStatus (status: string) =
-                sortedSites
-                |> Array.filter (fun s -> String.Equals(s.TypeStatus, status, StringComparison.Ordinal))
-                |> Array.length
-
-            let typedSites = countTypeStatus FieldSiteTypes.Typed
-            let unresolvedSites = countTypeStatus FieldSiteTypes.Unresolved
-            let timedOutTypeSites = countTypeStatus FieldSiteTypes.TimedOut
-            let degradedSites = unresolvedSites + timedOutTypeSites
-
-            // #207 review: a SUBSET of `typed`, not a third bucket — the identity
-            // `typed + degraded = fieldSites` still holds. These rows carry a type; what
-            // they also carry is another project's different answer for the same physical
-            // site, in `siteTypeAlternatives`.
-            let multiTypedSites =
-                sortedSites
-                |> Array.filter (fun s -> not (List.isEmpty s.TypeAlternatives))
-                |> Array.length
 
             // Declared coverage and actual semantic sweep breadth are intentionally
             // separate. Missing solution members count as requested evidence, but they
@@ -7529,6 +7504,11 @@ type internal FcsBridge
             // HEADLINE: a positive site is always useful, but absence is conclusive
             // only when every requested FCS project completed. FSAC outcomes remain
             // typed so not-ready/mismatch/failure cannot masquerade as zero hits.
+            // scope=file sites are filtered while they enter siteByKey, so determining
+            // whether the semantic sweep hit anything is O(1) and happens before the
+            // response-construction allowance begins. No post-sweep materialization is
+            // allowed to hide before that boundary.
+            let totalSites = siteByKey.Count
             let fcsMatched = totalSites > 0
 
             let mutable fsacFallbackTimedOut = false
@@ -7560,6 +7540,56 @@ type internal FcsBridge
                         | None ->
                             return FindFsacProbeResult.Unavailable "No FSAC probe was supplied."
                 }
+
+            // Semantic work ends with the zero-hit fallback. Everything below is response
+            // shaping and shares one fixed allowance, beginning before even the fallback
+            // result is normalized. A test-only asynchronous seam can deterministically
+            // occupy that allowance; production construction remains synchronous and
+            // checks the monotonic response deadline between bounded rows/steps.
+            deadline.BeginResponseConstruction()
+            let mutable responseConstructionTimedOut = deadline.ResponseExpired
+
+            match findResponseConstructionBeforeStartOverride with
+            | Some beforeStart when not responseConstructionTimedOut ->
+                let operation = beforeStart ()
+                observeFault operation
+                let remaining = deadline.RemainingResponseBudget()
+
+                if remaining <= TimeSpan.Zero then
+                    responseConstructionTimedOut <- true
+                else
+                    use responseWaitCancellation =
+                        CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+
+                    let contenders =
+                        match deadline.ResponseExpirySignal with
+                        | Some signal -> [| operation; Task.Delay(remaining, responseWaitCancellation.Token); signal |]
+                        | None -> [| operation; Task.Delay(remaining, responseWaitCancellation.Token) |]
+
+                    let! winner =
+                        Task.WhenAny(contenders)
+
+                    responseWaitCancellation.Cancel()
+
+                    if Object.ReferenceEquals(winner, operation) then
+                        do! operation
+                        responseConstructionTimedOut <- deadline.ResponseExpired
+                    else
+                        cancellationToken.ThrowIfCancellationRequested()
+                        responseConstructionTimedOut <- true
+            | _ -> ()
+
+            let responseStep phase index =
+                cancellationToken.ThrowIfCancellationRequested()
+
+                findResponseConstructionBeforeStepOverride
+                |> Option.iter (fun beforeStep -> beforeStep phase index)
+
+                if deadline.ResponseExpired then
+                    responseConstructionTimedOut <- true
+                    false
+                else
+                    true
 
             let fsacHits, fsacFallbackState, fsacFallbackReason =
                 match fsacProbeResult with
@@ -7621,50 +7651,236 @@ type internal FcsBridge
                             $"Cannot confirm absence: only %d{projectsAnalyzed}/%d{projectsRequested} requested project(s) were analyzed (%s{failureSummary})."
                 | _ -> None
 
-            // Semantic work stops before the overall deadline and leaves a fixed,
-            // documented allowance for this phase. A test-only asynchronous seam can
-            // deterministically occupy that allowance; production construction remains
-            // synchronous and checks the monotonic response deadline between bounded rows.
-            deadline.BeginResponseConstruction()
-            let mutable responseConstructionTimedOut = deadline.ResponseExpired
+            // Response shaping begins at the boundary above. Build the ordered index and
+            // all counters in ONE pass, checking the response deadline before every bounded
+            // dictionary/ordered-set step. This replaces materialize + sort + eleven full
+            // array scans that previously ran before BeginResponseConstruction.
+            let siteKeyComparer =
+                System.Collections.Generic.Comparer<
+                    struct (string * int * int * int * int * string)
+                 >.Create(fun
+                              (struct (leftFile, leftStartLine, leftStartCol, leftEndLine, leftEndCol, leftKind))
+                              (struct (rightFile, rightStartLine, rightStartCol, rightEndLine, rightEndCol, rightKind)) ->
+                    let byFile = StringComparer.Ordinal.Compare(leftFile, rightFile)
 
-            match findResponseConstructionBeforeStartOverride with
-            | Some beforeStart when not responseConstructionTimedOut ->
-                let operation = beforeStart ()
-                observeFault operation
-                let remaining = deadline.RemainingResponseBudget()
-
-                if remaining <= TimeSpan.Zero then
-                    responseConstructionTimedOut <- true
-                else
-                    use responseWaitCancellation =
-                        CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
-
-                    let contenders =
-                        match deadline.ResponseExpirySignal with
-                        | Some signal -> [| operation; Task.Delay(remaining, responseWaitCancellation.Token); signal |]
-                        | None -> [| operation; Task.Delay(remaining, responseWaitCancellation.Token) |]
-
-                    let! winner =
-                        Task.WhenAny(contenders)
-
-                    responseWaitCancellation.Cancel()
-
-                    if Object.ReferenceEquals(winner, operation) then
-                        do! operation
-                        responseConstructionTimedOut <- deadline.ResponseExpired
+                    if byFile <> 0 then
+                        byFile
                     else
-                        cancellationToken.ThrowIfCancellationRequested()
-                        responseConstructionTimedOut <- true
-            | _ -> ()
+                        let byStartLine = compare leftStartLine rightStartLine
 
-            let requestedPageSites =
-                if responseConstructionTimedOut then
-                    [||]
-                else
-                    sortedSites |> Array.skip (min pageOffset totalSites) |> Array.truncate pageSize
+                        if byStartLine <> 0 then
+                            byStartLine
+                        else
+                            let byStartCol = compare leftStartCol rightStartCol
 
-            let lineContextCache = System.Collections.Generic.Dictionary<string, string array>()
+                            if byStartCol <> 0 then
+                                byStartCol
+                            else
+                                let byEndLine = compare leftEndLine rightEndLine
+
+                                if byEndLine <> 0 then
+                                    byEndLine
+                                else
+                                    let byEndCol = compare leftEndCol rightEndCol
+
+                                    if byEndCol <> 0 then
+                                        byEndCol
+                                    else
+                                        StringComparer.Ordinal.Compare(leftKind, rightKind))
+
+            let sortedSiteIndex =
+                System.Collections.Generic.SortedDictionary<
+                    struct (string * int * int * int * int * string),
+                    _
+                 >(siteKeyComparer)
+
+            let mutable defCount = 0
+            let mutable refCount = 0
+            let mutable fLit = 0
+            let mutable fUpd = 0
+            let mutable fMut = 0
+            let mutable fPat = 0
+            let mutable fRead = 0
+            let mutable memCount = 0
+            let mutable typedSites = 0
+            let mutable unresolvedSites = 0
+            let mutable timedOutTypeSites = 0
+            let mutable multiTypedSites = 0
+
+            if not responseConstructionTimedOut then
+                use sites = (siteByKey.Values :> seq<_>).GetEnumerator()
+                let mutable shapingIndex = 0
+                let mutable keepShaping = true
+
+                while keepShaping && not responseConstructionTimedOut do
+                    if not (responseStep "post-sweep-shaping" shapingIndex) then
+                        keepShaping <- false
+                    elif sites.MoveNext() then
+                        let site = sites.Current
+
+                        sortedSiteIndex.Add(
+                            struct (
+                                site.File,
+                                site.StartLine,
+                                site.StartCol,
+                                site.EndLine,
+                                site.EndCol,
+                                site.Kind
+                            ),
+                            site
+                        )
+
+                        match site.Kind with
+                        | "definition" -> defCount <- defCount + 1
+                        | "reference" -> refCount <- refCount + 1
+                        | "field-set-literal" -> fLit <- fLit + 1
+                        | "field-set-update" -> fUpd <- fUpd + 1
+                        | "field-set-mutation" -> fMut <- fMut + 1
+                        | "field-pattern" -> fPat <- fPat + 1
+                        | "field-read" -> fRead <- fRead + 1
+                        | "member-usage" -> memCount <- memCount + 1
+                        | _ -> ()
+
+                        match site.TypeStatus with
+                        | status when String.Equals(status, FieldSiteTypes.Typed, StringComparison.Ordinal) ->
+                            typedSites <- typedSites + 1
+                        | status when String.Equals(status, FieldSiteTypes.Unresolved, StringComparison.Ordinal) ->
+                            unresolvedSites <- unresolvedSites + 1
+                        | status when String.Equals(status, FieldSiteTypes.TimedOut, StringComparison.Ordinal) ->
+                            timedOutTypeSites <- timedOutTypeSites + 1
+                        | _ -> ()
+
+                        if not (List.isEmpty site.TypeAlternatives) then
+                            multiTypedSites <- multiTypedSites + 1
+
+                        shapingIndex <- shapingIndex + 1
+                    else
+                        keepShaping <- false
+
+            if responseConstructionTimedOut then
+                sortedSiteIndex.Clear()
+                defCount <- 0
+                refCount <- 0
+                fLit <- 0
+                fUpd <- 0
+                fMut <- 0
+                fPat <- 0
+                fRead <- 0
+                memCount <- 0
+                typedSites <- 0
+                unresolvedSites <- 0
+                timedOutTypeSites <- 0
+                multiTypedSites <- 0
+
+            // #207: these counts cover the full scoped result, not just this cursor page.
+            let fieldSiteCount = fLit + fUpd + fMut + fPat + fRead
+            let degradedSites = unresolvedSites + timedOutTypeSites
+
+            let requestedPageSites = ResizeArray<_>()
+
+            if not responseConstructionTimedOut then
+                use orderedSites = (sortedSiteIndex.Values :> seq<_>).GetEnumerator()
+                let mutable sortedIndex = 0
+                let mutable keepSelecting = true
+
+                while
+                    keepSelecting
+                    && requestedPageSites.Count < pageSize
+                    && not responseConstructionTimedOut
+                    do
+                    if not (responseStep "page-selection" sortedIndex) then
+                        keepSelecting <- false
+                    elif orderedSites.MoveNext() then
+                        if sortedIndex >= pageOffset then
+                            requestedPageSites.Add(orderedSites.Current)
+
+                        sortedIndex <- sortedIndex + 1
+                    else
+                        keepSelecting <- false
+
+            if responseConstructionTimedOut then
+                requestedPageSites.Clear()
+
+            // Cache only the exact, bounded context requested by a returned site. Unlike
+            // lineContextToJson (used by legacy tools), this never materializes a whole file:
+            // it streams only through the requested trailing line and checks the response
+            // deadline before every line and every JSON row.
+            let lineContextCache =
+                System.Collections.Generic.Dictionary<struct (string * int * int), JsonNode>()
+
+            let emptyLineContext () =
+                jobj
+                    [ "lineText", jstr ""
+                      "before", JsonArray() :> JsonNode
+                      "after", JsonArray() :> JsonNode ]
+
+            let tryLineContextToJson filePath startLine =
+                let boundedContextLines = max 0 contextLines
+                let cacheKey = normalizePath filePath
+                let contextKey = struct (cacheKey, startLine, boundedContextLines)
+
+                match lineContextCache.TryGetValue(contextKey) with
+                | true, cached -> Some cached
+                | _ when not (responseStep "line-context" 0) -> None
+                | _ when not (File.Exists cacheKey) ->
+                    let empty = emptyLineContext ()
+                    lineContextCache[contextKey] <- empty
+                    Some empty
+                | _ ->
+                    let targetLine = max 1 startLine
+                    let firstLine = max 1 (targetLine - boundedContextLines)
+                    let lastLine = targetLine + boundedContextLines
+                    let selected = ResizeArray<struct (int * string)>()
+                    use lines = File.ReadLines(cacheKey).GetEnumerator()
+                    let mutable lineNumber = 1
+                    let mutable reachedEnd = false
+                    let mutable contextComplete = true
+
+                    while lineNumber <= lastLine && not reachedEnd && contextComplete do
+                        if not (responseStep "line-context" lineNumber) then
+                            contextComplete <- false
+                        elif lines.MoveNext() then
+                            if lineNumber >= firstLine then
+                                selected.Add(struct (lineNumber, lines.Current))
+
+                            lineNumber <- lineNumber + 1
+                        else
+                            reachedEnd <- true
+
+                    if not contextComplete then
+                        None
+                    else
+                        let before = ResizeArray<JsonNode>()
+                        let after = ResizeArray<JsonNode>()
+                        let mutable lineText = ""
+                        let mutable selectedIndex = 0
+
+                        while selectedIndex < selected.Count && contextComplete do
+                            if not (responseStep "line-context-json" selectedIndex) then
+                                contextComplete <- false
+                            else
+                                let struct (number, text) = selected[selectedIndex]
+
+                                if number = targetLine then
+                                    lineText <- text
+                                elif number < targetLine then
+                                    before.Add(jobj [ "line", jint number; "text", jstr text ] :> JsonNode)
+                                else
+                                    after.Add(jobj [ "line", jint number; "text", jstr text ] :> JsonNode)
+
+                                selectedIndex <- selectedIndex + 1
+
+                        if not contextComplete then
+                            None
+                        else
+                            let context =
+                                jobj
+                                    [ "lineText", jstr lineText
+                                      "before", JsonArray(before.ToArray()) :> JsonNode
+                                      "after", JsonArray(after.ToArray()) :> JsonNode ]
+
+                            lineContextCache[contextKey] <- context
+                            Some context
 
             // #207 review: the alternatives column is the one part of a row whose size is not
             // bounded by a per-value cap — it grows with the number of projects a linked file
@@ -7685,9 +7901,9 @@ type internal FcsBridge
                                   FullName: string
                                   SiteType: string
                                   TypeStatus: string
-                                  TypeAlternatives: (string * string) list |}) =
-                let ctx = lineContextToJson lineContextCache contextLines s.File s.StartLine
-
+                                  TypeAlternatives: (string * string) list |})
+                (ctx: JsonNode)
+                =
                 let rangeNode =
                     jobj
                         [ "startLine", jint s.StartLine
@@ -7751,19 +7967,30 @@ type internal FcsBridge
             let mutable responseSiteIndex = 0
 
             while
-                responseSiteIndex < requestedPageSites.Length
+                responseSiteIndex < requestedPageSites.Count
                 && not responseConstructionTimedOut
                 do
-                if deadline.ResponseExpired then
+                if not (responseStep "site-json" responseSiteIndex) then
                     responseConstructionTimedOut <- true
                 else
-                    siteNodeBuffer.Add(siteToJson requestedPageSites[responseSiteIndex])
-                    responseSiteIndex <- responseSiteIndex + 1
+                    let site = requestedPageSites[responseSiteIndex]
+
+                    match tryLineContextToJson site.File site.StartLine with
+                    | None -> responseConstructionTimedOut <- true
+                    | Some context ->
+                        let node = siteToJson site context
+
+                        if responseStep "site-json-complete" responseSiteIndex then
+                            siteNodeBuffer.Add(node)
+                            responseSiteIndex <- responseSiteIndex + 1
 
             if deadline.ResponseExpired then
                 responseConstructionTimedOut <- true
 
-            let pageSites = requestedPageSites |> Array.truncate siteNodeBuffer.Count
+            let pageSites =
+                requestedPageSites.ToArray()
+                |> Array.truncate siteNodeBuffer.Count
+
             let siteNodes = siteNodeBuffer.ToArray()
 
             // Project coverage and response delivery are separate dimensions. A complete
@@ -7779,20 +8006,78 @@ type internal FcsBridge
 
             // Aggregated diagnostics across swept projects: Error always (so callers can
             // detect broken projects even on zero hits), Warning/Info gated by includeInfo.
+            // Stop as soon as 200 retained rows are collected and check the response
+            // deadline before every source diagnostic; never clone/filter the full array.
+            let diagnosticNodes = ResizeArray<JsonNode>(200)
+            let mutable diagnosticIndex = 0
+
+            while
+                diagnosticIndex < aggregatedDiagnostics.Count
+                && diagnosticNodes.Count < 200
+                && not responseConstructionTimedOut
+                do
+                if not (responseStep "diagnostic-collection" diagnosticIndex) then
+                    responseConstructionTimedOut <- true
+                else
+                    let diagnostic = aggregatedDiagnostics[diagnosticIndex]
+
+                    if
+                        diagnostic.Severity = FSharpDiagnosticSeverity.Error
+                        || (includeInfo
+                            && (diagnostic.Severity = FSharpDiagnosticSeverity.Warning
+                                || diagnostic.Severity = FSharpDiagnosticSeverity.Hidden
+                                || diagnostic.Severity = FSharpDiagnosticSeverity.Info))
+                    then
+                        diagnosticNodes.Add(diagnosticToJson diagnostic)
+
+                    diagnosticIndex <- diagnosticIndex + 1
+
             let diagNodes =
                 if responseConstructionTimedOut || deadline.ResponseExpired then
                     responseConstructionTimedOut <- true
                     [||]
                 else
-                    aggregatedDiagnostics.ToArray()
-                    |> Array.filter (fun d ->
-                        d.Severity = FSharpDiagnosticSeverity.Error
-                        || (includeInfo
-                            && (d.Severity = FSharpDiagnosticSeverity.Warning
-                                || d.Severity = FSharpDiagnosticSeverity.Hidden
-                                || d.Severity = FSharpDiagnosticSeverity.Info)))
-                    |> Array.truncate 200
-                    |> Array.map diagnosticToJson
+                    diagnosticNodes.ToArray()
+
+            // F5 (#100): drop per-project entries that matched nothing and didn't error —
+            // on a large solution they are one-noise-line-per-project that dwarfs a small
+            // result. `projectsSwept` still conveys the full sweep breadth either way.
+            // This is response shaping too, so finish it before freezing the phase ledger.
+            let isErrorEntry (node: JsonNode) =
+                match node with
+                | :? JsonObject as o -> o.ContainsKey("error")
+                | _ -> false
+
+            let retainedPerProject = ResizeArray<JsonNode>()
+            let mutable perProjectIndex = 0
+
+            while perProjectIndex < perProject.Count && not responseConstructionTimedOut do
+                if not (responseStep "per-project" perProjectIndex) then
+                    responseConstructionTimedOut <- true
+                else
+                    let node = perProject[perProjectIndex]
+
+                    let keep =
+                        if includePerProject then
+                            perProjectKeep[perProjectIndex]
+                        else
+                            isErrorEntry node
+
+                    if keep then
+                        retainedPerProject.Add(node)
+
+                    perProjectIndex <- perProjectIndex + 1
+
+            let perProjectField =
+                if responseConstructionTimedOut then
+                    []
+                elif includePerProject || retainedPerProject.Count > 0 then
+                    // includePerProject=false still SURFACES failed-sweep entries — the only
+                    // place a per-project load/timeout error is visible. Pure zero-match
+                    // noise entries stay omitted.
+                    [ ("perProject", JsonArray(retainedPerProject.ToArray()) :> JsonNode) ]
+                else
+                    []
 
             if deadline.ResponseExpired then
                 responseConstructionTimedOut <- true
@@ -7828,7 +8113,8 @@ type internal FcsBridge
 
                 let phases =
                     JsonArray(
-                        [| jobj
+                        [| jobj [ "phase", jstr "admission"; "status", jstr "complete" ] :> JsonNode
+                           jobj
                                [ "phase", jstr "position_resolution"
                                  "status", jstr (if kind = "position" then "complete" else "not_needed") ]
                            :> JsonNode
@@ -7980,36 +8266,6 @@ type internal FcsBridge
                             "paginationRestartRequired", jbool true ]
                 else
                     fields
-
-            // F5 (#100): drop per-project entries that matched nothing and didn't error —
-            // on a large solution they are one-noise-line-per-project that dwarfs a small
-            // result. `projectsSwept` still conveys the full sweep breadth either way.
-            let isErrorEntry (node: JsonNode) =
-                match node with
-                | :? JsonObject as o -> o.ContainsKey("error")
-                | _ -> false
-
-            let perProjectField =
-                if responseConstructionTimedOut then
-                    []
-                elif includePerProject then
-                    let kept =
-                        Seq.zip perProject perProjectKeep
-                        |> Seq.choose (fun (node, keep) -> if keep then Some node else None)
-                        |> Seq.toArray
-
-                    [ ("perProject", JsonArray(kept) :> JsonNode) ]
-                else
-                    // includePerProject=false still SURFACES failed-sweep entries — the only
-                    // place a per-project load/timeout error is visible. Omitting them would
-                    // let a caller read a failed project as "zero uses" and delete a live
-                    // symbol (#100). Pure zero-match noise entries stay omitted.
-                    let errored = perProject |> Seq.filter isErrorEntry |> Seq.toArray
-
-                    if errored.Length > 0 then
-                        [ ("perProject", JsonArray(errored) :> JsonNode) ]
-                    else
-                        []
 
             // F1 (#100): a dotted query that resolved to nothing reads like "symbol absent".
             // symbolMatches now accepts a dotted suffix, so this only fires for a genuine miss
