@@ -185,13 +185,13 @@ let ``mergeAlternatives orders alternatives deterministically, whatever the swee
 [<Fact>]
 let ``alternativesFields stays absent on the common single-project row`` () =
     // The row shape for a normal sweep must be byte-identical to before the fix.
-    Assert.Empty(FieldSiteTypes.alternativesFields true true [])
-    Assert.Empty(FieldSiteTypes.alternativesFields false true [ ("string", "ProjB") ])
+    Assert.Empty(FieldSiteTypes.alternativesFields true [])
+    Assert.Empty(FieldSiteTypes.alternativesFields false [ ("string", "ProjB") ])
 
 [<Fact>]
 let ``alternativesFields names each other type WITH the projects that resolved it`` () =
     let fields =
-        FieldSiteTypes.alternativesFields true true [ ("bool", "ProjD"); ("string", "ProjB"); ("string", "ProjC") ]
+        FieldSiteTypes.alternativesFields true [ ("bool", "ProjD"); ("string", "ProjB"); ("string", "ProjC") ]
 
     Assert.Equal(1, List.length fields)
     Assert.Equal("siteTypeAlternatives", fst fields[0])
@@ -232,23 +232,9 @@ let ``alternativeEntries caps projects per type and reports the remainder on the
     Assert.Equal(0, typesOmitted)
 
 [<Fact>]
-let ``alternativesFields past the page allowance keeps the COUNT and drops the strings`` () =
-    // The count is what makes the truncation non-silent: the caller still learns the site is
-    // contested and by how many types, and the page cannot blow the response ceiling.
-    let pairs = [ ("bool", "ProjB"); ("string", "ProjC") ]
-    let fields = FieldSiteTypes.alternativesFields true false pairs
-
-    Assert.Equal(1, List.length fields)
-    Assert.Equal("siteTypeAlternativesOmitted", fst fields[0])
-
-    let serialized = (FsLangMcp.Types.jobj fields).ToJsonString()
-    Assert.Equal("""{"siteTypeAlternativesOmitted":2}""", serialized)
-
-[<Fact>]
-let ``a full page of pathological rows stays inside the alternatives allowance`` () =
-    // The bound the per-type 200-char cap does NOT give on its own: alternatives grow with
-    // the number of projects a linked file is compiled by, once per site. Render a full
-    // default page of worst-case rows against the real budget loop and measure.
+let ``alternativesFields is a deterministic per-site projection`` () =
+    // The same physical site must serialize identically regardless of which sites precede it
+    // or how much response budget remains. Only the final page planner may omit the whole row.
     let hugeType index =
         String.replicate 200 "x" + string index // each already at the siteType cap
 
@@ -256,25 +242,16 @@ let ``a full page of pathological rows stays inside the alternatives allowance``
         [ for typeIndex in 1..10 do
               for projectIndex in 1..10 -> (hugeType typeIndex, $"AVeryLongProjectName{projectIndex}") ]
 
-    let mutable budget = FieldSiteTypes.AlternativesPageBudgetChars
-    let mutable rendered = 0
+    let render () =
+        let node = FieldSiteTypes.alternativesFields true pairs |> FsLangMcp.Types.jobj
+        node.ToJsonString()
 
-    for _ in 1..80 do
-        let fields = FieldSiteTypes.alternativesFields true (budget > 0) pairs
-        let size = (FsLangMcp.Types.jobj fields).ToJsonString().Length
-        rendered <- rendered + size
+    let first = render ()
+    let second = render ()
 
-        for _, node in fields do
-            if not (isNull node) then
-                budget <- budget - node.ToJsonString().Length
-
-    // Allowance, plus the small per-row counters every remaining row still carries.
-    let ceiling = FieldSiteTypes.AlternativesPageBudgetChars + 80 * 64
-
-    Assert.True(
-        rendered <= ceiling,
-        $"80 pathological rows rendered {rendered} chars of alternatives; allowance + counters is {ceiling}"
-    )
+    Assert.Equal(first, second)
+    Assert.Contains("\"siteTypeAlternatives\"", first)
+    Assert.Contains("\"siteTypeAlternativesOmitted\":7", first)
 
 [<Fact>]
 let ``alternativesTruncated reports every cap, including the projects-only one`` () =
@@ -287,10 +264,9 @@ let ``alternativesTruncated reports every cap, including the projects-only one``
     let manyTypes =
         [ ("aaa", "P1"); ("bbb", "P2"); ("ccc", "P3"); ("ddd", "P4") ]
 
-    Assert.True(FieldSiteTypes.alternativesTruncated true manyProjects, "projects cap must count")
-    Assert.True(FieldSiteTypes.alternativesTruncated true manyTypes, "types cap must count")
-    Assert.True(FieldSiteTypes.alternativesTruncated false [ ("string", "P1") ], "budget exhaustion must count")
+    Assert.True(FieldSiteTypes.alternativesTruncated manyProjects, "projects cap must count")
+    Assert.True(FieldSiteTypes.alternativesTruncated manyTypes, "types cap must count")
 
     // The ordinary case is not truncation, and neither is an empty column.
-    Assert.False(FieldSiteTypes.alternativesTruncated true [ ("string", "P1") ])
-    Assert.False(FieldSiteTypes.alternativesTruncated false [])
+    Assert.False(FieldSiteTypes.alternativesTruncated [ ("string", "P1") ])
+    Assert.False(FieldSiteTypes.alternativesTruncated [])

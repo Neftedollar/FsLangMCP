@@ -54,9 +54,21 @@ jobs:
         # IncludeTestAssembly is no longer needed — prod and test code are in separate assemblies.
         run: |
           dotnet test FsLangMcp.slnx --no-build --no-restore --configuration Release \
+            --blame-hang \
+            --blame-hang-timeout 3m \
+            --blame-hang-dump-type none \
+            --logger "console;verbosity=normal" \
             /p:CollectCoverage=true \
             /p:CoverletOutputFormat=cobertura \
             /p:CoverletOutput=./coverage/
+
+      - name: Upload test hang diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-hang-diagnostics
+          path: '**/TestResults/**'
+          if-no-files-found: warn
 
       - name: Coverage gate (≥ 54% line)
         run: |

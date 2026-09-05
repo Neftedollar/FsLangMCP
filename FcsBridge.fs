@@ -327,26 +327,18 @@ module internal FieldSiteTypes =
                 | typeOrder -> typeOrder)
 
     /// Per-row caps: distinct alternative types, and projects listed under one type. They
-    /// stop a single pathological row from eating the whole page allowance below.
+    /// make one site's serialized alternatives deterministic and bounded in cardinality.
+    /// These caps are deliberately independent of cursor position, maxResults, and the
+    /// response budget: a physical site has one canonical row on every page that contains it.
     [<Literal>]
     let AlternativeTypesPerSite = 3
 
     [<Literal>]
     let AlternativeProjectsPerType = 3
 
-    /// Page-wide allowance for the alternatives column, in rendered characters.
-    ///
-    /// #207 review: the number of alternatives is NOT bounded by the per-type 200-char cap —
-    /// it grows with the number of projects a linked file is compiled by, once per site. The
-    /// documented worst case for a full page is 80 × (527 + 203 + 15) ≈ 59.6k against a ~72k
-    /// ceiling, so the column gets the headroom and no more. Rows past the allowance keep the
-    /// COUNT and drop the strings, which is bounded by construction.
-    [<Literal>]
-    let AlternativesPageBudgetChars = 6000
-
     /// Group (type, project) pairs into per-type entries under the per-row caps. Returns the
     /// entries — each as (siteType, projects shown, projects omitted) — plus how many distinct
-    /// types the cap left out. Pure: the page-budget decision belongs to the caller.
+    /// types the cap left out. Pure and page-invariant by construction.
     let alternativeEntries (alternatives: (string * string) list) : (string * string list * int) list * int =
         let byType =
             alternatives
@@ -369,15 +361,13 @@ module internal FieldSiteTypes =
 
         entries, max 0 (byType.Length - AlternativeTypesPerSite)
 
-    /// True when this row's alternatives were capped in ANY way — distinct types dropped,
-    /// projects under a type dropped, or the whole list replaced by a count past the page
-    /// allowance. Drives the `alternativesTruncatedRows` ledger entry, which would otherwise
-    /// have to be inferred by sniffing the rendered JSON and would miss the projects-only case.
-    let alternativesTruncated (withinPageBudget: bool) (alternatives: (string * string) list) : bool =
+    /// True when this row's alternatives were capped in ANY way — distinct types dropped or
+    /// projects under a type dropped. Drives the `alternativesTruncatedRows` ledger entry,
+    /// which would otherwise have to be inferred by sniffing the rendered JSON and would miss
+    /// the projects-only case.
+    let alternativesTruncated (alternatives: (string * string) list) : bool =
         if List.isEmpty alternatives then
             false
-        elif not withinPageBudget then
-            true
         else
             let entries, typesOmitted = alternativeEntries alternatives
 
@@ -386,13 +376,11 @@ module internal FieldSiteTypes =
 
     /// The `siteTypeAlternatives` row fields — emitted ONLY when another swept project
     /// resolved the same physical site to a different type, so the common row shape is
-    /// byte-identical to a single-project sweep. `withinPageBudget=false` keeps the count and
-    /// drops the strings: an agent still learns the site is contested, and the page stays
-    /// inside the response ceiling. Nothing is ever dropped silently — every omission is a
-    /// number in the row.
+    /// byte-identical to a single-project sweep. Nothing is ever dropped silently — every
+    /// per-site omission is a number in the row. The response-size planner never reshapes
+    /// this projection; it can only omit the whole site by choosing a shorter page prefix.
     let alternativesFields
         (includeSiteTypes: bool)
-        (withinPageBudget: bool)
         (alternatives: (string * string) list)
         : (string * JsonNode) list =
         if not includeSiteTypes || List.isEmpty alternatives then
@@ -400,31 +388,28 @@ module internal FieldSiteTypes =
         else
             let entries, typesOmitted = alternativeEntries alternatives
 
-            if not withinPageBudget then
-                [ ("siteTypeAlternativesOmitted", jint (entries.Length + typesOmitted)) ]
-            else
-                let entryNodes =
-                    entries
-                    |> List.map (fun (siteType, projects, projectsOmitted) ->
-                        jobj (
-                            [ "siteType", jstr siteType
-                              "projects", JsonArray(projects |> List.map jstr |> List.toArray) :> JsonNode ]
-                            // Parenthesised on purpose: a one-element list of an
-                            // UNparenthesised tuple raises FS3536 ("did you mean ';'?"), and
-                            // FcsBridgeTests type-checks this very file expecting zero
-                            // diagnostics at every severity — informational included.
-                            @ (if projectsOmitted > 0 then
-                                   [ ("projectsOmitted", jint projectsOmitted) ]
-                               else
-                                   [])
-                        )
-                        :> JsonNode)
+            let entryNodes =
+                entries
+                |> List.map (fun (siteType, projects, projectsOmitted) ->
+                    jobj (
+                        [ "siteType", jstr siteType
+                          "projects", JsonArray(projects |> List.map jstr |> List.toArray) :> JsonNode ]
+                        // Parenthesised on purpose: a one-element list of an
+                        // UNparenthesised tuple raises FS3536 ("did you mean ';'?"), and
+                        // FcsBridgeTests type-checks this very file expecting zero
+                        // diagnostics at every severity — informational included.
+                        @ (if projectsOmitted > 0 then
+                               [ ("projectsOmitted", jint projectsOmitted) ]
+                           else
+                               [])
+                    )
+                    :> JsonNode)
 
-                [ ("siteTypeAlternatives", JsonArray(entryNodes |> List.toArray) :> JsonNode) ]
-                @ (if typesOmitted > 0 then
-                       [ ("siteTypeAlternativesOmitted", jint typesOmitted) ]
-                   else
-                       [])
+            [ ("siteTypeAlternatives", JsonArray(entryNodes |> List.toArray) :> JsonNode) ]
+            @ (if typesOmitted > 0 then
+                   [ ("siteTypeAlternativesOmitted", jint typesOmitted) ]
+               else
+                   [])
 
     /// Project a site's stored (siteType, typeStatus) into the JSON fields its row carries.
     /// Present on EVERY field site under includeSiteTypes — an explicit JSON null for a
@@ -2348,6 +2333,9 @@ type private WaiterAwareSingleFlight<'T>
                     onCompleted this
             })
 
+    // Liveness predicates run under gate: they must be fast, non-blocking, and must
+    // not call back into this flight. Only cancellation is interpreted as inactivity;
+    // other exceptions indicate a broken caller contract and are not hidden.
     member _.TryAddWaiter(isActive: unit -> bool) =
         lock gate (fun () ->
             if acceptingWaiters then
@@ -2784,8 +2772,16 @@ type internal FcsBridge
         ?findSiteTypeDeadlineExpiredOverride: (unit -> bool),
         ?referenceResolutionProbeOverride: (string array -> int * int),
         ?projectOptionsCacheValidationBeforeComputeOverride: (string -> unit),
-        ?trustedFileCheckAnswerOverride: (FSharpCheckFileAnswer -> FSharpCheckFileAnswer)
+        ?trustedFileCheckAnswerOverride: (FSharpCheckFileAnswer -> FSharpCheckFileAnswer),
+        // Deterministic test seam for the otherwise fixed production find ceiling.
+        ?findResponseBudgetCharsOverride: int
     ) =
+    let findResponseBudgetChars =
+        match findResponseBudgetCharsOverride with
+        | Some value when value > 0 -> value
+        | Some value -> invalidArg (nameof findResponseBudgetCharsOverride) $"find response budget must be positive; got {value}."
+        | None -> FindResponseBudget.MaxSerializedChars
+
     // FCS default projectCacheSize is 3. The `find` multi-project union sweep
     // (issue #128) re-checks EVERY member project of the active solution on each
     // call; with a cache of 3 a >3-project solution thrashes FCS's project cache
@@ -3933,6 +3929,71 @@ type internal FcsBridge
                 [ "lineText", jstr lineText
                   "before", JsonArray(before) :> JsonNode
                   "after", JsonArray(after) :> JsonNode ]
+
+    /// `find`-specific source context. Every source line is a bounded, contiguous
+    /// UTF-16 slice; the semantic range remains full-source coordinates and these
+    /// offsets tell consumers how to map the visible snippet back to that source.
+    /// Surrounding line count is capped independently from the response budget so
+    /// `contextLines=Int32.MaxValue` cannot allocate an unbounded intermediate array.
+    let findLineContextToJson
+        (linesByNumber: System.Collections.Generic.IReadOnlyDictionary<int, string>)
+        requestedContextLines
+        startLine
+        startColumn
+        endLine
+        endColumn
+        =
+        let requestedContextLines = max 0 requestedContextLines
+
+        let appliedContextLines =
+            min requestedContextLines FindResponseBudget.MaxContextLines
+
+        let snippetNode lineNumber focusStart focusEnd text =
+            let snippet = FindResponseBudget.boundedSnippet focusStart focusEnd text
+
+            jobj
+                [ "line", jint lineNumber
+                  "text", jstr snippet.Text
+                  "sourceStartColumn", jint snippet.SourceStartColumn
+                  "sourceEndColumn", jint snippet.SourceEndColumn
+                  "sourceLength", jint snippet.SourceLength
+                  "truncated", jbool snippet.Truncated ]
+            :> JsonNode
+
+        let targetLine = max 1 startLine
+
+        let matchedLine =
+            match linesByNumber.TryGetValue(targetLine) with
+            | true, text -> text
+            | _ -> ""
+
+        let matchedFocusEnd =
+            if startLine = endLine then endColumn else startColumn
+
+        let matchedSnippet =
+            FindResponseBudget.boundedSnippet startColumn matchedFocusEnd matchedLine
+
+        let contextRange first last =
+            [| first..last |]
+            |> Array.choose (fun line ->
+                match linesByNumber.TryGetValue(line) with
+                | true, text -> Some(snippetNode line startColumn startColumn text)
+                | _ -> None)
+
+        let before = contextRange (max 1 (targetLine - appliedContextLines)) (targetLine - 1)
+        let after = contextRange (targetLine + 1) (targetLine + appliedContextLines)
+
+        jobj
+            [ "lineText", jstr matchedSnippet.Text
+              "lineTextSourceStartColumn", jint matchedSnippet.SourceStartColumn
+              "lineTextSourceEndColumn", jint matchedSnippet.SourceEndColumn
+              "lineTextSourceLength", jint matchedSnippet.SourceLength
+              "lineTextTruncated", jbool matchedSnippet.Truncated
+              "contextLinesRequested", jint requestedContextLines
+              "contextLinesApplied", jint appliedContextLines
+              "contextLinesTruncated", jbool (requestedContextLines > appliedContextLines)
+              "before", JsonArray(before) :> JsonNode
+              "after", JsonArray(after) :> JsonNode ]
 
     let symbolMatches query exact (symbol: FSharpSymbol) =
         let displayName = symbol.DisplayName
@@ -6622,7 +6683,7 @@ type internal FcsBridge
                     )
         }
 
-    member internal this.FindWithinDeadline
+    member private this.FindCoreWithinDeadline
         (
             args: FindArgs,
             deadline: FindRequestDeadline,
@@ -6749,8 +6810,7 @@ type internal FcsBridge
             // memberSites buckets (which duplicated every site) were dropped, so the
             // per-site cost dropped from ~1030 to ~527 chars (measured on
             // find("FindArgs")). With one representation the default is raised from 40
-            // to 80: a full 80-site page is ~43k chars (~14k tokens, under the
-            // ~25k-token ceiling ≈ ~72k chars), and a 69-site hot symbol now fits one
+            // to 80: a typical 80-site page is ~43k chars, and a 69-site hot symbol fits one
             // page at ~37k chars instead of truncating at 40. breakdown + totalSites
             // still report the FULL set, and cursor/nextCursor pages the rest, so a
             // complete refactor list stays reachable past the default.
@@ -6759,16 +6819,13 @@ type internal FcsBridge
             // adds one `siteType` string per FIELD row, so the envelope above is no longer
             // the whole story. The increment is bounded by construction at
             // `siteTypeMaxChars` (200) + a "..." marker, giving a capped worst case of
-            // 80 × (527 + 203 + ~15 chars of JSON key overhead) ≈ 59.6k chars, still under
-            // the ~72k ceiling — so the default 80 stands with the flag on. Measured real
+            // 80 × (527 + 203 + ~15 chars of JSON key overhead) ≈ 59.6k chars. Measured real
             // growth is far smaller: +18.5 chars/site on the field fixture, and a 58-char
             // longest siteType across a 3434-site sweep of this repo. That arithmetic is
             // ASSERTED in FindTests ("the type column stays inside find's documented page
             // budget"), so raising siteTypeMaxChars without redoing this math fails there.
-            // Caveat inherited from this envelope, not introduced by #207: 527 is a measured
-            // AVERAGE, not a bound — `lineText` is emitted uncapped, so a page of
-            // pathologically long source lines can exceed the arithmetic with or without
-            // the column.
+            // This arithmetic now guides only the default; bounded snippets plus the exact
+            // final production-serializer guard below provide the actual hard ceiling.
             let pageSize = args.maxResults |> Option.defaultValue 80
 
             let invalidArgs message =
@@ -8004,96 +8061,70 @@ type internal FcsBridge
             if responseConstructionTimedOut then
                 requestedPageSites.Clear()
 
-            // Cache only the exact, bounded context requested by a returned site. Unlike
-            // lineContextToJson (used by legacy tools), this never materializes a whole file:
-            // it streams only through the requested trailing line and checks the response
-            // deadline before every line and every JSON row.
+            // Retain only the requested source window, then project a bounded snippet
+            // for each match's own columns. Reading and row construction share the deadline.
             let lineContextCache =
-                System.Collections.Generic.Dictionary<struct (string * int * int), JsonNode>()
+                System.Collections.Generic.Dictionary<
+                    struct (string * int * int),
+                    System.Collections.Generic.IReadOnlyDictionary<int, string>
+                 >()
 
-            let emptyLineContext () =
-                jobj
-                    [ "lineText", jstr ""
-                      "before", JsonArray() :> JsonNode
-                      "after", JsonArray() :> JsonNode ]
-
-            let tryLineContextToJson filePath startLine =
-                let boundedContextLines = max 0 contextLines
+            let tryLineContextToJson filePath startLine startColumn endLine endColumn =
+                let appliedContextLines = min (max 0 contextLines) FindResponseBudget.MaxContextLines
                 let cacheKey = normalizePath filePath
-                let contextKey = struct (cacheKey, startLine, boundedContextLines)
+                let contextKey = struct (cacheKey, startLine, appliedContextLines)
 
-                match lineContextCache.TryGetValue(contextKey) with
-                | true, cached -> Some cached
-                | _ when not (responseStep "line-context" 0) -> None
-                | _ when not (File.Exists cacheKey) ->
-                    let empty = emptyLineContext ()
-                    lineContextCache[contextKey] <- empty
-                    Some empty
-                | _ ->
-                    let targetLine = max 1 startLine
-                    let firstLine = max 1 (targetLine - boundedContextLines)
-                    let lastLine = targetLine + boundedContextLines
-                    let selected = ResizeArray<struct (int * string)>()
-                    use lines = File.ReadLines(cacheKey).GetEnumerator()
-                    let mutable lineNumber = 1
-                    let mutable reachedEnd = false
-                    let mutable contextComplete = true
+                let renderContext (lines: System.Collections.Generic.IReadOnlyDictionary<int, string>) =
+                    let mutable index = 0
+                    let mutable ready = true
 
-                    while lineNumber <= lastLine && not reachedEnd && contextComplete do
-                        if not (responseStep "line-context" lineNumber) then
-                            contextComplete <- false
-                        elif lines.MoveNext() then
-                            if lineNumber >= firstLine then
-                                selected.Add(struct (lineNumber, lines.Current))
+                    while ready && index < lines.Count do
+                        ready <- responseStep "line-context-json" index
+                        index <- index + 1
 
-                            lineNumber <- lineNumber + 1
-                        else
-                            reachedEnd <- true
-
-                    if not contextComplete then
-                        None
+                    if ready && responseStep "line-context-json-complete" index then
+                        Some(findLineContextToJson lines contextLines startLine startColumn endLine endColumn)
                     else
-                        let before = ResizeArray<JsonNode>()
-                        let after = ResizeArray<JsonNode>()
-                        let mutable lineText = ""
-                        let mutable selectedIndex = 0
+                        None
 
-                        while selectedIndex < selected.Count && contextComplete do
-                            if not (responseStep "line-context-json" selectedIndex) then
-                                contextComplete <- false
-                            else
-                                let struct (number, text) = selected[selectedIndex]
+                if not (responseStep "line-context" 0) then
+                    None
+                else
+                    match lineContextCache.TryGetValue(contextKey) with
+                    | true, cached -> renderContext cached
+                    | _ ->
+                        let selected = System.Collections.Generic.Dictionary<int, string>()
+                        let targetLine = max 1 startLine
+                        let firstLine = max 1 (targetLine - appliedContextLines)
+                        let lastLine = targetLine + appliedContextLines
+                        let mutable contextComplete = true
 
-                                if number = targetLine then
-                                    lineText <- text
-                                elif number < targetLine then
-                                    before.Add(jobj [ "line", jint number; "text", jstr text ] :> JsonNode)
+                        if File.Exists cacheKey then
+                            use lines = File.ReadLines(cacheKey).GetEnumerator()
+                            let mutable lineNumber = 1
+                            let mutable reachedEnd = false
+
+                            while lineNumber <= lastLine && not reachedEnd && contextComplete do
+                                if not (responseStep "line-context" lineNumber) then
+                                    contextComplete <- false
+                                elif lines.MoveNext() then
+                                    if lineNumber >= firstLine then
+                                        selected.Add(lineNumber, lines.Current)
+
+                                    lineNumber <- lineNumber + 1
                                 else
-                                    after.Add(jobj [ "line", jint number; "text", jstr text ] :> JsonNode)
-
-                                selectedIndex <- selectedIndex + 1
+                                    reachedEnd <- true
 
                         if not contextComplete then
                             None
                         else
-                            let context =
-                                jobj
-                                    [ "lineText", jstr lineText
-                                      "before", JsonArray(before.ToArray()) :> JsonNode
-                                      "after", JsonArray(after.ToArray()) :> JsonNode ]
+                            lineContextCache[contextKey] <- selected
+                            renderContext selected
 
-                            lineContextCache[contextKey] <- context
-                            Some context
-
-            // #207 review: the alternatives column is the one part of a row whose size is not
-            // bounded by a per-value cap — it grows with the number of projects a linked file
-            // is compiled by. Spend a fixed page allowance in row order (siteToJson runs
-            // sequentially over pageSites, so this is deterministic); once it is gone, rows
-            // keep the count and drop the strings. Charged against what was actually rendered,
-            // not an estimate.
-            let mutable alternativesBudget = FieldSiteTypes.AlternativesPageBudgetChars
-            let mutable alternativesTruncatedRows = 0
-
+            // Canonical row projection: every field of one site is derived only from that site
+            // and the request's content options. In particular, alternatives use deterministic
+            // per-site caps rather than a shared page allowance, so maxResults, cursor position,
+            // and the final response-budget boundary cannot reshape a row.
             let siteToJson (s: {| File: string
                                   StartLine: int
                                   StartCol: int
@@ -8121,44 +8152,46 @@ type internal FcsBridge
                 // restores the richer surrounding-code output.
                 let contextFields =
                     if contextLines > 0 then
-                        [ "before", ctx["before"].DeepClone(); "after", ctx["after"].DeepClone() ]
+                        [ "contextLinesRequested", ctx["contextLinesRequested"].DeepClone()
+                          "contextLinesApplied", ctx["contextLinesApplied"].DeepClone()
+                          "contextLinesTruncated", ctx["contextLinesTruncated"].DeepClone()
+                          "before", ctx["before"].DeepClone()
+                          "after", ctx["after"].DeepClone() ]
                     else
                         []
 
                 // #207: see FieldSiteTypes.rowFields — extracted so its degraded (JSON null)
                 // arm is unit-testable, which inline here it was not.
-                let withinAlternativesBudget = alternativesBudget > 0
+                let alternativeFields = FieldSiteTypes.alternativesFields includeSiteTypes s.TypeAlternatives
 
-                let alternativeFields =
-                    FieldSiteTypes.alternativesFields includeSiteTypes withinAlternativesBudget s.TypeAlternatives
-
-                for _, node in alternativeFields do
-                    if not (isNull node) then
-                        alternativesBudget <- alternativesBudget - node.ToJsonString().Length
-
-                if
+                let alternativesWereTruncated =
                     includeSiteTypes
-                    && FieldSiteTypes.alternativesTruncated withinAlternativesBudget s.TypeAlternatives
-                then
-                    alternativesTruncatedRows <- alternativesTruncatedRows + 1
+                    && FieldSiteTypes.alternativesTruncated s.TypeAlternatives
 
                 let siteTypeFields =
                     FieldSiteTypes.rowFields includeSiteTypes s.SiteType s.TypeStatus
                     @ alternativeFields
 
-                jobj
-                    ([ "file", jstr s.File
-                       "range", rangeNode
-                       "kind", jstr s.Kind
-                       "project", jstr s.Project
-                       "symbolFullName",
-                       (match s.FullName with
-                        | null -> null
-                        | v -> jstr v)
-                       "lineText", ctx["lineText"].DeepClone() ]
-                     @ siteTypeFields
-                     @ contextFields)
-                :> JsonNode
+                let node =
+                    jobj
+                        ([ "file", jstr s.File
+                           "range", rangeNode
+                           "kind", jstr s.Kind
+                           "project", jstr s.Project
+                           "symbolFullName",
+                           (match s.FullName with
+                            | null -> null
+                            | v -> jstr v)
+                           "lineText", ctx["lineText"].DeepClone()
+                           "lineTextSourceStartColumn", ctx["lineTextSourceStartColumn"].DeepClone()
+                           "lineTextSourceEndColumn", ctx["lineTextSourceEndColumn"].DeepClone()
+                           "lineTextSourceLength", ctx["lineTextSourceLength"].DeepClone()
+                           "lineTextTruncated", ctx["lineTextTruncated"].DeepClone() ]
+                         @ siteTypeFields
+                         @ contextFields)
+                    :> JsonNode
+
+                node, alternativesWereTruncated
 
             // One self-describing representation per site: each node carries
             // file / range / kind / project / symbolFullName / lineText, so an agent
@@ -8167,58 +8200,46 @@ type internal FcsBridge
             // were dropped — they re-emitted every site a second time and doubled the
             // payload (the reason the default page cap had been forced down to 40).
             let siteNodeBuffer = ResizeArray<JsonNode>()
+            let alternativesTruncatedBuffer = ResizeArray<bool>()
             let mutable responseSiteIndex = 0
 
-            while
-                responseSiteIndex < requestedPageSites.Count
-                && not responseConstructionTimedOut
-                do
+            while responseSiteIndex < requestedPageSites.Count && not responseConstructionTimedOut do
                 if not (responseStep "site-json" responseSiteIndex) then
                     responseConstructionTimedOut <- true
                 else
                     let site = requestedPageSites[responseSiteIndex]
 
-                    match tryLineContextToJson site.File site.StartLine with
+                    match tryLineContextToJson site.File site.StartLine site.StartCol site.EndLine site.EndCol with
                     | None -> responseConstructionTimedOut <- true
                     | Some context ->
-                        let node = siteToJson site context
+                        let node, alternativesTruncated = siteToJson site context
 
                         if responseStep "site-json-complete" responseSiteIndex then
                             siteNodeBuffer.Add(node)
+                            alternativesTruncatedBuffer.Add(alternativesTruncated)
                             responseSiteIndex <- responseSiteIndex + 1
 
             if deadline.ResponseExpired then
                 responseConstructionTimedOut <- true
 
-            let pageSites =
-                requestedPageSites.ToArray()
-                |> Array.truncate siteNodeBuffer.Count
-
+            let candidatePageSites = requestedPageSites.ToArray()
             let siteNodes = siteNodeBuffer.ToArray()
+            let alternativesTruncatedBySite = alternativesTruncatedBuffer.ToArray()
 
-            // Project coverage and response delivery are separate dimensions. A complete
-            // sweep can still return only one cursor page; in that case the caller has not
-            // received the complete site set yet. Cursor pages after the first also omit
-            // earlier sites even when `truncated=false` on the final page.
             let mutable resolutionComplete =
                 coverageComplete
                 && not fsacFallbackTimedOut
                 && not responseConstructionTimedOut
                 && pageOffset = 0
-                && pageSites.Length = totalSites
+                && siteNodes.Length = totalSites
 
-            // Aggregated diagnostics across swept projects: Error always (so callers can
-            // detect broken projects even on zero hits), Warning/Info gated by includeInfo.
-            // Stop as soon as 200 retained rows are collected and check the response
-            // deadline before every source diagnostic; never clone/filter the full array.
-            let diagnosticNodes = ResizeArray<JsonNode>(200)
+            // Count every eligible raw diagnostic within the deadline, retaining at most
+            // 200 rows before JSON projection. A timed-out count is explicitly incomplete.
+            let diagnosticPrefix = ResizeArray<FSharpDiagnostic>(200)
+            let mutable projectDiagnosticsTotalCount = 0
             let mutable diagnosticIndex = 0
 
-            while
-                diagnosticIndex < aggregatedDiagnostics.Count
-                && diagnosticNodes.Count < 200
-                && not responseConstructionTimedOut
-                do
+            while diagnosticIndex < aggregatedDiagnostics.Count && not responseConstructionTimedOut do
                 if not (responseStep "diagnostic-collection" diagnosticIndex) then
                     responseConstructionTimedOut <- true
                 else
@@ -8231,21 +8252,41 @@ type internal FcsBridge
                                 || diagnostic.Severity = FSharpDiagnosticSeverity.Hidden
                                 || diagnostic.Severity = FSharpDiagnosticSeverity.Info))
                     then
-                        diagnosticNodes.Add(diagnosticToJson diagnostic)
+                        projectDiagnosticsTotalCount <- projectDiagnosticsTotalCount + 1
+
+                        if diagnosticPrefix.Count < 200 then
+                            diagnosticPrefix.Add(diagnostic)
 
                     diagnosticIndex <- diagnosticIndex + 1
 
-            let diagNodes =
-                if responseConstructionTimedOut || deadline.ResponseExpired then
-                    responseConstructionTimedOut <- true
+            let ensureResponseStep phase index =
+                if not (responseStep phase index) then
+                    raise (TimeoutException("The find response-construction deadline expired."))
+
+            let initialDiagNodes =
+                if responseConstructionTimedOut then
                     [||]
                 else
-                    diagnosticNodes.ToArray()
+                    try
+                        let mutable jsonIndex = 0
+                        let mapDiagnostic diagnostic =
+                            ensureResponseStep "diagnostic-json" jsonIndex
+                            jsonIndex <- jsonIndex + 1
+                            diagnosticToJson diagnostic
 
-            // F5 (#100): drop per-project entries that matched nothing and didn't error —
-            // on a large solution they are one-noise-line-per-project that dwarfs a small
-            // result. `projectsSwept` still conveys the full sweep breadth either way.
-            // This is response shaping too, so finish it before freezing the phase ledger.
+                        let _, nodes =
+                            FindResponseBudget.materializeCappedPrefix
+                                200
+                                mapDiagnostic
+                                (diagnosticPrefix.ToArray())
+
+                        nodes
+                    with :? TimeoutException ->
+                        responseConstructionTimedOut <- true
+                        [||]
+
+            // Apply metadata filtering before freezing the phase ledger. Cloning happens
+            // only for the bounded prefixes selected by the response planner below.
             let isErrorEntry (node: JsonNode) =
                 match node with
                 | :? JsonObject as o -> o.ContainsKey("error")
@@ -8259,28 +8300,12 @@ type internal FcsBridge
                     responseConstructionTimedOut <- true
                 else
                     let node = perProject[perProjectIndex]
-
-                    let keep =
-                        if includePerProject then
-                            perProjectKeep[perProjectIndex]
-                        else
-                            isErrorEntry node
+                    let keep = if includePerProject then perProjectKeep[perProjectIndex] else isErrorEntry node
 
                     if keep then
-                        retainedPerProject.Add(node.DeepClone())
+                        retainedPerProject.Add(node)
 
                     perProjectIndex <- perProjectIndex + 1
-
-            let perProjectField =
-                if responseConstructionTimedOut then
-                    []
-                elif includePerProject || retainedPerProject.Count > 0 then
-                    // includePerProject=false still SURFACES failed-sweep entries — the only
-                    // place a per-project load/timeout error is visible. Pure zero-match
-                    // noise entries stay omitted.
-                    [ ("perProject", JsonArray(retainedPerProject.ToArray()) :> JsonNode) ]
-                else
-                    []
 
             if deadline.ResponseExpired then
                 responseConstructionTimedOut <- true
@@ -8364,7 +8389,9 @@ type internal FcsBridge
                 jobj
                     [ "matched", matchedNode
                       "outcome", jstr outcome
-                      "complete", jbool resolutionComplete
+                      // Finalized after the serialized-size planner chooses the delivered
+                      // site prefix. Coverage and delivery completeness are independent.
+                      "complete", jbool false
                       "kindResolved", jstr kindResolved
                       "scopeResolved", jstr scopeResolved
                       "projectsSwept", jint projectsSwept
@@ -8402,7 +8429,51 @@ type internal FcsBridge
             // #207: the honesty ledger for includeSiteTypes. `typed + degraded` must always
             // equal `fieldSites`, so a caller can tell "every site carries its type" from
             // "some rows are blank" without diffing the sites array.
-            let siteTypesFields =
+            let siteTypesNote alternativesTruncatedRows =
+                if fieldSiteCount = 0 && not coverageComplete then
+                    let failureSummary = coverageFailureSummary ()
+
+                    // Do not blame the caller's `kind` for an empty result the sweep
+                    // never got far enough to produce — coverage is the real story.
+                    $"No field site was typed because the sweep is incomplete: %d{projectsAnalyzed} of %d{projectsRequested} project(s) were analyzed (%s{failureSummary}). See coverage/message; restore missing projects, retry busy work, or re-run with a larger timeoutMs before reading anything into the empty result."
+                elif fieldSiteCount = 0 then
+                    // Advice must name a NEXT step the caller has not already taken.
+                    // Telling a kind='auto'/'field' caller to "use kind='field' or
+                    // kind='auto'" is circular, and a kind='position' caller sees
+                    // kindResolved='symbol' (position folds into the symbol sweep),
+                    // so each entry point gets the step that actually differs.
+                    let recipe =
+                        match kind, kindResolved with
+                        | "position", _ ->
+                            "kind='position' resolves the symbol under the cursor and then sweeps it as kind='symbol', which never unions field sites. Re-run with kind='field' and the resolved name as query (echoed above as `query`)."
+                        | _, ("field" | "auto") ->
+                            $"The query already unioned field sites — '%s{query}' simply matches no record field here. Check the declaring type name (find matches fields by their DECLARING type, not the field name), drop field='…' if it is over-restricting, or pass exact=false for a substring match on the type."
+                        | _ ->
+                            "Re-run with kind='field' (optionally with field='Name') or kind='auto', which union record-field sites; this kind does not."
+
+                    $"includeSiteTypes annotates record-field sites only, and this sweep produced none (kindResolved='%s{kindResolved}'). %s{recipe}"
+                else
+                    let degradedClause =
+                        if degradedSites = 0 then
+                            "Every field site is typed."
+                        else
+                            $"%d{degradedSites} of %d{fieldSiteCount} field sites could not be typed (%d{unresolvedSites} unresolved, %d{timedOutTypeSites} past the timeoutMs budget) and carry siteType: null."
+
+                    let multiClause =
+                        if multiTypedSites = 0 then
+                            ""
+                        else
+                            let truncationClause =
+                                if alternativesTruncatedRows = 0 then
+                                    ""
+                                else
+                                    $" On {alternativesTruncatedRows} delivered row(s) the column hit its deterministic per-site cap and carries siteTypeAlternativesOmitted and/or projectsOmitted counts instead of the full list — narrow with scope/projectPath to reduce the competing project interpretations."
+
+                            $" {multiTypedSites} site(s) are compiled by more than one swept project and resolved to DIFFERENT types: siteType/project report the first project's answer and siteTypeAlternatives names each other type with the project(s) that resolved it — plan those sites per project, not from one type.{truncationClause}"
+
+                    $"siteType is the field's type as the CURRENT typecheck resolves it at that site, rendered with that site's own opens — the BEFORE half of a field-type change. {degradedClause}{multiClause} find deliberately does NOT typecheck a hypothetical new record shape: edit every site listed here, then run check(scope='project') for the AFTER verdict. On a generic record the type shows as the type PARAMETER (e.g. 'T), not its instantiation at the site."
+
+            let siteTypesFields alternativesTruncatedRows =
                 if responseConstructionTimedOut || not includeSiteTypes then
                     []
                 else
@@ -8416,72 +8487,17 @@ type internal FcsBridge
                               "degradedTimedOut", jint timedOutTypeSites
                               // Subset of `typed`; see multiTypedSites.
                               "typedDifferentlyByAnotherProject", jint multiTypedSites
-                              // Rows on THIS page where the alternatives column hit a cap or
-                              // the page allowance and rendered a count instead of the
-                              // strings — a truncation the caller can see, not infer.
+                              // Rows on THIS page where the alternatives column hit its
+                              // deterministic per-site cap — a truncation the caller can see,
+                              // not infer. Page boundaries never reshape a site's alternatives.
                               "alternativesTruncatedRows", jint alternativesTruncatedRows ]
                         :> JsonNode
 
-                    let note =
-                        if fieldSiteCount = 0 && not coverageComplete then
-                            let failureSummary = coverageFailureSummary ()
+                    [ ("siteTypes", summary)
+                      ("siteTypesNote", jstr (siteTypesNote alternativesTruncatedRows)) ]
 
-                            // Do not blame the caller's `kind` for an empty result the sweep
-                            // never got far enough to produce — coverage is the real story.
-                            $"No field site was typed because the sweep is incomplete: %d{projectsAnalyzed} of %d{projectsRequested} project(s) were analyzed (%s{failureSummary}). See coverage/message; retry busy work or re-run with a larger timeoutMs before reading anything into the empty result."
-                        elif fieldSiteCount = 0 then
-                            // Advice must name a NEXT step the caller has not already taken.
-                            // Telling a kind='auto'/'field' caller to "use kind='field' or
-                            // kind='auto'" is circular, and a kind='position' caller sees
-                            // kindResolved='symbol' (position folds into the symbol sweep),
-                            // so each entry point gets the step that actually differs.
-                            let recipe =
-                                match kind, kindResolved with
-                                | "position", _ ->
-                                    "kind='position' resolves the symbol under the cursor and then sweeps it as kind='symbol', which never unions field sites. Re-run with kind='field' and the resolved name as query (echoed above as `query`)."
-                                | _, ("field" | "auto") ->
-                                    $"The query already unioned field sites — '%s{query}' simply matches no record field here. Check the declaring type name (find matches fields by their DECLARING type, not the field name), drop field='…' if it is over-restricting, or pass exact=false for a substring match on the type."
-                                | _ ->
-                                    "Re-run with kind='field' (optionally with field='Name') or kind='auto', which union record-field sites; this kind does not."
-
-                            $"includeSiteTypes annotates record-field sites only, and this sweep produced none (kindResolved='%s{kindResolved}'). %s{recipe}"
-                        else
-                            let degradedClause =
-                                if degradedSites = 0 then
-                                    "Every field site is typed."
-                                else
-                                    $"%d{degradedSites} of %d{fieldSiteCount} field sites could not be typed (%d{unresolvedSites} unresolved, %d{timedOutTypeSites} past the timeoutMs budget) and carry siteType: null."
-
-                            let multiClause =
-                                if multiTypedSites = 0 then
-                                    ""
-                                else
-                                    let truncationClause =
-                                        if alternativesTruncatedRows = 0 then
-                                            ""
-                                        else
-                                            $" On {alternativesTruncatedRows} row(s) the column hit its per-row cap or this page's size allowance and carries siteTypeAlternativesOmitted (a count) instead of the full list — narrow with scope/projectPath, or page through, to see them."
-
-                                    $" {multiTypedSites} site(s) are compiled by more than one swept project and resolved to DIFFERENT types: siteType/project report the first project's answer and siteTypeAlternatives names each other type with the project(s) that resolved it — plan those sites per project, not from one type.{truncationClause}"
-
-                            $"siteType is the field's type as the CURRENT typecheck resolves it at that site, rendered with that site's own opens — the BEFORE half of a field-type change. {degradedClause}{multiClause} find deliberately does NOT typecheck a hypothetical new record shape: edit every site listed here, then run check(scope='project') for the AFTER verdict. On a generic record the type shows as the type PARAMETER (e.g. 'T), not its instantiation at the site."
-
-                    [ ("siteTypes", summary); ("siteTypesNote", jstr note) ]
-
-            let paginationFields =
-                let fields =
-                    Cursor.paginationFields "sites" totalSites pageOffset pageSize pageSites.Length
-
-                if responseConstructionTimedOut then
-                    fields
-                    |> List.filter (fun (name, _) -> name <> "truncated" && name <> "nextCursor")
-                    |> fun kept ->
-                        kept
-                        @ [ "truncated", jbool true
-                            "nextCursor", null
-                            "paginationRestartRequired", jbool true ]
-                else
-                    fields
+            let perProjectNodes = retainedPerProject.ToArray()
+            let emitPerProject = includePerProject || perProjectNodes.Length > 0
 
             // F1 (#100): a dotted query that resolved to nothing reads like "symbol absent".
             // symbolMatches now accepts a dotted suffix, so this only fires for a genuine miss
@@ -8594,6 +8610,15 @@ type internal FcsBridge
                 else
                     responseStatus
 
+            let perProjectField =
+                if emitPerProject then
+                    [ ("perProject", JsonArray() :> JsonNode) ]
+                else
+                    []
+
+            let paginationFields =
+                Cursor.paginationFields "sites" totalSites pageOffset pageSize 0
+
             let baseFields =
                 [ "status", jstr finalResponseStatus
                   "timeoutMs", jint deadline.TimeoutMs
@@ -8618,17 +8643,313 @@ type internal FcsBridge
                   "totalSites", jint totalSites
                   "matchedUseCount", jint totalSites
                   "breakdown", breakdown
-                  "sites", JsonArray(siteNodes) :> JsonNode
+                  "returnedSiteCount", jint 0
+                  "sitesTruncatedByBudget", jbool false
+                  "sites", JsonArray() :> JsonNode
                   "resultSetComplete", jbool resolutionComplete ]
                 @ completenessFields
                 @ perProjectField
-                @ [ "sweepElapsedMs", jint (int sweepSw.ElapsedMilliseconds)
-                    "projectDiagnostics", JsonArray(diagNodes) :> JsonNode ]
+                @ [ "perProjectTotalCount", jint perProjectNodes.Length
+                    "perProjectReturnedCount", jint 0
+                    "perProjectTruncatedByBudget", jbool false
+                    "sweepElapsedMs", jint (int sweepSw.ElapsedMilliseconds)
+                    "projectDiagnosticsTotalCount", jint projectDiagnosticsTotalCount
+                    "projectDiagnosticsCountComplete", jbool (diagnosticIndex = aggregatedDiagnostics.Count)
+                    "projectDiagnosticsReturnedCount", jint 0
+                    "projectDiagnosticsTruncated", jbool false
+                    "projectDiagnosticsTruncatedByBudget", jbool false
+                    "projectDiagnostics", JsonArray() :> JsonNode ]
                 @ hintField
-                @ siteTypesFields
+                @ siteTypesFields 0
                 @ scopeNoteField
+                @ [ "responseTruncatedByBudget", jbool false
+                    "responseBudgetChars", jint findResponseBudgetChars
+                    "responseSizeUnit", jstr FindResponseBudget.SizeUnit
+                    "responseSizeHint", null
+                    "cursorAdvancedBy", jint 0 ]
 
-            return jobj (baseFields @ paginationFields) :> JsonNode
+            let responseTemplate = jobj (baseFields @ paginationFields)
+
+            let jsonArrayPrefix (nodes: JsonNode array) count =
+                Array.init count (fun index ->
+                    ensureResponseStep "response-json-copy" index
+                    nodes[index].DeepClone())
+                |> JsonArray
+                :> JsonNode
+
+            let mutable plannerProbe = 0
+
+            let buildResponse deliveredSites deliveredDiagnostics deliveredProjects =
+                ensureResponseStep "response-planning" plannerProbe
+                plannerProbe <- plannerProbe + 1
+                let response = responseTemplate.DeepClone() :?> JsonObject
+                response["sites"] <- jsonArrayPrefix siteNodes deliveredSites
+                response["projectDiagnostics"] <- jsonArrayPrefix initialDiagNodes deliveredDiagnostics
+
+                if emitPerProject then
+                    response["perProject"] <- jsonArrayPrefix perProjectNodes deliveredProjects
+
+                let alternativesTruncatedRows =
+                    alternativesTruncatedBySite
+                    |> Array.take deliveredSites
+                    |> Array.filter id
+                    |> Array.length
+
+                if includeSiteTypes then
+                    let siteTypes = response["siteTypes"] :?> JsonObject
+                    siteTypes["alternativesTruncatedRows"] <- jint alternativesTruncatedRows
+                    response["siteTypesNote"] <- jstr (siteTypesNote alternativesTruncatedRows)
+
+                // Project coverage and response delivery are separate dimensions. A
+                // complete sweep can still deliver only a serialized-budget prefix.
+                let resolutionComplete =
+                    coverageComplete
+                    && not fsacFallbackTimedOut
+                    && pageOffset = 0
+                    && deliveredSites = totalSites
+
+                let responseResolution = response["resolution"] :?> JsonObject
+                responseResolution["complete"] <- jbool resolutionComplete
+                response["resultSetComplete"] <- jbool resolutionComplete
+
+                let sitesTruncatedByBudget = deliveredSites < siteNodes.Length
+                let diagnosticsTruncatedByBudget = deliveredDiagnostics < initialDiagNodes.Length
+                let diagnosticsTruncated = deliveredDiagnostics < projectDiagnosticsTotalCount
+                let perProjectTruncatedByBudget = deliveredProjects < perProjectNodes.Length
+
+                let responseTruncatedByBudget =
+                    sitesTruncatedByBudget
+                    || diagnosticsTruncatedByBudget
+                    || perProjectTruncatedByBudget
+
+                response["returnedSiteCount"] <- jint deliveredSites
+                response["sitesTruncatedByBudget"] <- jbool sitesTruncatedByBudget
+                response["perProjectReturnedCount"] <- jint deliveredProjects
+                response["perProjectTruncatedByBudget"] <- jbool perProjectTruncatedByBudget
+                response["projectDiagnosticsReturnedCount"] <- jint deliveredDiagnostics
+                response["projectDiagnosticsTruncated"] <- jbool diagnosticsTruncated
+                response["projectDiagnosticsTruncatedByBudget"] <- jbool diagnosticsTruncatedByBudget
+                response["responseTruncatedByBudget"] <- jbool responseTruncatedByBudget
+                response["cursorAdvancedBy"] <- jint deliveredSites
+
+                response["responseSizeHint"] <-
+                    if responseTruncatedByBudget then
+                        jstr
+                            $"The complete production-serialized find response is capped at %d{findResponseBudgetChars} UTF-16 code units. This page delivered %d{deliveredSites} site(s), %d{deliveredDiagnostics} diagnostic(s), and %d{deliveredProjects} per-project row(s); full scalar coverage and match counts remain available. Follow nextCursor when present."
+                    else
+                        null
+
+                let nextOffset = pageOffset + deliveredSites
+                let truncated = nextOffset < totalSites
+                response["truncated"] <- jbool truncated
+
+                response["nextCursor"] <-
+                    if truncated && deliveredSites > 0 then
+                        jstr (Cursor.encode nextOffset)
+                    else
+                        null
+
+                ensureResponseStep "response-planning-complete" plannerProbe
+                response :> JsonNode
+
+            let responseTimeout () =
+                let response = responseTemplate.DeepClone() :?> JsonObject
+                response["status"] <- jstr (if matched = Some true then "partial" else "unknown")
+                response["errorKind"] <- jstr "find_response_timeout"
+                response["message"] <-
+                    jstr "The find response-construction deadline expired. Restart without a cursor after narrowing the request."
+                response["retryable"] <- jbool true
+                response["elapsedMs"] <- jint deadline.ElapsedMilliseconds
+                response["resultSetComplete"] <- jbool false
+                response["paginationRestartRequired"] <- jbool true
+                response["truncated"] <- jbool true
+                response["nextCursor"] <- null
+                response["projectDiagnosticsTruncated"] <- jbool (projectDiagnosticsTotalCount > 0)
+                let responseResolution = response["resolution"] :?> JsonObject
+                responseResolution["complete"] <- jbool false
+                let responseCoverage = response["coverage"]
+                let phases = responseCoverage["phases"] :?> JsonArray
+
+                for phase in phases do
+                    if phase["phase"].GetValue<string>() = "response_construction" then
+                        phase["status"] <- jstr "timed_out"
+
+                response :> JsonNode
+
+            let budgetFailure errorCode message =
+                let failureMatchedNode =
+                    match matched with
+                    | Some value -> jbool value
+                    | None -> null
+
+                let failureResolution =
+                    jobj
+                        [ "matched", failureMatchedNode
+                          "outcome", jstr outcome
+                          "complete", jbool false
+                          "kindResolved", jstr kindResolved
+                          "scopeResolved", jstr scopeResolved
+                          "projectsSwept", jint projectsSwept
+                          "projectsRequested", jint projectsRequested
+                          "projectsAnalyzed", jint projectsAnalyzed
+                          "projectsFailed", jint projectsFailed
+                          "projectsMissing", jint projectsMissing
+                          "projectsTimedOut", jint projectsTimedOut
+                          "projectsBusy", jint projectsBusy
+                          "projectsNotStarted", jint projectsNotStarted
+                          "via", jstr via
+                          "fcsSiteCount", jint totalSites
+                          "fsacFallbackHits", jint fsacHits
+                          "fsacFallbackState", jstr fsacFallbackState
+                          // A potentially unbounded infrastructure message is omitted from
+                          // this last-resort envelope; its typed state remains available.
+                          "fsacFallbackReason", null ]
+                    :> JsonNode
+
+                // The planner reaches this envelope only after a one-site response (or
+                // fixed metadata alone) has already failed to fit. Reducing maxResults
+                // therefore cannot change the serialized payload, so retaining a cursor
+                // would only send the caller into a non-progressing retry loop.
+                let canRetrySameCursor = false
+
+                let sameCursorRetry =
+                    jobj
+                        [ "allowed", jbool canRetrySameCursor
+                          "action", jstr "retry_same_cursor"
+                          "requiresUnchangedResultIdentity", jbool true
+                          "allowedChangedInputs", JsonArray([| jstr "maxResults" |]) :> JsonNode
+                          "recommendedMaxResults", jint 1
+                          "reuseOriginalCursor", jbool canRetrySameCursor ]
+                    :> JsonNode
+
+                let changedIdentityRetry =
+                    jobj
+                        [ "action", jstr "restart_without_cursor"
+                          "requiredBeforeChangingResultIdentity", jbool true
+                          "recommendedContextLines", jint 0
+                          "recommendedIncludeInfo", jbool false
+                          "recommendedIncludePerProject", jbool false
+                          "recommendedMaxResults", jint 1
+                          "reuseOriginalCursor", jbool false ]
+                    :> JsonNode
+
+                let recovery =
+                    jobj
+                        [ "action", jstr "restart_without_cursor"
+                          "instruction",
+                          jstr
+                              "Reducing maxResults cannot make this blocked response fit because the planner already tested one site or fixed metadata alone. Restart without a cursor before reducing contextLines or metadata, or before changing query, kind, exact, member, field, scope, projectPath, path, line, character, word, occurrence, includeDeclaration, or includeSiteTypes."
+                          "reuseOriginalCursor", jbool false
+                          "reuseOriginalCursorCondition", jstr "never_for_budget_failure"
+                          "sameCursorRetry", sameCursorRetry
+                          "changedIdentityRetry", changedIdentityRetry ]
+                    :> JsonNode
+
+                jobj
+                    [ "status", jstr "aborted"
+                      "timeoutMs", jint deadline.TimeoutMs
+                      "responseConstructionAllowanceMs", jint deadline.ResponseAllowanceMs
+                      "elapsedMs", jint deadline.ElapsedMilliseconds
+                      "outcome", jstr outcome
+                      "deliveryStatus", jstr "blocked"
+                      "errorCode", jstr errorCode
+                      "message", jstr message
+                      "retryable", jbool true
+                      "resolution", failureResolution
+                      "coverage", coverage.DeepClone()
+                      "projectsSwept", jint projectsSwept
+                      "projectsRequested", jint projectsRequested
+                      "projectsAnalyzed", jint projectsAnalyzed
+                      "projectsFailed", jint projectsFailed
+                      "projectsMissing", jint projectsMissing
+                      "projectsTimedOut", jint projectsTimedOut
+                      "projectsBusy", jint projectsBusy
+                      "projectsNotStarted", jint projectsNotStarted
+                      "resultSetComplete", jbool false
+                      "totalSites", jint totalSites
+                      "matchedUseCount", jint totalSites
+                      "breakdown", breakdown.DeepClone()
+                      "sites", JsonArray() :> JsonNode
+                      "returnedSiteCount", jint 0
+                      "sitesTruncatedByBudget", jbool (candidatePageSites.Length > 0)
+                      "projectDiagnosticsTotalCount", jint projectDiagnosticsTotalCount
+                      "projectDiagnosticsCountComplete", jbool (diagnosticIndex = aggregatedDiagnostics.Count)
+                      "projectDiagnosticsReturnedCount", jint 0
+                      "projectDiagnosticsTruncated", jbool (projectDiagnosticsTotalCount > 0)
+                      "projectDiagnosticsTruncatedByBudget", jbool (initialDiagNodes.Length > 0)
+                      "perProjectTotalCount", jint perProjectNodes.Length
+                      "perProjectReturnedCount", jint 0
+                      "perProjectTruncatedByBudget", jbool (perProjectNodes.Length > 0)
+                      "responseTruncatedByBudget", jbool true
+                      "responseBudgetChars", jint findResponseBudgetChars
+                      "responseSizeUnit", jstr FindResponseBudget.SizeUnit
+                      "pageOffset", jint pageOffset
+                      "pageSize", jint pageSize
+                      "cursorAdvancedBy", jint 0
+                      "truncated", jbool (pageOffset < totalSites)
+                      // Never emit a non-advancing cursor; blocked pages require restart.
+                      "nextCursor", null
+                      "totalEstimate", (jobj [ ("sites", jint totalSites) ] :> JsonNode)
+                      "blockedSiteIndex",
+                      (if candidatePageSites.Length > 0 then jint pageOffset else null)
+                      "recovery", recovery ]
+                :> JsonNode
+
+            if responseConstructionTimedOut || deadline.ResponseExpired then
+                return responseTimeout ()
+            else
+                try
+                    let plan =
+                        FindResponseBudget.planResponse
+                            findResponseBudgetChars
+                            siteNodes.Length
+                            initialDiagNodes.Length
+                            perProjectNodes.Length
+                            buildResponse
+
+                    ensureResponseStep "response-serialization" plannerProbe
+
+                    match plan with
+                    | FindResponseBudget.FitPlan.Fits(deliveredSites, deliveredDiagnostics, deliveredProjects) ->
+                        let response = buildResponse deliveredSites deliveredDiagnostics deliveredProjects
+                        let responseLength = renderedLength response
+                        ensureResponseStep "response-serialization-complete" plannerProbe
+
+                        if responseLength <= findResponseBudgetChars then
+                            return response
+                        else
+                            return
+                                budgetFailure
+                                    "find_response_budget_invariant_failed"
+                                    "The final find response exceeded its production-serialized ceiling after planning. Retry with narrower response-shaping arguments."
+                    | FindResponseBudget.FitPlan.FirstSiteOverflow ->
+                        return
+                            budgetFailure
+                                "find_site_exceeds_response_budget"
+                                "The next find site cannot fit within the serialized response ceiling even after optional diagnostic and per-project rows were removed. No cursor was advanced."
+                    | FindResponseBudget.FitPlan.FixedMetadataOverflow ->
+                        return
+                            budgetFailure
+                                "find_metadata_exceeds_response_budget"
+                                "The fixed find response metadata cannot fit within the serialized response ceiling. No cursor was advanced."
+                with :? TimeoutException ->
+                    responseConstructionTimedOut <- true
+                    return responseTimeout ()
+        }
+
+    /// Keep every result path behind one final exact-serializer ceiling, including
+    /// early validation/position/discovery exits that never reach planResponse.
+    member internal this.FindWithinDeadline
+        (
+            args: FindArgs,
+            deadline: FindRequestDeadline,
+            cancellationToken: CancellationToken,
+            retainUntil: Task -> unit,
+            fsacProbe: (string -> Task<FindFsacProbeResult>) option
+        ) : Task<JsonNode> =
+        task {
+            let! response = this.FindCoreWithinDeadline(args, deadline, cancellationToken, retainUntil, fsacProbe)
+            return FindResponseBudget.guardFinalResponse response
         }
 
     member this.Find(args: FindArgs, ?fsacProbe: string -> Task<FindFsacProbeResult>) : Task<JsonNode> =
