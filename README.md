@@ -8,7 +8,7 @@
 [![Target](https://img.shields.io/badge/target-net10.0-blue.svg)](https://dotnet.microsoft.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-[Documentation](https://neftedollar.github.io/FsLangMCP/) · [Getting started](https://neftedollar.github.io/FsLangMCP/guide/getting-started/) · [Tools reference](https://neftedollar.github.io/FsLangMCP/tools/reference/)
+[Documentation](https://neftedollar.com/FsLangMCP/) · [Getting started](https://neftedollar.com/FsLangMCP/guide/getting-started/) · [Tools reference](https://neftedollar.com/FsLangMCP/tools/reference/)
 
 <p align="center">
   <img src="docs/static/agent-session.gif" width="840"
