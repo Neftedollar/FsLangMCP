@@ -53,6 +53,24 @@ let private waitForProcessExit pid =
     }
 
 [<Fact>]
+let ``Runner rejects caller cancellation before entering the process launch path`` () : Task =
+    task {
+        use cancellation = new CancellationTokenSource()
+        cancellation.Cancel()
+
+        // A nonexistent executable is a deterministic launch sentinel on every OS:
+        // reaching Process.Start would surface a start failure instead of cancellation.
+        let id = Guid.NewGuid().ToString("N")
+        let executable = $"fslangmcp-must-not-launch-%s{id}"
+
+        let operation =
+            runAsync executable Seq.empty (TimeSpan.FromSeconds(30.0)) cancellation.Token
+
+        let! error = Assert.ThrowsAnyAsync<OperationCanceledException>(fun () -> operation :> Task)
+        Assert.Equal(cancellation.Token, error.CancellationToken)
+    }
+
+[<Fact>]
 let ``Runner drains stdout and stderr concurrently`` () : Task =
     task {
         let script =
