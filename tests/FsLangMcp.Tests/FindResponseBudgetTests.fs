@@ -15,7 +15,7 @@ let private dotnetHost =
     Environment.GetEnvironmentVariable("DOTNET_HOST_PATH")
     |> Option.ofObj
     |> Option.filter (String.IsNullOrWhiteSpace >> not)
-    |> Option.defaultValue "/Users/roman/.dotnet/dotnet"
+    |> Option.defaultValue "dotnet"
 
 let private jsonArrayPrefix (nodes: JsonNode array) count =
     nodes
