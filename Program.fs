@@ -271,6 +271,94 @@ let internal runLimitedWithTimeoutRetained
     : Task<JsonNode> =
     runLimitedWithTimeoutRetainedCore gate cancellationToken timeoutMs ignore work
 
+/// Find-specific admission wrapper. Unlike the legacy relative-timeout helper, this
+/// receives the same monotonic deadline object that the admitted find operation uses,
+/// so queue wait and every later phase consume one clock. The semantic cutoff reserves
+/// FindRequestDeadline.ResponseAllowanceMs for constructing a typed response.
+let internal runLimitedWithFindDeadlineRetainedCore
+    (gate: SemaphoreSlim)
+    (cancellationToken: CancellationToken)
+    (deadline: FindRequestDeadline)
+    (onAdmitted: unit -> unit)
+    (work: FindRequestDeadline -> (Task -> unit) -> Task<JsonNode>)
+    : Task<JsonNode> =
+    task {
+        let mutable lifetime: ProtectedWorkLifetime option = None
+
+        let admissionTimeout () =
+            jobj
+                [ "status", jstr "timeout"
+                  "errorKind", jstr "fcs_admission_timeout"
+                  "message",
+                  jstr
+                      $"FCS admission exhausted find's end-to-end timeoutMs=%d{deadline.TimeoutMs} before protected work started."
+                  "timeoutMs", jint deadline.TimeoutMs
+                  "retryable", jbool true ]
+            :> JsonNode
+
+        try
+            let remaining = deadline.RemainingSemanticBudget()
+
+            if remaining <= TimeSpan.Zero then
+                deadline.MarkSemanticExpired()
+                return admissionTimeout ()
+            else
+                use admissionCancellation =
+                    CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+
+                let admission = gate.WaitAsync(admissionCancellation.Token)
+                let timeout = Task.Delay(remaining, admissionCancellation.Token)
+
+                let contenders =
+                    match deadline.SemanticExpirySignal with
+                    | Some signal -> [| admission; timeout; signal |]
+                    | None -> [| admission; timeout |]
+
+                let! winner = Task.WhenAny(contenders)
+                admissionCancellation.Cancel()
+
+                let admitted =
+                    Object.ReferenceEquals(winner, admission)
+                    && admission.IsCompletedSuccessfully
+                    && not deadline.SemanticExpired
+
+                if not admitted then
+                    try
+                        do! admission
+                    with :? OperationCanceledException ->
+                        ()
+
+                    // The semaphore can complete concurrently with expiry after WhenAny
+                    // chose the other contender. Return that raced permit explicitly.
+                    if admission.IsCompletedSuccessfully then
+                        gate.Release() |> ignore
+
+                    cancellationToken.ThrowIfCancellationRequested()
+                    deadline.MarkSemanticExpired()
+                    return admissionTimeout ()
+                else
+                    let admittedLifetime = ProtectedWorkLifetime(gate)
+                    lifetime <- Some admittedLifetime
+                    onAdmitted ()
+                    cancellationToken.ThrowIfCancellationRequested()
+
+                    if deadline.SemanticExpired then
+                        deadline.MarkSemanticExpired()
+                        return admissionTimeout ()
+                    else
+                        return! work deadline admittedLifetime.Retain
+        finally
+            lifetime |> Option.iter _.CompleteResponseOwner()
+    }
+
+let internal runLimitedWithFindDeadlineRetained
+    (gate: SemaphoreSlim)
+    (cancellationToken: CancellationToken)
+    (deadline: FindRequestDeadline)
+    (work: FindRequestDeadline -> (Task -> unit) -> Task<JsonNode>)
+    : Task<JsonNode> =
+    runLimitedWithFindDeadlineRetainedCore gate cancellationToken deadline ignore work
+
 let internal runLimited
     (gate: SemaphoreSlim)
     (cancellationToken: CancellationToken)
@@ -856,12 +944,49 @@ let private mainCore argv =
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            let timeoutMs = args.timeoutMs |> Option.defaultValue 120_000 |> Some
+                            let timeoutMs = args.timeoutMs |> Option.defaultValue 120_000
 
                             toolResult (fun () ->
-                                runLimitedWithTimeout fcsGate ct timeoutMs (fun remainingTimeoutMs ->
-                                    let args = { args with timeoutMs = remainingTimeoutMs }
-                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.Find args))))
+                                if timeoutMs < 0 then
+                                    runLimitedWithTimeout fcsGate ct (Some timeoutMs) (fun _ ->
+                                        Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.Find args))
+                                else
+                                    task {
+                                        let deadline = FindRequestDeadline(timeoutMs)
+
+                                        let! result =
+                                            runLimitedWithFindDeadlineRetained
+                                                fcsGate
+                                                ct
+                                                deadline
+                                                (fun sharedDeadline retainUntil ->
+                                                    Dispatcher.FindDispatch.runWithinDeadline
+                                                        fcsBridge
+                                                        bridge
+                                                        sharedDeadline
+                                                        ct
+                                                        retainUntil
+                                                        (Dispatcher.Find args))
+
+                                        let isAdmissionTimeout =
+                                            match result["errorKind"] with
+                                            | null -> false
+                                            | errorKind ->
+                                                errorKind.GetValue<string>() = "fcs_admission_timeout"
+
+                                        if isAdmissionTimeout then
+                                            return
+                                                FindDeadlineResponse.beforeDiscovery
+                                                    args
+                                                    deadline
+                                                    "admission"
+                                                    "timed_out"
+                                                    "fcs_admission_timeout"
+                                                    (result["message"].GetValue<string>())
+                                                |> FindResponseBudget.guardFinalResponse
+                                        else
+                                            return result
+                                    }))
                     |> unwrapResult
                 )
 

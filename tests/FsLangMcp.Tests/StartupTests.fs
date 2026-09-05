@@ -9,6 +9,7 @@ open System.Threading.Tasks
 open System.Text.Json
 open System.Text.Json.Nodes
 open Xunit
+open FsLangMcp.FcsBridge
 open FsLangMcp.Program
 open FsLangMcp.McpHost
 open FsMcp.Core
@@ -318,6 +319,37 @@ let ``retained protected worker keeps FCS slot through response and fault then r
 
         do! gate.WaitAsync().WaitAsync(TimeSpan.FromSeconds(2.0))
         Assert.Equal(0, gate.CurrentCount)
+        gate.Release() |> ignore
+        Assert.Equal(1, gate.CurrentCount)
+    }
+
+[<Fact>]
+let ``find admission observes the shared deadline without leaving a queued waiter`` () =
+    task {
+        use gate = new SemaphoreSlim(0, 1)
+        let expiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let deadline = FindRequestDeadline(20_000, semanticExpirySignal = expiry.Task)
+        let mutable starts = 0
+
+        let request =
+            runLimitedWithFindDeadlineRetainedCore
+                gate
+                CancellationToken.None
+                deadline
+                ignore
+                (fun _ _ ->
+                    Interlocked.Increment(&starts) |> ignore
+                    Task.FromResult(JsonObject() :> JsonNode))
+
+        expiry.TrySetResult(()) |> ignore
+        let! result = request.WaitAsync(TimeSpan.FromSeconds(2.0))
+
+        Assert.Equal("timeout", result["status"].GetValue<string>())
+        Assert.Equal("fcs_admission_timeout", result["errorKind"].GetValue<string>())
+        Assert.Equal(0, Volatile.Read(&starts))
+
+        // The expired waiter was cancelled and drained, so a later permit remains
+        // available instead of being consumed by work that already returned.
         gate.Release() |> ignore
         Assert.Equal(1, gate.CurrentCount)
     }

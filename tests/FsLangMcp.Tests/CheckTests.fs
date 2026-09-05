@@ -439,6 +439,26 @@ let private runAutoScopeDiscoveryDeadlineTest () : Task =
                 Directory.Delete(root, true)
     }
 
+// Release blocked producers and drain their owning requests even when an assertion
+// fails. No cleanup timeout: fixture files must outlive the real workers.
+type private BlockedCheckRequests(release: unit -> unit, reset: unit -> unit) =
+    let requests = ResizeArray<Task>()
+
+    member _.Track(request: Task<'T>) =
+        requests.Add(request :> Task)
+        request
+
+    interface IAsyncDisposable with
+        member _.DisposeAsync() =
+            ValueTask(task {
+                release ()
+
+                try
+                    do! Task.WhenAll(requests)
+                finally
+                    reset ()
+            })
+
 [<Fact>]
 let ``fast project check returns unknown when expectation evaluation exhausts the overall timeout`` () : Task =
     task {
@@ -457,32 +477,47 @@ let ``fast project check returns unknown when expectation evaluation exhausts th
 
         let bridge = FcsBridge(projectEvaluationBeforeLoadOverride = blockedLoad)
 
-        try
-            let checkTask =
-                bridge.Check(
-                    { bareCheck with
-                        scope = Some "project"
-                        speed = Some "fast"
-                        projectPath = Some projectPath
-                        timeoutMs = Some 300 },
-                    fsacSnapshot = (fun expectation ->
-                        snapshotCalled <- true
-                        Task.FromResult(CheckFsacSnapshot.unavailable expectation "must not be reached"))
-                )
+        use requests = new BlockedCheckRequests((fun () -> releaseLoad.TrySetResult(()) |> ignore), ignore)
 
-            do! loadStarted.Task.WaitAsync(TimeSpan.FromSeconds(1.0))
-            let! result = checkTask.WaitAsync(TimeSpan.FromSeconds(2.0))
+        // Admit the exact options producer without spending the Check caller's
+        // 300ms budget on scheduler admission. This request also owns its cleanup.
+        let seed = bridge.GetEvaluatedProjectSnapshot(projectPath) |> requests.Track
+        do! loadStarted.Task.WaitAsync(TimeSpan.FromSeconds(10.0))
+        Assert.Equal(1, bridge.ProjectEvaluationActiveCount)
+        Assert.Equal(1, bridge.ProjectOptionsInFlightCount)
 
-            Assert.Equal("succeeded", gs result "status")
-            Assert.Equal("unknown", gs result "verdict")
-            Assert.False(gb result "analyzed")
-            Assert.False(gb result "expectationComplete")
-            Assert.Contains("timed out", (gs result "reason").ToLowerInvariant())
-            Assert.False(snapshotCalled, "No FSAC snapshot work may start after expectation exhausted the budget.")
-            Assert.Equal(1, bridge.ProjectEvaluationActiveCount)
-            Assert.Equal(0L, bridge.ProjectTypeCheckStartCount)
-        finally
-            releaseLoad.TrySetResult(()) |> ignore
+        let checkTask =
+            bridge.Check(
+                { bareCheck with
+                    scope = Some "project"
+                    speed = Some "fast"
+                    projectPath = Some projectPath
+                    timeoutMs = Some 300 },
+                fsacSnapshot = (fun expectation ->
+                    snapshotCalled <- true
+                    Task.FromResult(CheckFsacSnapshot.unavailable expectation "must not be reached"))
+            )
+            |> requests.Track
+
+        let! result = checkTask.WaitAsync(TimeSpan.FromSeconds(2.0))
+
+        Assert.Equal("succeeded", gs result "status")
+        Assert.Equal("unknown", gs result "verdict")
+        Assert.False(gb result "analyzed")
+        Assert.False(gb result "expectationComplete")
+        Assert.Contains("timed out", (gs result "reason").ToLowerInvariant())
+        Assert.False(snapshotCalled, "No FSAC snapshot work may start after expectation exhausted the budget.")
+        Assert.Equal(1, bridge.ProjectEvaluationActiveCount)
+        Assert.Equal(1L, bridge.ProjectEvaluationStartedCount)
+        Assert.Equal(0L, bridge.ProjectEvaluationRejectedCount)
+        Assert.Equal(0L, bridge.ProjectTypeCheckStartCount)
+
+        releaseLoad.TrySetResult(()) |> ignore
+        let! seededResult = seed.WaitAsync(TimeSpan.FromSeconds(10.0))
+        Assert.Equal(Error "controlled fast evaluation completion", seededResult)
+        Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
+        Assert.Equal(0, bridge.ProjectOptionsInFlightCount)
+        Assert.False(snapshotCalled, "Draining the producer must not start an expired caller's snapshot.")
     }
 
 [<Fact>]
@@ -867,112 +902,131 @@ type CheckTests(fx: CheckFixture) =
             let! warmed = bridge.ProbeProjectOptions(fx.ProbeFsproj)
             Assert.True(Result.isOk warmed, $"Could not warm project options: {warmed}")
 
-            try
-                let firstCheck =
+            use requests =
+                new BlockedCheckRequests(
+                    (fun () ->
+                        releaseFirst.TrySetResult(()) |> ignore
+                        releaseSecond.TrySetResult(()) |> ignore),
+                    fx.ResetClean
+                )
+
+            // Admission belongs to a long-lived seed, not to the measured 300ms
+            // caller. Keep it alive until release so awaiting it drains worker A.
+            let seed =
+                bridge.Check(
+                    { bareCheck with
+                        scope = Some "project"
+                        speed = Some "trusted"
+                        projectPath = Some fx.ProbeFsproj
+                        timeoutMs = Some Int32.MaxValue }
+                )
+                |> requests.Track
+
+            do! firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(10.0))
+
+            let firstCheck =
+                bridge.Check(
+                    { bareCheck with
+                        scope = Some "project"
+                        speed = Some "trusted"
+                        projectPath = Some fx.ProbeFsproj
+                        timeoutMs = Some 300 }
+                )
+                |> requests.Track
+
+            let! firstResult = firstCheck.WaitAsync(TimeSpan.FromSeconds(10.0))
+
+            Assert.Equal("unknown", gs firstResult "verdict")
+            Assert.False(gb firstResult "analyzed")
+            Assert.Equal(1, workerCalls)
+            Assert.Equal(1L, bridge.FreshProjectCheckStartedCount)
+            Assert.Equal(1L, bridge.ProjectTypeCheckStartCount)
+            Assert.Equal(1, bridge.FreshProjectCheckActiveCount)
+            Assert.Equal(1, bridge.FreshProjectCheckInFlightCount)
+
+            // The same snapshot must neither reject nor start a second worker. This
+            // short caller may expire upstream; these counters alone do not prove
+            // that it reached the join before its deadline.
+            let! sameSnapshot =
+                bridge.Check(
+                    { bareCheck with
+                        scope = Some "project"
+                        speed = Some "trusted"
+                        projectPath = Some fx.ProbeFsproj
+                        timeoutMs = Some 150 }
+                )
+                |> requests.Track
+                |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(10.0))
+
+            Assert.Equal("unknown", gs sameSnapshot "verdict")
+            Assert.Equal(1, workerCalls)
+            Assert.Equal(1L, bridge.FreshProjectCheckStartedCount)
+            Assert.Equal(0L, bridge.FreshProjectCheckRejectedCount)
+            Assert.Equal(1, bridge.FreshProjectCheckInFlightCount)
+
+            // Each content revision is a distinct type-check key. While A owns
+            // admission all are rejected promptly, without a cross-key waiter or
+            // retained dictionary entry.
+            for index in 1..6 do
+                File.WriteAllText(fx.MainFs, cleanMain + $"\n// distinct snapshot {index}\n")
+                let elapsed = Stopwatch.StartNew()
+
+                let! busy =
                     bridge.Check(
                         { bareCheck with
                             scope = Some "project"
                             speed = Some "trusted"
                             projectPath = Some fx.ProbeFsproj
-                            timeoutMs = Some 300 }
+                            timeoutMs = Some 1000 }
                     )
-
-                do! firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(10.0))
-                let! firstResult = firstCheck.WaitAsync(TimeSpan.FromSeconds(10.0))
-
-                Assert.Equal("unknown", gs firstResult "verdict")
-                Assert.False(gb firstResult "analyzed")
-                Assert.Equal(1, workerCalls)
-                Assert.Equal(1L, bridge.FreshProjectCheckStartedCount)
-                Assert.Equal(1L, bridge.ProjectTypeCheckStartCount)
-                Assert.Equal(1, bridge.FreshProjectCheckActiveCount)
-                Assert.Equal(1, bridge.FreshProjectCheckInFlightCount)
-
-                // Same project + same byte snapshot joins A; it must neither reject
-                // nor start a second real worker after its own caller times out.
-                let! sameSnapshot =
-                    bridge.Check(
-                        { bareCheck with
-                            scope = Some "project"
-                            speed = Some "trusted"
-                            projectPath = Some fx.ProbeFsproj
-                            timeoutMs = Some 150 }
-                    )
+                    |> requests.Track
                     |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(10.0))
 
-                Assert.Equal("unknown", gs sameSnapshot "verdict")
-                Assert.Equal(1, workerCalls)
-                Assert.Equal(1L, bridge.FreshProjectCheckStartedCount)
-                Assert.Equal(0L, bridge.FreshProjectCheckRejectedCount)
-                Assert.Equal(1, bridge.FreshProjectCheckInFlightCount)
+                Assert.Equal("unknown", gs busy "verdict")
+                Assert.False(gb busy "analyzed")
+                Assert.Contains("type-check busy", (gs busy "reason").ToLowerInvariant())
+                Assert.Equal("fcs_worker_busy", gs (busy["blockingReason"]) "errorKind")
+                Assert.True(elapsed.Elapsed < TimeSpan.FromMilliseconds(750.0), "busy type-check must not queue")
 
-                // Each content revision is a distinct type-check key. While A owns
-                // admission all are rejected promptly, without a cross-key waiter or
-                // retained dictionary entry.
-                for index in 1..6 do
-                    File.WriteAllText(fx.MainFs, cleanMain + $"\n// distinct snapshot {index}\n")
-                    let elapsed = Stopwatch.StartNew()
+            Assert.Equal(1, workerCalls)
+            Assert.Equal(1L, bridge.FreshProjectCheckStartedCount)
+            Assert.Equal(6L, bridge.FreshProjectCheckRejectedCount)
+            Assert.Equal(1, bridge.FreshProjectCheckInFlightCount)
+            Assert.Equal(1, bridge.FreshProjectCheckMaxObservedConcurrency)
 
-                    let! busy =
-                        bridge.Check(
-                            { bareCheck with
-                                scope = Some "project"
-                                speed = Some "trusted"
-                                projectPath = Some fx.ProbeFsproj
-                                timeoutMs = Some 1000 }
-                        )
-                        |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(10.0))
+            // A completed against an obsolete snapshot. Its late empty result is
+            // discarded, admission is released, and the current snapshot can be
+            // retried as a new worker B.
+            releaseFirst.TrySetResult(()) |> ignore
+            let! staleResult = seed.WaitAsync(TimeSpan.FromSeconds(10.0))
 
-                    Assert.Equal("unknown", gs busy "verdict")
-                    Assert.False(gb busy "analyzed")
-                    Assert.Contains("type-check busy", (gs busy "reason").ToLowerInvariant())
-                    Assert.Equal("fcs_worker_busy", gs (busy["blockingReason"]) "errorKind")
-                    Assert.True(elapsed.Elapsed < TimeSpan.FromMilliseconds(750.0), "busy type-check must not queue")
+            Assert.Equal("unknown", gs staleResult "verdict")
+            Assert.False(gb staleResult "analyzed")
+            Assert.Equal(0, bridge.FreshProjectCheckActiveCount)
+            Assert.Equal(0, bridge.FreshProjectCheckInFlightCount)
 
-                Assert.Equal(1, workerCalls)
-                Assert.Equal(1L, bridge.FreshProjectCheckStartedCount)
-                Assert.Equal(6L, bridge.FreshProjectCheckRejectedCount)
-                Assert.Equal(1, bridge.FreshProjectCheckInFlightCount)
-                Assert.Equal(1, bridge.FreshProjectCheckMaxObservedConcurrency)
+            let retry =
+                bridge.Check(
+                    { bareCheck with
+                        scope = Some "project"
+                        speed = Some "trusted"
+                        projectPath = Some fx.ProbeFsproj
+                        timeoutMs = Some 5000 }
+                )
+                |> requests.Track
 
-                // A completed against an obsolete snapshot. Its late empty result is
-                // discarded, admission is released, and the current snapshot can be
-                // retried as a new worker B.
-                releaseFirst.TrySetResult(()) |> ignore
-                let settle = Stopwatch.StartNew()
-                let freshCheckStillRunning () =
-                    bridge.FreshProjectCheckActiveCount <> 0
-                    || bridge.FreshProjectCheckInFlightCount <> 0
+            do! secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(10.0))
+            Assert.Equal(2, workerCalls)
+            Assert.Equal(2L, bridge.FreshProjectCheckStartedCount)
+            Assert.Equal(2L, bridge.ProjectTypeCheckStartCount)
+            releaseSecond.TrySetResult(()) |> ignore
+            let! retryResult = retry.WaitAsync(TimeSpan.FromSeconds(10.0))
 
-                while freshCheckStillRunning () && settle.Elapsed < TimeSpan.FromSeconds(10.0) do
-                    do! Task.Delay(10)
-
-                Assert.Equal(0, bridge.FreshProjectCheckActiveCount)
-                Assert.Equal(0, bridge.FreshProjectCheckInFlightCount)
-
-                let retry =
-                    bridge.Check(
-                        { bareCheck with
-                            scope = Some "project"
-                            speed = Some "trusted"
-                            projectPath = Some fx.ProbeFsproj
-                            timeoutMs = Some 5000 }
-                    )
-
-                do! secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(10.0))
-                Assert.Equal(2, workerCalls)
-                Assert.Equal(2L, bridge.FreshProjectCheckStartedCount)
-                Assert.Equal(2L, bridge.ProjectTypeCheckStartCount)
-                releaseSecond.TrySetResult(()) |> ignore
-                let! retryResult = retry.WaitAsync(TimeSpan.FromSeconds(10.0))
-
-                Assert.Equal("clean", gs retryResult "verdict")
-                Assert.True(gb retryResult "analyzed")
-                Assert.Equal(0, gi retryResult "errorCount")
-            finally
-                releaseFirst.TrySetResult(()) |> ignore
-                releaseSecond.TrySetResult(()) |> ignore
-                fx.ResetClean()
+            Assert.Equal("clean", gs retryResult "verdict")
+            Assert.True(gb retryResult "analyzed")
+            Assert.Equal(0, gi retryResult "errorCount")
+            Assert.Equal(0, bridge.FreshProjectCheckActiveCount)
+            Assert.Equal(0, bridge.FreshProjectCheckInFlightCount)
         }
 
     [<Fact>]

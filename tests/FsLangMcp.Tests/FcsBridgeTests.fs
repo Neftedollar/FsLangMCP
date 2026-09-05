@@ -14,6 +14,7 @@ open Xunit
 open FsLangMcp.Types
 open FsLangMcp.Tools
 open FsLangMcp.FcsBridge
+open FsLangMcp.Program
 
 // ─── ToolError serialization tests ────────────────────────────────────────────
 // These tests call the real toolErrorToJson from Tools.fs so that regressions
@@ -101,6 +102,19 @@ let private findRepoRoot () =
 
 let private jsonArrayLength (node: JsonNode) = (node :?> JsonArray).Count
 
+let private awaitObservedCount description expected (readCount: unit -> int) =
+    task {
+        let elapsed = System.Diagnostics.Stopwatch.StartNew()
+
+        while readCount () <> expected && elapsed.Elapsed < TimeSpan.FromSeconds(5.0) do
+            do! Task.Delay(10)
+
+        Assert.True(
+            readCount () = expected,
+            $"Timed out waiting for {description}: expected {expected}, observed {readCount ()}."
+        )
+    }
+
 let private writeSimpleProject (root: string) (projectName: string) (symbolName: string) =
     let dir = Path.Combine(root, projectName)
     Directory.CreateDirectory(dir) |> ignore
@@ -151,6 +165,22 @@ let private writeProjectWithSource (root: string) (projectName: string) (source:
 
     sourcePath, projectPath
 
+let private writeSolution (root: string) (fileName: string) (projectPaths: string list) =
+    Directory.CreateDirectory(root) |> ignore
+    let solutionPath = Path.Combine(root, fileName)
+
+    let lines =
+        projectPaths
+        |> List.mapi (fun index projectPath ->
+            let projectName = Path.GetFileNameWithoutExtension(projectPath)
+            let relativePath = Path.GetRelativePath(root, projectPath)
+            let projectGuid = $"00000000-0000-0000-0000-%012d{index + 1}"
+
+            $"Project(\"{{F2A71F9B-5D33-465A-A702-920D77279786}}\") = \"{projectName}\", \"{relativePath}\", \"{{{projectGuid}}}\"")
+
+    File.WriteAllLines(solutionPath, lines)
+    solutionPath
+
 let private admissionFindArgs (projectPath: string) (timeoutMs: int) : FindArgs =
     { query = "value"
       kind = Some "symbol"
@@ -172,6 +202,74 @@ let private admissionFindArgs (projectPath: string) (timeoutMs: int) : FindArgs 
       maxResults = Some 10
       timeoutMs = Some timeoutMs
       cursor = None }
+
+let private findPhaseStatus (result: JsonNode) (phaseName: string) =
+    (result["coverage"]["phases"] :?> JsonArray)
+    |> Seq.find (fun phase -> phase["phase"].GetValue<string>() = phaseName)
+    |> fun phase -> phase["status"].GetValue<string>()
+
+let private captureRetainedOperation
+    (completion: TaskCompletionSource<Task>)
+    (retainUntil: Task -> unit)
+    (operation: Task)
+    =
+    completion.TrySetResult(operation) |> ignore
+    retainUntil operation
+
+let private awaitFullGateAvailability (gate: SemaphoreSlim) capacity : Task =
+    task {
+        let mutable acquired = 0
+
+        try
+            while acquired < capacity do
+                do! gate.WaitAsync().WaitAsync(TimeSpan.FromSeconds(5.0))
+                acquired <- acquired + 1
+        finally
+            if acquired > 0 then
+                gate.Release(acquired) |> ignore
+    }
+
+let private awaitExactCompletion (operation: Task) : Task =
+    task {
+        let observe =
+            task {
+                try
+                    do! operation
+                with _ ->
+                    ()
+            }
+
+        do! observe.WaitAsync(TimeSpan.FromSeconds(5.0))
+        Assert.True(operation.IsCompleted)
+    }
+
+[<Fact>]
+let ``find immediate expiry with malformed project path stays typed`` () : Task =
+    task {
+        let malformedProjectPath = "\u0000broken.fsproj"
+        let bridge = FcsBridge()
+        let deadline = FindRequestDeadline(0)
+
+        let! result =
+            bridge.FindWithinDeadline(
+                admissionFindArgs malformedProjectPath 0,
+                deadline,
+                CancellationToken.None,
+                ignore,
+                None
+            )
+
+        Assert.Equal("unknown", result["status"].GetValue<string>())
+        Assert.Equal("find_timeout", result["errorKind"].GetValue<string>())
+        Assert.Equal("timed_out", findPhaseStatus result "admission")
+        Assert.Equal("not_started", findPhaseStatus result "target_discovery")
+        Assert.Equal(1, result["projectsRequested"].GetValue<int>())
+        Assert.Equal(1, result["projectsNotStarted"].GetValue<int>())
+        let project = (result["perProject"] :?> JsonArray)[0]
+        Assert.Equal(malformedProjectPath, project["fsproj"].GetValue<string>())
+        Assert.Equal("not_started", project["status"].GetValue<string>())
+        Assert.True(project["retryable"].GetValue<bool>())
+    }
 
 [<Fact>]
 let ``project evaluation rejects distinct keys without queueing and admits retry after completion`` () : Task =
@@ -263,12 +361,190 @@ let ``project evaluation rejects distinct keys without queueing and admits retry
     }
 
 [<Fact>]
+let ``find project-options expiry retains actual evaluation and rejects a distinct key`` () : Task =
+    task {
+        use outerGate = new SemaphoreSlim(2, 2)
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_options_deadline_{Guid.NewGuid():N}")
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let firstExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable deadlineSignal = firstExpiry
+        let mutable blockFirst = 1
+        let retained = TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let beforeLoad (_: string) : Task =
+            (task {
+                if Interlocked.Exchange(&blockFirst, 0) = 1 then
+                    entered.TrySetResult(()) |> ignore
+                    do! release.Task
+             }
+             :> Task)
+
+        let emptySweep (_: string) =
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let bridge =
+            FcsBridge(
+                projectEvaluationBeforeLoadOverride = beforeLoad,
+                projectSweepWorkerOverride = emptySweep
+            )
+
+        let runFind args =
+            let deadline =
+                FindRequestDeadline(20_000, semanticExpirySignal = deadlineSignal.Task)
+
+            runLimitedWithFindDeadlineRetained
+                outerGate
+                CancellationToken.None
+                deadline
+                (fun sharedDeadline retainUntil ->
+                    let captureAndRetain operation =
+                        captureRetainedOperation retained retainUntil operation
+
+                    bridge.FindWithinDeadline(
+                        args,
+                        sharedDeadline,
+                        CancellationToken.None,
+                        captureAndRetain,
+                        None
+                    ))
+
+        try
+            let _, firstProject = writeSimpleProject root "FirstOptions" "value"
+            let _, secondProject = writeSimpleProject root "SecondOptions" "value"
+
+            let firstCaller = runFind (admissionFindArgs firstProject 20_000)
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            firstExpiry.TrySetResult(()) |> ignore
+            let! expired = firstCaller.WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.Equal("unknown", expired["status"].GetValue<string>())
+            Assert.Equal("find_timeout", expired["errorKind"].GetValue<string>())
+            Assert.Equal(1, expired["projectsRequested"].GetValue<int>())
+            Assert.Equal(1, expired["projectsSwept"].GetValue<int>())
+            Assert.Equal(1, expired["projectsTimedOut"].GetValue<int>())
+            Assert.Equal("timed_out", findPhaseStatus expired "project_sweep")
+            let timedOutProject = (expired["perProject"] :?> JsonArray)[0]
+            Assert.Equal("timed_out", timedOutProject["status"].GetValue<string>())
+            Assert.True(timedOutProject["retryable"].GetValue<bool>())
+            Assert.Equal(1, bridge.ProjectEvaluationActiveCount)
+            Assert.Equal(1, bridge.ProjectOptionsInFlightCount)
+            Assert.Equal(0L, bridge.ProjectOptionsLoadCount)
+            Assert.Equal(0L, bridge.ProjectUsesStartedCount)
+            Assert.Equal(1, outerGate.CurrentCount)
+
+            // The second request may enter the second outer slot, but the project-options
+            // admission has no queue and must reject this distinct key immediately.
+            deadlineSignal <-
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let! busy =
+                runFind (admissionFindArgs secondProject 20_000)
+                |> _.WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.Equal("unknown", busy["status"].GetValue<string>())
+            Assert.True(busy["projectsBusy"].GetValue<int>() = 1, busy.ToJsonString())
+            Assert.Equal(0, busy["projectsTimedOut"].GetValue<int>())
+            Assert.Equal(1L, bridge.ProjectEvaluationRejectedCount)
+            Assert.Equal(1, bridge.ProjectEvaluationActiveCount)
+            Assert.Equal(1, bridge.ProjectOptionsInFlightCount)
+            Assert.Equal(0L, bridge.ProjectOptionsLoadCount)
+            Assert.Equal(0L, bridge.ProjectUsesStartedCount)
+            Assert.Equal(1, outerGate.CurrentCount)
+
+            release.TrySetResult(()) |> ignore
+
+            let! retainedOperation = retained.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            do! awaitExactCompletion retainedOperation
+            do! awaitFullGateAvailability outerGate 2
+
+            Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
+            Assert.Equal(0, bridge.ProjectOptionsInFlightCount)
+            Assert.Equal(2, outerGate.CurrentCount)
+        finally
+            release.TrySetResult(()) |> ignore
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find cancellation retains an admitted project-options evaluation`` () : Task =
+    task {
+        use outerGate = new SemaphoreSlim(1, 1)
+        use cancellation = new CancellationTokenSource()
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_options_cancel_{Guid.NewGuid():N}")
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let retained = TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let beforeLoad (_: string) : Task =
+            (task {
+                entered.TrySetResult(()) |> ignore
+                do! release.Task
+             }
+             :> Task)
+
+        let bridge = FcsBridge(projectEvaluationBeforeLoadOverride = beforeLoad)
+
+        try
+            let _, projectPath = writeSimpleProject root "CancelledOptions" "value"
+            let deadline = FindRequestDeadline(20_000)
+
+            let request =
+                runLimitedWithFindDeadlineRetained
+                    outerGate
+                    cancellation.Token
+                    deadline
+                    (fun sharedDeadline retainUntil ->
+                        let captureAndRetain operation =
+                            captureRetainedOperation retained retainUntil operation
+
+                        bridge.FindWithinDeadline(
+                            admissionFindArgs projectPath 20_000,
+                            sharedDeadline,
+                            cancellation.Token,
+                            captureAndRetain,
+                            None
+                        ))
+
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            cancellation.Cancel()
+            let! _ = Assert.ThrowsAnyAsync<OperationCanceledException>(fun () -> request :> Task)
+
+            Assert.Equal(1, bridge.ProjectEvaluationActiveCount)
+            Assert.Equal(1, bridge.ProjectOptionsInFlightCount)
+            Assert.Equal(0L, bridge.ProjectOptionsLoadCount)
+            Assert.Equal(0L, bridge.ProjectUsesStartedCount)
+            Assert.Equal(0, outerGate.CurrentCount)
+
+            release.TrySetResult(()) |> ignore
+
+            let! retainedOperation = retained.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            do! awaitExactCompletion retainedOperation
+            do! awaitFullGateAvailability outerGate 1
+
+            Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
+            Assert.Equal(0, bridge.ProjectOptionsInFlightCount)
+            Assert.Equal(1, outerGate.CurrentCount)
+        finally
+            release.TrySetResult(()) |> ignore
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
 let ``timed out project-use sweep retains actual-worker admission across distinct keys`` () : Task =
     task {
+        use outerGate = new SemaphoreSlim(2, 2)
         let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_project_uses_admission_{Guid.NewGuid():N}")
         let firstStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
         let releaseFirst = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let firstDeadline = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable deadlineSignal = firstDeadline
         let mutable workerStarts = 0
+        let retained = TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously)
 
         let controlledSweep
             (_projectPath: string)
@@ -289,33 +565,57 @@ let ``timed out project-use sweep retains actual-worker admission across distinc
                 projectSweepWorkerOverride = controlledSweep
             )
 
+        let runFind args =
+            let deadline =
+                FindRequestDeadline(20_000, semanticExpirySignal = deadlineSignal.Task)
+
+            runLimitedWithFindDeadlineRetained
+                outerGate
+                CancellationToken.None
+                deadline
+                (fun sharedDeadline retainUntil ->
+                    let captureAndRetain operation =
+                        captureRetainedOperation retained retainUntil operation
+
+                    bridge.FindWithinDeadline(
+                        args,
+                        sharedDeadline,
+                        CancellationToken.None,
+                        captureAndRetain,
+                        None
+                    ))
+
         try
             let _, firstProject = writeSimpleProject root "FirstSweep" "value"
             let _, secondProject = writeSimpleProject root "SecondSweep" "value"
 
-            // Pre-resolve MSBuild options so the short caller deadline exercises the
+            // Pre-resolve MSBuild options so the controlled deadline exercises the
             // ProjectSweepUses boundary rather than project evaluation.
             let! firstSnapshot = bridge.GetEvaluatedProjectSnapshot(firstProject)
             let! secondSnapshot = bridge.GetEvaluatedProjectSnapshot(secondProject)
             Assert.True(Result.isOk firstSnapshot)
             Assert.True(Result.isOk secondSnapshot)
 
-            let firstCaller = bridge.Find(admissionFindArgs firstProject 500)
+            let firstCaller = runFind (admissionFindArgs firstProject 20_000)
             do! firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
-            let sharedCaller = bridge.Find(admissionFindArgs firstProject 500)
-            let! firstResults =
-                Task.WhenAll([| firstCaller; sharedCaller |]).WaitAsync(TimeSpan.FromSeconds(5.0))
+            firstDeadline.TrySetResult(()) |> ignore
+            let! firstResult = firstCaller.WaitAsync(TimeSpan.FromSeconds(5.0))
 
-            Assert.All(firstResults, fun result -> Assert.Equal("unknown", result["status"].GetValue<string>()))
+            Assert.Equal("unknown", firstResult["status"].GetValue<string>())
             Assert.Equal(1, Volatile.Read(&workerStarts))
             Assert.Equal(0L, bridge.ProjectUsesRejectedCount)
             Assert.Equal(1, bridge.ProjectUsesActiveCount)
             Assert.Equal(1, bridge.ProjectUsesInFlightCount)
+            Assert.Equal(1, outerGate.CurrentCount)
 
             // A different snapshot must be rejected while the timed-out caller's real
             // FCS worker is still alive. Exact-key single-flight alone cannot prove this.
+            deadlineSignal <-
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
             let! secondResult =
-                bridge.Find(admissionFindArgs secondProject 5_000).WaitAsync(TimeSpan.FromSeconds(5.0))
+                runFind (admissionFindArgs secondProject 20_000)
+                |> _.WaitAsync(TimeSpan.FromSeconds(5.0))
 
             Assert.Equal("unknown", secondResult["status"].GetValue<string>())
             Assert.Equal(1, secondResult["projectsBusy"].GetValue<int>())
@@ -335,27 +635,1481 @@ let ``timed out project-use sweep retains actual-worker admission across distinc
             Assert.Equal(1, Volatile.Read(&workerStarts))
             Assert.Equal(1L, bridge.ProjectUsesRejectedCount)
             Assert.Equal(1, bridge.ProjectUsesMaxObservedConcurrency)
+            Assert.Equal(1, outerGate.CurrentCount)
 
             releaseFirst.TrySetResult(()) |> ignore
 
-            let settle = System.Diagnostics.Stopwatch.StartNew()
-
-            while
-                (bridge.ProjectUsesActiveCount <> 0 || bridge.ProjectUsesInFlightCount <> 0)
-                && settle.Elapsed < TimeSpan.FromSeconds(5.0)
-                do
-                do! Task.Delay(20)
+            let! retainedOperation = retained.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            do! awaitExactCompletion retainedOperation
+            do! awaitFullGateAvailability outerGate 2
 
             Assert.Equal(0, bridge.ProjectUsesActiveCount)
             Assert.Equal(0, bridge.ProjectUsesInFlightCount)
+            Assert.Equal(2, outerGate.CurrentCount)
 
-            let! retry = bridge.Find(admissionFindArgs secondProject 5_000)
+            let! retry = runFind (admissionFindArgs secondProject 20_000)
             Assert.Equal("succeeded", retry["status"].GetValue<string>())
+            Assert.Equal("complete", findPhaseStatus retry "admission")
             Assert.Equal(2, Volatile.Read(&workerStarts))
             Assert.Equal(2L, bridge.ProjectUsesStartedCount)
+            Assert.Equal(2, outerGate.CurrentCount)
         finally
             releaseFirst.TrySetResult(()) |> ignore
 
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find expiry during position resolution returns before the retained worker completes`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_position_deadline_{Guid.NewGuid():N}")
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let expiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let retained = TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let beforePositionCompute () : Task =
+            (task {
+                entered.TrySetResult(()) |> ignore
+                do! release.Task
+             }
+             :> Task)
+
+        let bridge =
+            FcsBridge(
+                findPositionResolutionBeforeComputeOverride = beforePositionCompute,
+                findDeadlineSignalOverride = (fun () -> expiry.Task)
+            )
+
+        try
+            let sourcePath, projectPath = writeSimpleProject root "PositionDeadline" "value"
+
+            let args =
+                { admissionFindArgs projectPath 20_000 with
+                    kind = Some "position"
+                    path = Some sourcePath
+                    line = Some 2
+                    word = Some "value" }
+
+            let deadline = FindRequestDeadline(20_000, semanticExpirySignal = expiry.Task)
+
+            let captureAndRetain operation =
+                captureRetainedOperation retained ignore operation
+
+            let request =
+                bridge.FindWithinDeadline(
+                    args,
+                    deadline,
+                    CancellationToken.None,
+                    captureAndRetain,
+                    None
+                )
+
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            expiry.TrySetResult(()) |> ignore
+            let! result = request.WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.Equal("unknown", result["status"].GetValue<string>())
+            Assert.Equal("find_timeout", result["errorKind"].GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus result "position_resolution")
+            Assert.Equal("not_started", findPhaseStatus result "target_discovery")
+            Assert.Equal(0L, bridge.FindPositionResolutionComputeCount)
+            Assert.Equal(0L, bridge.ProjectOptionsLoadCount)
+            Assert.Equal(0L, bridge.ProjectUsesStartedCount)
+            Assert.Equal(1, bridge.FindPositionResolutionActiveCount)
+            Assert.Equal(1, bridge.FindPositionResolutionInFlightCount)
+
+            release.TrySetResult(()) |> ignore
+
+            let! retainedOperation = retained.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            do! awaitExactCompletion retainedOperation
+
+            Assert.Equal(0, bridge.FindPositionResolutionActiveCount)
+            Assert.Equal(0, bridge.FindPositionResolutionInFlightCount)
+        finally
+            release.TrySetResult(()) |> ignore
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Theory>]
+[<InlineData(false, false)>]
+[<InlineData(false, true)>]
+[<InlineData(true, false)>]
+[<InlineData(true, true)>]
+let ``cold position project-options continuation follows all parent waiters``
+    (keepFollower: bool, explicitProject: bool)
+    : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_position_nested_{Guid.NewGuid():N}")
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let firstExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let secondExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let retained = System.Collections.Concurrent.ConcurrentBag<Task>()
+        let requests = ResizeArray<Task<JsonNode>>()
+
+        let beforeLoad (_: string) : Task =
+            task {
+                entered.TrySetResult(()) |> ignore
+                do! release.Task
+            }
+
+        let emptySweep (_: string) =
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let bridge =
+            FcsBridge(
+                projectEvaluationBeforeLoadOverride = beforeLoad,
+                projectSweepWorkerOverride = emptySweep
+            )
+
+        let mutable failure = None
+
+        try
+            let sourcePath, projectPath = writeSimpleProject root "PositionNestedOptions" "value"
+
+            let args =
+                { admissionFindArgs projectPath 30_000 with
+                    kind = Some "position"
+                    path = Some sourcePath
+                    projectPath = if explicitProject then Some projectPath else None
+                    line = Some 2
+                    word = Some "value" }
+
+            let start (expiry: TaskCompletionSource<unit>) =
+                let request =
+                    bridge.FindWithinDeadline(
+                        args,
+                        FindRequestDeadline(30_000, semanticExpirySignal = expiry.Task),
+                        CancellationToken.None,
+                        retained.Add,
+                        None
+                    )
+
+                requests.Add request
+                request
+
+            let first = start firstExpiry
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            let second = start secondExpiry
+            do! awaitObservedCount "two position callers" 2 (fun () -> bridge.FindPositionResolutionWaiterCount)
+            Assert.Equal(1, bridge.ProjectOptionsWaiterCount)
+            Assert.Equal(0L, bridge.ProjectOptionsLoadCount)
+
+            firstExpiry.TrySetResult(()) |> ignore
+
+            if not keepFollower then
+                secondExpiry.TrySetResult(()) |> ignore
+
+            let! expired = first.WaitAsync(TimeSpan.FromSeconds(5.0))
+            Assert.Equal("find_timeout", expired["errorKind"].GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus expired "position_resolution")
+
+            if keepFollower then
+                Assert.False(second.IsCompleted)
+                Assert.Equal(1, bridge.FindPositionResolutionWaiterCount)
+                release.TrySetResult(()) |> ignore
+                let! result = second.WaitAsync(TimeSpan.FromSeconds(20.0))
+                Assert.Equal("succeeded", result["status"].GetValue<string>())
+                Assert.Equal("complete", findPhaseStatus result "position_resolution")
+                Assert.Equal(1L, bridge.ProjectOptionsLoadCount)
+            else
+                let! alsoExpired = second.WaitAsync(TimeSpan.FromSeconds(5.0))
+                Assert.Equal("find_timeout", alsoExpired["errorKind"].GetValue<string>())
+                Assert.Equal(1, bridge.ProjectEvaluationActiveCount)
+                Assert.Equal(1, bridge.FindPositionResolutionActiveCount)
+        with ex ->
+            failure <- Some ex
+
+        // Public timeouts precede actual completion. Release every hook, drain both
+        // public calls and each exact retained position worker, then remove its files.
+        // This also runs on assertion failure; no cleanup timeout can hide live work.
+        release.TrySetResult(()) |> ignore
+
+        for request in requests do
+            try
+                let! _ = request
+                ()
+            with ex ->
+                if failure.IsNone then failure <- Some ex
+
+        for worker in retained do
+            try
+                do! worker
+            with
+            | :? TimeoutException -> ()
+            | ex -> if failure.IsNone then failure <- Some ex
+
+        Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
+        Assert.Equal(0, bridge.ProjectOptionsInFlightCount)
+        Assert.Equal(0, bridge.FindPositionResolutionActiveCount)
+        Assert.Equal(0, bridge.FindPositionResolutionInFlightCount)
+
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+        match failure with
+        | Some ex -> return raise ex
+        | None -> Assert.Equal((if keepFollower then 1L else 0L), bridge.ProjectOptionsLoadCount)
+    }
+
+[<Fact>]
+let ``find expiry during sln discovery stops line materialization and releases retained admission`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_sln_deadline_{Guid.NewGuid():N}")
+        use outerGate = new SemaphoreSlim(1, 1)
+        use release = new ManualResetEventSlim(false)
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let expiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let retained = TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable lineSteps = 0
+        let mutable projectSteps = 0
+
+        let beforeDiscoveryStep phase _ =
+            if phase = "sln-line" then
+                let current = Interlocked.Increment(&lineSteps)
+
+                if current = 4 then
+                    entered.TrySetResult(()) |> ignore
+                    expiry.TrySetResult(()) |> ignore
+                    release.Wait()
+            elif phase = "sln-project" then
+                Interlocked.Increment(&projectSteps) |> ignore
+
+        let controlledSweep (_: string) =
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let bridge =
+            FcsBridge(
+                findTargetDiscoveryBeforeStepOverride = beforeDiscoveryStep,
+                projectSweepWorkerOverride = controlledSweep
+            )
+
+        try
+            let missingProjects =
+                [ for index in 1..12 -> Path.Combine(root, $"Missing{index}.fsproj") ]
+
+            let solutionPath = writeSolution root "Deadline.sln" missingProjects
+
+            let args =
+                { admissionFindArgs solutionPath 20_000 with
+                    scope = Some "workspace" }
+
+            let deadline = FindRequestDeadline(20_000, semanticExpirySignal = expiry.Task)
+
+            let request =
+                runLimitedWithFindDeadlineRetained
+                    outerGate
+                    CancellationToken.None
+                    deadline
+                    (fun sharedDeadline retainUntil ->
+                        let captureAndRetain operation =
+                            captureRetainedOperation retained retainUntil operation
+
+                        bridge.FindWithinDeadline(
+                            args,
+                            sharedDeadline,
+                            CancellationToken.None,
+                            captureAndRetain,
+                            None
+                        ))
+
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            let! result = request.WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.Equal("unknown", result["status"].GetValue<string>())
+            Assert.Equal("find_timeout", result["errorKind"].GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus result "target_discovery")
+            Assert.Equal("not_started", findPhaseStatus result "project_sweep")
+            Assert.Equal("not_started", findPhaseStatus result "fsac_fallback")
+            Assert.Equal(4, Volatile.Read(&lineSteps))
+            Assert.Equal(3, Volatile.Read(&projectSteps))
+            Assert.Equal(0L, bridge.ProjectUsesStartedCount)
+            Assert.Equal(1, bridge.FindTargetDiscoveryActiveCount)
+            Assert.Equal(1, bridge.FindTargetDiscoveryInFlightCount)
+            Assert.Equal(0, outerGate.CurrentCount)
+
+            release.Set()
+
+            let! retainedOperation = retained.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            do! awaitExactCompletion retainedOperation
+            do! awaitFullGateAvailability outerGate 1
+
+            Assert.Equal(4, Volatile.Read(&lineSteps))
+            Assert.Equal(3, Volatile.Read(&projectSteps))
+            Assert.Equal(0, bridge.FindTargetDiscoveryActiveCount)
+            Assert.Equal(0, bridge.FindTargetDiscoveryInFlightCount)
+            Assert.Equal(1, outerGate.CurrentCount)
+        finally
+            release.Set()
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find expiry during nearest project discovery stops before the next directory`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_nearest_deadline_{Guid.NewGuid():N}")
+        let nested = Path.Combine(root, "A", "B")
+        Directory.CreateDirectory(nested) |> ignore
+        let sourcePath = Path.Combine(nested, "Library.fs")
+        File.WriteAllText(sourcePath, "module Nested\nlet value = 42\n")
+        let expiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable directorySteps = 0
+        let mutable fileSteps = 0
+
+        let beforeDiscoveryStep phase _ =
+            if phase = "nearest-project-directory" then
+                let current = Interlocked.Increment(&directorySteps)
+
+                if current = 2 then
+                    expiry.TrySetResult(()) |> ignore
+            elif phase = "nearest-project-file" then
+                Interlocked.Increment(&fileSteps) |> ignore
+
+        let bridge = FcsBridge(findTargetDiscoveryBeforeStepOverride = beforeDiscoveryStep)
+
+        try
+            let args =
+                { admissionFindArgs "" 20_000 with
+                    projectPath = None
+                    path = Some sourcePath }
+
+            let deadline = FindRequestDeadline(20_000, semanticExpirySignal = expiry.Task)
+
+            let! result =
+                bridge.FindWithinDeadline(args, deadline, CancellationToken.None, ignore, None)
+
+            Assert.Equal("unknown", result["status"].GetValue<string>())
+            Assert.Equal("find_timeout", result["errorKind"].GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus result "target_discovery")
+            Assert.Equal(2, Volatile.Read(&directorySteps))
+            Assert.Equal(1, Volatile.Read(&fileSteps))
+            Assert.Equal(0L, bridge.ProjectOptionsLoadCount)
+            Assert.Equal(0L, bridge.ProjectUsesStartedCount)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find expiry during missing project rows stops shaping and reports honest phases`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_missing_rows_{Guid.NewGuid():N}")
+        let expiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable missingRowSteps = 0
+        let mutable sweepStarts = 0
+
+        let beforeDiscoveryStep phase _ =
+            if phase = "missing-project-row" then
+                let current = Interlocked.Increment(&missingRowSteps)
+
+                if current = 3 then
+                    expiry.TrySetResult(()) |> ignore
+
+        let controlledSweep (_: string) =
+            Interlocked.Increment(&sweepStarts) |> ignore
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let bridge =
+            FcsBridge(
+                findTargetDiscoveryBeforeStepOverride = beforeDiscoveryStep,
+                projectSweepWorkerOverride = controlledSweep
+            )
+
+        try
+            let _, loadableProject = writeSimpleProject root "Loadable" "value"
+
+            let missingProjects =
+                [ for index in 1..8 -> Path.Combine(root, $"Missing{index}.fsproj") ]
+
+            let solutionPath =
+                writeSolution root "MissingRows.sln" (loadableProject :: missingProjects)
+
+            let args =
+                { admissionFindArgs solutionPath 20_000 with
+                    scope = Some "workspace" }
+
+            let deadline = FindRequestDeadline(20_000, semanticExpirySignal = expiry.Task)
+
+            let! result =
+                bridge.FindWithinDeadline(args, deadline, CancellationToken.None, ignore, None)
+
+            Assert.Equal("unknown", result["status"].GetValue<string>())
+            Assert.Equal("find_timeout", result["errorKind"].GetValue<string>())
+            Assert.Equal(3, Volatile.Read(&missingRowSteps))
+            Assert.Equal(0, Volatile.Read(&sweepStarts))
+            Assert.Equal(9, result["projectsRequested"].GetValue<int>())
+            Assert.Equal(1, result["projectsSwept"].GetValue<int>())
+            Assert.Equal(8, result["projectsMissing"].GetValue<int>())
+            Assert.Equal(1, result["projectsNotStarted"].GetValue<int>())
+            Assert.Equal(2, result["perProject"].AsArray().Count)
+            Assert.Equal("project", (result["resolution"]["scopeResolved"]).GetValue<string>())
+            Assert.Equal("not_started", (result["resolution"]["fsacFallbackState"]).GetValue<string>())
+            Assert.Equal("incomplete-target-discovery", (result["resolution"]["via"]).GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus result "target_discovery")
+            Assert.Equal("not_started", findPhaseStatus result "project_sweep")
+            Assert.Equal("not_started", findPhaseStatus result "fsac_fallback")
+            Assert.Equal("complete", findPhaseStatus result "response_construction")
+            Assert.False((result["coverage"]["complete"]).GetValue<bool>())
+            Assert.False(result["resultSetComplete"].GetValue<bool>())
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find slnx discovery checks continuation between XML nodes`` () =
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_slnx_deadline_{Guid.NewGuid():N}")
+    Directory.CreateDirectory(root) |> ignore
+
+    try
+        let solutionPath = Path.Combine(root, "Deadline.slnx")
+
+        let projects =
+            [ for index in 1..12 -> $"  <Project Path=\"Missing{index}.fsproj\" />" ]
+            |> String.concat Environment.NewLine
+
+        File.WriteAllText(solutionPath, $"<Solution>{Environment.NewLine}{projects}{Environment.NewLine}</Solution>")
+        let mutable nodeSteps = 0
+        let mutable canContinue = true
+
+        let beforeStep phase _ =
+            if phase = "slnx-node" then
+                let current = Interlocked.Increment(&nodeSteps)
+
+                if current = 4 then
+                    canContinue <- false
+
+        Assert.Throws<TimeoutException>(fun () ->
+            FsLangMcp.ProjectFiles.SolutionParsing.discoverProjectsForFind
+                solutionPath
+                beforeStep
+                (fun () -> canContinue)
+            |> ignore)
+        |> ignore
+
+        Assert.Equal(4, Volatile.Read(&nodeSteps))
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Fact>]
+let ``find discovery expiry retains the worker rejects a distinct key and admits retry`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_discovery_deadline_{Guid.NewGuid():N}")
+        let firstRoot = Path.Combine(root, "FirstWorkspace")
+        let secondRoot = Path.Combine(root, "SecondWorkspace")
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let firstExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable deadlineSignal = firstExpiry
+        let mutable blockFirst = 1
+        let retained = TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let beforeDiscoveryCompute phase : Task =
+            (task {
+                if phase = "projects" && Interlocked.Exchange(&blockFirst, 0) = 1 then
+                    entered.TrySetResult(()) |> ignore
+                    do! release.Task
+             }
+             :> Task)
+
+        let emptySweep (_: string) =
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let bridge =
+            FcsBridge(
+                freshProjectCheckConcurrencyOverride = 1,
+                findTargetDiscoveryBeforeComputeOverride = beforeDiscoveryCompute,
+                findDeadlineSignalOverride = (fun () -> deadlineSignal.Task),
+                projectSweepWorkerOverride = emptySweep
+            )
+
+        let workspaceArgs workspace =
+            { admissionFindArgs workspace 20_000 with
+                scope = Some "workspace" }
+
+        let runFind args =
+            let deadline =
+                FindRequestDeadline(20_000, semanticExpirySignal = deadlineSignal.Task)
+
+            bridge.FindWithinDeadline(args, deadline, CancellationToken.None, ignore, None)
+
+        try
+            let _ = writeSimpleProject firstRoot "First" "value"
+            let _ = writeSimpleProject secondRoot "Second" "value"
+
+            let firstDeadline =
+                FindRequestDeadline(20_000, semanticExpirySignal = firstExpiry.Task)
+
+            let captureAndRetain operation =
+                captureRetainedOperation retained ignore operation
+
+            let first =
+                bridge.FindWithinDeadline(
+                    workspaceArgs firstRoot,
+                    firstDeadline,
+                    CancellationToken.None,
+                    captureAndRetain,
+                    None
+                )
+
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            firstExpiry.TrySetResult(()) |> ignore
+            let! expired = first.WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.Equal("unknown", expired["status"].GetValue<string>())
+            Assert.Equal("find_timeout", expired["errorKind"].GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus expired "target_discovery")
+            Assert.Equal(0L, bridge.FindTargetDiscoveryComputeCount)
+            Assert.Equal(0L, bridge.ProjectOptionsLoadCount)
+            Assert.Equal(0L, bridge.ProjectUsesStartedCount)
+            Assert.Equal(1, bridge.FindTargetDiscoveryActiveCount)
+            Assert.Equal(1, bridge.FindTargetDiscoveryInFlightCount)
+
+            deadlineSignal <-
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let! busy =
+                (runFind (workspaceArgs secondRoot)).WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.Equal("unknown", busy["status"].GetValue<string>())
+            Assert.Equal("fcs_worker_busy", busy["errorKind"].GetValue<string>())
+            Assert.Equal("busy", findPhaseStatus busy "target_discovery")
+            Assert.Equal(1L, bridge.FindTargetDiscoveryRejectedCount)
+            Assert.Equal(0L, bridge.FindTargetDiscoveryComputeCount)
+
+            release.TrySetResult(()) |> ignore
+
+            let! retainedOperation = retained.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            do! awaitExactCompletion retainedOperation
+
+            Assert.Equal(0, bridge.FindTargetDiscoveryActiveCount)
+            Assert.Equal(0, bridge.FindTargetDiscoveryInFlightCount)
+
+            let! retry =
+                (runFind (workspaceArgs secondRoot)).WaitAsync(TimeSpan.FromSeconds(20.0))
+
+            Assert.Equal("succeeded", retry["status"].GetValue<string>())
+            Assert.Equal(1L, bridge.FindTargetDiscoveryComputeCount)
+            Assert.Equal(2L, bridge.FindTargetDiscoveryStartedCount)
+            Assert.Equal(1L, bridge.ProjectUsesStartedCount)
+        finally
+            release.TrySetResult(()) |> ignore
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find project discovery lets a long follower outlive a short leader`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_discovery_waiters_{Guid.NewGuid():N}")
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let shortExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let longExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable projectWorkerStarts = 0
+
+        let beforeDiscoveryCompute phase : Task =
+            (task {
+                if phase = "projects" then
+                    Interlocked.Increment(&projectWorkerStarts) |> ignore
+                    entered.TrySetResult(()) |> ignore
+                    do! release.Task
+             }
+             :> Task)
+
+        let emptySweep (_: string) =
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let bridge =
+            FcsBridge(
+                findTargetDiscoveryBeforeComputeOverride = beforeDiscoveryCompute,
+                projectSweepWorkerOverride = emptySweep
+            )
+
+        try
+            let _, projectPath = writeSimpleProject root "DiscoveryFollower" "value"
+            let! warmed = bridge.GetEvaluatedProjectSnapshot(projectPath)
+            Assert.True(Result.isOk warmed)
+            let solutionPath = writeSolution root "Follower.sln" [ projectPath ]
+
+            let args =
+                { admissionFindArgs solutionPath 20_000 with
+                    scope = Some "workspace" }
+
+            let runFind expiry =
+                let deadline = FindRequestDeadline(20_000, semanticExpirySignal = expiry)
+                bridge.FindWithinDeadline(args, deadline, CancellationToken.None, ignore, None)
+
+            let shortLeader = runFind shortExpiry.Task
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            let longFollower = runFind longExpiry.Task
+
+            do!
+                awaitObservedCount
+                    "two project-discovery waiters"
+                    2
+                    (fun () -> bridge.FindTargetDiscoveryWaiterCount)
+
+            shortExpiry.TrySetResult(()) |> ignore
+            let! expired = shortLeader.WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.Equal("unknown", expired["status"].GetValue<string>())
+            Assert.Equal("find_timeout", expired["errorKind"].GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus expired "target_discovery")
+            Assert.False(longFollower.IsCompleted)
+            Assert.Equal(1, bridge.FindTargetDiscoveryWaiterCount)
+
+            release.TrySetResult(()) |> ignore
+            let! succeeded = longFollower.WaitAsync(TimeSpan.FromSeconds(20.0))
+
+            Assert.Equal("succeeded", succeeded["status"].GetValue<string>())
+            Assert.Equal(1, Volatile.Read(&projectWorkerStarts))
+            Assert.Equal(1L, bridge.FindTargetDiscoveryStartedCount)
+            Assert.Equal(1L, bridge.FindTargetDiscoveryComputeCount)
+            Assert.Equal(0, bridge.FindTargetDiscoveryActiveCount)
+            Assert.Equal(0, bridge.FindTargetDiscoveryInFlightCount)
+            Assert.Equal(0, bridge.FindTargetDiscoveryWaiterCount)
+        finally
+            release.TrySetResult(()) |> ignore
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find project discovery lets a long leader outlive a short follower`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_discovery_leader_{Guid.NewGuid():N}")
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let shortExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let longExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let requests = ResizeArray<Task<JsonNode>>()
+        let retainedWorkers = System.Collections.Concurrent.ConcurrentQueue<Task>()
+        let mutable projectWorkerStarts = 0
+
+        let beforeDiscoveryCompute phase : Task =
+            (task {
+                if phase = "projects" then
+                    Interlocked.Increment(&projectWorkerStarts) |> ignore
+                    entered.TrySetResult(()) |> ignore
+                    do! release.Task
+             }
+             :> Task)
+
+        let emptySweep (_: string) =
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let bridge =
+            FcsBridge(
+                findTargetDiscoveryBeforeComputeOverride = beforeDiscoveryCompute,
+                projectSweepWorkerOverride = emptySweep
+            )
+
+        // task awaits DisposeAsync even when an assertion fails before release.
+        use cleanup =
+            { new IAsyncDisposable with
+                member _.DisposeAsync() =
+                    ValueTask(
+                        task {
+                            release.TrySetResult(()) |> ignore
+
+                            for request in requests do
+                                do! awaitExactCompletion request
+
+                            // Expired requests may leave lifecycle work behind.
+                            for worker in retainedWorkers do
+                                do! awaitExactCompletion worker
+
+                            // Leave the fixture intact if draining times out.
+                            if Directory.Exists root then
+                                Directory.Delete(root, true)
+                        }
+                    ) }
+
+        let _, projectPath = writeSimpleProject root "DiscoveryLeader" "value"
+        let! warmed = bridge.GetEvaluatedProjectSnapshot(projectPath)
+        Assert.True(Result.isOk warmed)
+        let solutionPath = writeSolution root "Leader.sln" [ projectPath ]
+
+        let args =
+            { admissionFindArgs solutionPath 20_000 with
+                scope = Some "workspace" }
+
+        let runFind expiry =
+            let deadline = FindRequestDeadline(20_000, semanticExpirySignal = expiry)
+
+            let operation =
+                bridge.FindWithinDeadline(args, deadline, CancellationToken.None, retainedWorkers.Enqueue, None)
+
+            requests.Add(operation)
+            operation
+
+        let longLeader = runFind longExpiry.Task
+        do! entered.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+        let shortFollower = runFind shortExpiry.Task
+
+        do!
+            awaitObservedCount
+                "two project-discovery waiters"
+                2
+                (fun () -> bridge.FindTargetDiscoveryWaiterCount)
+
+        shortExpiry.TrySetResult(()) |> ignore
+        let! expired = shortFollower.WaitAsync(TimeSpan.FromSeconds(5.0))
+
+        Assert.Equal("unknown", expired["status"].GetValue<string>())
+        Assert.Equal("find_timeout", expired["errorKind"].GetValue<string>())
+        Assert.Equal("timed_out", findPhaseStatus expired "target_discovery")
+        Assert.False(longLeader.IsCompleted)
+        Assert.Equal(1, bridge.FindTargetDiscoveryActiveCount)
+        Assert.Equal(1, bridge.FindTargetDiscoveryInFlightCount)
+        Assert.Equal(1, bridge.FindTargetDiscoveryWaiterCount)
+
+        release.TrySetResult(()) |> ignore
+        let! succeeded = longLeader.WaitAsync(TimeSpan.FromSeconds(20.0))
+
+        Assert.Equal("succeeded", succeeded["status"].GetValue<string>())
+        Assert.Equal(1, Volatile.Read(&projectWorkerStarts))
+        Assert.Equal(1L, bridge.FindTargetDiscoveryStartedCount)
+        Assert.Equal(1L, bridge.FindTargetDiscoveryComputeCount)
+        Assert.Equal(0, bridge.FindTargetDiscoveryActiveCount)
+        Assert.Equal(0, bridge.FindTargetDiscoveryInFlightCount)
+        Assert.Equal(0, bridge.FindTargetDiscoveryWaiterCount)
+    }
+
+[<Fact>]
+let ``find nearest project discovery uses the same waiter-aware lifecycle`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_nearest_waiters_{Guid.NewGuid():N}")
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let shortExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let longExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable nearestWorkerStarts = 0
+
+        let beforeDiscoveryCompute phase : Task =
+            (task {
+                if phase = "nearest-project" then
+                    Interlocked.Increment(&nearestWorkerStarts) |> ignore
+                    entered.TrySetResult(()) |> ignore
+                    do! release.Task
+             }
+             :> Task)
+
+        let emptySweep (_: string) =
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let bridge =
+            FcsBridge(
+                findTargetDiscoveryBeforeComputeOverride = beforeDiscoveryCompute,
+                projectSweepWorkerOverride = emptySweep
+            )
+
+        try
+            let sourcePath, projectPath = writeSimpleProject root "NearestFollower" "value"
+            let! warmed = bridge.GetEvaluatedProjectSnapshot(projectPath)
+            Assert.True(Result.isOk warmed)
+
+            let args =
+                { admissionFindArgs "" 20_000 with
+                    projectPath = None
+                    path = Some sourcePath }
+
+            let runFind expiry =
+                let deadline = FindRequestDeadline(20_000, semanticExpirySignal = expiry)
+                bridge.FindWithinDeadline(args, deadline, CancellationToken.None, ignore, None)
+
+            let shortLeader = runFind shortExpiry.Task
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            let longFollower = runFind longExpiry.Task
+
+            do!
+                awaitObservedCount
+                    "two nearest-project waiters"
+                    2
+                    (fun () -> bridge.FindTargetDiscoveryWaiterCount)
+
+            shortExpiry.TrySetResult(()) |> ignore
+            let! expired = shortLeader.WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.Equal("unknown", expired["status"].GetValue<string>())
+            Assert.Equal("find_timeout", expired["errorKind"].GetValue<string>())
+            Assert.False(longFollower.IsCompleted)
+            Assert.Equal(1, bridge.FindTargetDiscoveryWaiterCount)
+
+            release.TrySetResult(()) |> ignore
+            let! succeeded = longFollower.WaitAsync(TimeSpan.FromSeconds(20.0))
+
+            Assert.Equal("succeeded", succeeded["status"].GetValue<string>())
+            Assert.Equal(1, Volatile.Read(&nearestWorkerStarts))
+            Assert.Equal(2L, bridge.FindTargetDiscoveryStartedCount)
+            Assert.Equal(2L, bridge.FindTargetDiscoveryComputeCount)
+            Assert.Equal(0, bridge.FindTargetDiscoveryActiveCount)
+            Assert.Equal(0, bridge.FindTargetDiscoveryInFlightCount)
+            Assert.Equal(0, bridge.FindTargetDiscoveryWaiterCount)
+        finally
+            release.TrySetResult(()) |> ignore
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find position resolution lets a long follower outlive a short leader`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_position_waiters_{Guid.NewGuid():N}")
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let shortExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let longExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let beforePositionCompute () : Task =
+            (task {
+                entered.TrySetResult(()) |> ignore
+                do! release.Task
+             }
+             :> Task)
+
+        let emptySweep (_: string) =
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let bridge =
+            FcsBridge(
+                findPositionResolutionBeforeComputeOverride = beforePositionCompute,
+                projectSweepWorkerOverride = emptySweep
+            )
+
+        try
+            let sourcePath, projectPath = writeSimpleProject root "PositionFollower" "value"
+            let! warmed = bridge.GetEvaluatedProjectSnapshot(projectPath)
+            Assert.True(Result.isOk warmed)
+
+            let args =
+                { admissionFindArgs projectPath 20_000 with
+                    kind = Some "position"
+                    path = Some sourcePath
+                    line = Some 2
+                    word = Some "value" }
+
+            let runFind expiry =
+                let deadline = FindRequestDeadline(20_000, semanticExpirySignal = expiry)
+                bridge.FindWithinDeadline(args, deadline, CancellationToken.None, ignore, None)
+
+            let shortLeader = runFind shortExpiry.Task
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            let longFollower = runFind longExpiry.Task
+
+            do!
+                awaitObservedCount
+                    "two position-resolution waiters"
+                    2
+                    (fun () -> bridge.FindPositionResolutionWaiterCount)
+
+            shortExpiry.TrySetResult(()) |> ignore
+            let! expired = shortLeader.WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.Equal("unknown", expired["status"].GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus expired "position_resolution")
+            Assert.False(longFollower.IsCompleted)
+            Assert.Equal(1, bridge.FindPositionResolutionWaiterCount)
+
+            release.TrySetResult(()) |> ignore
+            let! succeeded = longFollower.WaitAsync(TimeSpan.FromSeconds(20.0))
+
+            Assert.Equal("succeeded", succeeded["status"].GetValue<string>())
+            Assert.Equal(1L, bridge.FindPositionResolutionStartedCount)
+            Assert.Equal(1L, bridge.FindPositionResolutionComputeCount)
+            Assert.Equal(0, bridge.FindPositionResolutionActiveCount)
+            Assert.Equal(0, bridge.FindPositionResolutionInFlightCount)
+            Assert.Equal(0, bridge.FindPositionResolutionWaiterCount)
+        finally
+            release.TrySetResult(()) |> ignore
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find project options lets a long follower outlive a short leader`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_options_waiters_{Guid.NewGuid():N}")
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let shortExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let longExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let beforeLoad (_: string) : Task =
+            (task {
+                entered.TrySetResult(()) |> ignore
+                do! release.Task
+             }
+             :> Task)
+
+        let emptySweep (_: string) =
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let bridge =
+            FcsBridge(
+                projectEvaluationBeforeLoadOverride = beforeLoad,
+                projectSweepWorkerOverride = emptySweep
+            )
+
+        try
+            let _, projectPath = writeSimpleProject root "OptionsFollower" "value"
+            let args = admissionFindArgs projectPath 20_000
+
+            let runFind expiry =
+                let deadline = FindRequestDeadline(20_000, semanticExpirySignal = expiry)
+                bridge.FindWithinDeadline(args, deadline, CancellationToken.None, ignore, None)
+
+            let shortLeader = runFind shortExpiry.Task
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            let longFollower = runFind longExpiry.Task
+
+            do!
+                awaitObservedCount
+                    "two project-options waiters"
+                    2
+                    (fun () -> bridge.ProjectOptionsWaiterCount)
+
+            shortExpiry.TrySetResult(()) |> ignore
+            let! expired = shortLeader.WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.Equal("unknown", expired["status"].GetValue<string>())
+            Assert.Equal(1, expired["projectsTimedOut"].GetValue<int>())
+            Assert.False(longFollower.IsCompleted)
+            Assert.Equal(1, bridge.ProjectOptionsWaiterCount)
+
+            release.TrySetResult(()) |> ignore
+            let! succeeded = longFollower.WaitAsync(TimeSpan.FromSeconds(20.0))
+
+            Assert.Equal("succeeded", succeeded["status"].GetValue<string>())
+            Assert.Equal(1L, bridge.ProjectEvaluationStartedCount)
+            Assert.Equal(1L, bridge.ProjectOptionsLoadCount)
+            Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
+            Assert.Equal(0, bridge.ProjectOptionsInFlightCount)
+            Assert.Equal(0, bridge.ProjectOptionsWaiterCount)
+        finally
+            release.TrySetResult(()) |> ignore
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find analysis snapshot lets a long follower outlive a short leader`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_snapshot_waiters_{Guid.NewGuid():N}")
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let shortExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let longExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let beforeSnapshotCompute () =
+            entered.TrySetResult(()) |> ignore
+            release.Task.GetAwaiter().GetResult()
+
+        let emptySweep (_: string) =
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let bridge =
+            FcsBridge(
+                analysisSnapshotKeyBeforeComputeOverride = beforeSnapshotCompute,
+                projectSweepWorkerOverride = emptySweep
+            )
+
+        try
+            let _, projectPath = writeSimpleProject root "SnapshotFollower" "value"
+            let! warmed = bridge.GetEvaluatedProjectSnapshot(projectPath)
+            Assert.True(Result.isOk warmed)
+            let args = admissionFindArgs projectPath 20_000
+
+            let runFind expiry =
+                let deadline = FindRequestDeadline(20_000, semanticExpirySignal = expiry)
+                bridge.FindWithinDeadline(args, deadline, CancellationToken.None, ignore, None)
+
+            let shortLeader = runFind shortExpiry.Task
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            let longFollower = runFind longExpiry.Task
+
+            do!
+                awaitObservedCount
+                    "two analysis-snapshot waiters"
+                    2
+                    (fun () -> bridge.SnapshotComputationWaiterCount)
+
+            shortExpiry.TrySetResult(()) |> ignore
+            let! expired = shortLeader.WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.Equal("unknown", expired["status"].GetValue<string>())
+            Assert.Equal(1, expired["projectsTimedOut"].GetValue<int>())
+            Assert.False(longFollower.IsCompleted)
+            Assert.Equal(1, bridge.SnapshotComputationWaiterCount)
+
+            release.TrySetResult(()) |> ignore
+            let! succeeded = longFollower.WaitAsync(TimeSpan.FromSeconds(20.0))
+
+            Assert.Equal("succeeded", succeeded["status"].GetValue<string>())
+            Assert.Equal(1L, bridge.SnapshotComputationStartedCount)
+            Assert.Equal(0, bridge.SnapshotComputationActiveCount)
+            Assert.Equal(0, bridge.SnapshotComputationInFlightCount)
+            Assert.Equal(0, bridge.SnapshotComputationWaiterCount)
+        finally
+            release.TrySetResult(()) |> ignore
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find expiry during zero-hit FSAC fallback stays typed and indeterminate`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_fallback_deadline_{Guid.NewGuid():N}")
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let completed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let expiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let emptySweep (_: string) =
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let fallback (_: string) =
+            task {
+                entered.TrySetResult(()) |> ignore
+
+                try
+                    do! release.Task
+                    return FindFsacProbeResult.Available 0
+                finally
+                    completed.TrySetResult(()) |> ignore
+            }
+
+        let bridge =
+            FcsBridge(
+                projectSweepWorkerOverride = emptySweep,
+                findDeadlineSignalOverride = (fun () -> expiry.Task)
+            )
+
+        try
+            let _, projectPath = writeSimpleProject root "FallbackDeadline" "value"
+            let args = { admissionFindArgs projectPath 20_000 with query = "missing" }
+            let request = bridge.Find(args, fsacProbe = fallback)
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(20.0))
+            expiry.TrySetResult(()) |> ignore
+            let! result = request.WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.Equal("unknown", result["status"].GetValue<string>())
+            Assert.Equal("indeterminate", result["outcome"].GetValue<string>())
+            Assert.Null(result["resolution"]["matched"])
+            Assert.Equal("timed_out", (result["resolution"]["fsacFallbackState"]).GetValue<string>())
+            Assert.Equal("incomplete-fsac-fallback", (result["resolution"]["via"]).GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus result "fsac_fallback")
+            Assert.True((result["coverage"]["complete"]).GetValue<bool>())
+            Assert.False(result["resultSetComplete"].GetValue<bool>())
+            Assert.False(completed.Task.IsCompleted)
+
+            release.TrySetResult(()) |> ignore
+            do! completed.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+        finally
+            release.TrySetResult(()) |> ignore
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find response construction expiry returns a typed restart-required envelope`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_response_deadline_{Guid.NewGuid():N}")
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let completed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let expiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let emptySweep (_: string) =
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let beforeResponse () : Task =
+            (task {
+                entered.TrySetResult(()) |> ignore
+
+                try
+                    do! release.Task
+                finally
+                    completed.TrySetResult(()) |> ignore
+             }
+             :> Task)
+
+        let bridge =
+            FcsBridge(
+                projectSweepWorkerOverride = emptySweep,
+                findResponseDeadlineSignalOverride = (fun () -> expiry.Task),
+                findResponseConstructionBeforeStartOverride = beforeResponse
+            )
+
+        try
+            let _, projectPath = writeSimpleProject root "ResponseDeadline" "value"
+            let request = bridge.Find({ admissionFindArgs projectPath 20_000 with query = "missing" })
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(20.0))
+            expiry.TrySetResult(()) |> ignore
+            let! result = request.WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.Equal("unknown", result["status"].GetValue<string>())
+            Assert.Equal("find_response_timeout", result["errorKind"].GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus result "response_construction")
+            Assert.True((result["coverage"]["complete"]).GetValue<bool>())
+            Assert.False(result["resultSetComplete"].GetValue<bool>())
+            Assert.True(result["truncated"].GetValue<bool>())
+            Assert.True(result["paginationRestartRequired"].GetValue<bool>())
+            Assert.Null(result["nextCursor"])
+            Assert.Empty((result["sites"]).AsArray())
+            Assert.False(completed.Task.IsCompleted)
+
+            release.TrySetResult(()) |> ignore
+            do! completed.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+        finally
+            release.TrySetResult(()) |> ignore
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find response expiry during post-sweep shaping stops before later response work`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_shaping_deadline_{Guid.NewGuid():N}")
+        let expiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable shapingSteps = 0
+        let mutable laterSteps = 0
+
+        let emptySweep (_: string) =
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let beforeResponseStep phase _ =
+            if phase = "post-sweep-shaping" then
+                Interlocked.Increment(&shapingSteps) |> ignore
+                expiry.TrySetResult(()) |> ignore
+            else
+                Interlocked.Increment(&laterSteps) |> ignore
+
+        let bridge =
+            FcsBridge(
+                projectSweepWorkerOverride = emptySweep,
+                findResponseDeadlineSignalOverride = (fun () -> expiry.Task),
+                findResponseConstructionBeforeStepOverride = beforeResponseStep
+            )
+
+        let noFsacHits (_: string) =
+            Task.FromResult(FindFsacProbeResult.Available 0)
+
+        try
+            let _, projectPath = writeSimpleProject root "ShapingDeadline" "value"
+
+            let! result =
+                bridge.Find(
+                    { admissionFindArgs projectPath 20_000 with query = "missing" },
+                    fsacProbe = noFsacHits
+                )
+
+            Assert.Equal("unknown", result["status"].GetValue<string>())
+            Assert.Equal("find_response_timeout", result["errorKind"].GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus result "response_construction")
+            Assert.Equal(1, Volatile.Read(&shapingSteps))
+            Assert.Equal(0, Volatile.Read(&laterSteps))
+            Assert.Empty(result["sites"].AsArray())
+            Assert.Empty(result["projectDiagnostics"].AsArray())
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find response shaping expiry marks retained category counts as incomplete`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_breakdown_deadline_{Guid.NewGuid():N}")
+        let expiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable expireDuringShaping = false
+
+        let beforeResponseStep phase index =
+            if expireDuringShaping && phase = "post-sweep-shaping" && index = 1 then
+                expiry.TrySetResult(()) |> ignore
+
+        let bridge =
+            FcsBridge(
+                findResponseDeadlineSignalOverride = (fun () -> expiry.Task),
+                findResponseConstructionBeforeStepOverride = beforeResponseStep
+            )
+
+        let countBreakdown (result: JsonNode) =
+            result["breakdown"].AsObject()
+            |> Seq.sumBy (fun entry -> entry.Value.GetValue<int>())
+
+        try
+            let _, projectPath =
+                writeProjectWithSource root "BreakdownDeadline"
+                    "module BreakdownDeadline\nlet value = 42\nlet first = value\nlet second = value\n"
+            let args = admissionFindArgs projectPath 20_000
+            let! complete = bridge.Find(args)
+
+            Assert.Equal("succeeded", complete["status"].GetValue<string>())
+            Assert.True(complete["breakdownComplete"].GetValue<bool>())
+            let totalSites = complete["totalSites"].GetValue<int>()
+            Assert.True(totalSites > 1)
+            Assert.Equal(totalSites, countBreakdown complete)
+
+            expireDuringShaping <- true
+            let! partial = bridge.Find(args)
+
+            Assert.Equal("find_response_timeout", partial["errorKind"].GetValue<string>())
+            Assert.True((partial["coverage"]["complete"]).GetValue<bool>())
+            Assert.Equal(totalSites, partial["totalSites"].GetValue<int>())
+            Assert.False(partial["breakdownComplete"].GetValue<bool>())
+            Assert.Equal(1, countBreakdown partial)
+            Assert.False(partial["resultSetComplete"].GetValue<bool>())
+            Assert.Empty(partial["sites"].AsArray())
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Theory>]
+[<InlineData("diagnostic-collection")>]
+[<InlineData("diagnostic-json")>]
+let ``find diagnostic shaping caps projection before budgeting and observes controlled expiry`` (expiryPhase: string) : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_diagnostics_deadline_{Guid.NewGuid():N}")
+        let diagnosticPath = Path.Combine(root, "DiagnosticSource.fsx")
+        let mutable responseExpiry =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let mutable expireAtStep = 0
+        let mutable diagnosticSteps = 0
+        let mutable diagnosticJsonSteps = 0
+
+        try
+            Directory.CreateDirectory(root) |> ignore
+
+            let diagnosticSource =
+                [ yield "module DiagnosticSource"
+
+                  for index in 1..260 do
+                      yield $"let value{index} : int = \"wrong\"" ]
+                |> String.concat Environment.NewLine
+
+            File.WriteAllText(diagnosticPath, diagnosticSource)
+            let sourceText = SourceText.ofString diagnosticSource
+            let! options, _ = checker.GetProjectOptionsFromScript(diagnosticPath, sourceText) |> asTask
+            let! checkedProject = checker.ParseAndCheckProject(options) |> asTask
+            let diagnostics = checkedProject.Diagnostics
+            Assert.True(diagnostics.Length > 200, $"Expected >200 controlled diagnostics, got {diagnostics.Length}.")
+
+            let controlledSweep (_: string) =
+                Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], diagnostics)
+
+            let beforeResponseStep phase _ =
+                let current =
+                    match phase with
+                    | "diagnostic-collection" -> Interlocked.Increment(&diagnosticSteps)
+                    | "diagnostic-json" -> Interlocked.Increment(&diagnosticJsonSteps)
+                    | _ -> 0
+
+                if phase = expiryPhase && Volatile.Read(&expireAtStep) > 0 && current = Volatile.Read(&expireAtStep) then
+                    responseExpiry.TrySetResult(()) |> ignore
+
+            let bridge =
+                FcsBridge(
+                    projectSweepWorkerOverride = controlledSweep,
+                    findResponseDeadlineSignalOverride = (fun () -> responseExpiry.Task),
+                    findResponseConstructionBeforeStepOverride = beforeResponseStep
+                )
+
+            let noFsacHits (_: string) =
+                Task.FromResult(FindFsacProbeResult.Available 0)
+
+            let _, projectPath = writeSimpleProject root "DiagnosticDeadline" "value"
+            let args = { admissionFindArgs projectPath 20_000 with query = "missing" }
+
+            let! capped = bridge.Find(args, fsacProbe = noFsacHits)
+            Assert.Equal("succeeded", capped["status"].GetValue<string>())
+            Assert.Equal("complete", findPhaseStatus capped "admission")
+            let expectedErrors = diagnostics |> Array.filter (fun diagnostic -> diagnostic.Severity = FSharpDiagnosticSeverity.Error) |> Array.length
+            let delivered = capped["projectDiagnostics"].AsArray().Count
+            Assert.InRange(delivered, 1, 200)
+            Assert.Equal(delivered, capped["projectDiagnosticsReturnedCount"].GetValue<int>())
+            Assert.Equal(expectedErrors, capped["projectDiagnosticsTotalCount"].GetValue<int>())
+            Assert.True(capped["projectDiagnosticsCountComplete"].GetValue<bool>())
+            Assert.True(capped["projectDiagnosticsTruncated"].GetValue<bool>())
+            Assert.Equal(diagnostics.Length, Volatile.Read(&diagnosticSteps))
+            Assert.Equal(200, Volatile.Read(&diagnosticJsonSteps))
+            Assert.True(renderedLength capped <= FindResponseBudget.MaxSerializedChars)
+
+            responseExpiry <-
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            Volatile.Write(&diagnosticSteps, 0)
+            Volatile.Write(&diagnosticJsonSteps, 0)
+            Volatile.Write(&expireAtStep, 3)
+
+            let! expired = bridge.Find(args, fsacProbe = noFsacHits)
+            Assert.Equal("unknown", expired["status"].GetValue<string>())
+            Assert.Equal("find_response_timeout", expired["errorKind"].GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus expired "response_construction")
+            let expiredDuringCollection = expiryPhase = "diagnostic-collection"
+            Assert.Equal((if expiredDuringCollection then 3 else diagnostics.Length), Volatile.Read(&diagnosticSteps))
+            Assert.Equal((if expiredDuringCollection then 0 else 3), Volatile.Read(&diagnosticJsonSteps))
+            Assert.Equal(not expiredDuringCollection, expired["projectDiagnosticsCountComplete"].GetValue<bool>())
+            Assert.Empty(expired["projectDiagnostics"].AsArray())
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find source context streams each file once for many distant sites`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_context_scan_{Guid.NewGuid():N}")
+        let mutable fileScans = 0
+        let mutable lineReads = 0
+
+        let beforeResponseStep phase _ =
+            match phase with
+            | "line-context-file" -> fileScans <- fileScans + 1
+            | "line-context" -> lineReads <- lineReads + 1
+            | _ -> ()
+
+        let sourceLines =
+            [ yield "module SourceWindow"
+              yield "let value = 42"
+              for _ in 1..5000 -> "// a gap before the page's later matches"
+              for index in 1..100 -> $"let item{index} = value + {index}" ]
+
+        let bridge = FcsBridge(findResponseConstructionBeforeStepOverride = beforeResponseStep)
+
+        try
+            let _, projectPath = writeProjectWithSource root "SourceWindow" (String.concat "\n" sourceLines)
+            let! result =
+                bridge.Find(
+                    { admissionFindArgs projectPath 20_000 with
+                        contextLines = Some 8
+                        maxResults = Some 1000 }
+                )
+
+            Assert.True(result["status"].GetValue<string>() = "succeeded", renderToken result)
+            Assert.True(result["totalSites"].GetValue<int>() > 50)
+            Assert.Equal(1, fileScans)
+            Assert.InRange(lineReads, 5000, sourceLines.Length + 1)
+            Assert.NotEmpty(result["sites"].AsArray())
+            Assert.True(renderedLength result <= FindResponseBudget.MaxSerializedChars)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Theory>]
+[<InlineData("response-planning")>]
+[<InlineData("response-json-copy")>]
+[<InlineData("response-serialization")>]
+[<InlineData("response-serialization-complete")>]
+let ``find response planner expiry preserves coverage but requires a fresh page`` (expiryPhase: string) : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_planner_deadline_{Guid.NewGuid():N}")
+        let expiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable expiryObserved = false
+        let mutable laterSteps = 0
+
+        let beforeResponseStep phase _ =
+            if expiryObserved then
+                laterSteps <- laterSteps + 1
+            elif phase = expiryPhase then
+                expiryObserved <- true
+                expiry.TrySetResult(()) |> ignore
+
+        let bridge =
+            FcsBridge(
+                findResponseDeadlineSignalOverride = (fun () -> expiry.Task),
+                findResponseConstructionBeforeStepOverride = beforeResponseStep
+            )
+
+        try
+            let _, projectPath = writeSimpleProject root "PlannerDeadline" "value"
+            let args = { admissionFindArgs projectPath 20_000 with includeSiteTypes = Some true }
+            let! result = bridge.Find(args)
+
+            Assert.True(expiryObserved, $"Did not reach {expiryPhase}.")
+            Assert.Equal(0, laterSteps)
+            Assert.Equal("partial", result["status"].GetValue<string>())
+            Assert.Equal("find_response_timeout", result["errorKind"].GetValue<string>())
+            Assert.True((result["resolution"]["matched"]).GetValue<bool>())
+            Assert.True((result["coverage"]["complete"]).GetValue<bool>())
+            Assert.Equal("timed_out", findPhaseStatus result "response_construction")
+            Assert.True(result["breakdownComplete"].GetValue<bool>())
+            Assert.False((result["resolution"]["complete"]).GetValue<bool>())
+            Assert.False(result["resultSetComplete"].GetValue<bool>())
+            Assert.True(result["totalSites"].GetValue<int>() > 0)
+            Assert.True(result["paginationRestartRequired"].GetValue<bool>())
+            Assert.True(result["truncated"].GetValue<bool>())
+            Assert.Equal(0, result["returnedSiteCount"].GetValue<int>())
+            Assert.Equal(0, result["cursorAdvancedBy"].GetValue<int>())
+            Assert.Empty(result["sites"].AsArray())
+            Assert.Null(result["nextCursor"])
+            Assert.True(renderedLength result <= FindResponseBudget.MaxSerializedChars)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find reuses only the exact final measured response and still guards early errors`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_final_measurement_{Guid.NewGuid():N}")
+        let mutable finalMeasurements = 0
+        let mutable extraMeasurements = 0
+
+        let beforeResponseStep phase _ =
+            if phase = "response-serialization-complete" then
+                finalMeasurements <- finalMeasurements + 1
+
+        let bridge =
+            FcsBridge(
+                findResponseConstructionBeforeStepOverride = beforeResponseStep,
+                findFinalResponseBeforeMeasureOverride = (fun () -> extraMeasurements <- extraMeasurements + 1)
+            )
+
+        try
+            let _, projectPath =
+                writeProjectWithSource root "FinalMeasurement"
+                    (String.concat "\n"
+                        [ yield "module FinalMeasurement"
+                          yield "let value = 42"
+                          for index in 1..100 -> $"let item{index} = value + {index}" ])
+
+            let args = { admissionFindArgs projectPath 20_000 with maxResults = Some 1000 }
+            let! result = bridge.Find(args)
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.True(result["sites"].AsArray().Count > 1)
+            Assert.Equal(1, finalMeasurements)
+            Assert.Equal(0, extraMeasurements)
+            Assert.True(renderedLength result <= FindResponseBudget.MaxSerializedChars)
+
+            // A later call on the same bridge cannot inherit the first result's
+            // measurement. This caller-controlled early error must still be capped.
+            let! oversizedError =
+                bridge.Find({ args with kind = Some(String.replicate 60_001 "x") })
+
+            Assert.Equal(1, finalMeasurements)
+            Assert.Equal(1, extraMeasurements)
+            Assert.Equal("find_response_exceeds_budget", oversizedError["errorCode"].GetValue<string>())
+            Assert.True(renderedLength oversizedError <= FindResponseBudget.MaxSerializedChars)
+        finally
             if Directory.Exists root then
                 Directory.Delete(root, true)
     }

@@ -2,6 +2,7 @@ module FsLangMcp.ProjectFiles
 
 open System
 open System.IO
+open System.Xml
 open System.Xml.Linq
 open System.Text.Json.Nodes
 open FsLangMcp.Types
@@ -443,6 +444,78 @@ module internal WorkspaceDirectoryDiscovery =
 
         found |> Seq.toArray
 
+    /// Find-only traversal that lets the caller stop between individual filesystem
+    /// enumeration steps. Existing callers retain filesBelow's original behavior.
+    let filesBelowWithContinuation
+        (directory: string)
+        (patterns: string array)
+        (beforeStep: string -> int -> unit)
+        (shouldContinue: unit -> bool)
+        : System.Collections.Generic.SortedSet<string> =
+        let ensureCanContinue phase index =
+            beforeStep phase index
+
+            if not (shouldContinue ()) then
+                raise (TimeoutException($"Workspace project discovery expired during {phase}."))
+
+        let options = EnumerationOptions()
+        options.RecurseSubdirectories <- false
+        options.IgnoreInaccessible <- true
+        options.ReturnSpecialDirectories <- false
+        options.AttributesToSkip <- options.AttributesToSkip ||| FileAttributes.ReparsePoint
+
+        let pending = System.Collections.Generic.Stack<string>()
+        let found = System.Collections.Generic.SortedSet<string>(pathComparer)
+        ensureCanContinue "directory-root" 0
+        pending.Push(Path.GetFullPath(directory))
+        let mutable directoryIndex = 0
+        let mutable fileIndex = 0
+        let mutable childIndex = 0
+
+        while pending.Count > 0 do
+            ensureCanContinue "directory" directoryIndex
+            let current = pending.Pop()
+            directoryIndex <- directoryIndex + 1
+
+            for pattern in patterns do
+                try
+                    use paths = Directory.EnumerateFiles(current, pattern, options).GetEnumerator()
+                    let mutable scanningFiles = true
+
+                    while scanningFiles do
+                        ensureCanContinue "directory-file" fileIndex
+
+                        if paths.MoveNext() then
+                            found.Add(Path.GetFullPath(paths.Current)) |> ignore
+                            fileIndex <- fileIndex + 1
+                        else
+                            scanningFiles <- false
+                with
+                | :? UnauthorizedAccessException
+                | :? IOException -> ()
+
+            try
+                use children = Directory.EnumerateDirectories(current, "*", options).GetEnumerator()
+                let mutable scanningChildren = true
+
+                while scanningChildren do
+                    ensureCanContinue "directory-child" childIndex
+
+                    if children.MoveNext() then
+                        let child = children.Current
+
+                        if not (ignoredDirectoryNames.Contains(Path.GetFileName(child))) then
+                            pending.Push(child)
+
+                        childIndex <- childIndex + 1
+                    else
+                        scanningChildren <- false
+            with
+            | :? UnauthorizedAccessException
+            | :? IOException -> ()
+
+        found
+
 // ─── SolutionParsing ──────────────────────────────────────────────────────────
 // Extracts .fsproj paths from .sln / .slnx files. Pure functions, no IO beyond
 // reading the solution file.
@@ -456,6 +529,15 @@ module internal SolutionParsing =
     type ProjectDiscovery =
         { ProjectPath: string
           Status: ProjectDiscoveryStatus }
+
+    /// Mutable only while the dedicated find discovery worker owns it. Returning the
+    /// buffers directly avoids an uninterruptible O(project-count) array copy after the
+    /// deadline-aware scan has completed.
+    [<NoEquality; NoComparison>]
+    type FindProjectDiscovery =
+        { MemberProjectPaths: System.Collections.Generic.HashSet<string>
+          LoadableProjects: ResizeArray<string>
+          MissingProjects: ResizeArray<string> }
 
     let private xname localName = XName.Get(localName)
 
@@ -471,6 +553,48 @@ module internal SolutionParsing =
                 ProjectDiscoveryStatus.Loadable
             else
                 ProjectDiscoveryStatus.Missing }
+
+    let private projectPathComparer =
+        if OperatingSystem.IsWindows() then
+            StringComparer.OrdinalIgnoreCase
+        else
+            StringComparer.Ordinal
+
+    let private emptyFindProjectDiscovery () =
+        { MemberProjectPaths = System.Collections.Generic.HashSet<string>(projectPathComparer)
+          LoadableProjects = ResizeArray<string>()
+          MissingProjects = ResizeArray<string>() }
+
+    let private addFindProject (result: FindProjectDiscovery) (project: ProjectDiscovery) =
+        if result.MemberProjectPaths.Add(project.ProjectPath) then
+            match project.Status with
+            | ProjectDiscoveryStatus.Loadable -> result.LoadableProjects.Add(project.ProjectPath)
+            | ProjectDiscoveryStatus.Missing -> result.MissingProjects.Add(project.ProjectPath)
+
+    let private ensureFindDiscoveryContinuation beforeStep shouldContinue phase index =
+        beforeStep phase index
+
+        if not (shouldContinue ()) then
+            raise (TimeoutException($"Find project discovery expired during {phase}."))
+
+    let private tryProjectPathFromSlnLine slnDir (line: string) =
+        let trimmed = line.TrimStart()
+
+        if trimmed.StartsWith("Project(", StringComparison.OrdinalIgnoreCase) then
+            let parts = trimmed.Split('"')
+            // Project("{type}") = "Name", "relative\path.fsproj", "{guid}"
+            // indices:   1              3         5
+            if parts.Length > 5 && parts[5].EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
+                let normalized = parts[5].Replace('\\', Path.DirectorySeparatorChar)
+                let full = Path.GetFullPath(Path.Combine(slnDir, normalized))
+                Some full
+            else
+                None
+        else
+            None
+
+    let private tryProjectFromSlnLine slnDir line =
+        tryProjectPathFromSlnLine slnDir line |> Option.map classifyProject
 
     let projectPath (project: ProjectDiscovery) = project.ProjectPath
 
@@ -494,21 +618,7 @@ module internal SolutionParsing =
         let slnDir = Path.GetDirectoryName(slnPath)
 
         File.ReadAllLines(slnPath)
-        |> Array.choose (fun line ->
-            let trimmed = line.TrimStart()
-
-            if trimmed.StartsWith("Project(", StringComparison.OrdinalIgnoreCase) then
-                let parts = trimmed.Split('"')
-                // Project("{type}") = "Name", "relative\path.fsproj", "{guid}"
-                // indices:   1              3         5
-                if parts.Length > 5 && parts[5].EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
-                    let normalized = parts[5].Replace('\\', Path.DirectorySeparatorChar)
-                    let full = Path.GetFullPath(Path.Combine(slnDir, normalized))
-                    Some(classifyProject full)
-                else
-                    None
-            else
-                None)
+        |> Array.choose (tryProjectFromSlnLine slnDir)
 
     /// Parses an .slnx file and preserves every declared F# project as a typed
     /// discovery result. Missing members remain visible without becoming load targets.
@@ -543,6 +653,117 @@ module internal SolutionParsing =
     let private projectsBelowDirectory (directory: string) =
         WorkspaceDirectoryDiscovery.filesBelow directory [| "*.fsproj" |]
         |> Array.sort
+
+    /// Dedicated find path. It preserves the old discovery APIs for every other caller,
+    /// but checks the shared find continuation between solution lines, XML nodes,
+    /// directory entries, and project materialization steps.
+    let discoverProjectsForFind
+        (workspacePath: string)
+        (beforeStep: string -> int -> unit)
+        (shouldContinue: unit -> bool)
+        : FindProjectDiscovery =
+        let result = emptyFindProjectDiscovery ()
+
+        let ensure phase index =
+            ensureFindDiscoveryContinuation beforeStep shouldContinue phase index
+
+        let addProjectPath phase index projectPath =
+            ensure phase index
+            addFindProject result (classifyProject projectPath)
+
+        ensure "target" 0
+
+        if Directory.Exists workspacePath then
+            let paths =
+                WorkspaceDirectoryDiscovery.filesBelowWithContinuation
+                    workspacePath
+                    [| "*.fsproj" |]
+                    beforeStep
+                    shouldContinue
+
+            use projects = (paths :> seq<string>).GetEnumerator()
+            let mutable projectIndex = 0
+            let mutable reading = true
+
+            while reading do
+                ensure "directory-project" projectIndex
+
+                if projects.MoveNext() then
+                    addFindProject result (classifyProject projects.Current)
+                    projectIndex <- projectIndex + 1
+                else
+                    reading <- false
+        elif File.Exists workspacePath then
+            let ext = Path.GetExtension(workspacePath)
+
+            if String.Equals(ext, ".fsproj", StringComparison.OrdinalIgnoreCase) then
+                addProjectPath "fsproj-project" 0 (Path.GetFullPath workspacePath)
+            elif String.Equals(ext, ".sln", StringComparison.OrdinalIgnoreCase) then
+                let slnDir = Path.GetDirectoryName(workspacePath)
+                ensure "sln-open" 0
+                use lines = File.ReadLines(workspacePath).GetEnumerator()
+                let mutable lineIndex = 0
+                let mutable projectIndex = 0
+                let mutable reading = true
+
+                while reading do
+                    ensure "sln-line" lineIndex
+
+                    if lines.MoveNext() then
+                        match tryProjectPathFromSlnLine slnDir lines.Current with
+                        | Some projectPath ->
+                            addProjectPath "sln-project" projectIndex projectPath
+                            projectIndex <- projectIndex + 1
+                        | None -> ()
+
+                        lineIndex <- lineIndex + 1
+                    else
+                        reading <- false
+            elif String.Equals(ext, ".slnx", StringComparison.OrdinalIgnoreCase) then
+                try
+                    ensure "slnx-open" 0
+                    let settings = XmlReaderSettings(DtdProcessing = DtdProcessing.Prohibit)
+                    use reader = XmlReader.Create(workspacePath, settings)
+                    let slnxDir = Path.GetDirectoryName(workspacePath)
+                    let mutable nodeIndex = 0
+                    let mutable projectIndex = 0
+                    let mutable reading = true
+
+                    while reading do
+                        ensure "slnx-node" nodeIndex
+
+                        if reader.Read() then
+                            if
+                                reader.NodeType = XmlNodeType.Element
+                                && String.Equals(reader.Name, "Project", StringComparison.Ordinal)
+                            then
+                                reader.GetAttribute("Path")
+                                |> Option.ofObj
+                                |> Option.filter (fun path ->
+                                    path.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase))
+                                |> Option.iter (fun path ->
+                                    ensure "slnx-project" projectIndex
+
+                                    let normalized =
+                                        path
+                                            .Replace('/', Path.DirectorySeparatorChar)
+                                            .Replace('\\', Path.DirectorySeparatorChar)
+
+                                    let full = Path.GetFullPath(Path.Combine(slnxDir, normalized))
+                                    addFindProject result (classifyProject full)
+                                    projectIndex <- projectIndex + 1)
+
+                            nodeIndex <- nodeIndex + 1
+                        else
+                            reading <- false
+                with
+                | :? TimeoutException -> reraise ()
+                | _ ->
+                    result.MemberProjectPaths.Clear()
+                    result.LoadableProjects.Clear()
+                    result.MissingProjects.Clear()
+
+        result
 
     /// Discovers every declared project for the workspace target. Solution members
     /// retain a typed Missing state; direct projects and directory results are loadable.

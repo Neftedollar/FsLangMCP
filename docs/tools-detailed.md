@@ -90,8 +90,8 @@ elapsed time means.
 solution and unions definitions, references, record-field set sites, and member-usage sites.
 Bare `find(query)` suffices; optional `kind`
 (`auto`|`symbol`|`members`|`field`|`definition`|`position`) and `scope` narrow it. `scopeNote`
-rides exactly the sweep-outcome responses and names how many projects were actually swept and how
-to widen/narrow (#193 — see below); every pre-sweep return carries no note. Prefer over text search
+names how many projects were actually swept and how to widen/narrow (#193 — see below); a
+deadline before discovery instead explains which phase could not finish. Prefer over text search
 for cross-project refactors.
 
 **Signature:** `query` is the only required argument. `kind` (default `auto`) and `scope` (default
@@ -103,6 +103,38 @@ for cross-project refactors.
 (default 80, valid range 1..1000), `timeoutMs` (default 120000, non-negative), and `cursor` round
 out the surface. `scope=file` requires `path`; `scope=project` requires a direct `.fsproj` target or
 a `path` that resolves to one member project of the requested solution.
+
+### One request deadline
+
+`timeoutMs` is one monotonic end-to-end budget, including queue admission, position resolution,
+project discovery, project-options loading, the semantic sweep, and FSAC fallback. No phase
+restarts that clock. Up to 250 ms (5% of the requested budget, with a 1 ms minimum for positive
+budgets) is reserved **inside** it for response construction; `responseConstructionAllowanceMs`
+reports the reservation. The response planner, diagnostic projection, source-line streaming,
+JSON copying, and final serialization checks observe that same bounded allowance.
+
+An immediate or pre-discovery expiry returns `errorKind="find_timeout"` and never performs a new
+scan just to count missing projects. A known explicit `.fsproj` is `not_started`; an undiscovered
+solution has no invented member count. `coverage.phases` names the affected phase, while
+`projectsNotStarted`, `projectsTimedOut`, `projectsBusy`, `projectsMissing`, and `projectsFailed`
+remain distinct. An incomplete zero-result answer stays indeterminate.
+
+If response construction expires after the sweep, `errorKind="find_response_timeout"` preserves
+the available semantic evidence but sets `resultSetComplete=false`,
+`paginationRestartRequired=true`, and `nextCursor=null`. Restart without a cursor after narrowing
+the request. `coverage.complete` may still be true: completing analysis does not imply successful
+delivery of every site.
+
+`breakdownComplete` independently says whether all per-kind counts were computed. If the response
+deadline interrupts that counting pass, `breakdown` retains the counted prefix as lower bounds and
+sets the flag to false, even though `totalSites` already names the full known site set. Later
+context/planner expiry does not invalidate a completed breakdown.
+
+Requests sharing an in-flight worker retain independent deadlines. A short-lived caller cannot
+cancel work still needed by a live caller; when all waiters expire, avoidable continuations stop.
+Uncancellable work already running retains its admission slot until it actually completes, so an
+early timeout cannot create an unbounded worker backlog. A synchronous filesystem or compiler
+call already in progress is not forcibly interrupted.
 
 ### Bare-call default
 
@@ -117,9 +149,9 @@ project the resolved sweep target actually has, exactly as `file`/`project` alwa
 What's new is that **every response that completes a sweep carries a top-level `scopeNote`**
 (`succeeded`, `partial`, and `unknown` all get one) reporting the real outcome (driven by
 `projectsSwept`/`projectsAnalyzed`, not by which `scope` string was requested) and the recipe to
-change it. `scopeNote` rides exactly those sweep-outcome responses; every pre-sweep return —
-argument validation, `kind=position`'s own resolution failures, and a missing project context — is
-note-less, because none of them reach the code that builds the note.
+change it. Argument validation, ordinary `kind=position` resolution failures, and a missing
+project context remain note-less. A typed pre-sweep deadline response instead carries a note
+describing the expired phase and explicitly says that later semantic work was not started.
 
 - **One project swept** — however the sweep target arrived (an explicit `.fsproj` `projectPath`, a
   `path`-derived fallback, or a solution/directory that itself has only one member project): the
@@ -182,6 +214,12 @@ fits. Per-project detail retains priority over diagnostics exactly as before: th
 keeps all project rows and finds the largest diagnostics prefix that fits. Only when even zero
 diagnostics cannot coexist with all project rows does it keep diagnostics empty and search the
 largest fitting project prefix.
+
+Raw diagnostics are counted before projection, but only the first 200 eligible records are
+converted to JSON. `projectDiagnosticsTotalCount` reports the eligible total;
+`projectDiagnosticsCountComplete=false` marks a deadline-interrupted count rather than presenting
+a partial count as exhaustive. The serialized budget can reduce the delivered prefix further:
+compare `projectDiagnosticsReturnedCount` and `projectDiagnosticsTruncated` with the total.
 
 After planning, every public `Find` result passes once through the same exact-serializer final
 guard, including validation, position-resolution, and project-discovery errors that return before

@@ -31,7 +31,9 @@ These two tools replace the legacy search/check entry points removed in v0.11.0.
   delivery is capped at 8 lines per side and every source-line snippet at 512 UTF-16 code units
 - `includeSiteTypes` — add `siteType` (the field's type as resolved TODAY) to every record-field row (default: `false`)
 - `maxResults` — page size from 1 to 1000 (default: `80`)
-- `timeoutMs` — non-negative whole-sweep budget; `0` returns an immediate typed timeout (default: `120000`)
+- `timeoutMs` — non-negative end-to-end budget including admission, resolution, discovery,
+  sweep, fallback, and bounded response construction; `0` returns an immediate typed timeout
+  (default: `120000`)
 
 **Use when:** "Where is `X` defined?", "What calls `OrderId`?", "Which files set this record field?"
 
@@ -67,10 +69,21 @@ from an incomplete sweep return `status="partial"`. A busy `perProject` entry ca
 `errorKind="fcs_worker_busy"` and `retryable=true`; `projectsBusy` keeps it separate from failures.
 
 **Delivery completeness:** `coverage.complete` means every requested project was analyzed;
-`resolution.complete` means this response contains the entire site set from offset zero. A page
+`resolution.complete` / `resultSetComplete` mean this response contains the entire site set from offset zero. A page
 capped by `maxResults`, and every nonzero cursor page, has `resolution.complete=false` even if
 the project sweep completed. Follow `truncated` / `nextCursor` and reconcile the collected rows
 with `totalEstimate.sites` before treating a refactor count as exhaustive.
+
+**Deadlines:** phases share one clock, reserving at most 250 ms inside `timeoutMs` for response
+construction. `coverage.phases` identifies expired/not-started work; `projectsNotStarted` does not
+inflate `projectsTimedOut`. Shared workers retain separate caller deadlines and keep admission
+protection until actual completion. A `find_response_timeout` requires restarting without a
+cursor (`paginationRestartRequired=true`), even if project coverage completed. Diagnostic totals
+are exhaustive only when `projectDiagnosticsCountComplete=true`; at most 200 are projected, and
+the final size limit may deliver fewer.
+If `breakdownComplete=false`, per-kind counts are only the prefix counted before expiry, not a
+complete reconciliation of `totalSites`. A later response timeout can leave this flag true when
+the counting pass had already finished.
 
 **Serialized response ceiling:** the complete indented JSON shipped by the MCP transport is capped
 at 60,000 UTF-16 code units, measured with the same production serializer as the transport. The
