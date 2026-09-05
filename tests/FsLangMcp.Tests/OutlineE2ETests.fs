@@ -334,10 +334,119 @@ let ``ProjectOutline with alternation filter 'Timer|Channel' matches both types`
 // ─── H. Evil pattern — structural DoS regression guard ──────────────────────
 
 [<Fact>]
+let ``outline watchdog retains and observes a late-faulting producer`` () : Task =
+    task {
+        let fixtureName = "OutlineE2ETests.watchdog-regression"
+
+        let root =
+            Path.Combine(Path.GetTempPath(), $"fslangmcp_watchdog_regression_{Guid.NewGuid():N}")
+
+        Directory.CreateDirectory(root) |> ignore
+        TestRunTrace.fixture "fixture_init" fixtureName root
+
+        let releaseProducer =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let watchdogSignal =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let lateFailure = InvalidOperationException("late producer fault marker")
+        let mutable deferredCleanup: Task<TestRunTrace.DeferredCleanupResult> option = None
+
+        let producer =
+            task {
+                do! releaseProducer.Task
+                return raise lateFailure
+            }
+
+        let transferProducerOwnership producerTask =
+            deferredCleanup <-
+                Some(
+                    TestRunTrace.deferOwnedDirectoryUntilProducerCompletes
+                        fixtureName
+                        root
+                        producerTask
+                )
+
+        let guarded =
+            TestTiming.awaitProducerWithWatchdogTask
+                "outline hostile-filter probe"
+                (TimeSpan.FromSeconds(17.0))
+                watchdogSignal.Task
+                transferProducerOwnership
+                producer
+
+        watchdogSignal.SetResult(())
+
+        let! watchdogFailure =
+            Assert.ThrowsAsync<TestTiming.WatchdogTimeoutException>(fun () -> guarded :> Task)
+
+        let producerWasRetained = deferredCleanup.IsSome
+        let producerWasStillRunning = not producer.IsCompleted
+        let fixtureExistedWhileProducerRan = Directory.Exists(root)
+        releaseProducer.SetResult(())
+
+        let! cleanupResult = deferredCleanup.Value
+
+        Assert.Equal("outline hostile-filter probe", watchdogFailure.OperationName)
+        Assert.Equal(TimeSpan.FromSeconds(17.0), watchdogFailure.WatchdogDuration)
+        Assert.Null(watchdogFailure.InnerException)
+
+        Assert.Equal(
+            "Test watchdog 'outline hostile-filter probe' expired after 00:00:17; underlying producer ownership was transferred for observation and deferred fixture cleanup.",
+            watchdogFailure.Message
+        )
+
+        Assert.True(producerWasRetained)
+        Assert.True(producerWasStillRunning)
+        Assert.True(fixtureExistedWhileProducerRan)
+        Assert.Same(lateFailure, cleanupResult.ProducerFailure.Value)
+        Assert.True(cleanupResult.CleanupFailure.IsNone)
+        Assert.True(producer.IsFaulted)
+        Assert.False(Directory.Exists(root))
+    }
+
+[<Fact>]
+let ``outline watchdog preserves a producer TimeoutException identity`` () : Task =
+    task {
+        let productTimeout = TimeoutException("product timeout marker")
+        let producer = Task.FromException<int>(productTimeout)
+
+        let watchdogSignal =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let guarded =
+            TestTiming.awaitProducerWithWatchdogTask
+                "producer timeout identity probe"
+                (TimeSpan.FromSeconds(17.0))
+                watchdogSignal.Task
+                (fun _ -> Assert.Fail("A producer timeout must not be treated as watchdog expiry."))
+                producer
+
+        let! observed =
+            Assert.ThrowsAsync<TimeoutException>(fun () -> guarded :> Task)
+
+        Assert.Same(productTimeout, observed)
+        Assert.Equal("product timeout marker", observed.Message)
+    }
+
+[<Fact>]
 let ``ProjectOutline uses a bounded non-backtracking regex for hostile filters`` () : System.Threading.Tasks.Task =
     task {
         let projectPath, root = createFixtureProject ()
         let bridge = FcsBridge()
+        let fixtureName = "OutlineE2ETests.hostile-filter"
+        let mutable deferredCleanup: Task<TestRunTrace.DeferredCleanupResult> option = None
+        TestRunTrace.fixture "fixture_init" fixtureName root
+
+        let transferProducerOwnership producerTask =
+            deferredCleanup <-
+                Some(
+                    TestRunTrace.deferOwnedDirectoryUntilProducerCompletes
+                        fixtureName
+                        root
+                        producerTask
+                )
 
         try
             let hostileFilter = ProjectOutlineFilter.compile "(a+)+$"
@@ -362,17 +471,24 @@ let ``ProjectOutline uses a bounded non-backtracking regex for hostile filters``
 
             // (a+)+$ is the canonical catastrophic-backtracking pattern.
             // Against a long-ish string without NonBacktracking this would hang.
-            let! result =
+            let producer =
                 bridge.ProjectOutline(
                     { defaultArgs projectPath with
                         maxFiles = Some 100
                         filter = Some "(a+)+$" }
                 )
-                |> fun work -> work.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(10.0)))
+
+            let! result =
+                TestTiming.awaitProducer
+                    "ProjectOutline hostile-filter probe"
+                    (TimeSpan.FromSeconds(10.0))
+                    transferProducerOwnership
+                    producer
 
             Assert.Equal("ok", result["status"].GetValue<string>())
         finally
-            if Directory.Exists(root) then Directory.Delete(root, true)
+            if deferredCleanup.IsNone then
+                TestRunTrace.deleteOwnedDirectory fixtureName root
     }
 
 // ─── I. Overlong filter → InvalidArgException ─────────────────────────────────
@@ -796,6 +912,8 @@ let ``ProjectOutline pre-wait cancellation retains hot worker and outer FCS gate
 let ``ProjectOutline options timeout returns unknown and retains actual evaluation`` () =
     task {
         let projectPath, root = createFixtureProject ()
+        let fixtureName = "OutlineE2ETests.options-timeout"
+        TestRunTrace.fixture "fixture_init" fixtureName root
 
         let evaluationStarted =
             TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -804,6 +922,18 @@ let ``ProjectOutline options timeout returns unknown and retains actual evaluati
             TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
 
         let mutable retained: Task option = None
+        let mutable pending: Task<JsonNode> option = None
+        let mutable retainedObserved = false
+        let mutable deferredCleanup: Task<TestRunTrace.DeferredCleanupResult> option = None
+
+        let transferProducerOwnership producerTask =
+            deferredCleanup <-
+                Some(
+                    TestRunTrace.deferOwnedDirectoryUntilProducerCompletes
+                        fixtureName
+                        root
+                        producerTask
+                )
 
         let beforeLoad (_: string) =
             task {
@@ -815,7 +945,7 @@ let ``ProjectOutline options timeout returns unknown and retains actual evaluati
         let bridge = FcsBridge(projectEvaluationBeforeLoadOverride = beforeLoad)
 
         try
-            let pending =
+            let request =
                 bridge.ProjectOutlineWithinDeadline(
                     { defaultArgs projectPath with
                         timeoutMs = Some 150 },
@@ -823,8 +953,9 @@ let ``ProjectOutline options timeout returns unknown and retains actual evaluati
                     fun operation -> retained <- Some operation
                 )
 
+            pending <- Some request
             do! evaluationStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
-            let! result = pending
+            let! result = request
             Assert.Equal("unknown", result["status"].GetValue<string>())
             let operationalCoverage = result["coverage"]
             Assert.Equal(0, operationalCoverage["filesScanned"].GetValue<int>())
@@ -834,17 +965,39 @@ let ``ProjectOutline options timeout returns unknown and retains actual evaluati
 
             releaseEvaluation.TrySetResult(()) |> ignore
 
-            try
-                do! retained.Value.WaitAsync(TimeSpan.FromSeconds(10.0))
-            with :? TimeoutException ->
-                ()
+            let retainedProducer =
+                task {
+                    do! retained.Value
+                }
 
+            let! productTimeout =
+                Assert.ThrowsAsync<TimeoutException>(fun () ->
+                    TestTiming.awaitProducer
+                        "ProjectOutline retained options evaluation"
+                        (TimeSpan.FromSeconds(10.0))
+                        transferProducerOwnership
+                        retainedProducer
+                    :> Task)
+
+            retainedObserved <- true
+            Assert.Equal("The project-options worker has no active callers.", productTimeout.Message)
+            Assert.Null(productTimeout.InnerException)
             Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
         finally
             releaseEvaluation.TrySetResult(()) |> ignore
 
-            if Directory.Exists(root) then
-                Directory.Delete(root, true)
+            match deferredCleanup with
+            | Some _ -> ()
+            | None ->
+                match retained with
+                | Some operation when not retainedObserved ->
+                    transferProducerOwnership operation
+                | _ ->
+                    match pending with
+                    | Some operation when not operation.IsCompleted ->
+                        transferProducerOwnership operation
+                    | _ ->
+                        TestRunTrace.deleteOwnedDirectory fixtureName root
     }
 
 [<Fact>]

@@ -8,6 +8,7 @@ open System.Reflection
 open System.Text
 open System.Text.Json.Nodes
 open System.Threading
+open System.Threading.Tasks
 open Xunit
 open Xunit.Abstractions
 open Xunit.Sdk
@@ -21,6 +22,18 @@ do ()
 /// disabling hang enforcement.
 module internal TestTiming =
 
+    let private formatWatchdogDuration (duration: TimeSpan) =
+        duration.ToString("c", CultureInfo.InvariantCulture)
+
+    type WatchdogTimeoutException(operationName: string, watchdogDuration: TimeSpan) =
+        inherit
+            TimeoutException(
+                $"Test watchdog '{operationName}' expired after {formatWatchdogDuration watchdogDuration}; underlying producer ownership was transferred for observation and deferred fixture cleanup."
+            )
+
+        member _.OperationName = operationName
+        member _.WatchdogDuration = watchdogDuration
+
     let private multiplier =
         lazy
             (let raw = Environment.GetEnvironmentVariable("FSLANGMCP_TEST_TIME_MULTIPLIER")
@@ -32,10 +45,65 @@ module internal TestTiming =
     let watchdog (duration: TimeSpan) =
         TimeSpan.FromTicks(int64 (float duration.Ticks * multiplier.Value))
 
+    /// Wait for a producer without abandoning it when the watchdog wins. The
+    /// transfer callback must retain the producer and arrange observation before
+    /// this returns a distinct watchdog exception. A producer-originated
+    /// TimeoutException passes through unchanged because completion identity,
+    /// not exception type, selects the path.
+    let awaitProducerWithWatchdogTask
+        (operationName: string)
+        (watchdogDuration: TimeSpan)
+        (watchdogTask: Task)
+        (transferProducerOwnership: Task -> unit)
+        (producer: Task<'T>)
+        : Task<'T> =
+        task {
+            let producerTask = producer :> Task
+            let! completed = Task.WhenAny(producerTask, watchdogTask)
+
+            if Object.ReferenceEquals(completed, producerTask) then
+                return! producer
+            else
+                // A faulted/cancelled injected watchdog is not an expiry signal.
+                do! watchdogTask
+                transferProducerOwnership producerTask
+                return raise (WatchdogTimeoutException(operationName, watchdogDuration))
+        }
+
+    let awaitProducer
+        (operationName: string)
+        (duration: TimeSpan)
+        (transferProducerOwnership: Task -> unit)
+        (producer: Task<'T>)
+        : Task<'T> =
+        task {
+            let effectiveDuration = watchdog duration
+            use watchdogCancellation = new CancellationTokenSource()
+            let watchdogTask = Task.Delay(effectiveDuration, watchdogCancellation.Token)
+
+            try
+                return!
+                    awaitProducerWithWatchdogTask
+                        operationName
+                        effectiveDuration
+                        watchdogTask
+                        transferProducerOwnership
+                        producer
+            finally
+                watchdogCancellation.Cancel()
+        }
+
 /// Opt-in, append-free trace for CI recurrence forensics. Each event is flushed
 /// immediately so a killed testhost still leaves the last observed lifecycle
-/// transition in TestResults. Tracing must never change a test outcome.
+/// transition in TestResults. Timestamps record when the xUnit message sink
+/// observes an event, not the instant the test body starts or finishes. Tracing
+/// must never change a test outcome.
 module internal TestRunTrace =
+
+    [<NoComparison; NoEquality>]
+    type DeferredCleanupResult =
+        { ProducerFailure: exn option
+          CleanupFailure: exn option }
 
     let private writeGate = obj ()
 
@@ -79,6 +147,7 @@ module internal TestRunTrace =
                 node["timestampUtc"] <-
                     JsonValue.Create(DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture))
 
+                node["timestampSemantics"] <- JsonValue.Create("xunit_message_sink_observation")
                 node["monotonicTimestamp"] <- JsonValue.Create(System.Diagnostics.Stopwatch.GetTimestamp())
                 node["processId"] <- JsonValue.Create(Environment.ProcessId)
                 node["managedThreadId"] <- JsonValue.Create(Environment.CurrentManagedThreadId)
@@ -125,6 +194,42 @@ module internal TestRunTrace =
                   "message", ex.Message ]
 
             reraise ()
+
+    /// Transfer fixture ownership to a live producer. This task never faults:
+    /// it observes and records a late producer failure, then attempts cleanup
+    /// only after that producer reaches a terminal state.
+    let deferOwnedDirectoryUntilProducerCompletes fixtureName root (producer: Task) : Task<DeferredCleanupResult> =
+        task {
+            fixture "fixture_dispose_deferred" fixtureName root
+
+            let! producerFailure =
+                task {
+                    try
+                        do! producer
+                        write "fixture_producer_complete" [ "fixture", fixtureName; "root", root ]
+                        return None
+                    with ex ->
+                        write
+                            "fixture_producer_failed"
+                            [ "fixture", fixtureName
+                              "root", root
+                              "exceptionType", ex.GetType().FullName
+                              "message", ex.Message ]
+
+                        return Some ex
+                }
+
+            let cleanupFailure =
+                try
+                    deleteOwnedDirectory fixtureName root
+                    None
+                with ex ->
+                    Some ex
+
+            return
+                { ProducerFailure = producerFailure
+                  CleanupFailure = cleanupFailure }
+        }
 
     let private collectionName (message: ITestCollectionMessage) = message.TestCollection.DisplayName
 
