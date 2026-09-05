@@ -283,6 +283,171 @@ type FindCursorIntegrationTests(fixture: FindCursorFixture) =
         }
 
     [<Fact>]
+    member _.``every legacy cursor consumer rejects a tagged find cursor``() : Task =
+        task {
+            Assert.True(fixture.BuildExitCode = 0, fixture.BuildLog)
+            let bridge = FcsBridge()
+            let hash = String.replicate 43 "A"
+            let taggedFindCursor = encodeFindV2 1 hash hash
+
+            let assertMismatchResponse label (response: JsonNode) =
+                Assert.Equal("invalid_args", stringValue response "status")
+
+                Assert.Contains(
+                    "cursor_tool_mismatch",
+                    stringValue response "message",
+                    StringComparison.Ordinal
+                )
+
+                Assert.True(response["nextCursor"] = null, $"{label} must not mint a cursor")
+
+            let! projectUsesError =
+                Assert.ThrowsAsync<ArgumentException>(fun () ->
+                    bridge.ProjectSymbolUses(
+                        { path = fixture.ASource
+                          text = None
+                          projectPath = Some fixture.AProject
+                          projectOptions = None
+                          symbolQuery = "target"
+                          exact = Some true
+                          maxResults = Some 1
+                          cursor = Some taggedFindCursor }
+                    )
+                    :> Task)
+
+            Assert.Contains("cursor_tool_mismatch", projectUsesError.Message, StringComparison.Ordinal)
+
+            let! memberUsesError =
+                Assert.ThrowsAsync<ArgumentException>(fun () ->
+                    bridge.FindMemberUsages(
+                        { typeName = "CursorFixture.A"
+                          memberName = "target"
+                          path = Some fixture.ASource
+                          text = None
+                          projectPath = Some fixture.AProject
+                          projectOptions = None
+                          exact = Some true
+                          maxResults = Some 1
+                          cursor = Some taggedFindCursor }
+                    )
+                    :> Task)
+
+            Assert.Contains("cursor_tool_mismatch", memberUsesError.Message, StringComparison.Ordinal)
+
+            let! recordFields =
+                bridge.RecordFieldAudit(
+                    { typeName = "MissingRecord"
+                      fieldName = "MissingField"
+                      path = Some fixture.ASource
+                      text = None
+                      projectPath = Some fixture.AProject
+                      projectOptions = None
+                      maxResults = Some 1
+                      cursor = Some taggedFindCursor }
+                )
+
+            assertMismatchResponse "fcs_record_field_audit" recordFields
+
+            let! findSymbolError =
+                Assert.ThrowsAsync<ArgumentException>(fun () ->
+                    bridge.FindSymbol(
+                        { path = fixture.ASource
+                          text = None
+                          projectPath = Some fixture.AProject
+                          projectOptions = None
+                          symbolQuery = "target"
+                          exact = Some true
+                          maxResults = Some 1
+                          contextLines = Some 0
+                          includeDeclaration = Some true
+                          includeInfo = Some false
+                          cursor = Some taggedFindCursor }
+                    )
+                    :> Task)
+
+            Assert.Contains("cursor_tool_mismatch", findSymbolError.Message, StringComparison.Ordinal)
+
+            let! testsForSymbol =
+                bridge.TestsForSymbol(
+                    { symbolQuery = "target"
+                      exact = Some true
+                      path = None
+                      text = None
+                      projectPath = Some fixture.Solution
+                      maxResults = Some 1
+                      timeoutMs = Some 30_000
+                      cursor = Some taggedFindCursor }
+                )
+
+            assertMismatchResponse "fcs_tests_for_symbol" testsForSymbol
+
+            let! outlineError =
+                Assert.ThrowsAsync<ArgumentException>(fun () ->
+                    bridge.ProjectOutline(
+                        { projectPath = Some fixture.AProject
+                          workspacePath = None
+                          includePrivate = None
+                          includeTests = None
+                          includeGeneratedFiles = None
+                          maxFiles = Some 1
+                          maxResultsPerFile = Some 1
+                          summaryOnly = Some true
+                          cursor = Some taggedFindCursor
+                          filter = None
+                          nameContains = None
+                          timeoutMs = Some 30_000 }
+                    )
+                    :> Task)
+
+            Assert.Contains("cursor_tool_mismatch", outlineError.Message, StringComparison.Ordinal)
+
+            let! referenced =
+                bridge.ReferencedSymbols(
+                    { query = "String"
+                      projectPath = Some fixture.AProject
+                      includeNonPublic = Some false
+                      maxResults = Some 1
+                      cursor = Some taggedFindCursor }
+                )
+
+            assertMismatchResponse "fcs_referenced_symbols" referenced
+
+            let! nugetTypes =
+                bridge.NugetTypes(
+                    { packageId = "System.Runtime"
+                      projectPath = Some fixture.AProject
+                      includeNonPublic = Some false
+                      maxResults = Some 1
+                      cursor = Some taggedFindCursor }
+                )
+
+            assertMismatchResponse "fcs_nuget_types" nugetTypes
+
+            let! nugetMembers =
+                bridge.NugetMembers(
+                    { packageId = "System.Runtime"
+                      typeName = "String"
+                      projectPath = Some fixture.AProject
+                      includeNonPublic = Some false
+                      maxResults = Some 1
+                      cursor = Some taggedFindCursor }
+                )
+
+            assertMismatchResponse "fcs_nuget_members" nugetMembers
+
+            let! publicApi =
+                bridge.PublicApi(
+                    { projectPath = Some fixture.AProject
+                      includeInternal = Some false
+                      namespaceFilter = None
+                      maxResults = Some 1
+                      cursor = Some taggedFindCursor }
+                )
+
+            assertMismatchResponse "fcs_public_api" publicApi
+        }
+
+    [<Fact>]
     member _.``solution member loss and gain both make an unchanged-request cursor stale``() : Task =
         task {
             Assert.True(fixture.BuildExitCode = 0, fixture.BuildLog)
