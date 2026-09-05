@@ -414,11 +414,13 @@ the bare call already swept all of them.
 suffices: returns `verdict` (`clean`|`errors`|`unknown`) after a FRESH in-process type-check, so it
 never reports a stale-`{}` false-clean within the current FCS/check profile. Optional `scope`
 (`auto`|`file`|`project`|`workspace`|`snippet`), `path`, `snippet` (inline source), `speed` (trusted
-default | `fast` = cached FSAC snapshot), and `severity` shape the request.
+default | `fast` = cached FSAC snapshot), `snippetPosition` (`start`|`end`, default `end`), and
+`severity` shape the request.
 
 **Signature:** every argument is optional. `scope` (default `auto`) picks `snippet` when `snippet`
 is set, `file` when `path` is set, else the active project (or the whole solution when it spans
->1 `.fsproj`). `path` / `snippet` / `fileGlob` / `mode` (`fs`|`fsi`) target the unit to check.
+>1 `.fsproj`). `path` / `snippet` / `fileGlob` / `mode` (`fs`|`fsi`) target the unit to check;
+`snippetPosition` controls where a snippet sits in project compile order.
 `speed` (`trusted` default | `fast`), `severity` (`error` default | `warning` | `information` |
 `hint` | `all`), `projectPath` (falls back to active `set_project`), and `timeoutMs` (default 60000)
 round out the surface.
@@ -451,6 +453,25 @@ untyped unavailable FSAC snapshot remain separately classified as `timeout`, `ca
 | `trusted` (default) | Runs a FRESH FCS check; the verdict reflects the current source on disk |
 | `fast` | Reads a project-bound FSAC snapshot; `clean` requires a current publication for every evaluated in-scope source file |
 
+### Snippet placement
+
+`scope=snippet` type-checks source text as one synthetic project file. `snippetPosition` makes its
+compile-order location explicit and the response echoes the normalized effective value:
+
+| `snippetPosition` | Compile-order semantics |
+|-------------------|-------------------------|
+| `end` (default) | Appends the snippet after every evaluated project source file, preserving v0.17.1 behavior and allowing it to consume symbols from the final `<Compile>` item |
+| `start` | Prepends the snippet before every evaluated project source file, so project-source symbols are intentionally not yet in scope |
+
+Both placements keep diagnostics scoped to the snippet itself: project-file diagnostics and
+synthetic wrapper artifacts remain filtered, and temporary files are deleted after checking.
+Ordinary F# shadowing rules apply at the selected point; for example, an `end` snippet can open a
+project module and then shadow one of its values with a local binding.
+
+This is source-order validation, not built-assembly execution. Symbols that exist only after a
+build step (for example generated or emitted members absent from evaluated source files) are not
+made available by `snippetPosition=end`.
+
 ### How it works internally
 
 1. Resolves `scope`: `snippet` when `snippet` is set, `file` when `path` is set, else `project`
@@ -459,7 +480,8 @@ untyped unavailable FSAC snapshot remain separately classified as `timeout`, `ca
    `ParseAndCheckProject` for a project/workspace) so the result reflects the current source — never
    a stale cached payload. At `speed=fast`, derives the expected files from evaluated FCS project
    options, then accepts only diagnostics from the matching live FSAC generation.
-3. For `scope=snippet`, first scopes diagnostics to the snippet's content: wrapper artifacts
+3. For `scope=snippet`, inserts the synthetic source file at `snippetPosition=start` or `end`, then
+   scopes diagnostics to the snippet's content: wrapper artifacts
    (FS0222 missing-module, FS0225 source-file bookkeeping), diagnostics attached to other
    project files, and duplicates are removed, and `file` reads `"snippet"` — so bare
    expression code without a `module` header is valid.

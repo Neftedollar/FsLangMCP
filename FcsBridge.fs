@@ -10247,6 +10247,12 @@ type internal FcsBridge
         task {
             let speed = (args.speed |> Option.defaultValue "trusted").Trim().ToLowerInvariant()
             let mode = (args.mode |> Option.defaultValue "fs").Trim().ToLowerInvariant()
+            // v0.17.1 already appended snippets after SourceFiles. Keep that useful
+            // behavior as the explicit default while allowing callers to request the
+            // pre-project position when they need to model an early compile file.
+            let snippetPosition =
+                (args.snippetPosition |> Option.defaultValue "end").Trim().ToLowerInvariant()
+
             let severityFloor = (args.severity |> Option.defaultValue "error").Trim().ToLowerInvariant()
             let scopeRaw = (args.scope |> Option.defaultValue "auto").Trim().ToLowerInvariant()
             let timeoutMs = args.timeoutMs |> Option.defaultValue 60000
@@ -10283,6 +10289,8 @@ type internal FcsBridge
                 return invalid $"speed must be 'trusted' or 'fast' (got '{speed}')"
             elif mode <> "fs" && mode <> "fsi" then
                 return invalid $"mode must be 'fs' or 'fsi' (got '{mode}')"
+            elif snippetPosition <> "start" && snippetPosition <> "end" then
+                return invalid $"snippetPosition must be 'start' or 'end' (got '{snippetPosition}')"
             elif not (List.contains severityFloor severityNames) then
                 return invalid $"severity must be one of error|warning|information|hint|all (got '{severityFloor}')"
             elif not (List.contains scopeRaw [ "auto"; "file"; "project"; "workspace"; "snippet" ]) then
@@ -10647,7 +10655,7 @@ type internal FcsBridge
                         [||]
                         (Some discoveryReason)
                         ([ ("projectsSwept", jint 0) ] @ blockingFields discoveryFailure)
-            // ── snippet: always FRESH (ignores speed); old ValidateSnippet logic ──
+            // ── snippet: always FRESH (ignores speed); placement-aware validation ──
             | "snippet" ->
                 match args.snippet with
                 | Some snippetText when not (String.IsNullOrWhiteSpace snippetText) ->
@@ -10677,9 +10685,14 @@ type internal FcsBridge
                         try
                             File.WriteAllText(snippetFile, snippetText)
 
+                            let snippetSourceFiles =
+                                match snippetPosition with
+                                | "start" -> Array.append [| snippetFile |] options.SourceFiles
+                                | _ -> Array.append options.SourceFiles [| snippetFile |]
+
                             let modifiedOptions =
                                 { options with
-                                    SourceFiles = Array.append options.SourceFiles [| snippetFile |] }
+                                    SourceFiles = snippetSourceFiles }
 
                             let sourceText = SourceText.ofString snippetText
 
@@ -10743,6 +10756,7 @@ type internal FcsBridge
                                     [||] // synthetic temp file — no meaningful source path to surface
                                     reason
                                     [ "mode", jstr mode
+                                      "snippetPosition", jstr snippetPosition
                                       "projectFileName", jstr options.ProjectFileName
                                       "optionsSource", jstr optionsSource ]
                         finally
