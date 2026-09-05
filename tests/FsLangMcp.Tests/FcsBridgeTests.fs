@@ -734,6 +734,128 @@ let ``find expiry during position resolution returns before the retained worker 
                 Directory.Delete(root, true)
     }
 
+[<Theory>]
+[<InlineData(false, false)>]
+[<InlineData(false, true)>]
+[<InlineData(true, false)>]
+[<InlineData(true, true)>]
+let ``cold position project-options continuation follows all parent waiters``
+    (keepFollower: bool, explicitProject: bool)
+    : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_position_nested_{Guid.NewGuid():N}")
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let firstExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let secondExpiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let retained = System.Collections.Concurrent.ConcurrentBag<Task>()
+        let requests = ResizeArray<Task<JsonNode>>()
+
+        let beforeLoad (_: string) : Task =
+            task {
+                entered.TrySetResult(()) |> ignore
+                do! release.Task
+            }
+
+        let emptySweep (_: string) =
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let bridge =
+            FcsBridge(
+                projectEvaluationBeforeLoadOverride = beforeLoad,
+                projectSweepWorkerOverride = emptySweep
+            )
+
+        let mutable failure = None
+
+        try
+            let sourcePath, projectPath = writeSimpleProject root "PositionNestedOptions" "value"
+
+            let args =
+                { admissionFindArgs projectPath 30_000 with
+                    kind = Some "position"
+                    path = Some sourcePath
+                    projectPath = if explicitProject then Some projectPath else None
+                    line = Some 2
+                    word = Some "value" }
+
+            let start (expiry: TaskCompletionSource<unit>) =
+                let request =
+                    bridge.FindWithinDeadline(
+                        args,
+                        FindRequestDeadline(30_000, semanticExpirySignal = expiry.Task),
+                        CancellationToken.None,
+                        retained.Add,
+                        None
+                    )
+
+                requests.Add request
+                request
+
+            let first = start firstExpiry
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            let second = start secondExpiry
+            do! awaitObservedCount "two position callers" 2 (fun () -> bridge.FindPositionResolutionWaiterCount)
+            Assert.Equal(1, bridge.ProjectOptionsWaiterCount)
+            Assert.Equal(0L, bridge.ProjectOptionsLoadCount)
+
+            firstExpiry.TrySetResult(()) |> ignore
+
+            if not keepFollower then
+                secondExpiry.TrySetResult(()) |> ignore
+
+            let! expired = first.WaitAsync(TimeSpan.FromSeconds(5.0))
+            Assert.Equal("find_timeout", expired["errorKind"].GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus expired "position_resolution")
+
+            if keepFollower then
+                Assert.False(second.IsCompleted)
+                Assert.Equal(1, bridge.FindPositionResolutionWaiterCount)
+                release.TrySetResult(()) |> ignore
+                let! result = second.WaitAsync(TimeSpan.FromSeconds(20.0))
+                Assert.Equal("succeeded", result["status"].GetValue<string>())
+                Assert.Equal("complete", findPhaseStatus result "position_resolution")
+                Assert.Equal(1L, bridge.ProjectOptionsLoadCount)
+            else
+                let! alsoExpired = second.WaitAsync(TimeSpan.FromSeconds(5.0))
+                Assert.Equal("find_timeout", alsoExpired["errorKind"].GetValue<string>())
+                Assert.Equal(1, bridge.ProjectEvaluationActiveCount)
+                Assert.Equal(1, bridge.FindPositionResolutionActiveCount)
+        with ex ->
+            failure <- Some ex
+
+        // Public timeouts precede actual completion. Release every hook, drain both
+        // public calls and each exact retained position worker, then remove its files.
+        // This also runs on assertion failure; no cleanup timeout can hide live work.
+        release.TrySetResult(()) |> ignore
+
+        for request in requests do
+            try
+                let! _ = request
+                ()
+            with ex ->
+                if failure.IsNone then failure <- Some ex
+
+        for worker in retained do
+            try
+                do! worker
+            with
+            | :? TimeoutException -> ()
+            | ex -> if failure.IsNone then failure <- Some ex
+
+        Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
+        Assert.Equal(0, bridge.ProjectOptionsInFlightCount)
+        Assert.Equal(0, bridge.FindPositionResolutionActiveCount)
+        Assert.Equal(0, bridge.FindPositionResolutionInFlightCount)
+
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+        match failure with
+        | Some ex -> return raise ex
+        | None -> Assert.Equal((if keepFollower then 1L else 0L), bridge.ProjectOptionsLoadCount)
+    }
+
 [<Fact>]
 let ``find expiry during sln discovery stops line materialization and releases retained admission`` () : Task =
     task {

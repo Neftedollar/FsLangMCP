@@ -2950,26 +2950,31 @@ type internal FcsBridge
 
         entries.Remove(System.Collections.Generic.KeyValuePair(key, flight)) |> ignore
 
-    let acquireSingleFlight
+    let acquireSingleFlightWhileNeeded
         (registry: ConcurrentDictionary<string, WaiterAwareSingleFlight<'T>>)
         (key: string)
         (remainingBudget: (unit -> TimeSpan) option)
+        (callerIsNeeded: unit -> bool)
         (start: (unit -> bool) -> Task<'T>)
         =
         let ensureCallerCanWait () =
+            if not (callerIsNeeded ()) then
+                raise (TimeoutException("The parent worker has no active callers."))
+
             match remainingBudget with
             | Some getRemaining when getRemaining () <= TimeSpan.Zero -> raise (TimeoutException())
             | Some _
             | None -> ()
 
         let callerIsActive () =
-            match remainingBudget with
-            | Some getRemaining ->
-                try
-                    getRemaining () > TimeSpan.Zero
-                with :? OperationCanceledException ->
-                    false
-            | None -> true
+            callerIsNeeded ()
+            && (match remainingBudget with
+                | Some getRemaining ->
+                    try
+                        getRemaining () > TimeSpan.Zero
+                    with :? OperationCanceledException ->
+                        false
+                | None -> true)
 
         let rec acquire () =
             ensureCallerCanWait ()
@@ -2995,6 +3000,9 @@ type internal FcsBridge
                 acquire ()
 
         acquire ()
+
+    let acquireSingleFlight registry key remainingBudget start =
+        acquireSingleFlightWhileNeeded registry key remainingBudget (fun () -> true) start
 
     let normalizedCheckWorkPath (path: string) =
         let normalized =
@@ -4702,10 +4710,12 @@ type internal FcsBridge
                     // about by name. Raising here also keeps MSBuild untouched.
                     SdkPreflight.ensure [ projectDir ]
                     InstallationHealth.ensureCurrent ()
+                    ensureCanContinue ()
 
                     try
                         let toolsPath = Init.init (DirectoryInfo(projectDir)) None
                         let loader = WorkspaceLoader.Create(toolsPath, [])
+                        ensureCanContinue ()
                         Interlocked.Increment(&projectOptionsLoadCount) |> ignore
                         let projects = loader.LoadProjects([ fsprojPath ]) |> Seq.toList
 
@@ -4716,21 +4726,25 @@ type internal FcsBridge
                             let snapshot = EvaluatedProjectModel.create "ionide-proj-info" proj fcsOpts
                             Some(fcsOpts, fingerprint, snapshot)
                         | [] -> None
-                    with ex ->
+                    with
+                    | :? TimeoutException as ex -> raise ex
+                    | :? OperationCanceledException as ex -> raise ex
+                    | ex ->
                         Console.Error.WriteLine($"[proj-info] Failed to load %s{fsprojPath}: %s{ex.Message}")
                         None)
         }
 
     member private this.AcquireFsprojEntryWithinBudget
-        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option)
+        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option, ?callerIsNeeded: unit -> bool)
         =
         let fullPath = normalizePath fsprojPath
         let fsprojKey = makeFsprojOptionsCacheKey fullPath
 
-        acquireSingleFlight
+        acquireSingleFlightWhileNeeded
             optionsInFlight
             fsprojKey
             remainingBudget
+            (defaultArg callerIsNeeded (fun () -> true))
             (fun hasActiveWaiters ->
                 projectEvaluationAdmission.TryRun(
                     fullPath,
@@ -4812,11 +4826,12 @@ type internal FcsBridge
                 ))
 
     member private this.ResolveFsprojEntryWithinBudget
-        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option)
+        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option, ?callerIsNeeded: unit -> bool)
         : Task<ProjectOptionsCacheEntry> =
         task {
             let fullPath = normalizePath fsprojPath
-            use waiter = this.AcquireFsprojEntryWithinBudget(fullPath, remainingBudget)
+            use waiter =
+                this.AcquireFsprojEntryWithinBudget(fullPath, remainingBudget, ?callerIsNeeded = callerIsNeeded)
             let work = waiter.Operation
             observeFault work
 
@@ -4843,10 +4858,11 @@ type internal FcsBridge
         this.ResolveFsprojEntryWithinBudget(fsprojPath, None)
 
     member private this.ResolveFsprojOptionsWithinBudget
-        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option)
+        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option, ?callerIsNeeded: unit -> bool)
         : Task<FSharpProjectOptions * string> =
         task {
-            let! entry = this.ResolveFsprojEntryWithinBudget(fsprojPath, remainingBudget)
+            let! entry =
+                this.ResolveFsprojEntryWithinBudget(fsprojPath, remainingBudget, ?callerIsNeeded = callerIsNeeded)
             return entry.Options, entry.Source
         }
 
@@ -4854,9 +4870,30 @@ type internal FcsBridge
         this.ResolveFsprojOptionsWithinBudget(fsprojPath, None)
 
     member private this.ResolveProjectOptions
-        (path: string, text: string, projectPath: string option, projectOptions: string list option)
+        (
+            path: string,
+            text: string,
+            projectPath: string option,
+            projectOptions: string list option,
+            ?ensureCanContinue: unit -> unit
+        )
         : Task<FSharpProjectOptions * string> =
         task {
+            let continuation = ensureCanContinue
+            let ensureCanContinue = defaultArg continuation ignore
+
+            // This nested waiter represents the entire parent position worker, not
+            // its first caller. Do not invent a new deadline or permanently-live
+            // waiter: a surviving follower may still need the shared evaluation.
+            let callerIsNeeded () =
+                try
+                    ensureCanContinue ()
+                    true
+                with
+                | :? TimeoutException
+                | :? OperationCanceledException -> false
+
+            ensureCanContinue ()
             let fullPath = normalizePath path
             let cacheKey = makeCacheKey projectPath projectOptions
 
@@ -4870,6 +4907,7 @@ type internal FcsBridge
                 match optionsCache.TryGet(cacheKey) with
                 | Some cached -> return cached.Options, cached.Source
                 | None ->
+                    ensureCanContinue ()
                     let resolvedOptions =
                         checker.GetProjectOptionsFromCommandLineArgs(projectFileName, options |> List.toArray)
 
@@ -4879,20 +4917,33 @@ type internal FcsBridge
                 let requestedFsproj = explicitFsproj projectPath
 
                 let resolvedFsproj =
-                    requestedFsproj |> Option.orElseWith (fun () -> findNearestFsproj fullPath)
+                    requestedFsproj
+                    |> Option.orElseWith (fun () ->
+                        match continuation with
+                        | Some _ -> findNearestFsprojWithContinuation fullPath (fun _ _ -> ()) callerIsNeeded
+                        | None -> findNearestFsproj fullPath)
+
+                ensureCanContinue ()
 
                 match resolvedFsproj with
                 | Some fsprojPath ->
                     try
-                        return! this.ResolveFsprojOptions(fsprojPath)
-                    with ex ->
+                        return!
+                            this.ResolveFsprojOptionsWithinBudget(fsprojPath, None, callerIsNeeded = callerIsNeeded)
+                    with
+                    | :? TimeoutException as ex -> return raise ex
+                    | :? OperationCanceledException as ex -> return raise ex
+                    | ex ->
                         match requestedFsproj with
                         | Some _ -> return raise ex
                         | None ->
                             // Fall back to script inference with honest labelling.
+                            ensureCanContinue ()
                             let sourceText = SourceText.ofString text
 
+                            ensureCanContinue ()
                             let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
+                            ensureCanContinue ()
 
                             let discovered =
                                 { scriptOptions with
@@ -4900,6 +4951,7 @@ type internal FcsBridge
 
                             return discovered, "auto-discovered-script-fallback"
                 | None ->
+                    ensureCanContinue ()
                     let scriptKey = $"script::%s{fullPath}"
                     let contentHash = scriptSourceHash text
 
@@ -4908,7 +4960,9 @@ type internal FcsBridge
                         return cached.Options, cached.Source
                     | _ ->
                         let sourceText = SourceText.ofString text
+                        ensureCanContinue ()
                         let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
+                        ensureCanContinue ()
                         optionsCache.Set(
                             scriptKey,
                             makeOptionsCacheEntry scriptOptions "scriptInference" None (Some contentHash) None
@@ -4933,11 +4987,15 @@ type internal FcsBridge
             let fullPath = normalizePath path
             let source = text |> Option.defaultWith (fun () -> File.ReadAllText(fullPath))
             let sourceText = SourceText.ofString source
+            ensureCanContinue ()
 
             let! options, optionsSource =
                 match resolvedOptions with
                 | Some context -> Task.FromResult context
-                | None -> this.ResolveProjectOptions(fullPath, source, projectPath, projectOptions)
+                | None ->
+                    this.ResolveProjectOptions(
+                        fullPath, source, projectPath, projectOptions, ensureCanContinue = ensureCanContinue
+                    )
 
             ensureCanContinue ()
             let parsingOptions, _ = checker.GetParsingOptionsFromProjectOptions(options)
