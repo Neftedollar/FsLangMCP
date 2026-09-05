@@ -27,7 +27,8 @@ These two tools replace the legacy search/check entry points removed in v0.11.0.
 - `kind` — `auto` | `symbol` | `members` | `field` | `definition` | `position` (default: `auto`; unions symbol/member/field sites)
 - `member` — narrow to a specific member name when `kind=members`
 - `scope` — `auto` | `file` | `project` | `workspace` (default: `auto`); file requires `path`, project requires one member `.fsproj`
-- `contextLines` — non-negative surrounding source-line count (default: `0`)
+- `contextLines` — non-negative requested surrounding source-line count (default: `0`);
+  delivery is capped at 8 lines per side and every source-line snippet at 512 UTF-16 code units
 - `includeSiteTypes` — add `siteType` (the field's type as resolved TODAY) to every record-field row (default: `false`)
 - `maxResults` — page size from 1 to 1000 (default: `80`)
 - `timeoutMs` — non-negative whole-sweep budget; `0` returns an immediate typed timeout (default: `120000`)
@@ -48,9 +49,11 @@ fieldSites`). It never predicts the post-edit type: edit the sites, then run `ch
 compiled by several swept projects that resolve it differently keeps the first project's answer in
 `siteType`/`project` and lists the rest in `siteTypeAlternatives`, each entry naming the type and the
 projects that resolved it (counted by `siteTypes.typedDifferentlyByAnotherProject`, a subset of
-`typed`). That column is capped per row and per page; anything left out is reported as
+`typed`). That column has deterministic per-site caps, independent of `maxResults`, cursor, and
+response-budget boundaries; anything left out is reported as
 `siteTypeAlternativesOmitted` / `projectsOmitted` / `siteTypes.alternativesTruncatedRows`, never
-dropped silently. See `docs/tools-detailed.md`.
+dropped silently. The response budget can omit only a suffix of complete canonical site rows. See
+`docs/tools-detailed.md`.
 
 **Changed in v0.16.0:** `field-set-mutation` (`x.Field <- v`) and `field-pattern`
 (`| { Field = x } ->`) are new kinds — both used to be reported as `field-read`, mislabeling a
@@ -68,6 +71,17 @@ from an incomplete sweep return `status="partial"`. A busy `perProject` entry ca
 capped by `maxResults`, and every nonzero cursor page, has `resolution.complete=false` even if
 the project sweep completed. Follow `truncated` / `nextCursor` and reconcile the collected rows
 with `totalEstimate.sites` before treating a refactor count as exhaustive.
+
+**Serialized response ceiling:** the complete indented JSON shipped by the MCP transport is capped
+at 60,000 UTF-16 code units, measured with the same production serializer as the transport. The
+guard includes sites, diagnostics, per-project rows, coverage, and all other metadata. A page may
+therefore return fewer than `maxResults`; `returnedSiteCount`/`cursorAdvancedBy` report the actual
+prefix and `nextCursor` advances by exactly that count. `responseTruncatedByBudget` and the
+per-section fields report cuts. `lineText` and each `before`/`after` entry carry truncation and
+source-column offsets while `range` remains the exact full-source semantic range. If the next site
+still cannot fit after optional metadata rows are removed, `status="aborted"` with
+`errorCode="find_site_exceeds_response_budget"` returns a typed retry recipe and `nextCursor=null`;
+the server never emits a zero-progress continuation cursor.
 
 ---
 
