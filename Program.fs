@@ -278,6 +278,50 @@ let internal runLimited
     : Task<JsonNode> =
     runLimitedWithTimeout gate cancellationToken None (fun _ -> work ())
 
+let internal normalizeProjectOutlineAdmissionResult (timeoutMs: int) (result: JsonNode) : JsonNode =
+    let isAdmissionTimeout =
+        match result["errorKind"] with
+        | null -> false
+        | kind -> kind.GetValue<string>() = "fcs_admission_timeout"
+
+    if not isAdmissionTimeout then
+        result
+    else
+        let issue =
+            jobj
+                [ "phase", jstr "admission"
+                  "status", jstr "timed_out"
+                  "errorKind", jstr "fcs_admission_timeout"
+                  "message", result["message"].DeepClone() ]
+            :> JsonNode
+
+        jobj
+            [ "status", jstr "unknown"
+              "errorKind", jstr "fcs_admission_timeout"
+              "message", result["message"].DeepClone()
+              "timeoutMs", jint timeoutMs
+              "retryable", jbool true
+              "resultSetComplete", jbool false
+              "coverage",
+              jobj
+                  [ "complete", jbool false
+                    "filesRequested", jint 0
+                    "filesScanned", jint 0
+                    "filesTimedOut", jint 0
+                    "filesFailed", jint 0
+                    "filesNotStarted", jint 0
+                    "phases",
+                    JsonArray([| jobj [ "phase", jstr "admission"; "status", jstr "timed_out" ] :> JsonNode |])
+                    :> JsonNode
+                    "issues", JsonArray([| issue |]) :> JsonNode
+                    "issuesReturned", jint 1
+                    "issuesTruncated", jbool false ]
+              :> JsonNode
+              "truncated", jbool false
+              "nextCursor", null
+              "files", JsonArray() :> JsonNode ]
+        :> JsonNode
+
 type internal RuntimeToolPin =
     { PackageId: string
       Version: string
@@ -854,54 +898,10 @@ let private mainCore argv =
 
                                                 fcsBridge.ProjectOutlineWithinDeadline(args, ct, retainUntil))
 
-                                    let isAdmissionTimeout =
-                                        match result["errorKind"] with
-                                        | null -> false
-                                        | kind -> kind.GetValue<string>() = "fcs_admission_timeout"
-
-                                    if isAdmissionTimeout then
-                                        let issue =
-                                            jobj
-                                                [ "phase", jstr "admission"
-                                                  "status", jstr "timed_out"
-                                                  "errorKind", jstr "fcs_admission_timeout"
-                                                  "message", result["message"].DeepClone() ]
-                                            :> JsonNode
-
-                                        return
-                                            jobj
-                                                [ "status", jstr "unknown"
-                                                  "errorKind", jstr "fcs_admission_timeout"
-                                                  "message", result["message"].DeepClone()
-                                                  "timeoutMs", jint (timeoutMs |> Option.defaultValue 60_000)
-                                                  "retryable", jbool true
-                                                  "resultSetComplete", jbool false
-                                                  "coverage",
-                                                  jobj
-                                                      [ "complete", jbool false
-                                                        "filesRequested", jint 0
-                                                        "filesScanned", jint 0
-                                                        "filesTimedOut", jint 0
-                                                        "filesFailed", jint 0
-                                                        "filesNotStarted", jint 0
-                                                        "phases",
-                                                        JsonArray(
-                                                            [| jobj
-                                                                   [ "phase", jstr "admission"
-                                                                     "status", jstr "timed_out" ]
-                                                               :> JsonNode |]
-                                                        )
-                                                        :> JsonNode
-                                                        "issues", JsonArray([| issue |]) :> JsonNode
-                                                        "issuesReturned", jint 1
-                                                        "issuesTruncated", jbool false ]
-                                                  :> JsonNode
-                                                  "truncated", jbool false
-                                                  "nextCursor", null
-                                                  "files", JsonArray() :> JsonNode ]
-                                            :> JsonNode
-                                    else
-                                        return result
+                                    return
+                                        normalizeProjectOutlineAdmissionResult
+                                            (timeoutMs |> Option.defaultValue 60_000)
+                                            result
                                 }))
                     |> unwrapResult
                 )

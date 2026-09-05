@@ -24,6 +24,9 @@ jobs:
 
   build-and-verify:
     runs-on: ubuntu-latest
+    env:
+      DOTNET_INSTALL_DIR: ${{ github.workspace }}/.dotnet-exact
+      DOTNET_MULTILEVEL_LOOKUP: '0'
     permissions:
       contents: read
     outputs:

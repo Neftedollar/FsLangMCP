@@ -49,6 +49,9 @@ jobs:
     name: ${{ matrix.os }} / pinned runtime tools
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
+    env:
+      DOTNET_INSTALL_DIR: ${{ github.workspace }}/.dotnet-exact
+      DOTNET_MULTILEVEL_LOOKUP: '0'
     strategy:
       fail-fast: false
       matrix:

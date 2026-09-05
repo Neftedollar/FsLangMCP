@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Repository SDK selection now declares `10.0.100` as the supported floor and
+  uses `latestFeature`, so contributors can build with a stable .NET 10 feature
+  band instead of installing exactly `10.0.400`. CI exercises the `10.0.100`
+  floor independently, while primary, live-FSAC, and release builds stay pinned
+  to an isolated `10.0.400` installation. The project-outline MCP adapter was
+  factored so the earlier F# compiler can emit the same bounded admission-timeout
+  response without falling back to an `FS3511` dynamic state machine.
+
 ## [0.17.0] - 2026-08-31
 
 0.17.0 keeps the 35-tool surface intact and hardens the evidence agents use to plan changes:
