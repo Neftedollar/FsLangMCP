@@ -448,6 +448,15 @@ module internal WorkspaceDirectoryDiscovery =
 // reading the solution file.
 
 module internal SolutionParsing =
+    [<RequireQualifiedAccess>]
+    type ProjectDiscoveryStatus =
+        | Loadable
+        | Missing
+
+    type ProjectDiscovery =
+        { ProjectPath: string
+          Status: ProjectDiscoveryStatus }
+
     let private xname localName = XName.Get(localName)
 
     let private attr (name: string) (element: XElement) =
@@ -455,8 +464,33 @@ module internal SolutionParsing =
         | null -> None
         | value -> Some value.Value
 
-    /// Parses an .sln file and returns absolute paths of .fsproj entries that exist on disk.
-    let fsprojsFromSln (slnPath: string) : string array =
+    let private classifyProject (projectPath: string) =
+        { ProjectPath = projectPath
+          Status =
+            if File.Exists projectPath then
+                ProjectDiscoveryStatus.Loadable
+            else
+                ProjectDiscoveryStatus.Missing }
+
+    let projectPath (project: ProjectDiscovery) = project.ProjectPath
+
+    let isLoadable (project: ProjectDiscovery) =
+        project.Status = ProjectDiscoveryStatus.Loadable
+
+    let isMissing (project: ProjectDiscovery) =
+        project.Status = ProjectDiscoveryStatus.Missing
+
+    let private loadableProjectPaths (projects: ProjectDiscovery array) =
+        projects
+        |> Array.choose (fun project ->
+            if isLoadable project then
+                Some project.ProjectPath
+            else
+                None)
+
+    /// Parses an .sln file and preserves every declared F# project as a typed
+    /// discovery result. Missing members remain visible without becoming load targets.
+    let projectsFromSln (slnPath: string) : ProjectDiscovery array =
         let slnDir = Path.GetDirectoryName(slnPath)
 
         File.ReadAllLines(slnPath)
@@ -470,14 +504,15 @@ module internal SolutionParsing =
                 if parts.Length > 5 && parts[5].EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
                     let normalized = parts[5].Replace('\\', Path.DirectorySeparatorChar)
                     let full = Path.GetFullPath(Path.Combine(slnDir, normalized))
-                    if File.Exists full then Some full else None
+                    Some(classifyProject full)
                 else
                     None
             else
                 None)
 
-    /// Parses an .slnx file and returns absolute paths of .fsproj entries that exist on disk.
-    let fsprojsFromSlnx (slnxPath: string) : string array =
+    /// Parses an .slnx file and preserves every declared F# project as a typed
+    /// discovery result. Missing members remain visible without becoming load targets.
+    let projectsFromSlnx (slnxPath: string) : ProjectDiscovery array =
         let slnxDir = Path.GetDirectoryName(slnxPath)
 
         try
@@ -491,33 +526,45 @@ module internal SolutionParsing =
                     let normalized =
                         p.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar)
 
-                    Path.GetFullPath(Path.Combine(slnxDir, normalized))))
-            |> Seq.filter File.Exists
+                    Path.GetFullPath(Path.Combine(slnxDir, normalized))
+                    |> classifyProject))
             |> Seq.toArray
         with _ ->
             [||]
+
+    /// Declared-path views retained for existing callers. These deliberately do not
+    /// filter missing members; compilation-oriented callers must use listProjects.
+    let fsprojsFromSln (slnPath: string) : string array =
+        projectsFromSln slnPath |> Array.map projectPath
+
+    let fsprojsFromSlnx (slnxPath: string) : string array =
+        projectsFromSlnx slnxPath |> Array.map projectPath
 
     let private projectsBelowDirectory (directory: string) =
         WorkspaceDirectoryDiscovery.filesBelow directory [| "*.fsproj" |]
         |> Array.sort
 
-    /// Lists .fsproj files referenced by the given workspace target. For a direct
-    /// .fsproj path, returns [path]. For .sln / .slnx, returns all existing member
-    /// projects. A directory recursively returns its projects (excluding common build,
-    /// VCS, and dependency trees), so repository-root inputs remain useful.
-    let listProjects (workspacePath: string) : string array =
+    /// Discovers every declared project for the workspace target. Solution members
+    /// retain a typed Missing state; direct projects and directory results are loadable.
+    let discoverProjects (workspacePath: string) : ProjectDiscovery array =
         if Directory.Exists workspacePath then
             projectsBelowDirectory (Path.GetFullPath workspacePath)
+            |> Array.map classifyProject
         elif not (File.Exists workspacePath) then
             [||]
         else
             let ext = Path.GetExtension(workspacePath)
 
             if String.Equals(ext, ".fsproj", StringComparison.OrdinalIgnoreCase) then
-                [| Path.GetFullPath(workspacePath) |]
+                [| classifyProject (Path.GetFullPath workspacePath) |]
             elif String.Equals(ext, ".slnx", StringComparison.OrdinalIgnoreCase) then
-                fsprojsFromSlnx workspacePath
+                projectsFromSlnx workspacePath
             elif String.Equals(ext, ".sln", StringComparison.OrdinalIgnoreCase) then
-                fsprojsFromSln workspacePath
+                projectsFromSln workspacePath
             else
                 [||]
+
+    /// Lists only loadable .fsproj files referenced by the workspace target. Semantic
+    /// sweep callers must use discoverProjects when declared membership affects coverage.
+    let listProjects (workspacePath: string) : string array =
+        discoverProjects workspacePath |> loadableProjectPaths

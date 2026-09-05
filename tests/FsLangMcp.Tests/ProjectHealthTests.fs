@@ -220,6 +220,23 @@ let private reportWithProbe (probe: ProjectOptionsProbe) args snapshot =
 
     createReport args snapshot provider |> Async.RunSynchronously
 
+let private solutionContents (extension: string) (members: string list) =
+    if extension = ".slnx" then
+        [ "<Solution>"
+          yield! members |> List.map (fun path -> $"  <Project Path=\"{path}\" />")
+          "</Solution>" ]
+        |> String.concat "\n"
+    else
+        [ "Microsoft Visual Studio Solution File, Format Version 12.00"
+          yield!
+              members
+              |> List.mapi (fun index path ->
+                  let windowsPath = path.Replace('/', '\\')
+                  $"Project(\"{{F2A71F9B-5D33-465A-A702-920D77279786}}\") = \"Project{index}\", \"{windowsPath}\", \"{{00000000-0000-0000-0000-{index:D12}}}\"\nEndProject")
+          "Global"
+          "EndGlobal" ]
+        |> String.concat "\n"
+
 [<Fact>]
 let ``project_health reports source files and analyzer setup`` () =
     let runId = System.Guid.NewGuid().ToString("N")
@@ -303,6 +320,70 @@ let ``project_health summarizes a directory with multiple fsproj files (#100)`` 
         Assert.Equal("solution", (result["reportKind"]).GetValue<string>())
         Assert.Equal("solution", ((result["toolingReadiness"])["overall"]).GetValue<string>())
         Assert.Equal(2, ((result["solution"])["projectCount"]).GetValue<int>())
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Theory>]
+[<InlineData(".sln")>]
+[<InlineData(".slnx")>]
+let ``project_health reports every declared solution member with its real existence``
+    (extension: string)
+    =
+    let runId = Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_solution_%s{runId}")
+
+    let write (relativePath: string) (content: string) =
+        let path = Path.Combine(root, relativePath)
+        Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
+        File.WriteAllText(path, content)
+        path
+
+    try
+        write "PresentA/PresentA.fsproj" "<Project Sdk=\"Microsoft.NET.Sdk\" />" |> ignore
+        write "PresentB/PresentB.fsproj" "<Project Sdk=\"Microsoft.NET.Sdk\" />" |> ignore
+
+        let cases =
+            [ "all-present", [ "PresentA/PresentA.fsproj"; "PresentB/PresentB.fsproj" ], [| true; true |]
+              "one-missing", [ "PresentA/PresentA.fsproj"; "Missing/Missing.fsproj" ], [| true; false |]
+              "all-missing", [ "MissingOne/MissingOne.fsproj"; "MissingTwo/MissingTwo.fsproj" ], [| false; false |] ]
+
+        for name, members, expectedExists in cases do
+            let solutionPath =
+                write $"{name}{extension}" (solutionContents extension members)
+
+            let result =
+                report (healthArgs solutionPath (Some root)) (readySnapshot solutionPath root)
+
+            Assert.Equal("solution", result["reportKind"].GetValue<string>())
+            Assert.Equal(members.Length, (result["solution"]["projectCount"]).GetValue<int>())
+
+            Assert.Equal(
+                expectedExists |> Array.filter id |> Array.length,
+                (result["solution"]["loadableProjectCount"]).GetValue<int>()
+            )
+
+            Assert.Equal(
+                expectedExists |> Array.filter not |> Array.length,
+                (result["solution"]["missingProjectCount"]).GetValue<int>()
+            )
+
+            let projects = (result["solution"]["projects"]).AsArray()
+            let actualExists = projects |> Seq.map (fun project -> project["exists"].GetValue<bool>()) |> Seq.toArray
+
+            Assert.Equal<bool array>(expectedExists, actualExists)
+
+            let actualPaths =
+                projects |> Seq.map (fun project -> project["fsproj"].GetValue<string>()) |> Seq.toArray
+
+            let expectedPaths =
+                members
+                |> List.map (fun memberPath ->
+                    memberPath.Replace('/', Path.DirectorySeparatorChar)
+                    |> fun normalized -> Path.GetFullPath(Path.Combine(root, normalized)))
+                |> List.toArray
+
+            Assert.Equal<string array>(expectedPaths, actualPaths)
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)

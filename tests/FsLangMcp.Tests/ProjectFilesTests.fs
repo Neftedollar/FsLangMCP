@@ -291,3 +291,73 @@ let ``compileFiles normalizes MSBuild backslash separators to the host OS`` () =
 
     Assert.Contains(underRoot (Path.Combine("Domain", "Money.fs")), paths)
     Assert.Contains(underRoot "Program.fs", paths)
+
+let private solutionContents (extension: string) (members: string list) =
+    if extension = ".slnx" then
+        [ "<Solution>"
+          yield! members |> List.map (fun path -> $"  <Project Path=\"{path}\" />")
+          "</Solution>" ]
+        |> String.concat "\n"
+    else
+        [ "Microsoft Visual Studio Solution File, Format Version 12.00"
+          yield!
+              members
+              |> List.mapi (fun index path ->
+                  let windowsPath = path.Replace('/', '\\')
+                  $"Project(\"{{F2A71F9B-5D33-465A-A702-920D77279786}}\") = \"Project{index}\", \"{windowsPath}\", \"{{00000000-0000-0000-0000-{index:D12}}}\"\nEndProject")
+          "Global"
+          "EndGlobal" ]
+        |> String.concat "\n"
+
+[<Theory>]
+[<InlineData(".sln")>]
+[<InlineData(".slnx")>]
+let ``solution discovery preserves typed declared membership while loadable view filters missing projects``
+    (extension: string)
+    =
+    let runId = System.Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_solution_discovery_%s{runId}")
+
+    let write (relativePath: string) (content: string) =
+        let path = Path.Combine(root, relativePath)
+        Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
+        File.WriteAllText(path, content)
+        path
+
+    try
+        let existingA = write "A/A.fsproj" "<Project Sdk=\"Microsoft.NET.Sdk\" />"
+        let existingB = write "B/B.fsproj" "<Project Sdk=\"Microsoft.NET.Sdk\" />"
+
+        let cases =
+            [ "all-present", [ "A/A.fsproj"; "B/B.fsproj" ], [| true; true |]
+              "one-missing", [ "A/A.fsproj"; "Missing/Missing.fsproj" ], [| true; false |]
+              "all-missing", [ "MissingOne/MissingOne.fsproj"; "MissingTwo/MissingTwo.fsproj" ], [| false; false |] ]
+
+        for name, members, expectedExists in cases do
+            let solutionPath =
+                write $"{name}{extension}" (solutionContents extension members)
+
+            let discovered = SolutionParsing.discoverProjects solutionPath
+            let actualExists = discovered |> Array.map SolutionParsing.isLoadable
+            let declaredPaths =
+                if extension = ".sln" then
+                    SolutionParsing.fsprojsFromSln solutionPath
+                else
+                    SolutionParsing.fsprojsFromSlnx solutionPath
+
+            Assert.Equal<bool array>(expectedExists, actualExists)
+            Assert.Equal(members.Length, discovered.Length)
+            Assert.Equal<string array>(discovered |> Array.map SolutionParsing.projectPath, declaredPaths)
+
+            let loadable = SolutionParsing.listProjects solutionPath
+
+            Assert.Equal(expectedExists |> Array.filter id |> Array.length, loadable.Length)
+
+            for project in discovered |> Array.filter SolutionParsing.isMissing do
+                Assert.False(File.Exists(SolutionParsing.projectPath project))
+
+        Assert.Contains(existingA, SolutionParsing.listProjects(Path.Combine(root, $"all-present{extension}")))
+        Assert.Contains(existingB, SolutionParsing.listProjects(Path.Combine(root, $"all-present{extension}")))
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
