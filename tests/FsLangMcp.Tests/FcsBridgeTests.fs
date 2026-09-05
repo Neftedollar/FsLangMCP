@@ -152,6 +152,26 @@ let private writeProjectWithSource (root: string) (projectName: string) (source:
 
     sourcePath, projectPath
 
+let private writeSolution (root: string) (fileName: string) (projectPaths: string list) =
+    Directory.CreateDirectory(root) |> ignore
+    let solutionPath = Path.Combine(root, fileName)
+
+    let lines =
+        projectPaths
+        |> List.mapi (fun index projectPath ->
+            let projectName = Path.GetFileNameWithoutExtension(projectPath)
+            let relativePath = Path.GetRelativePath(root, projectPath)
+            let projectGuid = sprintf "00000000-0000-0000-0000-%012d" (index + 1)
+
+            sprintf
+                "Project(\"{F2A71F9B-5D33-465A-A702-920D77279786}\") = \"%s\", \"%s\", \"{%s}\""
+                projectName
+                relativePath
+                projectGuid)
+
+    File.WriteAllLines(solutionPath, lines)
+    solutionPath
+
 let private admissionFindArgs (projectPath: string) (timeoutMs: int) : FindArgs =
     { query = "value"
       kind = Some "symbol"
@@ -704,6 +724,248 @@ let ``find expiry during position resolution returns before the retained worker 
             if Directory.Exists root then
                 Directory.Delete(root, true)
     }
+
+[<Fact>]
+let ``find expiry during sln discovery stops line materialization and releases retained admission`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_sln_deadline_{Guid.NewGuid():N}")
+        use outerGate = new SemaphoreSlim(1, 1)
+        use release = new ManualResetEventSlim(false)
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let expiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let retained = TaskCompletionSource<Task>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable lineSteps = 0
+        let mutable projectSteps = 0
+
+        let beforeDiscoveryStep phase _ =
+            if phase = "sln-line" then
+                let current = Interlocked.Increment(&lineSteps)
+
+                if current = 4 then
+                    entered.TrySetResult(()) |> ignore
+                    expiry.TrySetResult(()) |> ignore
+                    release.Wait()
+            elif phase = "sln-project" then
+                Interlocked.Increment(&projectSteps) |> ignore
+
+        let controlledSweep (_: string) =
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let bridge =
+            FcsBridge(
+                findTargetDiscoveryBeforeStepOverride = beforeDiscoveryStep,
+                projectSweepWorkerOverride = controlledSweep
+            )
+
+        try
+            let missingProjects =
+                [ for index in 1..12 -> Path.Combine(root, $"Missing{index}.fsproj") ]
+
+            let solutionPath = writeSolution root "Deadline.sln" missingProjects
+
+            let args =
+                { admissionFindArgs solutionPath 20_000 with
+                    scope = Some "workspace" }
+
+            let deadline = FindRequestDeadline(20_000, semanticExpirySignal = expiry.Task)
+
+            let request =
+                runLimitedWithFindDeadlineRetained
+                    outerGate
+                    CancellationToken.None
+                    deadline
+                    (fun sharedDeadline retainUntil ->
+                        let captureAndRetain operation =
+                            captureRetainedOperation retained retainUntil operation
+
+                        bridge.FindWithinDeadline(
+                            args,
+                            sharedDeadline,
+                            CancellationToken.None,
+                            captureAndRetain,
+                            None
+                        ))
+
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            let! result = request.WaitAsync(TimeSpan.FromSeconds(5.0))
+
+            Assert.Equal("unknown", result["status"].GetValue<string>())
+            Assert.Equal("find_timeout", result["errorKind"].GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus result "target_discovery")
+            Assert.Equal("not_started", findPhaseStatus result "project_sweep")
+            Assert.Equal("not_started", findPhaseStatus result "fsac_fallback")
+            Assert.Equal(4, Volatile.Read(&lineSteps))
+            Assert.Equal(3, Volatile.Read(&projectSteps))
+            Assert.Equal(0L, bridge.ProjectUsesStartedCount)
+            Assert.Equal(1, bridge.FindTargetDiscoveryActiveCount)
+            Assert.Equal(1, bridge.FindTargetDiscoveryInFlightCount)
+            Assert.Equal(0, outerGate.CurrentCount)
+
+            release.Set()
+
+            let! retainedOperation = retained.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            do! awaitExactCompletion retainedOperation
+            do! awaitFullGateAvailability outerGate 1
+
+            Assert.Equal(4, Volatile.Read(&lineSteps))
+            Assert.Equal(3, Volatile.Read(&projectSteps))
+            Assert.Equal(0, bridge.FindTargetDiscoveryActiveCount)
+            Assert.Equal(0, bridge.FindTargetDiscoveryInFlightCount)
+            Assert.Equal(1, outerGate.CurrentCount)
+        finally
+            release.Set()
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find expiry during nearest project discovery stops before the next directory`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_nearest_deadline_{Guid.NewGuid():N}")
+        let nested = Path.Combine(root, "A", "B")
+        Directory.CreateDirectory(nested) |> ignore
+        let sourcePath = Path.Combine(nested, "Library.fs")
+        File.WriteAllText(sourcePath, "module Nested\nlet value = 42\n")
+        let expiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable directorySteps = 0
+        let mutable fileSteps = 0
+
+        let beforeDiscoveryStep phase _ =
+            if phase = "nearest-project-directory" then
+                let current = Interlocked.Increment(&directorySteps)
+
+                if current = 2 then
+                    expiry.TrySetResult(()) |> ignore
+            elif phase = "nearest-project-file" then
+                Interlocked.Increment(&fileSteps) |> ignore
+
+        let bridge = FcsBridge(findTargetDiscoveryBeforeStepOverride = beforeDiscoveryStep)
+
+        try
+            let args =
+                { admissionFindArgs "" 20_000 with
+                    projectPath = None
+                    path = Some sourcePath }
+
+            let deadline = FindRequestDeadline(20_000, semanticExpirySignal = expiry.Task)
+
+            let! result =
+                bridge.FindWithinDeadline(args, deadline, CancellationToken.None, ignore, None)
+
+            Assert.Equal("unknown", result["status"].GetValue<string>())
+            Assert.Equal("find_timeout", result["errorKind"].GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus result "target_discovery")
+            Assert.Equal(2, Volatile.Read(&directorySteps))
+            Assert.Equal(1, Volatile.Read(&fileSteps))
+            Assert.Equal(0L, bridge.ProjectOptionsLoadCount)
+            Assert.Equal(0L, bridge.ProjectUsesStartedCount)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find expiry during missing project rows stops shaping and reports honest phases`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_missing_rows_{Guid.NewGuid():N}")
+        let expiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable missingRowSteps = 0
+        let mutable sweepStarts = 0
+
+        let beforeDiscoveryStep phase _ =
+            if phase = "missing-project-row" then
+                let current = Interlocked.Increment(&missingRowSteps)
+
+                if current = 3 then
+                    expiry.TrySetResult(()) |> ignore
+
+        let controlledSweep (_: string) =
+            Interlocked.Increment(&sweepStarts) |> ignore
+            Task.FromResult<FSharpSymbolUse array * FSharpDiagnostic array>([||], [||])
+
+        let bridge =
+            FcsBridge(
+                findTargetDiscoveryBeforeStepOverride = beforeDiscoveryStep,
+                projectSweepWorkerOverride = controlledSweep
+            )
+
+        try
+            let _, loadableProject = writeSimpleProject root "Loadable" "value"
+
+            let missingProjects =
+                [ for index in 1..8 -> Path.Combine(root, $"Missing{index}.fsproj") ]
+
+            let solutionPath =
+                writeSolution root "MissingRows.sln" (loadableProject :: missingProjects)
+
+            let args =
+                { admissionFindArgs solutionPath 20_000 with
+                    scope = Some "workspace" }
+
+            let deadline = FindRequestDeadline(20_000, semanticExpirySignal = expiry.Task)
+
+            let! result =
+                bridge.FindWithinDeadline(args, deadline, CancellationToken.None, ignore, None)
+
+            Assert.Equal("unknown", result["status"].GetValue<string>())
+            Assert.Equal("find_timeout", result["errorKind"].GetValue<string>())
+            Assert.Equal(3, Volatile.Read(&missingRowSteps))
+            Assert.Equal(0, Volatile.Read(&sweepStarts))
+            Assert.Equal(9, result["projectsRequested"].GetValue<int>())
+            Assert.Equal(1, result["projectsSwept"].GetValue<int>())
+            Assert.Equal(8, result["projectsMissing"].GetValue<int>())
+            Assert.Equal(1, result["projectsNotStarted"].GetValue<int>())
+            Assert.Equal(2, result["perProject"].AsArray().Count)
+            Assert.Equal("project", (result["resolution"]["scopeResolved"]).GetValue<string>())
+            Assert.Equal("not_started", (result["resolution"]["fsacFallbackState"]).GetValue<string>())
+            Assert.Equal("incomplete-target-discovery", (result["resolution"]["via"]).GetValue<string>())
+            Assert.Equal("timed_out", findPhaseStatus result "target_discovery")
+            Assert.Equal("not_started", findPhaseStatus result "project_sweep")
+            Assert.Equal("not_started", findPhaseStatus result "fsac_fallback")
+            Assert.Equal("complete", findPhaseStatus result "response_construction")
+            Assert.False((result["coverage"]["complete"]).GetValue<bool>())
+            Assert.False(result["resultSetComplete"].GetValue<bool>())
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find slnx discovery checks continuation between XML nodes`` () =
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_slnx_deadline_{Guid.NewGuid():N}")
+    Directory.CreateDirectory(root) |> ignore
+
+    try
+        let solutionPath = Path.Combine(root, "Deadline.slnx")
+
+        let projects =
+            [ for index in 1..12 -> $"  <Project Path=\"Missing{index}.fsproj\" />" ]
+            |> String.concat Environment.NewLine
+
+        File.WriteAllText(solutionPath, $"<Solution>{Environment.NewLine}{projects}{Environment.NewLine}</Solution>")
+        let mutable nodeSteps = 0
+        let mutable canContinue = true
+
+        let beforeStep phase _ =
+            if phase = "slnx-node" then
+                let current = Interlocked.Increment(&nodeSteps)
+
+                if current = 4 then
+                    canContinue <- false
+
+        Assert.Throws<TimeoutException>(fun () ->
+            FsLangMcp.ProjectFiles.SolutionParsing.discoverProjectsForFind
+                solutionPath
+                beforeStep
+                (fun () -> canContinue)
+            |> ignore)
+        |> ignore
+
+        Assert.Equal(4, Volatile.Read(&nodeSteps))
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
 
 [<Fact>]
 let ``find discovery expiry retains the worker rejects a distinct key and admits retry`` () : Task =
