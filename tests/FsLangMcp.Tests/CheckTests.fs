@@ -221,6 +221,24 @@ let private bareCheck: CheckArgs =
       projectPath = None
       timeoutMs = None }
 
+let private waitForDiscoveryState description predicate =
+    task {
+        let deadline = Stopwatch.StartNew()
+
+        while not (predicate ()) && deadline.Elapsed < TimeSpan.FromSeconds(10.0) do
+            do! Task.Delay(10)
+
+        Assert.True(predicate (), description)
+    }
+
+let private settleDiscovery (completion: Task) =
+    task {
+        try
+            do! completion.WaitAsync(TimeSpan.FromSeconds(10.0))
+        with :? TimeoutException when completion.IsCompleted ->
+            () // A zero-waiter worker terminates with the expected timeout.
+    }
+
 [<Fact>]
 let ``check discovery keys length-frame POSIX path components`` () =
     if not (OperatingSystem.IsWindows()) then
@@ -439,23 +457,49 @@ let private runAutoScopeDiscoveryDeadlineTest () : Task =
                 Directory.Delete(root, true)
     }
 
-// Release blocked producers and drain their owning requests even when an assertion
-// fails. No cleanup timeout: fixture files must outlive the real workers.
+// Release blocked producers and drain public requests plus exact retained workers
+// even when an assertion fails. No cleanup timeout: fixture files must outlive them.
 type private BlockedCheckRequests(release: unit -> unit, reset: unit -> unit) =
     let requests = ResizeArray<Task>()
+    let workers = ResizeArray<Task>()
+    let mutable verifyDrained = ignore
 
     member _.Track(request: Task<'T>) =
         requests.Add(request :> Task)
         request
+
+    member _.TrackWorker(completion: Task) =
+        workers.Add(completion)
+        completion
+
+    member _.TrackWorkerExpectingTimeout(completion: Task) =
+        workers.Add(
+            task {
+                try
+                    do! completion
+                with :? TimeoutException ->
+                    ()
+            }
+            :> Task
+        )
+
+        completion
+
+    member _.VerifyBeforeReset(verify: unit -> unit) =
+        verifyDrained <- verify
 
     interface IAsyncDisposable with
         member _.DisposeAsync() =
             ValueTask(task {
                 release ()
 
+                let pending =
+                    Array.append (requests.ToArray()) (workers.ToArray())
+
                 try
-                    do! Task.WhenAll(requests)
+                    do! Task.WhenAll(pending)
                 finally
+                    verifyDrained ()
                     reset ()
             })
 
@@ -1422,6 +1466,289 @@ type CheckTests(fx: CheckFixture) =
             Assert.True(gb retry "analyzed")
             Assert.Equal(1L, bridge.CheckProjectDiscoveryFallbackCount)
             Assert.Equal((if speed = "trusted" then 1L else 0L), bridge.ProjectTypeCheckStartCount)
+        }
+
+    [<Theory>]
+    [<InlineData("trusted", true)>]
+    [<InlineData("fast", true)>]
+    [<InlineData("trusted", false)>]
+    [<InlineData("fast", false)>]
+    member _.``check discovery all waiters expired never starts fallback``(speed: string, beforeCompute: bool) : Task =
+        task {
+            fx.ResetClean()
+            let reached = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            use leaderDeadline = new System.Threading.CancellationTokenSource()
+            use followerDeadline = new System.Threading.CancellationTokenSource()
+            let mutable callers = 0
+
+            let nextDeadline () =
+                match System.Threading.Interlocked.Increment(&callers) with
+                | 1 -> leaderDeadline.Token
+                | 2 -> followerDeadline.Token
+                | _ -> System.Threading.CancellationToken.None // Subsequent retry is live.
+
+            // The synchronous hook models an uncancellable filesystem operation.
+            let block () =
+                reached.TrySetResult(()) |> ignore
+                release.Task.GetAwaiter().GetResult()
+
+            let bridge =
+                FcsBridge(
+                    checkTargetDiscoveryBeforeComputeOverride = (fun () -> if beforeCompute then block ()),
+                    checkProjectDiscoveryBeforeFallbackOverride = (fun () -> if not beforeCompute then block ()),
+                    checkTargetDiscoveryDeadlineTokenOverride = nextDeadline,
+                    freshProjectCheckWorkerOverride = (fun _ -> Task.FromResult([||]))
+                )
+
+            use requests =
+                new BlockedCheckRequests((fun () -> release.TrySetResult(()) |> ignore), fx.ResetClean)
+
+            requests.VerifyBeforeReset(fun () ->
+                Assert.Equal(0, bridge.CheckTargetDiscoveryActiveCount)
+                Assert.Equal(0, bridge.CheckTargetDiscoveryInFlightCount))
+
+            let! warmed = bridge.ProbeProjectOptions(fx.ProbeFsproj)
+            Assert.True(Result.isOk warmed, $"Could not warm project options: {warmed}")
+            let target = Path.GetDirectoryName(fx.ProbeFsproj)
+            let args = { bareCheck with scope = Some "project"; projectPath = Some target; speed = Some speed }
+            let snapshot expectation = bindCompleteSnapshot expectation CheckFsacSnapshot.empty |> Task.FromResult
+
+            let leader = bridge.Check(args, fsacSnapshot = snapshot) |> requests.Track
+            do! reached.Task.WaitAsync(TimeSpan.FromSeconds(10.0))
+
+            let completion =
+                bridge.TryGetCheckTargetDiscoveryCompletionForTest("project", target, None)
+                |> Option.defaultWith (fun () -> failwith "Missing discovery worker.")
+                |> requests.TrackWorkerExpectingTimeout
+
+            let follower = bridge.Check(args, fsacSnapshot = snapshot) |> requests.Track
+            do! waitForDiscoveryState "Both callers must join the retained worker." (fun () -> bridge.CheckTargetDiscoveryWaiterCount = 2)
+
+            leaderDeadline.Cancel()
+            followerDeadline.Cancel()
+            let! leaderResult = leader.WaitAsync(TimeSpan.FromSeconds(10.0))
+            let! followerResult = follower.WaitAsync(TimeSpan.FromSeconds(10.0))
+            Assert.Equal("unknown", gs leaderResult "verdict")
+            Assert.Equal("unknown", gs followerResult "verdict")
+            do! waitForDiscoveryState "Expired callers must release only their waiters." (fun () -> bridge.CheckTargetDiscoveryWaiterCount = 0)
+            Assert.False(completion.IsCompleted)
+            Assert.Equal(1, bridge.CheckTargetDiscoveryActiveCount)
+            Assert.Equal(1, bridge.CheckTargetDiscoveryInFlightCount)
+            Assert.Equal(1L, bridge.CheckTargetDiscoveryStartedCount)
+
+            release.TrySetResult(()) |> ignore
+            do! settleDiscovery completion
+            Assert.Equal(0L, bridge.CheckProjectDiscoveryFallbackCount)
+            Assert.Equal(0, bridge.CheckTargetDiscoveryActiveCount)
+            Assert.Equal(0, bridge.CheckTargetDiscoveryInFlightCount)
+            Assert.Equal(0L, bridge.ProjectTypeCheckStartCount)
+
+            let! retry = bridge.Check(args, fsacSnapshot = snapshot) |> requests.Track
+            Assert.Equal("clean", gs retry "verdict")
+            Assert.Equal(1L, bridge.CheckProjectDiscoveryFallbackCount)
+            Assert.Equal(0, bridge.CheckTargetDiscoveryActiveCount)
+            Assert.Equal(0, bridge.CheckTargetDiscoveryInFlightCount)
+        }
+
+    [<Theory>]
+    [<InlineData("trusted", true, true)>]
+    [<InlineData("fast", true, true)>]
+    [<InlineData("trusted", false, true)>]
+    [<InlineData("fast", false, true)>]
+    [<InlineData("trusted", true, false)>]
+    [<InlineData("fast", true, false)>]
+    [<InlineData("trusted", false, false)>]
+    [<InlineData("fast", false, false)>]
+    member _.``check discovery expiring one same key waiter preserves the other``
+        (speed: string, expireLeader: bool, beforeCompute: bool) : Task =
+        task {
+            fx.ResetClean()
+            let reached = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            use leaderDeadline = new System.Threading.CancellationTokenSource()
+            use followerDeadline = new System.Threading.CancellationTokenSource()
+            let mutable callers = 0
+
+            let nextDeadline () =
+                if System.Threading.Interlocked.Increment(&callers) = 1 then leaderDeadline.Token
+                else followerDeadline.Token
+
+            let block () =
+                reached.TrySetResult(()) |> ignore
+                release.Task.GetAwaiter().GetResult()
+
+            let bridge =
+                FcsBridge(
+                    checkTargetDiscoveryBeforeComputeOverride = (fun () -> if beforeCompute then block ()),
+                    checkProjectDiscoveryBeforeFallbackOverride = (fun () -> if not beforeCompute then block ()),
+                    checkTargetDiscoveryDeadlineTokenOverride = nextDeadline,
+                    freshProjectCheckWorkerOverride = (fun _ -> Task.FromResult([||]))
+                )
+
+            use requests =
+                new BlockedCheckRequests((fun () -> release.TrySetResult(()) |> ignore), fx.ResetClean)
+
+            requests.VerifyBeforeReset(fun () ->
+                Assert.Equal(0, bridge.CheckTargetDiscoveryActiveCount)
+                Assert.Equal(0, bridge.CheckTargetDiscoveryInFlightCount))
+
+            let! warmed = bridge.ProbeProjectOptions(fx.ProbeFsproj)
+            Assert.True(Result.isOk warmed, $"Could not warm project options: {warmed}")
+            let target = Path.GetDirectoryName(fx.ProbeFsproj)
+            let args = { bareCheck with scope = Some "project"; projectPath = Some target; speed = Some speed }
+            let snapshot expectation = bindCompleteSnapshot expectation CheckFsacSnapshot.empty |> Task.FromResult
+
+            let leader = bridge.Check(args, fsacSnapshot = snapshot) |> requests.Track
+            do! reached.Task.WaitAsync(TimeSpan.FromSeconds(10.0))
+
+            let completion =
+                bridge.TryGetCheckTargetDiscoveryCompletionForTest("project", target, None)
+                |> Option.defaultWith (fun () -> failwith "Missing discovery worker.")
+                |> requests.TrackWorker
+
+            let follower = bridge.Check(args, fsacSnapshot = snapshot) |> requests.Track
+            do! waitForDiscoveryState "Follower must join before either deadline expires." (fun () -> bridge.CheckTargetDiscoveryWaiterCount = 2)
+
+            let expiring, surviving = if expireLeader then leader, follower else follower, leader
+            (if expireLeader then leaderDeadline else followerDeadline).Cancel()
+            let! expired = expiring.WaitAsync(TimeSpan.FromSeconds(10.0))
+            Assert.Equal("unknown", gs expired "verdict")
+            do! waitForDiscoveryState "The surviving caller must keep its waiter." (fun () -> bridge.CheckTargetDiscoveryWaiterCount = 1)
+            Assert.False(surviving.IsCompleted)
+            Assert.Equal(1, bridge.CheckTargetDiscoveryActiveCount)
+            Assert.Equal(1L, bridge.CheckTargetDiscoveryStartedCount)
+            Assert.Equal(0L, bridge.CheckTargetDiscoveryRejectedCount)
+
+            release.TrySetResult(()) |> ignore
+            let! result = surviving.WaitAsync(TimeSpan.FromSeconds(10.0))
+            do! completion
+            Assert.True(gs result "verdict" = "clean", result.ToJsonString())
+            Assert.True(gb result "analyzed")
+            Assert.Equal(1L, bridge.CheckProjectDiscoveryFallbackCount)
+            Assert.Equal(1L, bridge.CheckTargetDiscoveryStartedCount)
+            Assert.Equal(0, bridge.CheckTargetDiscoveryActiveCount)
+            Assert.Equal(0, bridge.CheckTargetDiscoveryInFlightCount)
+        }
+
+    [<Theory>]
+    [<InlineData("trusted")>]
+    [<InlineData("fast")>]
+    member _.``check discovery retains busy admission and exact worker cleanup across retries``(speed: string) : Task =
+        task {
+            fx.ResetClean()
+            let firstReached = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let releaseFirst = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let replacementReached = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let releaseReplacement = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            use firstDeadline = new System.Threading.CancellationTokenSource()
+            let mutable callers = 0
+            let mutable workers = 0
+
+            let block () =
+                match System.Threading.Interlocked.Increment(&workers) with
+                | 1 ->
+                    firstReached.TrySetResult(()) |> ignore
+                    releaseFirst.Task.GetAwaiter().GetResult()
+                | 2 ->
+                    replacementReached.TrySetResult(()) |> ignore
+                    releaseReplacement.Task.GetAwaiter().GetResult()
+                | _ -> () // The distinct-key retry completes normally.
+
+            let bridge =
+                FcsBridge(
+                    checkTargetDiscoveryBeforeComputeOverride = block,
+                    checkTargetDiscoveryDeadlineTokenOverride = (fun () ->
+                        if System.Threading.Interlocked.Increment(&callers) = 1 then firstDeadline.Token
+                        else System.Threading.CancellationToken.None),
+                    freshProjectCheckWorkerOverride = (fun _ -> Task.FromResult([||]))
+                )
+
+            use requests =
+                new BlockedCheckRequests(
+                    (fun () ->
+                        releaseFirst.TrySetResult(()) |> ignore
+                        releaseReplacement.TrySetResult(()) |> ignore),
+                    fx.ResetClean
+                )
+
+            requests.VerifyBeforeReset(fun () ->
+                Assert.Equal(0, bridge.CheckTargetDiscoveryActiveCount)
+                Assert.Equal(0, bridge.CheckTargetDiscoveryInFlightCount))
+
+            let! warmed = bridge.ProbeProjectOptions(fx.ProbeFsproj)
+            Assert.True(Result.isOk warmed, $"Could not warm project options: {warmed}")
+            let target = Path.GetDirectoryName(fx.ProbeFsproj)
+            let args = { bareCheck with scope = Some "project"; projectPath = Some target; speed = Some speed }
+            // Same actual project, distinct discovery key (directory vs explicit fsproj).
+            let distinctArgs = { args with projectPath = Some fx.ProbeFsproj }
+            let snapshot expectation = bindCompleteSnapshot expectation CheckFsacSnapshot.empty |> Task.FromResult
+
+            let first = bridge.Check(args, fsacSnapshot = snapshot) |> requests.Track
+            do! firstReached.Task.WaitAsync(TimeSpan.FromSeconds(10.0))
+
+            let completion =
+                bridge.TryGetCheckTargetDiscoveryCompletionForTest("project", target, None)
+                |> Option.defaultWith (fun () -> failwith "Missing original discovery worker.")
+                |> requests.TrackWorkerExpectingTimeout
+
+            let staleCleanup =
+                bridge.TryGetCheckTargetDiscoveryCleanupForTest("project", target, None)
+                |> Option.defaultWith (fun () -> failwith "Missing exact-worker cleanup.")
+
+            firstDeadline.Cancel()
+            let! expired = first.WaitAsync(TimeSpan.FromSeconds(10.0))
+            Assert.Equal("unknown", gs expired "verdict")
+
+            let! busy =
+                bridge.Check(distinctArgs, fsacSnapshot = snapshot)
+                |> requests.Track
+                |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(10.0))
+
+            Assert.Equal("unknown", gs busy "verdict")
+            Assert.Equal("fcs_worker_busy", gs busy["blockingReason"] "errorKind")
+            Assert.Equal(1L, bridge.CheckTargetDiscoveryRejectedCount)
+            Assert.Equal(1L, bridge.CheckTargetDiscoveryStartedCount)
+            Assert.Equal(1, bridge.CheckTargetDiscoveryActiveCount)
+            Assert.Equal(1, bridge.CheckTargetDiscoveryInFlightCount)
+            Assert.False(completion.IsCompleted)
+
+            releaseFirst.TrySetResult(()) |> ignore
+            do! settleDiscovery completion
+            Assert.Equal(0, bridge.CheckTargetDiscoveryInFlightCount)
+            Assert.Equal(0L, bridge.CheckProjectDiscoveryFallbackCount)
+
+            let replacement = bridge.Check(args, fsacSnapshot = snapshot) |> requests.Track
+            do! replacementReached.Task.WaitAsync(TimeSpan.FromSeconds(10.0))
+
+            let replacementCompletion =
+                bridge.TryGetCheckTargetDiscoveryCompletionForTest("project", target, None)
+                |> Option.defaultWith (fun () -> failwith "Missing replacement discovery worker.")
+                |> requests.TrackWorker
+
+            Assert.NotSame(completion, replacementCompletion)
+
+            staleCleanup ()
+            staleCleanup ()
+            Assert.Equal(1, bridge.CheckTargetDiscoveryInFlightCount)
+            let follower = bridge.Check(args, fsacSnapshot = snapshot) |> requests.Track
+            do! waitForDiscoveryState "Stale cleanup must leave the replacement joinable." (fun () -> bridge.CheckTargetDiscoveryWaiterCount = 2)
+            Assert.Equal(2L, bridge.CheckTargetDiscoveryStartedCount)
+            Assert.Equal(1L, bridge.CheckTargetDiscoveryRejectedCount)
+
+            releaseReplacement.TrySetResult(()) |> ignore
+            let! replacementResult = replacement.WaitAsync(TimeSpan.FromSeconds(10.0))
+            let! followerResult = follower.WaitAsync(TimeSpan.FromSeconds(10.0))
+            do! replacementCompletion
+            Assert.Equal("clean", gs replacementResult "verdict")
+            Assert.Equal("clean", gs followerResult "verdict")
+            Assert.Equal(0, bridge.CheckTargetDiscoveryInFlightCount)
+
+            let! retry = bridge.Check(distinctArgs, fsacSnapshot = snapshot) |> requests.Track
+            Assert.Equal("clean", gs retry "verdict")
+            Assert.Equal(3L, bridge.CheckTargetDiscoveryStartedCount)
+            Assert.Equal(0, bridge.CheckTargetDiscoveryActiveCount)
+            Assert.Equal(0, bridge.CheckTargetDiscoveryInFlightCount)
         }
 
     [<Fact>]
