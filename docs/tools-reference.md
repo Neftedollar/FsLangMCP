@@ -81,6 +81,9 @@ protection until actual completion. A `find_response_timeout` requires restartin
 cursor (`paginationRestartRequired=true`), even if project coverage completed. Diagnostic totals
 are exhaustive only when `projectDiagnosticsCountComplete=true`; at most 200 are projected, and
 the final size limit may deliver fewer.
+If `breakdownComplete=false`, per-kind counts are only the prefix counted before expiry, not a
+complete reconciliation of `totalSites`. A later response timeout can leave this flag true when
+the counting pass had already finished.
 
 **Serialized response ceiling:** the complete indented JSON shipped by the MCP transport is capped
 at 60,000 UTF-16 code units, measured with the same production serializer as the transport. The

@@ -675,6 +675,7 @@ module internal FindDeadlineResponse =
               "projectsNotStarted", jint projectsNotStarted
               "totalSites", jint 0
               "matchedUseCount", jint 0
+              "breakdownComplete", jbool false
               "breakdown",
               jobj
                   [ "definitions", jint 0
@@ -8017,20 +8018,12 @@ type internal FcsBridge
                     else
                         keepShaping <- false
 
+            // Counts already accumulated remain useful lower bounds. Capture their
+            // completeness here: later context/planner expiry cannot undo a full count.
+            let breakdownComplete = not responseConstructionTimedOut
+
             if responseConstructionTimedOut then
                 sortedSiteIndex.Clear()
-                defCount <- 0
-                refCount <- 0
-                fLit <- 0
-                fUpd <- 0
-                fMut <- 0
-                fPat <- 0
-                fRead <- 0
-                memCount <- 0
-                typedSites <- 0
-                unresolvedSites <- 0
-                timedOutTypeSites <- 0
-                multiTypedSites <- 0
 
             // #207: these counts cover the full scoped result, not just this cursor page.
             let fieldSiteCount = fLit + fUpd + fMut + fPat + fRead
@@ -8659,6 +8652,7 @@ type internal FcsBridge
                   "projectsNotStarted", jint projectsNotStarted
                   "totalSites", jint totalSites
                   "matchedUseCount", jint totalSites
+                  "breakdownComplete", jbool breakdownComplete
                   "breakdown", breakdown
                   "returnedSiteCount", jint 0
                   "sitesTruncatedByBudget", jbool false
@@ -8885,6 +8879,7 @@ type internal FcsBridge
                       "resultSetComplete", jbool false
                       "totalSites", jint totalSites
                       "matchedUseCount", jint totalSites
+                      "breakdownComplete", jbool breakdownComplete
                       "breakdown", breakdown.DeepClone()
                       "sites", JsonArray() :> JsonNode
                       "returnedSiteCount", jint 0

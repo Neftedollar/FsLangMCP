@@ -125,6 +125,11 @@ the available semantic evidence but sets `resultSetComplete=false`,
 the request. `coverage.complete` may still be true: completing analysis does not imply successful
 delivery of every site.
 
+`breakdownComplete` independently says whether all per-kind counts were computed. If the response
+deadline interrupts that counting pass, `breakdown` retains the counted prefix as lower bounds and
+sets the flag to false, even though `totalSites` already names the full known site set. Later
+context/planner expiry does not invalidate a completed breakdown.
+
 Requests sharing an in-flight worker retain independent deadlines. A short-lived caller cannot
 cancel work still needed by a live caller; when all waiters expire, avoidable continuations stop.
 Uncancellable work already running retains its admission slot until it actually completes, so an

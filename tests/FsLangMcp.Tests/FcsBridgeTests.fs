@@ -1710,6 +1710,55 @@ let ``find response expiry during post-sweep shaping stops before later response
                 Directory.Delete(root, true)
     }
 
+[<Fact>]
+let ``find response shaping expiry marks retained category counts as incomplete`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_breakdown_deadline_{Guid.NewGuid():N}")
+        let expiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable expireDuringShaping = false
+
+        let beforeResponseStep phase index =
+            if expireDuringShaping && phase = "post-sweep-shaping" && index = 1 then
+                expiry.TrySetResult(()) |> ignore
+
+        let bridge =
+            FcsBridge(
+                findResponseDeadlineSignalOverride = (fun () -> expiry.Task),
+                findResponseConstructionBeforeStepOverride = beforeResponseStep
+            )
+
+        let countBreakdown (result: JsonNode) =
+            result["breakdown"].AsObject()
+            |> Seq.sumBy (fun entry -> entry.Value.GetValue<int>())
+
+        try
+            let _, projectPath =
+                writeProjectWithSource root "BreakdownDeadline"
+                    "module BreakdownDeadline\nlet value = 42\nlet first = value\nlet second = value\n"
+            let args = admissionFindArgs projectPath 20_000
+            let! complete = bridge.Find(args)
+
+            Assert.Equal("succeeded", complete["status"].GetValue<string>())
+            Assert.True(complete["breakdownComplete"].GetValue<bool>())
+            let totalSites = complete["totalSites"].GetValue<int>()
+            Assert.True(totalSites > 1)
+            Assert.Equal(totalSites, countBreakdown complete)
+
+            expireDuringShaping <- true
+            let! partial = bridge.Find(args)
+
+            Assert.Equal("find_response_timeout", partial["errorKind"].GetValue<string>())
+            Assert.True((partial["coverage"]["complete"]).GetValue<bool>())
+            Assert.Equal(totalSites, partial["totalSites"].GetValue<int>())
+            Assert.False(partial["breakdownComplete"].GetValue<bool>())
+            Assert.Equal(1, countBreakdown partial)
+            Assert.False(partial["resultSetComplete"].GetValue<bool>())
+            Assert.Empty(partial["sites"].AsArray())
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
 [<Theory>]
 [<InlineData("diagnostic-collection")>]
 [<InlineData("diagnostic-json")>]
@@ -1880,6 +1929,7 @@ let ``find response planner expiry preserves coverage but requires a fresh page`
             Assert.True((result["resolution"]["matched"]).GetValue<bool>())
             Assert.True((result["coverage"]["complete"]).GetValue<bool>())
             Assert.Equal("timed_out", findPhaseStatus result "response_construction")
+            Assert.True(result["breakdownComplete"].GetValue<bool>())
             Assert.False((result["resolution"]["complete"]).GetValue<bool>())
             Assert.False(result["resultSetComplete"].GetValue<bool>())
             Assert.True(result["totalSites"].GetValue<int>() > 0)
