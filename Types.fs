@@ -757,7 +757,7 @@ let renderedLength (node: JsonNode) : int =
 /// exact indented JSON produced by `mcpRenderOptions` and shipped by `Tools.renderToken`.
 /// Keeping the planner here lets production shaping and focused tests call the same
 /// serializer without introducing a second set of JSON options.
-module FindResponseBudget =
+module internal FindResponseBudget =
     [<Literal>]
     let MaxSerializedChars = 60_000
 
