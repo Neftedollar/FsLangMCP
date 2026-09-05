@@ -289,6 +289,10 @@ type CheckArgs =
       /// Inline F# source to type-check against the project's references. Implies
       /// scope=snippet. (Consistent rename of fcs_validate_snippet's `content`.)
       snippet: string option
+      /// Compile-order placement for scope=snippet: "start" checks before every
+      /// project source file; "end" (default) checks after all project source files.
+      /// The effective normalized placement is echoed as snippetPosition.
+      snippetPosition: string option
       /// scope=workspace fast-mode glob over workspace-relative evaluated source paths
       /// (e.g. "src/Adapters/*.fs"); absolute paths and file-URI globs are also accepted.
       fileGlob: string option
