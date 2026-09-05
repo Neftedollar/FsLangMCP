@@ -8,15 +8,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-09-05
+
+0.17.1 is a correctness-hardening patch for project discovery and the `find` request lifecycle.
+It keeps the 35-tool surface compatible while making incomplete solution membership, deadlines,
+response delivery, linked compile items, cancellation, and test cleanup explicit and bounded.
+
+### Fixed
+
+- `find` and `project_health` preserve every declared F# solution member, including missing
+  `.fsproj` paths. Missing members count as requested evidence but never as swept projects;
+  absence remains indeterminate until the declared solution is loadable (#165).
+- `find` uses one end-to-end request deadline across admission, position resolution, target and
+  project discovery, project-options evaluation, FCS sweep, FSAC fallback, classification, and
+  response construction. Discovery is streamed, source windows are read once per file/page,
+  and retained workers keep bounded admission until their exact task completes. Each shared
+  worker's callers retain independent deadlines; response expiry explicitly requires a new
+  page without a cursor (#255).
+- `find` caps the complete production-serialized response at 60,000 UTF-16 code units, bounds
+  source context, preserves an in-order site prefix, and exposes exact truncation/cursor ledgers.
+  A blocked row never advances a cursor, and identity-changing recovery restarts without one
+  (#258).
+- Project inspection now preserves evaluated external `Compile` items only when external linked
+  files are explicitly enabled and the item carries `Link` metadata; directory and review scans
+  remain workspace-bounded (#256).
+- Pre-cancelled process execution is rejected at the final controlled boundary before launch,
+  avoiding an observable child-process side effect while retaining the documented post-check race
+  boundary (#257).
+- `check` discovery now observes all live callers of a shared worker, not only the first caller's
+  deadline. It does not start a fallback scan after all callers expire, retains admission until
+  actual completion, and removes only the exact completed worker. Deterministic trusted/fast
+  tests cover both deadline orders, fallback boundaries, busy/retry, and stale cleanup (#249).
+
 ### Changed
 
-- Repository SDK selection now declares `10.0.100` as the supported floor and
-  uses `latestFeature`, so contributors can build with a stable .NET 10 feature
-  band instead of installing exactly `10.0.400`. CI exercises the `10.0.100`
-  floor independently, while primary, live-FSAC, and release builds stay pinned
-  to an isolated `10.0.400` installation. The project-outline MCP adapter was
-  factored so the earlier F# compiler can emit the same bounded admission-timeout
-  response without falling back to an `FS3511` dynamic state machine.
+- Repository SDK selection declares .NET SDK `10.0.100` as the supported floor and uses
+  `latestFeature`, so contributors may use any compatible stable .NET 10 feature band. CI still
+  verifies the floor independently and pins release/runtime validation to `10.0.400` (#246).
+- CI records bounded VSTest hang diagnostics and uploads `TestResults` after a stalled coverage
+  run, so intermittent testhost lifecycle failures tracked in #199 produce actionable evidence.
+- The macOS live-runtime job is temporarily pinned to `macos-15` after the `macos-latest`
+  image migration broke the pinned Fantomas daemon. The original smoke checks remain intact;
+  restoring the rolling image is tracked separately in #271 (#269).
+
+### Deferred
+
+- Versioned query/snapshot-bound cursors are designed in ADR-0002 but remain a v0.18.0 runtime
+  change (#259); this patch preserves the existing cursor compatibility contract.
 
 ## [0.17.0] - 2026-08-31
 
@@ -1084,7 +1122,8 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
   above), so it has no link definition either — 0.15.0 compares from the
   last version that actually was tagged, 0.13.2.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.1...HEAD
+[0.17.1]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.13.2...v0.15.0
