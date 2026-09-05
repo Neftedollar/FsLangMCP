@@ -74,7 +74,8 @@ with `totalEstimate.sites` before treating a refactor count as exhaustive.
 
 **Serialized response ceiling:** the complete indented JSON shipped by the MCP transport is capped
 at 60,000 UTF-16 code units, measured with the same production serializer as the transport. The
-guard includes sites, diagnostics, per-project rows, coverage, and all other metadata. A page may
+guard includes early error results as well as sites, diagnostics, per-project rows, coverage, and
+all other metadata. A page may
 therefore return fewer than `maxResults`; `returnedSiteCount`/`cursorAdvancedBy` report the actual
 prefix and `nextCursor` advances by exactly that count. `responseTruncatedByBudget` and the
 per-section fields report cuts. `lineText` and each `before`/`after` entry carry truncation and

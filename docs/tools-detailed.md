@@ -178,9 +178,19 @@ increment. Count-capped and budget-capped pages therefore compose without skips.
 Metadata and site prefix counts are selected with logarithmic binary searches, not by removing one
 row and reserializing repeatedly. Every probe still builds the complete candidate response and
 measures it with the production serializer; no byte, token, or per-row size estimate decides what
-fits. Diagnostics retain priority over per-project detail exactly as before: the planner first
-keeps the largest diagnostics prefix that fits with all project rows, and only when none fits does
-it drop diagnostics and search the project prefix.
+fits. Per-project detail retains priority over diagnostics exactly as before: the planner first
+keeps all project rows and finds the largest diagnostics prefix that fits. Only when even zero
+diagnostics cannot coexist with all project rows does it keep diagnostics empty and search the
+largest fitting project prefix.
+
+After planning, every public `Find` result passes once through the same exact-serializer final
+guard, including validation, position-resolution, and project-discovery errors that return before
+the planner. An oversized early result is replaced by a fixed typed recovery envelope containing no
+caller-controlled strings, no continuation cursor, and `cursorAdvancedBy=0`. The guard is reusable
+by an outer deadline path for timeout envelopes it originates; applying it does not change timeout
+or admission behavior. Its generic recovery requires restarting without a cursor
+(`reuseOriginalCursor=false`), because shortening a query/path can change cursor identity; the
+site-aware late planner recovery remains separate and retains its more precise cursor semantics.
 
 Each site is projected to a canonical JSON row before that planner runs. Its `project`, source
 snippet metadata, and deterministic per-site `siteTypeAlternatives` projection do not depend on

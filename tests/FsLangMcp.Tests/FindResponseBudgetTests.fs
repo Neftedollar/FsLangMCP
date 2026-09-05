@@ -31,6 +31,23 @@ let private repeatedNodes key count chars =
               key, jstr (String.replicate chars "界") ]
         :> JsonNode)
 
+let private assertBoundedFinalRecovery (result: JsonNode) =
+    Assert.Equal("aborted", result["status"].GetValue<string>())
+    Assert.Equal("indeterminate", result["outcome"].GetValue<string>())
+    Assert.Equal("blocked", result["deliveryStatus"].GetValue<string>())
+    Assert.Equal("find_response_exceeds_budget", result["errorCode"].GetValue<string>())
+    Assert.True(result["retryable"].GetValue<bool>())
+    Assert.True(result["responseTruncatedByBudget"].GetValue<bool>())
+    Assert.Equal(FindResponseBudget.MaxSerializedChars, result["responseBudgetChars"].GetValue<int>())
+    Assert.Equal(FindResponseBudget.SizeUnit, result["responseSizeUnit"].GetValue<string>())
+    Assert.Equal(0, result["cursorAdvancedBy"].GetValue<int>())
+    Assert.Null(result["nextCursor"])
+    let recovery = result["recovery"]
+    Assert.False(recovery["reuseOriginalCursor"].GetValue<bool>())
+    Assert.Equal((renderToken result).Length, renderedLength result)
+    Assert.True(renderedLength result <= FindResponseBudget.MaxSerializedChars)
+    Assert.Same(result, FindResponseBudget.guardFinalResponse result)
+
 type FindBudgetFixture() =
     let runId = Guid.NewGuid().ToString("N")
     let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_budget_{runId}")
@@ -298,8 +315,77 @@ let ``planner returns a typed first-site overflow instead of a zero-progress pag
     | FindResponseBudget.FitPlan.FirstSiteOverflow -> ()
     | other -> Assert.Fail($"expected FirstSiteOverflow, got {other}")
 
+[<Fact>]
+let ``final guard preserves bounded deadline results and can bound oversized deadline details`` () =
+    let boundedTimeout =
+        jobj
+            [ "status", jstr "timeout"
+              "errorKind", jstr "fcs_admission_timeout"
+              "message", jstr "FCS admission timed out before protected work started."
+              "retryable", jbool true ]
+        :> JsonNode
+
+    Assert.Same(boundedTimeout, FindResponseBudget.guardFinalResponse boundedTimeout)
+
+    let oversizedTimeout =
+        jobj
+            [ "status", jstr "timeout"
+              "errorKind", jstr "find_deadline"
+              "message",
+              jstr (String.replicate (FindResponseBudget.MaxSerializedChars + 1_000) "timeout-detail") ]
+        :> JsonNode
+
+    oversizedTimeout
+    |> FindResponseBudget.guardFinalResponse
+    |> assertBoundedFinalRecovery
+
 type FindResponseBudgetIntegrationTests(fixture: FindBudgetFixture) =
     interface IClassFixture<FindBudgetFixture>
+
+    [<Fact>]
+    member _.``oversized invalid input is replaced by bounded final recovery`` () : Task =
+        task {
+            let bridge = FcsBridge()
+
+            let oversizedKind =
+                String.replicate (FindResponseBudget.MaxSerializedChars + 1_000) "k"
+
+            let! result =
+                bridge.Find(
+                    { findArgs fixture None with
+                        kind = Some oversizedKind }
+                )
+
+            assertBoundedFinalRecovery result
+        }
+
+    [<Fact>]
+    member _.``oversized project-resolution error is replaced by bounded final recovery`` () : Task =
+        task {
+            let bridge = FcsBridge()
+
+            // FindCore's non-validation project-resolution error includes both the
+            // resolved project and requested workspace paths. Keep each path below the
+            // Windows long-path limit while making their combined production JSON exceed
+            // the hard ceiling; no file-system object needs to be created.
+            let componentLength = FindResponseBudget.MaxSerializedChars / 2 + 256
+
+            let missingProjectPath =
+                Path.Combine(Path.GetTempPath(), String.replicate componentLength "p" + ".fsproj")
+
+            Assert.True(missingProjectPath.Length < 32_767)
+            Assert.True(missingProjectPath.Length * 2 > FindResponseBudget.MaxSerializedChars)
+
+            let! result =
+                bridge.Find(
+                    { findArgs fixture None with
+                        scope = Some "project"
+                        projectPath = Some missingProjectPath }
+                )
+
+            Assert.Equal(0L, bridge.ProjectEvaluationStartedCount)
+            assertBoundedFinalRecovery result
+        }
 
     [<Fact>]
     member _.``long Unicode context with huge limits stays bounded and cursor traversal has no skips`` () : Task =

@@ -783,6 +783,46 @@ module FindResponseBudget =
         | FirstSiteOverflow
         | FixedMetadataOverflow
 
+    /// Apply the hard production ceiling to one fully formed find result, including
+    /// validation, position-resolution, project-discovery, deadline, and planned
+    /// success envelopes. The replacement deliberately contains no caller-controlled
+    /// data and is returned directly (never recursively guarded), so an oversized
+    /// error cannot produce another oversized error or a non-advancing cursor loop.
+    /// Keep this function reusable by both Find and any outer FindWithinDeadline path.
+    let guardFinalResponse (response: JsonNode) : JsonNode =
+        if renderedLength response <= MaxSerializedChars then
+            response
+        else
+            let recovery =
+                jobj
+                    [ "action", jstr "restart_with_narrower_find_request"
+                      "instruction",
+                      jstr
+                          "Restart find without a cursor, using shorter string/path arguments and narrower response-shaping options. Do not reuse a prior cursor after changing the query shape."
+                      "recommendedContextLines", jint 0
+                      "recommendedMaxResults", jint 1
+                      "recommendedIncludeInfo", jbool false
+                      "recommendedIncludePerProject", jbool false
+                      "reuseOriginalCursor", jbool false ]
+                :> JsonNode
+
+            jobj
+                [ "status", jstr "aborted"
+                  "outcome", jstr "indeterminate"
+                  "deliveryStatus", jstr "blocked"
+                  "errorCode", jstr "find_response_exceeds_budget"
+                  "message",
+                  jstr
+                      "The complete find result exceeded the hard production-serialized response ceiling. Caller-controlled details were omitted; retry with narrower inputs."
+                  "retryable", jbool true
+                  "responseTruncatedByBudget", jbool true
+                  "responseBudgetChars", jint MaxSerializedChars
+                  "responseSizeUnit", jstr SizeUnit
+                  "cursorAdvancedBy", jint 0
+                  "nextCursor", null
+                  "recovery", recovery ]
+            :> JsonNode
+
     let private clampOffset length value =
         max 0 (min length value)
 

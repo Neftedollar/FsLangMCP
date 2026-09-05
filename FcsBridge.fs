@@ -6130,7 +6130,9 @@ type internal FcsBridge
                         )
         }
 
-    member this.Find(args: FindArgs, ?fsacProbe: string -> Task<FindFsacProbeResult>) : Task<JsonNode> =
+    member private this.FindCore
+        (args: FindArgs, fsacProbe: (string -> Task<FindFsacProbeResult>) option)
+        : Task<JsonNode> =
         task {
             match ArgsValidation.requireNonBlank "query" args.query with
             | Error _ ->
@@ -7482,6 +7484,14 @@ type internal FcsBridge
                     budgetFailure
                         "find_metadata_exceeds_response_budget"
                         "The fixed find response metadata cannot fit within the serialized response ceiling. No cursor was advanced."
+        }
+
+    /// Keep every result path behind one final exact-serializer ceiling, including
+    /// early validation/position/discovery exits that never reach planResponse.
+    member this.Find(args: FindArgs, ?fsacProbe: string -> Task<FindFsacProbeResult>) : Task<JsonNode> =
+        task {
+            let! response = this.FindCore(args, fsacProbe)
+            return FindResponseBudget.guardFinalResponse response
         }
 
     // ── fcs_tests_for_symbol (#60): the test-coverage slice of `find` ───────────
