@@ -1,6 +1,7 @@
 module FsLangMcp.ProcessRunner
 
 open System
+open System.ComponentModel
 open System.Diagnostics
 open System.IO
 open System.Runtime.InteropServices
@@ -56,6 +57,20 @@ type private JobObjectExtendedLimitInformation =
     val mutable PeakProcessMemoryUsed: unativeint
     val mutable PeakJobMemoryUsed: unativeint
 
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type private JobObjectBasicAccountingInformation =
+    val mutable TotalUserTime: int64
+    val mutable TotalKernelTime: int64
+    val mutable ThisPeriodTotalUserTime: int64
+    val mutable ThisPeriodTotalKernelTime: int64
+    val mutable TotalPageFaultCount: uint32
+    val mutable TotalProcesses: uint32
+    val mutable ActiveProcesses: uint32
+    val mutable TotalTerminatedProcesses: uint32
+
+[<Literal>]
+let private JobObjectBasicAccountingInformationClass = 1
+
 [<Literal>]
 let private JobObjectExtendedLimitInformationClass = 9
 
@@ -78,6 +93,15 @@ extern bool private AssignProcessToJobObject(nativeint job, nativeint childProce
 
 [<DllImport("kernel32.dll", SetLastError = true)>]
 extern bool private TerminateJobObject(nativeint job, uint32 exitCode)
+
+[<DllImport("kernel32.dll", SetLastError = true)>]
+extern bool private QueryInformationJobObject(
+    nativeint job,
+    int informationClass,
+    JobObjectBasicAccountingInformation& information,
+    uint32 informationLength,
+    nativeint returnLength
+)
 
 [<DllImport("kernel32.dll", SetLastError = true)>]
 extern bool private CloseHandle(nativeint handle)
@@ -214,22 +238,60 @@ let private unixProcessGroupHasLiveMembers groupId =
         let result = kill(-groupId, 0)
         result = 0 || Marshal.GetLastPInvokeError() <> 3
 
+let private windowsJobHasActiveProcesses handle =
+    let mutable information = Unchecked.defaultof<JobObjectBasicAccountingInformation>
+
+    let queried =
+        QueryInformationJobObject(
+            handle,
+            JobObjectBasicAccountingInformationClass,
+            &information,
+            uint32 (Marshal.SizeOf<JobObjectBasicAccountingInformation>()),
+            0n
+        )
+
+    if not queried then
+        let error = Marshal.GetLastPInvokeError()
+        raise (Win32Exception(error, $"Unable to query Windows job membership (error {error})."))
+
+    information.ActiveProcesses <> 0u
+
 type internal ProcessContainment private (childProcess: Process, unixProcessGroup: int option, windowsJob: nativeint option) =
     let mutable disposed = false
+    let mutable terminationRequested = false
+    let mutable terminationDrained = false
+    let childProcessId = childProcess.Id
 
-    member _.Process = childProcess
-
-    member _.Terminate() =
+    let signalContainedProcesses () =
         match unixProcessGroup with
         | Some groupId ->
-            // Negative pid addresses the process group, including descendants that
-            // outlived the direct child and can no longer be found via Process.Kill(true).
+            // The managed session wrapper may not have completed setsid(2) when
+            // termination is first requested. A later signal after the direct
+            // wrapper exits closes that launch race without widening containment.
             kill (-groupId, 9) |> ignore
         | None -> ()
 
         match windowsJob with
         | Some handle -> TerminateJobObject(handle, 1u) |> ignore
         | None -> ()
+
+    let hasLiveContainedProcesses () =
+        match unixProcessGroup, windowsJob with
+        | Some groupId, _ -> unixProcessGroupHasLiveMembers groupId
+        | None, Some handle -> windowsJobHasActiveProcesses handle
+        | None, None -> false
+
+    let containmentDescription =
+        match unixProcessGroup, windowsJob with
+        | Some groupId, _ -> $"Unix process group {groupId}"
+        | None, Some _ -> $"Windows job for process {childProcessId}"
+        | None, None -> $"process {childProcessId}"
+
+    member _.Process = childProcess
+
+    member _.Terminate() =
+        terminationRequested <- true
+        signalContainedProcesses ()
 
         try
             if not childProcess.HasExited then
@@ -239,26 +301,64 @@ type internal ProcessContainment private (childProcess: Process, unixProcessGrou
 
     member _.WaitForTerminationAsync(timeout: TimeSpan) : Task =
         (task {
+            if timeout < TimeSpan.Zero then
+                invalidArg (nameof timeout) "Process termination timeout must not be negative."
+
             let elapsed = Stopwatch.StartNew()
 
-            try
-                do! childProcess.WaitForExitAsync().WaitAsync(timeout)
-            with _ ->
-                ()
+            let remaining () =
+                let value = timeout - elapsed.Elapsed
 
-            match unixProcessGroup with
-            | Some groupId ->
-                // kill(2) only queues SIGKILL; under scheduler pressure a descendant
-                // can remain live briefly after the direct child is reaped. Wait for
-                // the group to contain no runnable/sleeping members. Linux zombies are
-                // already terminated and deliberately do not count as live containment
-                // leaks while their new parent catches up with wait(2).
-                let mutable live = unixProcessGroupHasLiveMembers groupId
+                if value > TimeSpan.Zero then value else TimeSpan.Zero
 
-                while live && elapsed.Elapsed < timeout do
-                    do! Task.Delay(10)
-                    live <- unixProcessGroupHasLiveMembers groupId
-            | None -> ()
+            if not childProcess.HasExited then
+                let directProcessWait = remaining ()
+
+                if directProcessWait = TimeSpan.Zero then
+                    raise (
+                        TimeoutException(
+                            $"Process containment did not drain within {int64 timeout.TotalMilliseconds}ms: process {childProcessId} is still active."
+                        )
+                    )
+
+                try
+                    do! childProcess.WaitForExitAsync().WaitAsync(directProcessWait)
+                with :? TimeoutException ->
+                    raise (
+                        TimeoutException(
+                            $"Process containment did not drain within {int64 timeout.TotalMilliseconds}ms: process {childProcessId} is still active."
+                        )
+                    )
+
+            // Termination can race the managed wrapper's setsid(2): the first
+            // group signal then sees no group, while the wrapper creates it just
+            // before its own asynchronous kill completes. Once the direct wrapper
+            // is reaped, the group identity is stable, so signal it again before
+            // checking membership.
+            if terminationRequested then
+                signalContainedProcesses ()
+
+            // TerminateJobObject and kill(2) initiate termination but do not prove
+            // that every contained process has left the OS membership set. Keep the
+            // containment handle open and query that set until it is empty.
+            let mutable live = hasLiveContainedProcesses ()
+
+            while live && remaining () > TimeSpan.Zero do
+                if terminationRequested then
+                    signalContainedProcesses ()
+
+                let delay = min (TimeSpan.FromMilliseconds(10.0)) (remaining ())
+                do! Task.Delay(delay)
+                live <- hasLiveContainedProcesses ()
+
+            if live then
+                raise (
+                    TimeoutException(
+                        $"Process containment did not drain within {int64 timeout.TotalMilliseconds}ms: {containmentDescription} still has active members."
+                    )
+                )
+
+            terminationDrained <- true
          }
          :> Task)
 
@@ -266,7 +366,9 @@ type internal ProcessContainment private (childProcess: Process, unixProcessGrou
         member this.Dispose() =
             if not disposed then
                 disposed <- true
-                this.Terminate()
+
+                if not terminationDrained then
+                    this.Terminate()
 
                 match windowsJob with
                 | Some handle -> CloseHandle(handle) |> ignore
@@ -371,7 +473,15 @@ let private terminate
     task {
         let proc = containment.Process
         containment.Terminate()
-        do! containment.WaitForTerminationAsync(cleanupTimeout)
+
+        let! containmentError =
+            task {
+                try
+                    do! containment.WaitForTerminationAsync(cleanupTimeout)
+                    return None
+                with error ->
+                    return Some error
+            }
 
         // A direct child can exit after spawning a descendant that inherited one of
         // the redirected pipe handles. In that case WaitForExitAsync has completed,
@@ -393,11 +503,39 @@ let private terminate
         let pipesTask = Task.WhenAll(stdoutTask, stderrTask)
         observeFault pipesTask
 
-        try
-            let! _ = pipesTask.WaitAsync(cleanupTimeout)
-            ()
-        with _ ->
-            ()
+        let! pipeError =
+            task {
+                try
+                    let! _ = pipesTask.WaitAsync(cleanupTimeout)
+                    return None
+                with
+                | :? TimeoutException ->
+                    return
+                        Some(
+                            TimeoutException(
+                                $"Process output pipes did not drain within {int64 cleanupTimeout.TotalMilliseconds}ms during cleanup."
+                            )
+                            :> exn
+                        )
+                | _ ->
+                    // Closing a reader intentionally faults an in-flight read. The
+                    // task is observed above; completion, rather than success, is the
+                    // cleanup invariant on cancellation and timeout paths.
+                    return None
+            }
+
+        match containmentError, pipeError with
+        | None, None -> ()
+        | Some error, None
+        | None, Some error -> return raise error
+        | Some containmentFailure, Some pipeFailure ->
+            return
+                raise (
+                    AggregateException(
+                        "Process containment and redirected-pipe cleanup both failed.",
+                        [| containmentFailure; pipeFailure |]
+                    )
+                )
     }
 
 let private runAsyncWithOutputLimitCore
@@ -443,29 +581,61 @@ let private runAsyncWithOutputLimitCore
         use timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
         timeoutCts.CancelAfter(timeout)
 
+        let! executionResult =
+            task {
+                try
+                    // The same linked token and CancelAfter deadline covers process exit AND
+                    // both redirected-pipe drains. Waiting for the parent alone is insufficient:
+                    // a grandchild may keep an inherited stdout/stderr handle open after the
+                    // parent exits (#164).
+                    do! proc.WaitForExitAsync(timeoutCts.Token)
+                    let! stdout, stdoutTruncated = stdoutTask.WaitAsync(timeoutCts.Token)
+                    let! stderr, stderrTruncated = stderrTask.WaitAsync(timeoutCts.Token)
+
+                    return
+                        Ok
+                            { ExitCode = proc.ExitCode
+                              StandardOutput = stdout
+                              StandardError = stderr
+                              StandardOutputTruncated = stdoutTruncated
+                              StandardErrorTruncated = stderrTruncated }
+                with error ->
+                    return Error error
+            }
+
+        let mutable cleanupError: exn option = None
+
         try
-            // The same linked token and CancelAfter deadline covers process exit AND
-            // both redirected-pipe drains. Waiting for the parent alone is insufficient:
-            // a grandchild may keep an inherited stdout/stderr handle open after the
-            // parent exits (#164).
-            do! proc.WaitForExitAsync(timeoutCts.Token)
-            let! stdout, stdoutTruncated = stdoutTask.WaitAsync(timeoutCts.Token)
-            let! stderr, stderrTruncated = stderrTask.WaitAsync(timeoutCts.Token)
-
-            return
-                { ExitCode = proc.ExitCode
-                  StandardOutput = stdout
-                  StandardError = stderr
-                  StandardOutputTruncated = stdoutTruncated
-                  StandardErrorTruncated = stderrTruncated }
-        with :? OperationCanceledException ->
+            // This also runs after an ordinary zero/nonzero exit. Descendants can
+            // redirect their own output, letting both parent pipes reach EOF while
+            // they remain in the process group/job; do not release the caller's slot
+            // until verified containment membership is empty.
             do! terminate containment stdoutTask stderrTask
+        with error ->
+            cleanupError <- Some error
 
-            if cancellationToken.IsCancellationRequested then
-                return raise (OperationCanceledException(cancellationToken))
-            else
-                return raise (
-                    TimeoutException($"Process '%s{fileName}' timed out after %d{int64 timeout.TotalMilliseconds}ms.")
+        let normalizeExecutionError (error: exn) =
+            match error with
+            | :? OperationCanceledException when cancellationToken.IsCancellationRequested ->
+                OperationCanceledException(cancellationToken) :> exn
+            | :? OperationCanceledException ->
+                TimeoutException(
+                    $"Process '%s{fileName}' timed out after %d{int64 timeout.TotalMilliseconds}ms."
+                )
+                :> exn
+            | _ -> error
+
+        match executionResult, cleanupError with
+        | Ok output, None -> return output
+        | Error error, None -> return raise (normalizeExecutionError error)
+        | Ok _, Some error -> return raise error
+        | Error error, Some containmentFailure ->
+            return
+                raise (
+                    AggregateException(
+                        "Process execution and containment cleanup both failed.",
+                        [| normalizeExecutionError error; containmentFailure |]
+                    )
                 )
     }
 

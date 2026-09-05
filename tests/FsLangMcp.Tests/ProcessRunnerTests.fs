@@ -52,6 +52,74 @@ let private waitForProcessExit pid =
         return not running
     }
 
+let private waitForFile path =
+    task {
+        let deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10.0)
+
+        while not (File.Exists path) && DateTime.UtcNow < deadline do
+            do! Task.Delay(25)
+
+        return File.Exists path
+    }
+
+let private readRecordedPids path =
+    File.ReadAllLines(path)
+    |> Array.choose (fun value ->
+        match Int32.TryParse value with
+        | true, pid -> Some pid
+        | _ -> None)
+
+let private stopRecordedProcesses pids =
+    for pid in pids do
+        if isProcessRunning pid then
+            try
+                use child = Process.GetProcessById(pid)
+                child.Kill(true)
+            with _ ->
+                ()
+
+let private escapeVerbatimString (value: string) = value.Replace("\"", "\"\"")
+
+let private processTreeScripts pidPath exitCode keepParentAlive =
+    let childScript = tempScript "System.Threading.Thread.Sleep(30000)\n"
+    let escapedPidPath = escapeVerbatimString pidPath
+    let escapedChildScript = childScript |> Path.GetFullPath |> escapeVerbatimString
+
+    let parentScript =
+        tempScript
+            $"""
+open System
+open System.Diagnostics
+open System.IO
+
+let startInfo = ProcessStartInfo()
+startInfo.FileName <- Environment.ProcessPath
+startInfo.UseShellExecute <- false
+startInfo.RedirectStandardOutput <- true
+startInfo.RedirectStandardError <- true
+startInfo.CreateNoWindow <- true
+startInfo.ArgumentList.Add("fsi")
+startInfo.ArgumentList.Add("--exec")
+startInfo.ArgumentList.Add(@"%s{escapedChildScript}")
+
+let child = new Process(StartInfo = startInfo)
+
+if not (child.Start()) then
+    failwith "Unable to start descendant process."
+
+let pidPath = @"%s{escapedPidPath}"
+let pendingPidPath = pidPath + ".pending"
+File.WriteAllLines(pendingPidPath, [| Environment.ProcessId.ToString(); child.Id.ToString() |])
+File.Move(pendingPidPath, pidPath)
+
+if %b{keepParentAlive} then
+    System.Threading.Thread.Sleep(30000)
+
+Environment.Exit(%d{exitCode})
+"""
+
+    parentScript, childScript
+
 [<Fact>]
 let ``Runner rejects caller cancellation before entering the process launch path`` () : Task =
     task {
@@ -92,13 +160,11 @@ let ``Runner kills a process tree when the timeout expires`` () : Task =
     task {
         let id = Guid.NewGuid().ToString("N")
         let pidPath = Path.Combine(Path.GetTempPath(), $"fslangmcp_process_%s{id}.pid")
-        let fileName, arguments, script =
+        let fileName, arguments, scripts =
             if OperatingSystem.IsWindows() then
-                let script =
-                    tempScript
-                        $"System.IO.File.WriteAllText(@\"%s{pidPath}\", System.Environment.ProcessId.ToString())\nSystem.Threading.Thread.Sleep(30000)\n"
+                let parentScript, childScript = processTreeScripts pidPath 0 true
 
-                "dotnet", [ "fsi"; "--exec"; script ], Some script
+                "dotnet", [ "fsi"; "--exec"; parentScript ], [ parentScript; childScript ]
             else
                 // Use a tiny native shell tree so suite-wide CPU pressure tests
                 // termination rather than racing the .NET SDK/F# Interactive startup.
@@ -108,7 +174,7 @@ let ``Runner kills a process tree when the timeout expires`` () : Task =
                   "sleep 30 & child=$!; printf '%s\n%s\n' \"$$\" \"$child\" > \"$1\"; wait \"$child\""
                   "fslangmcp-runner"
                   pidPath ],
-                None
+                []
 
         try
             let operation =
@@ -118,12 +184,7 @@ let ``Runner kills a process tree when the timeout expires`` () : Task =
             Assert.Contains("timed out", error.Message)
             Assert.True(File.Exists(pidPath), "The child did not start before the timeout.")
 
-            let pids =
-                File.ReadAllLines(pidPath)
-                |> Array.choose (fun value ->
-                    match Int32.TryParse value with
-                    | true, pid -> Some pid
-                    | _ -> None)
+            let pids = readRecordedPids pidPath
 
             Assert.NotEmpty pids
 
@@ -136,7 +197,132 @@ let ``Runner kills a process tree when the timeout expires`` () : Task =
             if File.Exists(pidPath) then
                 File.Delete(pidPath)
 
-            script |> Option.iter File.Delete
+            scripts |> List.iter File.Delete
+    }
+
+[<Theory>]
+[<InlineData(0)>]
+[<InlineData(23)>]
+let ``Runner returns from ordinary exits only after detached-output descendants are drained`` exitCode : Task =
+    task {
+        let id = Guid.NewGuid().ToString("N")
+        let pidPath = Path.Combine(Path.GetTempPath(), $"fslangmcp_completion_%s{id}.pid")
+        let parentScript, childScript = processTreeScripts pidPath exitCode false
+        let mutable pids = Array.empty
+
+        try
+            let! result =
+                runAsync
+                    "dotnet"
+                    [ "fsi"; "--exec"; parentScript ]
+                    (TimeSpan.FromSeconds(30.0))
+                    CancellationToken.None
+
+            Assert.Equal(exitCode, result.ExitCode)
+            Assert.True(File.Exists(pidPath), "The process tree did not start.")
+            pids <- readRecordedPids pidPath
+            Assert.Equal(2, pids.Length)
+
+            for pid in pids do
+                Assert.False(isProcessRunning pid, $"Process %d{pid} was still active after runner completion.")
+        finally
+            stopRecordedProcesses pids
+
+            if File.Exists(pidPath) then
+                File.Delete(pidPath)
+
+            File.Delete(parentScript)
+            File.Delete(childScript)
+    }
+
+[<Fact>]
+let ``Runner cancellation completes only after the contained process tree is drained`` () : Task =
+    task {
+        let id = Guid.NewGuid().ToString("N")
+        let pidPath = Path.Combine(Path.GetTempPath(), $"fslangmcp_cancellation_%s{id}.pid")
+        let parentScript, childScript = processTreeScripts pidPath 0 true
+        let mutable pids = Array.empty
+        use cancellation = new CancellationTokenSource()
+
+        try
+            let operation =
+                runAsync
+                    "dotnet"
+                    [ "fsi"; "--exec"; parentScript ]
+                    (TimeSpan.FromSeconds(30.0))
+                    cancellation.Token
+
+            let! started = waitForFile pidPath
+
+            if not started then
+                cancellation.Cancel()
+
+                try
+                    let! _ = operation
+                    ()
+                with _ ->
+                    ()
+
+            Assert.True(started, "The process tree did not start before cancellation.")
+            pids <- readRecordedPids pidPath
+            Assert.Equal(2, pids.Length)
+
+            cancellation.Cancel()
+            let! error = Assert.ThrowsAnyAsync<OperationCanceledException>(fun () -> operation :> Task)
+            Assert.Equal(cancellation.Token, error.CancellationToken)
+
+            for pid in pids do
+                Assert.False(isProcessRunning pid, $"Process %d{pid} was still active after cancellation completed.")
+        finally
+            stopRecordedProcesses pids
+
+            if File.Exists(pidPath) then
+                File.Delete(pidPath)
+
+            File.Delete(parentScript)
+            File.Delete(childScript)
+    }
+
+[<Fact>]
+let ``Containment wait reports an undrained process instead of silently succeeding`` () : Task =
+    task {
+        let startInfo = ProcessStartInfo()
+        let mutable script = None
+
+        if OperatingSystem.IsWindows() then
+            let path = tempScript "System.Threading.Thread.Sleep(30000)\n"
+            script <- Some path
+            startInfo.FileName <- "dotnet"
+            startInfo.ArgumentList.Add("fsi")
+            startInfo.ArgumentList.Add("--exec")
+            startInfo.ArgumentList.Add(path)
+        else
+            startInfo.FileName <- "/bin/sh"
+            startInfo.ArgumentList.Add("-c")
+            startInfo.ArgumentList.Add("sleep 30")
+
+        startInfo.UseShellExecute <- false
+        startInfo.CreateNoWindow <- true
+        use containment = startContainedProcess startInfo
+
+        let! waitError =
+            task {
+                try
+                    do! containment.WaitForTerminationAsync(TimeSpan.Zero)
+                    return None
+                with error ->
+                    return Some error
+            }
+
+        terminateContainedProcess containment
+        do! containment.WaitForTerminationAsync(TimeSpan.FromSeconds(5.0))
+        script |> Option.iter File.Delete
+
+        match waitError with
+        | Some error ->
+            let timeoutError = Assert.IsType<TimeoutException>(error)
+            Assert.Contains("did not drain", timeoutError.Message)
+        | None -> Assert.Fail("An active contained process was reported as drained.")
     }
 
 [<Fact>]
