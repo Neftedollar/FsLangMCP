@@ -12409,6 +12409,18 @@ type internal FcsBridge
     member _.CheckTargetDiscoveryStartedCount = checkTargetDiscoveryAdmission.StartedCount
     member _.CheckTargetDiscoveryRejectedCount = checkTargetDiscoveryAdmission.RejectedCount
     member _.CheckTargetDiscoveryInFlightCount = checkTargetDiscoveriesInFlight.Count
+
+    /// Returns the already-started exact-key discovery worker for deterministic cleanup tests.
+    /// Observing this seam never forces an unstarted Lazy worker to begin.
+    member _.TryGetCheckTargetDiscoveryCompletionForTest
+        (scope: string, target: string, path: string option)
+        : Task option =
+        let key = checkDiscoveryKey scope target path
+
+        match checkTargetDiscoveriesInFlight.TryGetValue(key) with
+        | true, pending when pending.IsValueCreated -> Some(pending.Value :> Task)
+        | _ -> None
+
     member _.CheckProjectDiscoveryFallbackCount = Volatile.Read(&checkProjectDiscoveryFallbackCount)
 
     /// Pure deterministic seam for verifying collision-free discovery key framing.
