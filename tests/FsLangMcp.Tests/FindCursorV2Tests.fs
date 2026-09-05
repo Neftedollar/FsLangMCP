@@ -57,6 +57,8 @@ let ``find v2 cursor roundtrips and contains only the accepted opaque fields`` (
 [<InlineData("{\"offset\":1}", "cursor_version_unsupported")>]
 [<InlineData("{\"v\":3,\"tool\":\"find\",\"offset\":1,\"query\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"snapshot\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}", "cursor_version_unsupported")>]
 [<InlineData("{\"v\":2,\"tool\":\"other\",\"offset\":1,\"query\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"snapshot\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}", "cursor_tool_mismatch")>]
+[<InlineData("{\"tool\":\"other\"}", "cursor_malformed")>]
+[<InlineData("{\"v\":3,\"tool\":\"find\",\"offset\":1,\"query\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"snapshot\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"extra\":true}", "cursor_malformed")>]
 [<InlineData("{\"v\":2,\"tool\":\"find\",\"offset\":-1,\"query\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"snapshot\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}", "cursor_malformed")>]
 [<InlineData("{\"v\":2,\"tool\":\"find\",\"offset\":1,\"query\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"snapshot\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}", "cursor_malformed")>]
 [<InlineData("{\"v\":2,\"tool\":\"find\",\"offset\":1,\"query\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"snapshot\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"extra\":true}", "cursor_malformed")>]

@@ -34,6 +34,8 @@ These two tools replace the legacy search/check entry points removed in v0.11.0.
 - `timeoutMs` — non-negative end-to-end budget including admission, resolution, discovery,
   sweep, fallback, and bounded response construction; `0` returns an immediate typed timeout
   (default: `120000`)
+- `cursor` — a stateless v2 continuation issued by `find`; it is bound to the canonical request
+  and complete result stream, while `maxResults` and `timeoutMs` may change between pages
 
 **Use when:** "Where is `X` defined?", "What calls `OrderId`?", "Which files set this record field?"
 
@@ -74,13 +76,23 @@ capped by `maxResults`, and every nonzero cursor page, has `resolution.complete=
 the project sweep completed. Follow `truncated` / `nextCursor` and reconcile the collected rows
 with `totalEstimate.sites` before treating a refactor count as exhaustive.
 
+**Cursor consistency:** never reuse an offset-only legacy cursor with `find`. A changed request
+returns `cursor_query_mismatch`; a changed source, resolved position symbol, project set, coverage
+category, diagnostic identity, or canonical site stream returns `cursor_stale`. Both require a
+restart without the cursor. `cursor_validation_incomplete` is different: it returns no sites and
+sets `retrySameCursor=true`, so retry the same cursor with a larger `timeoutMs`. An initial
+deadline-partial result is useful but has `nextCursor=null` and requires restarting at page zero.
+The token contains hashes rather than query/path/source text and retains no per-cursor server
+state; it is a consistency check, not a claim of an atomic filesystem snapshot.
+
 **Deadlines:** phases share one clock, reserving at most 250 ms inside `timeoutMs` for response
 construction. `coverage.phases` identifies expired/not-started work; `projectsNotStarted` does not
 inflate `projectsTimedOut`. Shared workers retain separate caller deadlines and keep admission
 protection until actual completion. A `find_response_timeout` requires restarting without a
-cursor (`paginationRestartRequired=true`), even if project coverage completed. Diagnostic totals
-are exhaustive only when `projectDiagnosticsCountComplete=true`; at most 200 are projected, and
-the final size limit may deliver fewer.
+cursor (`paginationRestartRequired=true`) on an initial request, even if project coverage
+completed; a continuation maps the same expiry to `cursor_validation_incomplete` and same-cursor
+retry. Diagnostic totals are exhaustive only when `projectDiagnosticsCountComplete=true`; at most
+200 are projected, and the final size limit may deliver fewer.
 If `breakdownComplete=false`, per-kind counts are only the prefix counted before expiry, not a
 complete reconciliation of `totalSites`. A later response timeout can leave this flag true when
 the counting pass had already finished.

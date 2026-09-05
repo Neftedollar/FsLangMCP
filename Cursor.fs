@@ -126,10 +126,6 @@ let private tryNonNegativeOffset (element: JsonElement) =
         | true, _ -> Error "cursor offset must be a non-negative integer"
         | false, _ -> Error "cursor offset is not a valid int32"
 
-let private tryProperty (root: JsonElement) (name: string) =
-    let mutable value = JsonElement()
-    if root.TryGetProperty(name, &value) then Some value else None
-
 let private isCanonicalSha256 (value: string) =
     if isNull value || value.Length <> 43 then
         false
@@ -217,68 +213,55 @@ let tryDecodeFind (cursor: string) : Result<FindCursorV2, FindCursorDecodeError>
                             FindCursorDecodeErrorKind.Legacy
                             "Offset-only find cursors are unsupported by the v2 continuation contract."
                     | Error reason -> findDecodeError FindCursorDecodeErrorKind.Malformed reason
-                | Ok(_, _) ->
-                    match tryProperty root "tool" with
-                    | Some tool when
-                        tool.ValueKind = JsonValueKind.String
-                        && not (String.Equals(tool.GetString(), "find", StringComparison.Ordinal))
-                        ->
+                | Ok(properties, names) ->
+                    let expected = [| "v"; "tool"; "offset"; "query"; "snapshot" |]
+
+                    if not (hasExactly expected properties names) then
                         findDecodeError
-                            FindCursorDecodeErrorKind.ToolMismatch
-                            "This cursor was issued for another tool and cannot be used with find."
-                    | _ ->
-                        match tryProperty root "v" with
-                        | Some version when version.ValueKind = JsonValueKind.Number ->
-                            match version.TryGetInt32() with
-                            | true, value when value <> 2 ->
-                                findDecodeError
-                                    FindCursorDecodeErrorKind.UnsupportedVersion
-                                    $"Find cursor version %d{value} is unsupported."
-                            | _ ->
-                                let expected = [| "v"; "tool"; "offset"; "query"; "snapshot" |]
+                            FindCursorDecodeErrorKind.Malformed
+                            "find cursor payload must contain exactly v, tool, offset, query, and snapshot"
+                    else
+                        let version = root.GetProperty("v")
+                        let tool = root.GetProperty("tool")
+                        let query = root.GetProperty("query")
+                        let snapshot = root.GetProperty("snapshot")
 
-                                match propertiesWithoutDuplicates root with
-                                | Ok(properties, names) when hasExactly expected properties names ->
-                                    let tool = root.GetProperty("tool")
-                                    let query = root.GetProperty("query")
-                                    let snapshot = root.GetProperty("snapshot")
-
-                                    if version.ValueKind <> JsonValueKind.Number then
-                                        findDecodeError FindCursorDecodeErrorKind.Malformed "find cursor 'v' must be an integer"
-                                    elif
-                                        match version.TryGetInt32() with
-                                        | true, 2 -> false
-                                        | _ -> true
-                                    then
-                                        findDecodeError FindCursorDecodeErrorKind.Malformed "find cursor 'v' must be the integer 2"
-                                    elif
-                                        tool.ValueKind <> JsonValueKind.String
-                                        || not (String.Equals(tool.GetString(), "find", StringComparison.Ordinal))
-                                    then
-                                        findDecodeError FindCursorDecodeErrorKind.Malformed "find cursor 'tool' must be 'find'"
-                                    elif query.ValueKind <> JsonValueKind.String || not (isCanonicalSha256 (query.GetString())) then
-                                        findDecodeError
-                                            FindCursorDecodeErrorKind.Malformed
-                                            "find cursor 'query' must be a canonical unpadded Base64URL SHA-256 value"
-                                    elif
-                                        snapshot.ValueKind <> JsonValueKind.String
-                                        || not (isCanonicalSha256 (snapshot.GetString()))
-                                    then
-                                        findDecodeError
-                                            FindCursorDecodeErrorKind.Malformed
-                                            "find cursor 'snapshot' must be a canonical unpadded Base64URL SHA-256 value"
-                                    else
-                                        match tryNonNegativeOffset (root.GetProperty("offset")) with
-                                        | Error reason -> findDecodeError FindCursorDecodeErrorKind.Malformed reason
-                                        | Ok offset ->
-                                            Ok
-                                                { Offset = offset
-                                                  Query = query.GetString()
-                                                  Snapshot = snapshot.GetString() }
-                                | _ ->
-                                    findDecodeError
-                                        FindCursorDecodeErrorKind.Malformed
-                                        "find cursor payload must contain exactly v, tool, offset, query, and snapshot"
+                        match version.ValueKind, version.TryGetInt32() with
+                        | JsonValueKind.Number, (true, value) when value <> 2 ->
+                            findDecodeError
+                                FindCursorDecodeErrorKind.UnsupportedVersion
+                                $"Find cursor version %d{value} is unsupported."
+                        | JsonValueKind.Number, (true, 2) when
+                            tool.ValueKind = JsonValueKind.String
+                            && not (String.Equals(tool.GetString(), "find", StringComparison.Ordinal))
+                            ->
+                            findDecodeError
+                                FindCursorDecodeErrorKind.ToolMismatch
+                                "This cursor was issued for another tool and cannot be used with find."
+                        | JsonValueKind.Number, (true, 2) when tool.ValueKind <> JsonValueKind.String ->
+                            findDecodeError FindCursorDecodeErrorKind.Malformed "find cursor 'tool' must be 'find'"
+                        | JsonValueKind.Number, (true, 2) when
+                            query.ValueKind <> JsonValueKind.String
+                            || not (isCanonicalSha256 (query.GetString()))
+                            ->
+                            findDecodeError
+                                FindCursorDecodeErrorKind.Malformed
+                                "find cursor 'query' must be a canonical unpadded Base64URL SHA-256 value"
+                        | JsonValueKind.Number, (true, 2) when
+                            snapshot.ValueKind <> JsonValueKind.String
+                            || not (isCanonicalSha256 (snapshot.GetString()))
+                            ->
+                            findDecodeError
+                                FindCursorDecodeErrorKind.Malformed
+                                "find cursor 'snapshot' must be a canonical unpadded Base64URL SHA-256 value"
+                        | JsonValueKind.Number, (true, 2) ->
+                            match tryNonNegativeOffset (root.GetProperty("offset")) with
+                            | Error reason -> findDecodeError FindCursorDecodeErrorKind.Malformed reason
+                            | Ok offset ->
+                                Ok
+                                    { Offset = offset
+                                      Query = query.GetString()
+                                      Snapshot = snapshot.GetString() }
                         | _ ->
                             findDecodeError FindCursorDecodeErrorKind.Malformed "find cursor 'v' must be an integer"
         with
@@ -431,7 +414,7 @@ let paginationFields
 
     [ "truncated", jbool isTruncated
       "nextCursor", nextCursorNode
-      "totalEstimate", jobj [ unitName, jint totalCount ]
+      "totalEstimate", jobj [ (unitName, jint totalCount) ]
       "pageOffset", jint pageOffset
       "pageSize", jint pageSize ]
 
@@ -455,6 +438,6 @@ let findPaginationFieldsV2
 
     [ "truncated", jbool isTruncated
       "nextCursor", nextCursorNode
-      "totalEstimate", jobj [ unitName, jint totalCount ]
+      "totalEstimate", jobj [ (unitName, jint totalCount) ]
       "pageOffset", jint pageOffset
       "pageSize", jint pageSize ]
