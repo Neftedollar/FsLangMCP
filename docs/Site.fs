@@ -10,7 +10,7 @@ open Nacara.Theme
 let RepositoryUrl = "https://github.com/Neftedollar/FsLangMCP"
 
 [<Literal>]
-let SiteOrigin = "https://neftedollar.github.io"
+let SiteOrigin = "https://neftedollar.com"
 
 [<Literal>]
 let SiteBaseUrl = "/FsLangMCP/"
@@ -165,7 +165,7 @@ let site =
         { options with
             CheckExternal = Environment.GetEnvironmentVariable "FSLANGMCP_DOCS_CHECK_EXTERNAL" = "1"
             FailOnExternal = false
-            Ignore = [ @"^https://neftedollar\.github\.io/FsLangMCP/" ]
+            Ignore = [ @"^https://neftedollar\.com/FsLangMCP/" ]
         }
     )
     |> LightningCss.register
