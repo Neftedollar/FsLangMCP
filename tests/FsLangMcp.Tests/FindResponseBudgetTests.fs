@@ -555,7 +555,7 @@ type FindResponseBudgetIntegrationTests(fixture: FindBudgetFixture) =
             Assert.False(recovery["reuseOriginalCursor"].GetValue<bool>())
 
             Assert.Equal(
-                "unchanged_result_identity_max_results_only",
+                "never_for_budget_failure",
                 recovery["reuseOriginalCursorCondition"].GetValue<string>()
             )
 
@@ -570,7 +570,7 @@ type FindResponseBudgetIntegrationTests(fixture: FindBudgetFixture) =
         }
 
     [<Fact>]
-    member _.``continuation overflow allows same cursor only for identity-neutral shaping`` () : Task =
+    member _.``continuation overflow rejects ineffective same cursor retry`` () : Task =
         task {
             Assert.True(
                 fixture.BuildExitCode = 0,
@@ -595,11 +595,13 @@ type FindResponseBudgetIntegrationTests(fixture: FindBudgetFixture) =
             Assert.Null(result["nextCursor"])
 
             let recovery = result["recovery"]
+            Assert.Equal("restart_without_cursor", recovery["action"].GetValue<string>())
             Assert.False(recovery["reuseOriginalCursor"].GetValue<bool>())
+            Assert.Equal("never_for_budget_failure", recovery["reuseOriginalCursorCondition"].GetValue<string>())
             let sameCursorRetry = recovery["sameCursorRetry"]
-            Assert.True(sameCursorRetry["allowed"].GetValue<bool>())
+            Assert.False(sameCursorRetry["allowed"].GetValue<bool>())
             Assert.True(sameCursorRetry["requiresUnchangedResultIdentity"].GetValue<bool>())
-            Assert.True(sameCursorRetry["reuseOriginalCursor"].GetValue<bool>())
+            Assert.False(sameCursorRetry["reuseOriginalCursor"].GetValue<bool>())
             let allowedChangedInputs = sameCursorRetry["allowedChangedInputs"] :?> JsonArray
             Assert.Equal(1, allowedChangedInputs.Count)
             Assert.Equal("maxResults", allowedChangedInputs[0].GetValue<string>())

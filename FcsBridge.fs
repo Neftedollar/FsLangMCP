@@ -7401,11 +7401,11 @@ type internal FcsBridge
                           "fsacFallbackReason", null ]
                     :> JsonNode
 
-                // Cursor v2 excludes maxResults from query identity, but includes the
-                // other response-shaping inputs below. Keep the two recovery choices
-                // structurally separate so a client cannot combine scope/path narrowing
-                // with the old continuation offset and silently skip a new result prefix.
-                let canRetrySameCursor = pageOffset > 0 && pageSize > 1
+                // The planner reaches this envelope only after a one-site response (or
+                // fixed metadata alone) has already failed to fit. Reducing maxResults
+                // therefore cannot change the serialized payload, so retaining a cursor
+                // would only send the caller into a non-progressing retry loop.
+                let canRetrySameCursor = false
 
                 let sameCursorRetry =
                     jobj
@@ -7430,14 +7430,12 @@ type internal FcsBridge
 
                 let recovery =
                     jobj
-                        [ "action", jstr "choose_cursor_safe_retry"
+                        [ "action", jstr "restart_without_cursor"
                           "instruction",
                           jstr
-                              "For a continuation, reuse the original cursor only with every result-identity input unchanged and only maxResults reduced. Before changing contextLines, includeInfo, includePerProject, query, kind, exact, member, field, scope, projectPath, path, line, character, word, occurrence, includeDeclaration, or includeSiteTypes, restart without a cursor."
-                          // Safe default for clients that do not understand the two
-                          // conditional branches below: never blindly reuse the cursor.
+                              "Reducing maxResults cannot make this blocked response fit because the planner already tested one site or fixed metadata alone. Restart without a cursor before reducing contextLines or metadata, or before changing query, kind, exact, member, field, scope, projectPath, path, line, character, word, occurrence, includeDeclaration, or includeSiteTypes."
                           "reuseOriginalCursor", jbool false
-                          "reuseOriginalCursorCondition", jstr "unchanged_result_identity_max_results_only"
+                          "reuseOriginalCursorCondition", jstr "never_for_budget_failure"
                           "sameCursorRetry", sameCursorRetry
                           "changedIdentityRetry", changedIdentityRetry ]
                     :> JsonNode
