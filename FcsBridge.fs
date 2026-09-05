@@ -2320,6 +2320,85 @@ type internal BoundedCheckWorkAdmission(operation: string, capacity: int) =
     member _.RejectedCount = Volatile.Read(&rejectedCount)
     member _.MaxObservedConcurrency = Volatile.Read(&maxObservedConcurrency)
 
+/// One exact-key actual worker with caller-owned waiters. The worker never captures
+/// the first caller's deadline: it only learns whether at least one caller still owns
+/// an interest in continuing. Once a worker observes zero waiters, the entry closes to
+/// late joiners and is removed only after that exact worker has settled.
+[<Sealed>]
+type private WaiterAwareSingleFlight<'T>
+    (
+        start: (unit -> bool) -> Task<'T>,
+        onCompleted: WaiterAwareSingleFlight<'T> -> unit
+    ) as this =
+    let gate = obj ()
+    let waiters = System.Collections.Generic.Dictionary<int, unit -> bool>()
+    let mutable nextWaiterId = 0
+    let mutable acceptingWaiters = true
+
+    let close () =
+        lock gate (fun () -> acceptingWaiters <- false)
+
+    let operation =
+        lazy
+            (task {
+                try
+                    return! start this.HasActiveWaiters
+                finally
+                    close ()
+                    onCompleted this
+            })
+
+    member _.TryAddWaiter(isActive: unit -> bool) =
+        lock gate (fun () ->
+            if acceptingWaiters then
+                nextWaiterId <- nextWaiterId + 1
+                waiters.Add(nextWaiterId, isActive)
+                Some nextWaiterId
+            else
+                None)
+
+    member _.ReleaseWaiter(waiterId: int) =
+        lock gate (fun () -> waiters.Remove(waiterId) |> ignore)
+
+    member _.HasActiveWaiters() =
+        lock gate (fun () ->
+            let expired = ResizeArray<int>()
+
+            for waiter in waiters do
+                let active =
+                    try
+                        waiter.Value()
+                    with :? OperationCanceledException ->
+                        false
+
+                if not active then
+                    expired.Add(waiter.Key)
+
+            for waiterId in expired do
+                waiters.Remove(waiterId) |> ignore
+
+            if waiters.Count > 0 then
+                true
+            else
+                acceptingWaiters <- false
+                false)
+
+    member _.Operation = operation.Value
+    member _.WaiterCount = lock gate (fun () -> waiters.Count)
+
+[<Sealed>]
+type private WaiterAwareSingleFlightWaiter<'T>(flight: WaiterAwareSingleFlight<'T>, waiterId: int) =
+    let mutable released = 0
+
+    member _.Operation = flight.Operation
+
+    member _.Release() =
+        if Interlocked.Exchange(&released, 1) = 0 then
+            flight.ReleaseWaiter(waiterId)
+
+    interface IDisposable with
+        member this.Dispose() = this.Release()
+
 [<RequireQualifiedAccess>]
 type private CheckTargetDiscoveryResult =
     | Scope of string
@@ -2748,7 +2827,7 @@ type internal FcsBridge
         System.Collections.Generic.Dictionary<string, string>(StringComparer.Ordinal)
 
     let optionsInFlight =
-        ConcurrentDictionary<string, Lazy<Task<ProjectOptionsCacheEntry>>>()
+        ConcurrentDictionary<string, WaiterAwareSingleFlight<ProjectOptionsCacheEntry>>()
 
     // Project-cache validation performs recursive hashing and Ionide/MSBuild loads
     // race on process-global SDK state. Keep the entire exact-fsproj resolve behind
@@ -2783,7 +2862,8 @@ type internal FcsBridge
     let snapshotComputationAdmission =
         BoundedCheckWorkAdmission("project snapshot computation", 1)
 
-    let snapshotComputationsInFlight = ConcurrentDictionary<string, Lazy<Task<string>>>()
+    let snapshotComputationsInFlight =
+        ConcurrentDictionary<string, WaiterAwareSingleFlight<string>>()
 
     let checkTargetDiscoveryAdmission =
         BoundedCheckWorkAdmission("check target discovery", 1)
@@ -2792,18 +2872,18 @@ type internal FcsBridge
         ConcurrentDictionary<string, Lazy<Task<CheckTargetDiscoveryResult>>>()
 
     // Find has the same uncancellable boundaries as Check, plus position resolution.
-    // Exact-key retries share the active Lazy; distinct keys are rejected immediately.
+    // Exact-key callers share the active worker; distinct keys are rejected immediately.
     // Caller/deadline expiry never releases these slots before the real worker settles.
     let findPositionResolutionAdmission =
         BoundedCheckWorkAdmission("find position resolution", freshProjectCheckCapacity)
 
     let findPositionResolutionsInFlight =
-        ConcurrentDictionary<string, Lazy<Task<Result<string, JsonNode>>>>()
+        ConcurrentDictionary<string, WaiterAwareSingleFlight<Result<string, JsonNode>>>()
 
     let findTargetDiscoveryAdmission = BoundedCheckWorkAdmission("find target discovery", 1)
 
     let findTargetDiscoveriesInFlight =
-        ConcurrentDictionary<string, Lazy<Task<FindTargetDiscoveryResult>>>()
+        ConcurrentDictionary<string, WaiterAwareSingleFlight<FindTargetDiscoveryResult>>()
 
     let mutable findPositionResolutionComputeCount = 0L
     let mutable findTargetDiscoveryComputeCount = 0L
@@ -2859,6 +2939,65 @@ type internal FcsBridge
             TaskScheduler.Default
         )
         |> ignore
+
+    let removeExactSingleFlight
+        (registry: ConcurrentDictionary<string, WaiterAwareSingleFlight<'T>>)
+        (key: string)
+        (flight: WaiterAwareSingleFlight<'T>)
+        =
+        let entries =
+            registry
+            :> System.Collections.Generic.ICollection<
+                System.Collections.Generic.KeyValuePair<string, WaiterAwareSingleFlight<'T>>
+             >
+
+        entries.Remove(System.Collections.Generic.KeyValuePair(key, flight)) |> ignore
+
+    let acquireSingleFlight
+        (registry: ConcurrentDictionary<string, WaiterAwareSingleFlight<'T>>)
+        (key: string)
+        (remainingBudget: (unit -> TimeSpan) option)
+        (start: (unit -> bool) -> Task<'T>)
+        =
+        let ensureCallerCanWait () =
+            match remainingBudget with
+            | Some getRemaining when getRemaining () <= TimeSpan.Zero -> raise (TimeoutException())
+            | Some _
+            | None -> ()
+
+        let callerIsActive () =
+            match remainingBudget with
+            | Some getRemaining ->
+                try
+                    getRemaining () > TimeSpan.Zero
+                with :? OperationCanceledException ->
+                    false
+            | None -> true
+
+        let rec acquire () =
+            ensureCallerCanWait ()
+
+            let flight =
+                registry.GetOrAdd(
+                    key,
+                    fun _ ->
+                        WaiterAwareSingleFlight<'T>(
+                            start,
+                            removeExactSingleFlight registry key
+                        )
+                )
+
+            match flight.TryAddWaiter(callerIsActive) with
+            | Some waiterId ->
+                new WaiterAwareSingleFlightWaiter<'T>(flight, waiterId)
+            | None ->
+                // A zero-waiter worker has already committed to stopping. Its exact
+                // completion callback removes the retained entry; a late caller must
+                // retry instead of inheriting that worker's terminal timeout.
+                Thread.Yield() |> ignore
+                acquire ()
+
+        acquire ()
 
     let normalizedCheckWorkPath (path: string) =
         let normalized =
@@ -2980,99 +3119,79 @@ type internal FcsBridge
     let runFindPositionResolution
         (args: FindArgs)
         (remainingBudget: unit -> TimeSpan)
-        (work: unit -> Task<Result<string, JsonNode>>)
-        : Task<Result<string, JsonNode>> =
+        (work: (unit -> bool) -> Task<Result<string, JsonNode>>)
+        =
         let key = findPositionResolutionKey args
 
-        let ensureBudget () =
-            if remainingBudget () <= TimeSpan.Zero then
-                raise (TimeoutException("The find position-resolution budget was exhausted."))
-
-        let pending =
-            findPositionResolutionsInFlight.GetOrAdd(
-                key,
-                fun _ ->
-                    Lazy<Task<Result<string, JsonNode>>>(
-                        (fun () ->
-                            task {
-                                try
-                                    return!
-                                        findPositionResolutionAdmission.TryRun(
-                                            key,
-                                            fun () ->
-                                                task {
-                                                    do! Task.Yield()
-                                                    ensureBudget ()
-
-                                                    match findPositionResolutionBeforeComputeOverride with
-                                                    | Some beforeCompute -> do! beforeCompute ()
-                                                    | None -> ()
-
-                                                    ensureBudget ()
-                                                    Interlocked.Increment(&findPositionResolutionComputeCount)
-                                                    |> ignore
-                                                    return! work ()
-                                                }
+        acquireSingleFlight
+            findPositionResolutionsInFlight
+            key
+            (Some remainingBudget)
+            (fun hasActiveWaiters ->
+                findPositionResolutionAdmission.TryRun(
+                    key,
+                    fun () ->
+                        task {
+                            let ensureWorkerNeeded () =
+                                if not (hasActiveWaiters ()) then
+                                    raise (
+                                        TimeoutException(
+                                            "The find position-resolution worker has no active callers."
                                         )
-                                finally
-                                    findPositionResolutionsInFlight.TryRemove(key) |> ignore
-                            }),
-                        LazyThreadSafetyMode.ExecutionAndPublication
-                    )
-            )
+                                    )
 
-        let operation = pending.Value
-        observeFault operation
-        operation
+                            do! Task.Yield()
+                            ensureWorkerNeeded ()
+
+                            match findPositionResolutionBeforeComputeOverride with
+                            | Some beforeCompute -> do! beforeCompute ()
+                            | None -> ()
+
+                            ensureWorkerNeeded ()
+                            Interlocked.Increment(&findPositionResolutionComputeCount)
+                            |> ignore
+                            return! work hasActiveWaiters
+                        }
+                ))
 
     let runFindTargetDiscovery
         (phase: string)
         (target: string)
         (remainingBudget: unit -> TimeSpan)
-        (work: unit -> FindTargetDiscoveryResult)
-        : Task<FindTargetDiscoveryResult> =
+        (work: (unit -> bool) -> FindTargetDiscoveryResult)
+        =
         let key = checkDiscoveryKey $"find-{phase}" target None
 
-        let ensureBudget () =
-            if remainingBudget () <= TimeSpan.Zero then
-                raise (TimeoutException($"The find {phase} budget was exhausted."))
-
-        let pending =
-            findTargetDiscoveriesInFlight.GetOrAdd(
-                key,
-                fun _ ->
-                    Lazy<Task<FindTargetDiscoveryResult>>(
-                        (fun () ->
-                            task {
-                                try
-                                    return!
-                                        findTargetDiscoveryAdmission.TryRun(
-                                            key,
-                                            fun () ->
-                                                task {
-                                                    do! Task.Yield()
-                                                    ensureBudget ()
-
-                                                    match findTargetDiscoveryBeforeComputeOverride with
-                                                    | Some beforeCompute -> do! beforeCompute phase
-                                                    | None -> ()
-
-                                                    ensureBudget ()
-                                                    Interlocked.Increment(&findTargetDiscoveryComputeCount)
-                                                    |> ignore
-                                                    return work ()
-                                                }
+        acquireSingleFlight
+            findTargetDiscoveriesInFlight
+            key
+            (Some remainingBudget)
+            (fun hasActiveWaiters ->
+                findTargetDiscoveryAdmission.TryRun(
+                    key,
+                    fun () ->
+                        task {
+                            let ensureWorkerNeeded () =
+                                if not (hasActiveWaiters ()) then
+                                    raise (
+                                        TimeoutException(
+                                            $"The find {phase} worker has no active callers."
                                         )
-                                finally
-                                    findTargetDiscoveriesInFlight.TryRemove(key) |> ignore
-                            }),
-                        LazyThreadSafetyMode.ExecutionAndPublication
-                    )
-            )
+                                    )
 
-        let operation = pending.Value
-        observeFault operation
-        operation
+                            do! Task.Yield()
+                            ensureWorkerNeeded ()
+
+                            match findTargetDiscoveryBeforeComputeOverride with
+                            | Some beforeCompute -> do! beforeCompute phase
+                            | None -> ()
+
+                            ensureWorkerNeeded ()
+                            Interlocked.Increment(&findTargetDiscoveryComputeCount)
+                            |> ignore
+                            return work hasActiveWaiters
+                        }
+                ))
 
     let resolveSingleCheckProject
         (target: string)
@@ -4043,71 +4162,63 @@ type internal FcsBridge
         observeFault operation
         operation
 
-    let resolveAnalysisSnapshotKeyCore
+    let acquireAnalysisSnapshotKey
         (projectOptions: FSharpProjectOptions)
         (remainingBudget: (unit -> TimeSpan) option)
-        (waitWithinBudget: bool)
-        : Task<string> =
+        =
         let workKey = snapshotComputationKey projectOptions
 
-        let ensureBudget () =
-            match remainingBudget with
-            | Some getRemaining when getRemaining () <= TimeSpan.Zero -> raise (TimeoutException())
-            | _ -> ()
-
-        let pending =
-            snapshotComputationsInFlight.GetOrAdd(
-                workKey,
-                fun _ ->
-                    Lazy<Task<string>>(
-                        (fun () ->
-                            task {
-                                try
-                                    return!
-                                        snapshotComputationAdmission.TryRun(
-                                            workKey,
-                                            fun () ->
-                                                Task.Run(fun () ->
-                                                    ensureBudget ()
-
-                                                    analysisSnapshotKeyBeforeComputeOverride
-                                                    |> Option.iter (fun hook -> hook ())
-
-                                                    ensureBudget ()
-                                                    computeAnalysisSnapshotKey projectOptions)
+        acquireSingleFlight
+            snapshotComputationsInFlight
+            workKey
+            remainingBudget
+            (fun hasActiveWaiters ->
+                snapshotComputationAdmission.TryRun(
+                    workKey,
+                    fun () ->
+                        Task.Run(fun () ->
+                            let ensureWorkerNeeded () =
+                                if not (hasActiveWaiters ()) then
+                                    raise (
+                                        TimeoutException(
+                                            "The analysis-snapshot worker has no active callers."
                                         )
-                                finally
-                                    snapshotComputationsInFlight.TryRemove(workKey) |> ignore
-                            }),
-                        LazyThreadSafetyMode.ExecutionAndPublication
-                    )
-            )
+                                    )
 
-        let operation = pending.Value
-        observeFault operation
+                            ensureWorkerNeeded ()
 
-        match remainingBudget, waitWithinBudget with
-        | _, false -> operation
-        | Some getRemaining, true ->
-            let remaining = getRemaining ()
+                            analysisSnapshotKeyBeforeComputeOverride
+                            |> Option.iter (fun hook -> hook ())
 
-            if remaining <= TimeSpan.Zero then
-                Task.FromException<string>(TimeoutException("Analysis snapshot budget was exhausted."))
-            else
-                operation.WaitAsync(remaining)
-        | None, true -> operation
+                            ensureWorkerNeeded ()
+                            computeAnalysisSnapshotKey projectOptions)
+                ))
 
     let resolveAnalysisSnapshotKey
         (projectOptions: FSharpProjectOptions)
         (remainingBudget: (unit -> TimeSpan) option)
         =
-        resolveAnalysisSnapshotKeyCore projectOptions remainingBudget true
+        task {
+            use waiter = acquireAnalysisSnapshotKey projectOptions remainingBudget
+            let operation = waiter.Operation
+            observeFault operation
 
-    let resolveAnalysisSnapshotKeyActual
+            match remainingBudget with
+            | Some getRemaining ->
+                let remaining = getRemaining ()
+
+                if remaining <= TimeSpan.Zero then
+                    return raise (TimeoutException("Analysis snapshot budget was exhausted."))
+                else
+                    return! operation.WaitAsync(remaining)
+            | None -> return! operation
+        }
+
+    let acquireAnalysisSnapshotKeyActual
         (projectOptions: FSharpProjectOptions)
         (remainingBudget: unit -> TimeSpan)
         =
-        resolveAnalysisSnapshotKeyCore projectOptions (Some remainingBudget) false
+        acquireAnalysisSnapshotKey projectOptions (Some remainingBudget)
 
     let commitAnalysisSnapshotKey (projectOptions: FSharpProjectOptions) (key: string) =
         let projectIdentity = analysisProjectIdentity projectOptions
@@ -4548,113 +4659,108 @@ type internal FcsBridge
                         None)
         }
 
-    member private this.ResolveFsprojEntryWithinBudget
-        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option, waitWithinBudget: bool)
-        : Task<ProjectOptionsCacheEntry> =
+    member private this.AcquireFsprojEntryWithinBudget
+        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option)
+        =
         let fullPath = normalizePath fsprojPath
         let fsprojKey = makeFsprojOptionsCacheKey fullPath
 
-        let ensureBudget () =
-            match remainingBudget with
-            | Some getRemaining when getRemaining () <= TimeSpan.Zero -> raise (TimeoutException())
-            | _ -> ()
-
-        let pending =
-            optionsInFlight.GetOrAdd(
-                fsprojKey,
-                fun _ ->
-                    Lazy<Task<ProjectOptionsCacheEntry>>(
-                        (fun () ->
-                            task {
-                                try
-                                    return!
-                                        projectEvaluationAdmission.TryRun(
-                                            fullPath,
-                                            fun () ->
-                                                task {
-                                                    ensureBudget ()
-
-                                                    // Cache-hit validation hashes imported
-                                                    // files and recursively inventories
-                                                    // source directories. It belongs inside
-                                                    // the same admitted actual worker as a
-                                                    // cache miss, not before single-flight.
-                                                    let! cached =
-                                                        Task.Run(fun () ->
-                                                            ensureBudget ()
-
-                                                            match optionsCache.TryGet(fsprojKey) with
-                                                            | Some entry ->
-                                                                projectOptionsCacheValidationBeforeComputeOverride
-                                                                |> Option.iter (fun hook -> hook fullPath)
-
-                                                                ensureBudget ()
-
-                                                                Interlocked.Increment(
-                                                                    &projectOptionsCacheValidationCount
-                                                                )
-                                                                |> ignore
-
-                                                                if projectOptionsCacheEntryIsCurrent entry then
-                                                                    Some entry
-                                                                else
-                                                                    // A precise reload signal: this key had a
-                                                                    // cached ProjInfo result, its full input
-                                                                    // fingerprint changed, and the single-flight
-                                                                    // owner will evaluate it again below. Cold
-                                                                    // first loads and bounded-cache evictions are
-                                                                    // deliberately not mislabeled as reloads.
-                                                                    Interlocked.Increment(
-                                                                        &projectOptionsStaleReloadCount
-                                                                    )
-                                                                    |> ignore
-
-                                                                    None
-                                                            | None -> None)
-
-                                                    match cached with
-                                                    | Some entry -> return entry
-                                                    | None ->
-                                                        ensureBudget ()
-                                                        let! projInfoResult =
-                                                            this.LoadProjectOptionsFromFsproj(fullPath, ensureBudget)
-
-                                                        match projInfoResult with
-                                                        | Some(projOpts, fingerprint, evaluatedSnapshot) ->
-                                                            let entry =
-                                                                makeOptionsCacheEntry
-                                                                    projOpts
-                                                                    "ionide-proj-info"
-                                                                    (Some fingerprint)
-                                                                    None
-                                                                    (Some evaluatedSnapshot)
-
-                                                            optionsCache.Set(fsprojKey, entry)
-                                                            return entry
-                                                        | None ->
-                                                            return
-                                                                raise (
-                                                                    InvalidOperationException(
-                                                                        $"Unable to load F# project options from explicit projectPath: %s{fullPath}"
-                                                                    )
-                                                                )
-                                                }
+        acquireSingleFlight
+            optionsInFlight
+            fsprojKey
+            remainingBudget
+            (fun hasActiveWaiters ->
+                projectEvaluationAdmission.TryRun(
+                    fullPath,
+                    fun () ->
+                        task {
+                            let ensureWorkerNeeded () =
+                                if not (hasActiveWaiters ()) then
+                                    raise (
+                                        TimeoutException(
+                                            "The project-options worker has no active callers."
                                         )
-                                finally
-                                    optionsInFlight.TryRemove(fsprojKey) |> ignore
-                            }),
-                        LazyThreadSafetyMode.ExecutionAndPublication
-                    )
-            )
+                                    )
 
-        let work = pending.Value
-        observeFault work
+                            ensureWorkerNeeded ()
 
-        match remainingBudget, waitWithinBudget with
-        | _, false -> work
-        | None, true -> work
-        | Some getRemaining, true ->
-            task {
+                            // Cache-hit validation hashes imported files and recursively
+                            // inventories source directories. It belongs inside the same
+                            // admitted actual worker as a cache miss, not before single-flight.
+                            let! cached =
+                                Task.Run(fun () ->
+                                    ensureWorkerNeeded ()
+
+                                    match optionsCache.TryGet(fsprojKey) with
+                                    | Some entry ->
+                                        projectOptionsCacheValidationBeforeComputeOverride
+                                        |> Option.iter (fun hook -> hook fullPath)
+
+                                        ensureWorkerNeeded ()
+
+                                        Interlocked.Increment(
+                                            &projectOptionsCacheValidationCount
+                                        )
+                                        |> ignore
+
+                                        if projectOptionsCacheEntryIsCurrent entry then
+                                            Some entry
+                                        else
+                                            // A precise reload signal: this key had a
+                                            // cached ProjInfo result, its full input
+                                            // fingerprint changed, and the single-flight
+                                            // owner will evaluate it again below. Cold
+                                            // first loads and bounded-cache evictions are
+                                            // deliberately not mislabeled as reloads.
+                                            Interlocked.Increment(
+                                                &projectOptionsStaleReloadCount
+                                            )
+                                            |> ignore
+
+                                            None
+                                    | None -> None)
+
+                            match cached with
+                            | Some entry -> return entry
+                            | None ->
+                                ensureWorkerNeeded ()
+                                let! projInfoResult =
+                                    this.LoadProjectOptionsFromFsproj(fullPath, ensureWorkerNeeded)
+
+                                match projInfoResult with
+                                | Some(projOpts, fingerprint, evaluatedSnapshot) ->
+                                    let entry =
+                                        makeOptionsCacheEntry
+                                            projOpts
+                                            "ionide-proj-info"
+                                            (Some fingerprint)
+                                            None
+                                            (Some evaluatedSnapshot)
+
+                                    optionsCache.Set(fsprojKey, entry)
+                                    return entry
+                                | None ->
+                                    return
+                                        raise (
+                                            InvalidOperationException(
+                                                $"Unable to load F# project options from explicit projectPath: {fullPath}"
+                                            )
+                                        )
+                        }
+                ))
+
+    member private this.ResolveFsprojEntryWithinBudget
+        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option)
+        : Task<ProjectOptionsCacheEntry> =
+        task {
+            let fullPath = normalizePath fsprojPath
+            use waiter = this.AcquireFsprojEntryWithinBudget(fullPath, remainingBudget)
+            let work = waiter.Operation
+            observeFault work
+
+            match remainingBudget with
+            | None -> return! work
+            | Some getRemaining ->
                 let remaining = getRemaining ()
 
                 if remaining <= TimeSpan.Zero then
@@ -4666,30 +4772,19 @@ type internal FcsBridge
                         return
                             raise (
                                 TimeoutException(
-                                    $"Project-options evaluation for '%s{Path.GetFileName fullPath}' exceeded the remaining %d{int remaining.TotalMilliseconds}ms budget."
+                                    $"Project-options evaluation for '{Path.GetFileName fullPath}' exceeded the remaining {int remaining.TotalMilliseconds}ms budget."
                                 )
                             )
-            }
+        }
 
     member private this.ResolveFsprojEntry(fsprojPath: string) : Task<ProjectOptionsCacheEntry> =
-        this.ResolveFsprojEntryWithinBudget(fsprojPath, None, true)
+        this.ResolveFsprojEntryWithinBudget(fsprojPath, None)
 
     member private this.ResolveFsprojOptionsWithinBudget
         (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option)
         : Task<FSharpProjectOptions * string> =
         task {
-            let! entry = this.ResolveFsprojEntryWithinBudget(fsprojPath, remainingBudget, true)
-            return entry.Options, entry.Source
-        }
-
-    /// Returns the actual project-evaluation task rather than a timeout proxy around it.
-    /// ProjectOutline races this task itself so its outer FCS gate can retain the real lifetime.
-    member private this.ResolveFsprojOptionsActualWithinBudget
-        (fsprojPath: string, remainingBudget: unit -> TimeSpan)
-        : Task<FSharpProjectOptions * string> =
-        task {
-            let! entry = this.ResolveFsprojEntryWithinBudget(fsprojPath, Some remainingBudget, false)
-
+            let! entry = this.ResolveFsprojEntryWithinBudget(fsprojPath, remainingBudget)
             return entry.Options, entry.Source
         }
 
@@ -6544,6 +6639,12 @@ type internal FcsBridge
                     deadline.MarkSemanticExpired()
                     raise (TimeoutException($"The find deadline was exhausted before {phase} started."))
 
+            let remainingWorkerBudget () =
+                if cancellationToken.IsCancellationRequested then
+                    TimeSpan.Zero
+                else
+                    deadline.RemainingSemanticBudget()
+
             let awaitWithinDeadline
                 (phase: string)
                 (retainIncompleteOperation: bool)
@@ -6597,6 +6698,16 @@ type internal FcsBridge
                             cancellationToken.ThrowIfCancellationRequested()
 
                             return raise (TimeoutException($"The find deadline was exhausted during {phase}."))
+                }
+
+            let awaitRetainedSingleFlight
+                (phase: string)
+                (waiter: WaiterAwareSingleFlightWaiter<'T>)
+                : Task<'T> =
+                task {
+                    use waiter = waiter
+                    let operation = waiter.Operation
+                    return! awaitWithinDeadline phase true operation
                 }
 
             let incompleteBeforeDiscovery phase phaseStatus errorKind message =
@@ -6713,17 +6824,23 @@ type internal FcsBridge
                             try
                                 ensureCanStart "position resolution"
 
-                                let operation =
+                                let waiter =
                                     runFindPositionResolution
                                         args
-                                        deadline.RemainingSemanticBudget
-                                        (fun () ->
+                                        remainingWorkerBudget
+                                        (fun hasActiveWaiters ->
                                             this.ResolveQueryAtPosition(
                                                 args,
-                                                fun () -> ensureCanStart "position resolution"
+                                                fun () ->
+                                                    if not (hasActiveWaiters ()) then
+                                                        raise (
+                                                            TimeoutException(
+                                                                "The find position-resolution worker has no active callers."
+                                                            )
+                                                        )
                                             ))
 
-                                let! result = awaitWithinDeadline "position resolution" true operation
+                                let! result = awaitRetainedSingleFlight "position resolution" waiter
                                 return result
                             with
                             | :? TimeoutException as ex ->
@@ -6764,7 +6881,7 @@ type internal FcsBridge
 
             let kindResolved = if kind = "position" then "symbol" else kind
 
-            let findNearestProjectForRequest path =
+            let findNearestProjectForRequest path shouldContinue =
                 let beforeStep =
                     findTargetDiscoveryBeforeStepOverride
                     |> Option.defaultValue (fun _ _ -> ())
@@ -6772,9 +6889,7 @@ type internal FcsBridge
                 findNearestFsprojWithContinuation
                     path
                     beforeStep
-                    (fun () ->
-                        not cancellationToken.IsCancellationRequested
-                        && deadline.RemainingSemanticBudget() > TimeSpan.Zero)
+                    shouldContinue
 
             // Resolve the sweep target inside the same deadline. The nearest-project
             // filesystem walk is admitted single-flight work, never a synchronous prelude.
@@ -6794,18 +6909,19 @@ type internal FcsBridge
                             try
                                 ensureCanStart "nearest-project discovery"
 
-                                let operation =
+                                let waiter =
                                     runFindTargetDiscovery
                                         "nearest-project"
                                         path
-                                        deadline.RemainingSemanticBudget
-                                        (fun () ->
-                                            findNearestProjectForRequest path
+                                        remainingWorkerBudget
+                                        (fun shouldContinue ->
+                                            findNearestProjectForRequest path shouldContinue
                                             |> Option.map normalizePath
                                             |> Option.toArray
                                             |> FindTargetDiscoveryResult.Paths)
 
-                                let! discovered = awaitWithinDeadline "nearest-project discovery" true operation
+                                let! discovered =
+                                    awaitRetainedSingleFlight "nearest-project discovery" waiter
 
                                 match discovered with
                                 | FindTargetDiscoveryResult.Paths paths -> return Ok(Array.tryHead paths)
@@ -6849,12 +6965,12 @@ type internal FcsBridge
                     try
                         ensureCanStart "project discovery"
 
-                        let operation =
+                        let waiter =
                             runFindTargetDiscovery
                                 "projects"
                                 sweepTarget
-                                deadline.RemainingSemanticBudget
-                                (fun () ->
+                                remainingWorkerBudget
+                                (fun shouldContinue ->
                                     let beforeStep =
                                         findTargetDiscoveryBeforeStepOverride
                                         |> Option.defaultValue (fun _ _ -> ())
@@ -6862,12 +6978,10 @@ type internal FcsBridge
                                     SolutionParsing.discoverProjectsForFind
                                         sweepTarget
                                         beforeStep
-                                        (fun () ->
-                                            not cancellationToken.IsCancellationRequested
-                                            && deadline.RemainingSemanticBudget() > TimeSpan.Zero)
+                                        shouldContinue
                                     |> FindTargetDiscoveryResult.Projects)
 
-                        let! discovery = awaitWithinDeadline "project discovery" true operation
+                        let! discovery = awaitRetainedSingleFlight "project discovery" waiter
 
                         match discovery with
                         | FindTargetDiscoveryResult.Projects projects -> return Ok projects
@@ -6936,18 +7050,19 @@ type internal FcsBridge
                             try
                                 ensureCanStart "scoped-project discovery"
 
-                                let operation =
+                                let waiter =
                                     runFindTargetDiscovery
                                         "scoped-project"
                                         path
-                                        deadline.RemainingSemanticBudget
-                                        (fun () ->
-                                            findNearestProjectForRequest path
+                                        remainingWorkerBudget
+                                        (fun shouldContinue ->
+                                            findNearestProjectForRequest path shouldContinue
                                             |> Option.map normalizePath
                                             |> Option.toArray
                                             |> FindTargetDiscoveryResult.Paths)
 
-                                let! projects = awaitWithinDeadline "scoped-project discovery" true operation
+                                let! projects =
+                                    awaitRetainedSingleFlight "scoped-project discovery" waiter
 
                                 match projects with
                                 | FindTargetDiscoveryResult.Paths paths -> return Array.tryHead paths
@@ -7231,17 +7346,18 @@ type internal FcsBridge
 
                     ensureCanStart $"project-options resolution for '{projDisplay}'"
 
-                    let optionsTask =
-                        this.ResolveFsprojOptionsActualWithinBudget(
+                    let optionsWaiter =
+                        this.AcquireFsprojEntryWithinBudget(
                             fsproj,
-                            deadline.RemainingSemanticBudget
+                            Some remainingWorkerBudget
                         )
 
-                    let! options, _ =
-                        awaitWithinDeadline
+                    let! optionsEntry =
+                        awaitRetainedSingleFlight
                             $"project-options resolution for '{projDisplay}'"
-                            true
-                            optionsTask
+                            optionsWaiter
+
+                    let options = optionsEntry.Options
 
                     // issue #131/#168 P1-07: memoize the whole-symbol-use enumeration by
                     // the shared content-addressed analysis snapshot. A cache HIT skips BOTH
@@ -7255,14 +7371,13 @@ type internal FcsBridge
                     // inside the loop trips FS3511).
                     ensureCanStart $"snapshot computation for '{projDisplay}'"
 
-                    let snapshotTask =
-                        resolveAnalysisSnapshotKeyActual options deadline.RemainingSemanticBudget
+                    let snapshotWaiter =
+                        acquireAnalysisSnapshotKeyActual options remainingWorkerBudget
 
                     let! usesKey =
-                        awaitWithinDeadline
+                        awaitRetainedSingleFlight
                             $"snapshot computation for '{projDisplay}'"
-                            true
-                            snapshotTask
+                            snapshotWaiter
 
                     commitAnalysisSnapshotKey options usesKey
                     ensureCanStart $"FCS sweep for '{projDisplay}'"
@@ -11860,12 +11975,12 @@ type internal FcsBridge
                         cancellationToken.ThrowIfCancellationRequested()
                         TimeSpan.FromMilliseconds(float (remainingMilliseconds ()))
 
-                    let optionsOperation =
-                        this.ResolveFsprojOptionsActualWithinBudget(projectPath, optionsRemainingBudget)
+                    use optionsWaiter =
+                        this.AcquireFsprojEntryWithinBudget(projectPath, Some optionsRemainingBudget)
 
                     try
-                        let! options = awaitWithinDeadline "project_options" optionsOperation
-                        resolvedProjectOptions <- Some options
+                        let! entry = awaitWithinDeadline "project_options" optionsWaiter.Operation
+                        resolvedProjectOptions <- Some(entry.Options, entry.Source)
                         optionsPhaseStatus <- "complete"
                     with
                     | :? TimeoutException as ex ->
@@ -13741,6 +13856,9 @@ type internal FcsBridge
     member _.ProjectEvaluationRejectedCount = projectEvaluationAdmission.RejectedCount
     member _.ProjectEvaluationMaxObservedConcurrency = projectEvaluationAdmission.MaxObservedConcurrency
     member _.ProjectOptionsInFlightCount = optionsInFlight.Count
+    member _.ProjectOptionsWaiterCount =
+        optionsInFlight.Values |> Seq.sumBy (fun flight -> flight.WaiterCount)
+
     member _.ProjectTypeCheckStartCount = Volatile.Read(&projectTypeCheckStartCount)
     member _.FreshProjectCheckActiveCount = freshProjectCheckAdmission.ActiveCount
     member _.FreshProjectCheckStartedCount = freshProjectCheckAdmission.StartedCount
@@ -13757,6 +13875,9 @@ type internal FcsBridge
     member _.SnapshotComputationStartedCount = snapshotComputationAdmission.StartedCount
     member _.SnapshotComputationRejectedCount = snapshotComputationAdmission.RejectedCount
     member _.SnapshotComputationInFlightCount = snapshotComputationsInFlight.Count
+    member _.SnapshotComputationWaiterCount =
+        snapshotComputationsInFlight.Values |> Seq.sumBy (fun flight -> flight.WaiterCount)
+
     member _.CheckTargetDiscoveryActiveCount = checkTargetDiscoveryAdmission.ActiveCount
     member _.CheckTargetDiscoveryStartedCount = checkTargetDiscoveryAdmission.StartedCount
     member _.CheckTargetDiscoveryRejectedCount = checkTargetDiscoveryAdmission.RejectedCount
@@ -13778,11 +13899,17 @@ type internal FcsBridge
     member _.FindPositionResolutionStartedCount = findPositionResolutionAdmission.StartedCount
     member _.FindPositionResolutionRejectedCount = findPositionResolutionAdmission.RejectedCount
     member _.FindPositionResolutionInFlightCount = findPositionResolutionsInFlight.Count
+    member _.FindPositionResolutionWaiterCount =
+        findPositionResolutionsInFlight.Values |> Seq.sumBy (fun flight -> flight.WaiterCount)
+
     member _.FindPositionResolutionComputeCount = Volatile.Read(&findPositionResolutionComputeCount)
     member _.FindTargetDiscoveryActiveCount = findTargetDiscoveryAdmission.ActiveCount
     member _.FindTargetDiscoveryStartedCount = findTargetDiscoveryAdmission.StartedCount
     member _.FindTargetDiscoveryRejectedCount = findTargetDiscoveryAdmission.RejectedCount
     member _.FindTargetDiscoveryInFlightCount = findTargetDiscoveriesInFlight.Count
+    member _.FindTargetDiscoveryWaiterCount =
+        findTargetDiscoveriesInFlight.Values |> Seq.sumBy (fun flight -> flight.WaiterCount)
+
     member _.FindTargetDiscoveryComputeCount = Volatile.Read(&findTargetDiscoveryComputeCount)
 
     /// Pure deterministic seam for verifying collision-free discovery key framing.
