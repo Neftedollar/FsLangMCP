@@ -2764,6 +2764,7 @@ type internal FcsBridge
         ?findResponseDeadlineSignalOverride: (unit -> Task),
         ?findResponseConstructionBeforeStartOverride: (unit -> Task),
         ?findResponseConstructionBeforeStepOverride: (string -> int -> unit),
+        ?findFinalResponseBeforeMeasureOverride: (unit -> unit),
         // #207: test-only seam for find's PER-SITE siteType deadline. The production check
         // reads the shared FindRequestDeadline, which cannot target one site deterministically
         // without a seam: timeoutMs=0 is exhausted BEFORE the sweep and yields no sites.
@@ -6748,7 +6749,8 @@ type internal FcsBridge
             deadline: FindRequestDeadline,
             cancellationToken: CancellationToken,
             retainUntil: Task -> unit,
-            fsacProbe: (string -> Task<FindFsacProbeResult>) option
+            fsacProbe: (string -> Task<FindFsacProbeResult>) option,
+            recordMeasuredResponse: JsonNode -> unit
         )
         : Task<JsonNode> =
         task {
@@ -8986,6 +8988,10 @@ type internal FcsBridge
                         ensureResponseStep "response-serialization-complete" plannerProbe
 
                         if responseLength <= findResponseBudgetChars then
+                            // Record only this exact, final, unmodified node, after
+                            // both size and deadline checks. The public wrapper must
+                            // not serialize it a second time outside this deadline.
+                            recordMeasuredResponse response
                             return response
                         else
                             return
@@ -9018,8 +9024,24 @@ type internal FcsBridge
             fsacProbe: (string -> Task<FindFsacProbeResult>) option
         ) : Task<JsonNode> =
         task {
-            let! response = this.FindCoreWithinDeadline(args, deadline, cancellationToken, retainUntil, fsacProbe)
-            return FindResponseBudget.guardFinalResponse response
+            let mutable measuredResponse: JsonNode = null
+
+            let! response =
+                this.FindCoreWithinDeadline(
+                    args, deadline, cancellationToken, retainUntil, fsacProbe,
+                    fun measured -> measuredResponse <- measured
+                )
+
+            if Object.ReferenceEquals(response, measuredResponse) then
+                // Per-call reference identity is evidence from the core, never a
+                // JSON field supplied by a caller. Nothing mutates this node after
+                // its final measured serialization and deadline check.
+                return response
+            else
+                // Early errors and timeout/budget envelopes were not measured by
+                // the planner, so they still need the universal hard-size guard.
+                findFinalResponseBeforeMeasureOverride |> Option.iter (fun hook -> hook ())
+                return FindResponseBudget.guardFinalResponse response
         }
 
     member this.Find(args: FindArgs, ?fsacProbe: string -> Task<FindFsacProbeResult>) : Task<JsonNode> =

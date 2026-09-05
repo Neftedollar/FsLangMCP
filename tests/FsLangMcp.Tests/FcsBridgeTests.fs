@@ -2068,6 +2068,53 @@ let ``find response planner expiry preserves coverage but requires a fresh page`
     }
 
 [<Fact>]
+let ``find reuses only the exact final measured response and still guards early errors`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_final_measurement_{Guid.NewGuid():N}")
+        let mutable finalMeasurements = 0
+        let mutable extraMeasurements = 0
+
+        let beforeResponseStep phase _ =
+            if phase = "response-serialization-complete" then
+                finalMeasurements <- finalMeasurements + 1
+
+        let bridge =
+            FcsBridge(
+                findResponseConstructionBeforeStepOverride = beforeResponseStep,
+                findFinalResponseBeforeMeasureOverride = (fun () -> extraMeasurements <- extraMeasurements + 1)
+            )
+
+        try
+            let _, projectPath =
+                writeProjectWithSource root "FinalMeasurement"
+                    (String.concat "\n"
+                        [ yield "module FinalMeasurement"
+                          yield "let value = 42"
+                          for index in 1..100 -> $"let item{index} = value + {index}" ])
+
+            let args = { admissionFindArgs projectPath 20_000 with maxResults = Some 1000 }
+            let! result = bridge.Find(args)
+            Assert.Equal("succeeded", result["status"].GetValue<string>())
+            Assert.True(result["sites"].AsArray().Count > 1)
+            Assert.Equal(1, finalMeasurements)
+            Assert.Equal(0, extraMeasurements)
+            Assert.True(renderedLength result <= FindResponseBudget.MaxSerializedChars)
+
+            // A later call on the same bridge cannot inherit the first result's
+            // measurement. This caller-controlled early error must still be capped.
+            let! oversizedError =
+                bridge.Find({ args with kind = Some(String.replicate 60_001 "x") })
+
+            Assert.Equal(1, finalMeasurements)
+            Assert.Equal(1, extraMeasurements)
+            Assert.Equal("find_response_exceeds_budget", oversizedError["errorCode"].GetValue<string>())
+            Assert.True(renderedLength oversizedError <= FindResponseBudget.MaxSerializedChars)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
 let ``fcs_parse_and_check_file succeeds on valid F# snippet`` () : Task =
     task {
         let src =
