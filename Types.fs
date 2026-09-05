@@ -770,6 +770,17 @@ module FindResponseBudget =
     [<Literal>]
     let SizeUnit = "UTF-16 code units in production JSON"
 
+    /// Preserve the total row count while materializing only the bounded prefix that
+    /// can participate in response planning. Keep the cap ahead of `map`: individual
+    /// rows may contain large caller/project-controlled strings, so mapping an
+    /// unbounded tail and truncating afterwards defeats the response budget's memory
+    /// and latency bound even though those rows can never be returned.
+    let internal materializeCappedPrefix maxCount mapRow (rows: 'T array) =
+        if maxCount < 0 then
+            invalidArg (nameof maxCount) "prefix cap must be non-negative"
+
+        rows.Length, rows |> Array.truncate maxCount |> Array.map mapRow
+
     type BoundedSnippet =
         { Text: string
           SourceStartColumn: int

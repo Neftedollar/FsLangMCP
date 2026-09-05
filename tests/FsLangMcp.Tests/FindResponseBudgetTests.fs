@@ -60,7 +60,11 @@ type FindBudgetFixture() =
     let source =
         [ "module FindBudget.Fixture"
           ""
-          "let target = 1" ]
+          "let target = 1"
+          ""
+          "let partial value ="
+          "    match value with"
+          "    | 0 -> target" ]
         @ [ for index in 0..31 -> $"let value{index:D2} = target + {index} // {longComment}" ]
         |> String.concat "\n"
 
@@ -188,6 +192,21 @@ let ``planner measures sites diagnostics and per-project metadata with the produ
         Assert.Equal((renderToken response).Length, renderedLength response)
         Assert.True(renderedLength response <= FindResponseBudget.MaxSerializedChars)
     | result -> Assert.Fail($"expected a fitting bounded plan, got {result}")
+
+[<Fact>]
+let ``diagnostic prefix is capped before expensive rows are materialized`` () =
+    let rows = [| 0..9_999 |]
+    let mutable mapped = 0
+
+    let totalCount, materialized =
+        FindResponseBudget.materializeCappedPrefix 200 (fun row ->
+            mapped <- mapped + 1
+            row * 2) rows
+
+    Assert.Equal(rows.Length, totalCount)
+    Assert.Equal(200, materialized.Length)
+    Assert.Equal(200, mapped)
+    Assert.Equal(398, materialized[199])
 
 [<Fact>]
 let ``planner worst-case metadata trimming probe count is bounded`` () =
@@ -517,6 +536,10 @@ type FindResponseBudgetIntegrationTests(fixture: FindBudgetFixture) =
             Assert.Equal(0, result["cursorAdvancedBy"].GetValue<int>())
             Assert.Null(result["nextCursor"])
             Assert.True(result["retryable"].GetValue<bool>())
+            Assert.True(result["projectDiagnosticsTotalCount"].GetValue<int>() > 0)
+            Assert.Equal(0, result["projectDiagnosticsReturnedCount"].GetValue<int>())
+            Assert.True(result["projectDiagnosticsTruncated"].GetValue<bool>())
+            Assert.True(result["projectDiagnosticsTruncatedByBudget"].GetValue<bool>())
             Assert.NotNull(result["coverage"])
             Assert.NotNull(result["resolution"])
             let resultResolution = result["resolution"]

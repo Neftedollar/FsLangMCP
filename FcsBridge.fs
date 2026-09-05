@@ -6990,7 +6990,7 @@ type internal FcsBridge
 
             // Aggregated diagnostics across swept projects: Error always (so callers can
             // detect broken projects even on zero hits), Warning/Info gated by includeInfo.
-            let diagNodesAll =
+            let eligibleDiagnostics =
                 aggregatedDiagnostics.ToArray()
                 |> Array.filter (fun d ->
                     d.Severity = FSharpDiagnosticSeverity.Error
@@ -6998,11 +6998,13 @@ type internal FcsBridge
                         && (d.Severity = FSharpDiagnosticSeverity.Warning
                             || d.Severity = FSharpDiagnosticSeverity.Hidden
                             || d.Severity = FSharpDiagnosticSeverity.Info)))
-                |> Array.map diagnosticToJson
 
-            // Preserve the existing count cap, then let the final exact response planner
-            // reduce this prefix further only when it competes with site progress.
-            let initialDiagNodes = diagNodesAll |> Array.truncate 200
+            // Preserve the full scalar count, but cap the raw rows BEFORE converting
+            // potentially large diagnostic messages/paths to JSON. The final exact
+            // response planner may reduce this bounded prefix further when it competes
+            // with site progress.
+            let projectDiagnosticsTotalCount, initialDiagNodes =
+                FindResponseBudget.materializeCappedPrefix 200 diagnosticToJson eligibleDiagnostics
 
             let scopeResolved =
                 if projectsSwept <= 1 then
@@ -7281,7 +7283,7 @@ type internal FcsBridge
                     "perProjectReturnedCount", jint 0
                     "perProjectTruncatedByBudget", jbool false
                     "sweepElapsedMs", jint (int sweepSw.ElapsedMilliseconds)
-                    "projectDiagnosticsTotalCount", jint diagNodesAll.Length
+                    "projectDiagnosticsTotalCount", jint projectDiagnosticsTotalCount
                     "projectDiagnosticsReturnedCount", jint 0
                     "projectDiagnosticsTruncated", jbool false
                     "projectDiagnosticsTruncatedByBudget", jbool false
@@ -7333,7 +7335,7 @@ type internal FcsBridge
 
                 let sitesTruncatedByBudget = deliveredSites < siteNodes.Length
                 let diagnosticsTruncatedByBudget = deliveredDiagnostics < initialDiagNodes.Length
-                let diagnosticsTruncated = deliveredDiagnostics < diagNodesAll.Length
+                let diagnosticsTruncated = deliveredDiagnostics < projectDiagnosticsTotalCount
                 let perProjectTruncatedByBudget = deliveredProjects < perProjectNodes.Length
 
                 let responseTruncatedByBudget =
@@ -7462,9 +7464,10 @@ type internal FcsBridge
                       "sites", JsonArray() :> JsonNode
                       "returnedSiteCount", jint 0
                       "sitesTruncatedByBudget", jbool (candidatePageSites.Length > 0)
-                      "projectDiagnosticsTotalCount", jint diagNodesAll.Length
+                      "projectDiagnosticsTotalCount", jint projectDiagnosticsTotalCount
                       "projectDiagnosticsReturnedCount", jint 0
-                      "projectDiagnosticsTruncated", jbool (diagNodesAll.Length > 0)
+                      "projectDiagnosticsTruncated", jbool (projectDiagnosticsTotalCount > 0)
+                      "projectDiagnosticsTruncatedByBudget", jbool (initialDiagNodes.Length > 0)
                       "perProjectTotalCount", jint perProjectNodes.Length
                       "perProjectReturnedCount", jint 0
                       "perProjectTruncatedByBudget", jbool (perProjectNodes.Length > 0)
