@@ -152,6 +152,31 @@ ledger, but it returns `nextCursor = null`. The caller repeats the request witho
 a cursor and with a larger `timeoutMs`; otherwise rows beyond the returned page
 could become permanently unreachable.
 
+A deadline-partial response that contains positive sites has this explicit wire
+state:
+
+```text
+status = "succeeded"
+deliveryStatus = "partial"
+coverage.complete = false
+resolution.complete = false
+truncated = true
+nextCursor = null
+paginationRestartRequired = true
+totalEstimateIsLowerBound = true
+paginationIncompleteReason = "deadline_incomplete"
+```
+
+With zero positive sites, `status`/`outcome` follow the existing indeterminate
+incomplete-coverage contract; every delivery, completeness, truncation, and restart
+field above is unchanged.
+
+For `find` v2, `truncated` therefore means that the logical delivery is incomplete;
+it no longer guarantees that a continuation cursor exists. Clients follow
+`nextCursor` only when non-null and otherwise inspect `paginationRestartRequired`.
+The lower-bound marker applies even when every currently known positive site fit,
+because an unstarted project may contain additional sites.
+
 A completed sweep may still contain stable negative coverage such as `missing` or
 `failed` and may paginate that fully known stream. If a later retry gains additional
 project evidence, snapshot validation makes the old cursor stale and the caller
@@ -350,8 +375,10 @@ adds installation lifecycle without solving result-stream consistency.
   stream reproduction or a typed stale/incomplete result, never mixed sites;
 - missing declared `.sln` and `.slnx` members before any cursor is issued;
 - an initial deadline-truncated sweep with positive sites and additional rows: it
-  returns honest `timed_out`/`not_started` coverage but no cursor; repeating the
-  original request with a larger deadline can return the complete stream;
+  returns the exact cursorless partial wire state above, including incomplete
+  coverage/resolution, `truncated = true`, the lower-bound marker, and restart
+  requirement; repeating the original request with a larger deadline can return
+  the complete stream;
 - a completed sweep with stable negative project coverage followed by newly
   available project evidence: its previously issued cursor becomes stale;
 - continuation timeout, then retry of the same cursor with a larger `timeoutMs`;
