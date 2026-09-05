@@ -105,7 +105,7 @@ let private executableExists (fileName: string) =
         |> fun value -> value.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
         |> Array.exists (fun directory -> File.Exists(Path.Combine(directory, fileName)))
 
-let private resolveDotnetHost () =
+let internal resolveDotnetHost () =
     let existingEnvironmentPath name =
         Environment.GetEnvironmentVariable(name)
         |> Option.ofObj

@@ -16,6 +16,7 @@ on:
       - "dotnet-tools.json"
       - "*.fs"
       - "scripts/runtime-toolchain.py"
+      - "scripts/project-evaluation-soak.py"
       - "scripts/verify-package-version.py"
       - "scripts/tests/**"
       # The Windows leg is the only place this family runs (#191) — retrigger when it changes.
@@ -31,6 +32,7 @@ on:
       - "dotnet-tools.json"
       - "*.fs"
       - "scripts/runtime-toolchain.py"
+      - "scripts/project-evaluation-soak.py"
       - "scripts/verify-package-version.py"
       - "scripts/tests/**"
       # The Windows leg is the only place this family runs (#191) — retrigger when it changes.
@@ -267,6 +269,9 @@ jobs:
 
       - name: Exercise the installed package through live FSAC and ProjInfo
         run: python scripts/runtime-toolchain.py smoke --tool-path "${{ runner.temp }}/fslangmcp-runtime-tools" --server "${{ env.FSLANGMCP_LIVE_SERVER }}" --project FsLangMcp.fsproj
+
+      - name: Prove real project reloads reclaim MSBuild threads
+        run: python scripts/project-evaluation-soak.py --tool-path "${{ runner.temp }}/fslangmcp-runtime-tools" --server "${{ env.FSLANGMCP_LIVE_SERVER }}" --iterations 12
 
       # The xunit suite otherwise runs on ubuntu only (ci.yml, publish.yml), so nothing
       # exercised the NuGet packageId -> assembly map against REAL Windows paths: the

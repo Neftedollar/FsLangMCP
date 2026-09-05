@@ -26,6 +26,7 @@
     <Compile Include="SdkPreflight.fs" />
     <Compile Include="Version.fs" />
     <Compile Include="InstallationHealth.fs" />
+    <Compile Include="ProjectEvaluation.fs" />
     <Compile Include="ProjectFiles.fs" />
     <Compile Include="Cursor.fs" />
     <Compile Include="ProjectInspection.fs" />
@@ -55,6 +56,7 @@
 
   <ItemGroup>
     <PackageReference Include="FSharp.Compiler.Service" Version="$(FSharpCompilerServiceVersion)" />
+    <PackageReference Include="FSharp.SystemTextJson" Version="[1.4.36]" />
     <PackageReference Include="FSharp.Analyzers.Build" Version="[0.5.0]">
       <IncludeAssets>build</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>

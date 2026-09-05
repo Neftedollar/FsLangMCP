@@ -228,10 +228,19 @@ persists, call `set_project` again and inspect the coverage fields. FsLangMCP
 retains MSBuild project options only while their project, imports, restore
 outputs, source contents, and source-directory inputs are unchanged.
 
-`fsharp_runtime_status.fcs.projectOptions` exposes `loadAttempts`, `staleReloads`,
+`fsharp_runtime_status.fcs.projectOptions` exposes `evaluationMode="isolated_helper"`, `loadAttempts`, `staleReloads`,
 `cacheValidations`, and `inFlight`. `staleReloads` increments only when an existing
 cached fingerprint became stale and was re-evaluated; cold loads and explicit evictions
 do not inflate it.
+
+Each genuine project-options evaluation runs in a short-lived process, so MSBuild's
+in-process nodes are reclaimed when that helper exits. Cache hits do not launch a
+helper. The existing one-evaluation admission limit still applies; a caller timing
+out does not cancel work needed by another caller. Once no callers need that flight,
+the helper process tree is terminated and drained before its slot is released.
+The private versioned JSON protocol transports evaluated data, not executable FCS
+delegates, and rejects responses exceeding 16 Mi UTF-16 code units rather than using
+partial settings. Such a failure is not a clean type-check verdict.
 
 If trusted `check` is `clean` but a Release build fails, first compare build profiles rather than
 assuming stale FCS state. `clean` covers the current FCS/check profile; optimized Release
@@ -244,8 +253,9 @@ still `dotnet build -c Release --warnaserror`.
 
 At 128 or more OS-visible threads, `process.threads.health.status` becomes `warning`,
 `restartRecommended` becomes true, and the response recommends restarting the parent MCP
-process. Retained in-process ProjInfo/MSBuild nodes are one known cause; the thread count
-alone is not proof of ownership or a leak.
+process. The thread count alone is not proof of ownership or a leak. Older versions
+could retain ProjInfo/MSBuild nodes in the parent; current project evaluation uses
+short-lived helpers, identified by `evaluationMode="isolated_helper"` in telemetry.
 
 Use `fcs.projectOptions.staleReloads` alongside the thread count to see whether repeated
 project-option re-evaluation correlates with growth. Restarting only the FSAC child cannot

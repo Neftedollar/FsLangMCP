@@ -4695,45 +4695,49 @@ type internal FcsBridge
             | None -> ()
 
             // A caller deadline may expire while a test/probe/cache phase is awaiting.
-            // Recheck immediately before the non-cancellable MSBuild worker starts.
+            // Recheck immediately before the isolated MSBuild worker starts.
             ensureCanContinue ()
 
-            // Offload to thread pool — MSBuild/SDK probing is CPU+IO bound. The
-            // caller owns the outer admission slot across this actual completion.
+            // Keep SDK probing and fingerprint work off the caller thread. MSBuild
+            // itself now runs in a short-lived process: genuine cache misses must
+            // not retain in-process MSBuild node threads in this long-lived host.
+            // The caller owns admission until the actual child has been drained.
             return!
-                Task.Run(fun () ->
-                    ensureCanContinue ()
-                    let projectDir = Path.GetDirectoryName(fsprojPath)
-
-                    // #192: outside the try on purpose. Init.init inherits this
-                    // directory's global.json, and an unsatisfiable `rollForward:
-                    // "disable"` pin is not a load failure to degrade into None —
-                    // it is a machine-configuration problem the agent must be told
-                    // about by name. Raising here also keeps MSBuild untouched.
-                    SdkPreflight.ensure [ projectDir ]
-                    InstallationHealth.ensureCurrent ()
-                    ensureCanContinue ()
-
-                    try
-                        let toolsPath = Init.init (DirectoryInfo(projectDir)) None
-                        let loader = WorkspaceLoader.Create(toolsPath, [])
+                Task.Run<(FSharpProjectOptions * ProjectOptionsFingerprint * EvaluatedProjectSnapshot) option>(fun () ->
+                    task {
                         ensureCanContinue ()
-                        Interlocked.Increment(&projectOptionsLoadCount) |> ignore
-                        let projects = loader.LoadProjects([ fsprojPath ]) |> Seq.toList
+                        let projectDir = Path.GetDirectoryName(fsprojPath)
 
-                        match projects with
-                        | proj :: _ ->
-                            let fcsOpts = FCS.mapToFSharpProjectOptions proj (projects |> Seq.map id)
-                            let fingerprint = captureProjectOptionsFingerprint projects
-                            let snapshot = EvaluatedProjectModel.create "ionide-proj-info" proj fcsOpts
-                            Some(fcsOpts, fingerprint, snapshot)
-                        | [] -> None
-                    with
-                    | :? TimeoutException as ex -> raise ex
-                    | :? OperationCanceledException as ex -> raise ex
-                    | ex ->
-                        Console.Error.WriteLine($"[proj-info] Failed to load %s{fsprojPath}: %s{ex.Message}")
-                        None)
+                        // #192: outside the try on purpose. Init.init inherits this
+                        // directory's global.json, and an unsatisfiable `rollForward:
+                        // "disable"` pin is not a load failure to degrade into None —
+                        // it is a machine-configuration problem the agent must be told
+                        // about by name. Raising here also keeps MSBuild untouched.
+                        SdkPreflight.ensure [ projectDir ]
+                        InstallationHealth.ensureCurrent ()
+                        ensureCanContinue ()
+
+                        try
+                            ensureCanContinue ()
+                            Interlocked.Increment(&projectOptionsLoadCount) |> ignore
+                            let! projects = ProjectEvaluation.loadProjectsAsync fsprojPath ensureCanContinue
+                            ensureCanContinue ()
+
+                            match projects with
+                            | proj :: _ ->
+                                let fcsOpts = FCS.mapToFSharpProjectOptions proj (projects |> Seq.map id)
+                                let fingerprint = captureProjectOptionsFingerprint projects
+                                let snapshot = EvaluatedProjectModel.create "ionide-proj-info" proj fcsOpts
+                                ensureCanContinue ()
+                                return Some(fcsOpts, fingerprint, snapshot)
+                            | [] -> return None
+                        with
+                        | :? TimeoutException as ex -> return raise ex
+                        | :? OperationCanceledException as ex -> return raise ex
+                        | ex ->
+                            Console.Error.WriteLine($"[proj-info] Failed to load %s{fsprojPath}: %s{ex.Message}")
+                            return None
+                    })
         }
 
     member private this.AcquireFsprojEntryWithinBudget

@@ -217,6 +217,7 @@ let ``runtime status exposes actual project-options load and stale-reload counte
     let result = buildSnapshotWithTelemetry defaultArgs defaultConfig None telemetry
     let projectOptions = result["fcs"]["projectOptions"]
 
+    Assert.Equal("isolated_helper", getStr projectOptions "evaluationMode")
     Assert.Equal(7L, getInt64At projectOptions "loadAttempts")
     Assert.Equal(2L, getInt64At projectOptions "staleReloads")
     Assert.Equal(31L, getInt64At projectOptions "cacheValidations")

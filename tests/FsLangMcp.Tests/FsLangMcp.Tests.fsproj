@@ -23,6 +23,7 @@
     <Compile Include="ProjectHealthTests.fs" />
     <Compile Include="BoundedCacheTests.fs" />
     <Compile Include="ProcessRunnerTests.fs" />
+    <Compile Include="ProjectEvaluationTests.fs" />
     <Compile Include="FcsBridgeTests.fs" />
     <Compile Include="OutlinePaginationTests.fs" />
     <Compile Include="CursorPropertyTests.fs" />
