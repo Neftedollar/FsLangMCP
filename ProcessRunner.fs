@@ -428,6 +428,11 @@ let private runAsyncWithOutputLimitCore
         for arg in args do
             psi.ArgumentList.Add(arg)
 
+        // Reject cancellation at the last boundary we control before Process.Start.
+        // Cancellation that races after this check can still observe child side effects;
+        // the containment cleanup below bounds that case but cannot make launch atomic.
+        cancellationToken.ThrowIfCancellationRequested()
+
         use containment = startContainedProcessWithPreference unixSessionWrapperPreference psi
         let proc = containment.Process
 
