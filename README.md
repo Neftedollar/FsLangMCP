@@ -151,7 +151,7 @@ Prefer the semantic tools above for free-form agent flows.
 
 ```
 1. set_project  {"projectPath": "/abs/path/MyApp.sln"}
-   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.17.0"
+   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.17.1"
 
 2. check  {}
    → verdict="clean"

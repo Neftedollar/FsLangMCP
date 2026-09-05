@@ -4,7 +4,7 @@ A living document. **Not a delivery contract** — priorities shift with real us
 
 ## Current status (pre-1.0)
 
-`v0.17.0` ships **35 MCP tools** across headline, semantic, LSP-proxy, and meta categories. The surface is still evolving toward a stable shape: v0.11.0 consolidated the former search/check aliases behind `find` and `check`, v0.15.0 made incomplete evidence explicit and tightened typed tool input to strict JSON, v0.16.0 made payloads self-explaining, and v0.17.0 hardens the same surface around result limits, admission-aware deadlines for find/check/test sweeps, test/outline coverage, stale runtime detection, and dependency closure. A 1.0 release will lock the contract.
+`v0.17.1` ships **35 MCP tools** across headline, semantic, LSP-proxy, and meta categories. The surface is still evolving toward a stable shape: v0.11.0 consolidated the former search/check aliases behind `find` and `check`, v0.15.0 made incomplete evidence explicit and tightened typed tool input to strict JSON, v0.16.0 made payloads self-explaining, and v0.17.0 hardened the same surface around result limits, admission-aware deadlines for find/check/test sweeps, test/outline coverage, stale runtime detection, and dependency closure. The v0.17.1 patch adds declared-member coverage, end-to-end find deadlines, an actual serialized-response ceiling, and waiter-aware discovery. Query/snapshot-bound cursor runtime remains planned for v0.18.0 (#259). A 1.0 release will lock the contract.
 
 ## 1.0 exit criteria
 

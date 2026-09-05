@@ -83,7 +83,7 @@ Once you have a base signal from `find` and `check`, the other 33 tools let you 
 
 ```
 1. set_project  {"projectPath": "/abs/path/MyApp.sln"}
-   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.17.0"
+   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.17.1"
 
 2. check  {}
    → verdict="clean"
