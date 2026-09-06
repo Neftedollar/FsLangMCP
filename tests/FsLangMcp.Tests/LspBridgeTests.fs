@@ -628,6 +628,7 @@ let ``diagnostic snapshots fail fast instead of queueing behind an in-flight LSP
                     { scope = Some "file"
                       path = Some checkSourcePath
                       snippet = None
+                      snippetPosition = None
                       fileGlob = None
                       mode = None
                       speed = Some "fast"
