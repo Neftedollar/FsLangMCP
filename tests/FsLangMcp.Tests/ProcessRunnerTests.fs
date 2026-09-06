@@ -59,15 +59,77 @@ let private waitForProcessExit pid =
         return not running
     }
 
-let private waitForFile path =
+let private waitForFileWithin path timeout =
     task {
-        let deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10.0)
+        let deadline = DateTime.UtcNow + timeout
 
         while not (File.Exists path) && DateTime.UtcNow < deadline do
             do! Task.Delay(25)
 
         return File.Exists path
     }
+
+let private waitForFile path = waitForFileWithin path (TimeSpan.FromSeconds(10.0))
+
+let private ownedProcessesByNameAndPath processName expectedExecutablePath =
+    Process.GetProcessesByName(processName)
+    |> Array.choose (fun processHandle ->
+        try
+            if processHandle.HasExited then
+                processHandle.Dispose()
+                None
+            else
+                // Opening SafeHandle while the process is alive pins this exact
+                // process identity through the post-timeout assertion.
+                let retainedHandle = processHandle.SafeHandle
+                let mainModule = processHandle.MainModule
+
+                if
+                    retainedHandle.IsInvalid
+                    || isNull mainModule
+                    || not (
+                        String.Equals(
+                            Path.GetFullPath(mainModule.FileName),
+                            Path.GetFullPath(expectedExecutablePath),
+                            StringComparison.OrdinalIgnoreCase
+                        )
+                    )
+                then
+                    processHandle.Dispose()
+                    None
+                else
+                    Some processHandle
+        with
+        | :? InvalidOperationException
+        | :? System.ComponentModel.Win32Exception ->
+            processHandle.Dispose()
+            None)
+
+let private waitForOwnedProcessesByNameAndPath processName expectedExecutablePath timeout =
+    task {
+        let deadline = DateTime.UtcNow + timeout
+        let mutable ownedProcesses = ownedProcessesByNameAndPath processName expectedExecutablePath
+
+        while ownedProcesses.Length = 0 && DateTime.UtcNow < deadline do
+            do! Task.Delay(10)
+            ownedProcesses <- ownedProcessesByNameAndPath processName expectedExecutablePath
+
+        return ownedProcesses
+    }
+
+let private stopOwnedProcesses (ownedProcesses: Process array) =
+    for ownedProcess in ownedProcesses do
+        try
+            if not ownedProcess.HasExited then
+                try
+                    ownedProcess.Kill(true)
+                with :? InvalidOperationException when ownedProcess.HasExited ->
+                    ()
+
+            if not (ownedProcess.WaitForExit(5000)) then
+                failwith $"Owned process %d{ownedProcess.Id} did not exit within five seconds after cleanup."
+        finally
+            ownedProcess.Dispose()
 
 let private readRecordedPids path =
     File.ReadAllLines(path)
@@ -494,46 +556,156 @@ let ``Runner drains stdout and stderr concurrently`` () : Task =
 [<Fact>]
 let ``Runner kills a process tree when the timeout expires`` () : Task =
     task {
-        let id = Guid.NewGuid().ToString("N")
-        let pidPath = Path.Combine(Path.GetTempPath(), $"fslangmcp_process_%s{id}.pid")
-        let fileName, arguments, scripts =
-            if OperatingSystem.IsWindows() then
-                let parentScript, childScript = processTreeScripts pidPath 0 true
+        if OperatingSystem.IsWindows() then
+            let id = Guid.NewGuid().ToString("N")
+            let systemDirectory = Environment.GetFolderPath(Environment.SpecialFolder.System)
+            let commandPath = Path.Combine(systemDirectory, "cmd.exe")
+            let systemPingPath = Path.Combine(systemDirectory, "ping.exe")
+            let childProcessName = $"flm%s{id.Substring(0, 8)}"
+            let authorization = "fslangmcp-timeout-start"
 
-                "dotnet", [ "fsi"; "--exec"; parentScript ], [ parentScript; childScript ]
-            else
+            Assert.True(File.Exists(commandPath), $"Windows command processor not found: %s{commandPath}")
+            Assert.True(File.Exists(systemPingPath), $"Windows ping executable not found: %s{systemPingPath}")
+
+            let fixtureDirectory = Directory.CreateTempSubdirectory("fslangmcp_native_tree_").FullName
+            let childExecutableName = childProcessName + ".exe"
+            let childExecutablePath = Path.Combine(fixtureDirectory, childExecutableName)
+            let readyFileName = "ready.txt"
+            let readyPath = Path.Combine(fixtureDirectory, readyFileName)
+            let batchPath = Path.Combine(fixtureDirectory, "run.cmd")
+            let mutable observedChildren: Process array = Array.empty
+
+            let batch =
+                [ "@echo off"
+                  "set /p FSLANGMCP_AUTH="
+                  "if not \"%FSLANGMCP_AUTH%\"==\"" + authorization + "\" exit /b 91"
+                  "start \"\" /b \"%~dp0" + childExecutableName + "\" -t 127.0.0.1 >nul 2>&1"
+                  "> \"%~dp0" + readyFileName + "\" echo ready"
+                  "\"%SystemRoot%\\System32\\ping.exe\" -t 127.0.0.1 >nul 2>&1" ]
+                |> String.concat "\r\n"
+                |> fun value -> value + "\r\n"
+
+            try
+                File.Copy(systemPingPath, childExecutablePath, false)
+                File.WriteAllText(batchPath, batch, System.Text.Encoding.ASCII)
+
+                let operation =
+                    runAsyncWithOutputLimitAfterRequiredContainment
+                        commandPath
+                        [ "/d"; "/c"; batchPath ]
+                        authorization
+                        (TimeSpan.FromSeconds(3.0))
+                        CancellationToken.None
+                        1024
+
+                let mutable readinessError = None
+                let mutable ready = false
+
+                try
+                    let! observed = waitForFileWithin readyPath (TimeSpan.FromSeconds(2.0))
+                    ready <- observed
+
+                    if ready then
+                        let! ownedProcesses =
+                            waitForOwnedProcessesByNameAndPath
+                                childProcessName
+                                childExecutablePath
+                                (TimeSpan.FromMilliseconds(500.0))
+
+                        observedChildren <- ownedProcesses
+                with error ->
+                    readinessError <- Some error
+
+                // Settle the real operation before any readiness assertion or fixture
+                // deletion, so even a failed probe cannot abandon the contained tree.
+                let! operationOutcome =
+                    task {
+                        try
+                            let! output = operation
+                            return Ok output
+                        with error ->
+                            return Error error
+                    }
+
+                match readinessError with
+                | Some error -> raise error
+                | None -> ()
+
+                Assert.True(ready, "The authorized native Windows fixture did not become ready.")
+                Assert.NotEmpty observedChildren
+
+                match operationOutcome with
+                | Ok output ->
+                    Assert.Fail($"The native Windows process tree exited with code %d{output.ExitCode} before timeout.")
+                | Error error ->
+                    let timeoutError = Assert.IsType<TimeoutException>(error)
+                    Assert.Contains("timed out", timeoutError.Message)
+
+                for childProcess in observedChildren do
+                    Assert.True(
+                        childProcess.HasExited,
+                        $"Timed-out native descendant process %d{childProcess.Id} was still active when the runner returned."
+                    )
+            finally
+                if observedChildren.Length = 0 then
+                    observedChildren <- ownedProcessesByNameAndPath childProcessName childExecutablePath
+
+                stopOwnedProcesses observedChildren
+                Directory.Delete(fixtureDirectory, true)
+        else
+            let id = Guid.NewGuid().ToString("N")
+            let pidPath = Path.Combine(Path.GetTempPath(), $"fslangmcp_process_%s{id}.pid")
+
+            try
                 // Use a tiny native shell tree so suite-wide CPU pressure tests
                 // termination rather than racing the .NET SDK/F# Interactive startup.
                 // Record both the direct shell and its background descendant.
-                "/bin/sh",
-                [ "-c"
-                  "sleep 30 & child=$!; printf '%s\n%s\n' \"$$\" \"$child\" > \"$1\"; wait \"$child\""
-                  "fslangmcp-runner"
-                  pidPath ],
-                []
+                let operation =
+                    runAsync
+                        "/bin/sh"
+                        [ "-c"
+                          "sleep 30 & child=$!; printf '%s\n%s\n' \"$$\" \"$child\" > \"$1\"; wait \"$child\""
+                          "fslangmcp-runner"
+                          pidPath ]
+                        (TimeSpan.FromSeconds(3.0))
+                        CancellationToken.None
 
-        try
+                let! error = Assert.ThrowsAsync<TimeoutException>(fun () -> operation :> Task)
+                Assert.Contains("timed out", error.Message)
+                Assert.True(File.Exists(pidPath), "The child did not start before the timeout.")
+
+                let pids = readRecordedPids pidPath
+
+                Assert.NotEmpty pids
+
+                for pid in pids do
+                    let stillRunning = isProcessRunning pid
+                    let state = tryLinuxProcessState pid |> Option.map string |> Option.defaultValue "unavailable"
+
+                    Assert.False(stillRunning, $"Timed-out process %d{pid} is still running (state={state}).")
+            finally
+                if File.Exists(pidPath) then
+                    File.Delete(pidPath)
+    }
+
+[<Fact>]
+let ``Runner applies its deadline to a native Windows root`` () : Task =
+    task {
+        if OperatingSystem.IsWindows() then
+            let pingPath =
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "ping.exe")
+
+            Assert.True(File.Exists(pingPath), $"Windows ping executable not found: %s{pingPath}")
+
             let operation =
-                runAsync fileName arguments (TimeSpan.FromSeconds(3.0)) CancellationToken.None
+                runAsync
+                    pingPath
+                    [ "-t"; "127.0.0.1" ]
+                    (TimeSpan.FromSeconds(3.0))
+                    CancellationToken.None
 
             let! error = Assert.ThrowsAsync<TimeoutException>(fun () -> operation :> Task)
             Assert.Contains("timed out", error.Message)
-            Assert.True(File.Exists(pidPath), "The child did not start before the timeout.")
-
-            let pids = readRecordedPids pidPath
-
-            Assert.NotEmpty pids
-
-            for pid in pids do
-                let stillRunning = isProcessRunning pid
-                let state = tryLinuxProcessState pid |> Option.map string |> Option.defaultValue "unavailable"
-
-                Assert.False(stillRunning, $"Timed-out process %d{pid} is still running (state={state}).")
-        finally
-            if File.Exists(pidPath) then
-                File.Delete(pidPath)
-
-            scripts |> List.iter File.Delete
     }
 
 [<Theory>]
