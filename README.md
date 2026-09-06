@@ -261,8 +261,13 @@ found but some projects were not analyzed; `status="unknown"` plus
 `truncated` / `nextCursor` and verify `totalEstimate.sites` before treating a refactor count as
 exhaustive. A v2 cursor may be retried with a different `maxResults` or `timeoutMs`, but changing
 any result-shaping input returns `cursor_query_mismatch`; a changed source/result/coverage stream
-returns `cursor_stale`. Deadline-incomplete initial pages have no cursor and require a restart;
-deadline-incomplete continuations return no sites with `retrySameCursor=true`. `check(speed="fast")`
+returns `cursor_stale`, including removal of the last or selected declared solution member.
+Deadline-incomplete initial pages have no cursor and require a restart; deadline-incomplete
+continuations return no sites with `retrySameCursor=true`. This also applies when constructing
+the final validation-error response exhausts the deadline: a well-formed continuation returns
+`cursor_validation_incomplete` and can be retried to obtain the actual validation result.
+Malformed cursors and invalid/missing-context requests keep their typed rejection routes.
+`check(speed="fast")`
 similarly exposes expected/received/missing/stale file coverage and never turns an
 incomplete empty snapshot into `clean`.
 

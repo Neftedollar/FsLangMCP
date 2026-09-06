@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plus SHA-256 identities, retain no per-cursor server state, and make no atomic-filesystem-
   snapshot claim. This wire-contract change **must ship in the next minor release**; the #259
   integration lane intentionally does not change the product version.
+- Unchanged `find` continuations restart as stale when the last or selected declared solution
+  member is removed, while initial missing targets and malformed/mismatched cursors keep their
+  distinct errors. The final error-response size guard checks the existing deadline before and
+  after serialization; expiry of a well-formed continuation returns a bounded, empty,
+  same-cursor-retry response, including when constructing stale/out-of-range/query errors.
 - Cursor validation rejects nonnumeric JSON versions and invalid Unicode without throwing, preserves same-cursor
   retries through final response serialization, and binds position cursors to the selected
   overload's semantic identity. Removed position targets restart as stale; unavailable resolution

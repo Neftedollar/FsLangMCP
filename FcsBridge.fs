@@ -2892,6 +2892,7 @@ type internal FcsBridge
         ?findResponseConstructionBeforeStartOverride: (unit -> Task),
         ?findResponseConstructionBeforeStepOverride: (string -> int -> unit),
         ?findFinalResponseBeforeMeasureOverride: (unit -> unit),
+        ?findFinalResponseAfterMeasureOverride: (unit -> unit),
         // #207: test-only seam for find's PER-SITE siteType deadline. The production check
         // reads the shared FindRequestDeadline, which cannot target one site deterministically
         // without a seam: timeoutMs=0 is exhausted BEFORE the sweep and yields no sites.
@@ -6923,6 +6924,7 @@ type internal FcsBridge
             cancellationToken: CancellationToken,
             retainUntil: Task -> unit,
             fsacProbe: (string -> Task<FindFsacProbeResult>) option,
+            recordValidatedContinuationEnvelope: unit -> unit,
             recordMeasuredResponse: JsonNode -> unit
         )
         : Task<JsonNode> =
@@ -7098,6 +7100,10 @@ type internal FcsBridge
                     && (args.path |> Option.forall String.IsNullOrWhiteSpace)
                 then
                     Some "scope='file' requires a non-empty path."
+                elif kind = "position" && (args.path |> Option.forall String.IsNullOrWhiteSpace) then
+                    Some "kind='position' requires 'path' (and 'line')."
+                elif kind = "position" && args.line.IsNone then
+                    Some "kind='position' requires 'line' (0-based)."
                 else
                     None
 
@@ -7136,6 +7142,13 @@ type internal FcsBridge
                 | Error _ -> None
 
             let pageOffset = cursorPayload |> Option.map _.Offset |> Option.defaultValue 0
+
+            // Record only a decoded v2 envelope with valid inputs and context. This
+            // is per-call evidence for the final deadline guard, not proof that its
+            // query/snapshot match, nor state retained for a cursor. Malformed tokens
+            // and invalid initial requests keep their typed errors even on late expiry.
+            if validationError.IsNone && not (String.IsNullOrEmpty(queryModel.Target)) then
+                cursorPayload |> Option.iter (fun _ -> recordValidatedContinuationEnvelope ())
 
             // kind=position resolves the symbol under the cursor, then sweeps it as a symbol.
             let! queryResult =
@@ -7502,6 +7515,16 @@ type internal FcsBridge
             if projectsToSweep.Count = 0 && missingProjects.Count = 0 then
                 match scopedProjectEarlyResponse with
                 | Some envelope -> return envelope
+                | None when cursorPayload.IsSome && deadline.SemanticExpired ->
+                    return
+                        FindCursorContract.validationIncomplete
+                            deadline
+                            "The find deadline expired while validating the requested project membership. Retry the same cursor with a larger timeoutMs."
+                | None when cursorPayload.IsSome ->
+                    // The envelope and canonical request already matched above. Losing
+                    // the last/selected declared member changes this stream, not the
+                    // request, even when discovery now has no project left to sweep.
+                    return FindCursorContract.stale ()
                 | None ->
                     let message =
                         projectResolutionError
@@ -9475,11 +9498,13 @@ type internal FcsBridge
         ) : Task<JsonNode> =
         task {
             let mutable measuredResponse: JsonNode = null
+            let mutable validatedContinuationEnvelope = false
 
             let! response =
                 this.FindCoreWithinDeadline(
                     args, deadline, cancellationToken, retainUntil, fsacProbe,
-                    fun measured -> measuredResponse <- measured
+                    (fun () -> validatedContinuationEnvelope <- true),
+                    (fun measured -> measuredResponse <- measured)
                 )
 
             if Object.ReferenceEquals(response, measuredResponse) then
@@ -9489,9 +9514,25 @@ type internal FcsBridge
                 return response
             else
                 // Early errors and timeout/budget envelopes were not measured by
-                // the planner, so they still need the universal hard-size guard.
+                // the planner. Begin its bounded response allowance if needed, without
+                // restarting the end-to-end deadline or an already-started allowance.
+                deadline.BeginResponseConstruction()
+                let validationIncomplete () =
+                    FindCursorContract.validationIncomplete
+                        deadline
+                        "The find deadline expired during continuation response construction. Retry the same cursor with a larger timeoutMs."
+                    |> FindResponseBudget.guardFinalResponse
+
                 findFinalResponseBeforeMeasureOverride |> Option.iter (fun hook -> hook ())
-                return FindResponseBudget.guardFinalResponse response
+                if validatedContinuationEnvelope && deadline.ResponseExpired then
+                    return validationIncomplete ()
+                else
+                    let guardedResponse = FindResponseBudget.guardFinalResponse response
+                    findFinalResponseAfterMeasureOverride |> Option.iter (fun hook -> hook ())
+                    if validatedContinuationEnvelope && deadline.ResponseExpired then
+                        return validationIncomplete ()
+                    else
+                        return guardedResponse
         }
 
     member this.Find(args: FindArgs, ?fsacProbe: string -> Task<FindFsacProbeResult>) : Task<JsonNode> =

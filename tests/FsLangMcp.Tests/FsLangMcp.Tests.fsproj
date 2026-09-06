@@ -34,6 +34,7 @@
     <Compile Include="FindTests.fs" />
     <Compile Include="FindCursorIntegrationTests.fs" />
     <Compile Include="FindCursorReviewTests.fs" />
+    <Compile Include="FindCursorBoundaryTests.fs" />
     <Compile Include="FindResponseBudgetTests.fs" />
     <Compile Include="TestsForSymbolTests.fs" />
     <Compile Include="CompileOrderTests.fs" />
