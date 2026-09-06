@@ -3,10 +3,17 @@ module FsLangMcp.Tests.ProcessRunnerTests
 open System
 open System.Diagnostics
 open System.IO
+open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
 open FsLangMcp.ProcessRunner
 open Xunit
+
+[<DllImport("libc")>]
+extern int private getsid(int pid)
+
+[<DllImport("libc")>]
+extern int private getpgid(int pid)
 
 let private tempScript (body: string) =
     let id = Guid.NewGuid().ToString("N")
@@ -79,6 +86,81 @@ let private stopRecordedProcesses pids =
                 ()
 
 let private escapeVerbatimString (value: string) = value.Replace("\"", "\"\"")
+
+[<Theory>]
+[<InlineData(true)>]
+[<InlineData(false)>]
+let ``Required helpers retain session-scoped synchronization inside their own process group`` required : Task =
+    task {
+        if not (OperatingSystem.IsWindows()) then
+            let parentSession = getsid 0
+            let parentGroup = getpgid 0
+            Assert.True(parentSession > 0 && parentGroup > 0)
+            let mutexName = "fslangmcp-session-probe-" + Guid.NewGuid().ToString("N")
+            let mutable created = false
+            // Keep the name alive without acquiring a thread-affine lock across await.
+            use sharedMutex = new Mutex(false, mutexName, &created)
+            Assert.True(created)
+
+            let authorization =
+                if required then
+                    "if Console.ReadLine() <> \"session-probe-start\" then failwith \"Not authorized\""
+                else
+                    "()"
+
+            let script =
+                tempScript
+                    $"""
+open System
+open System.Runtime.InteropServices
+open System.Threading
+[<DllImport("libc")>]
+extern int getsid(int pid)
+[<DllImport("libc")>]
+extern int getpgid(int pid)
+{authorization}
+let mutable created = false
+let shared = new Mutex(false, "{mutexName}", &created)
+printfn "%%d|%%d|%%b" (getsid 0) (getpgid 0) created
+shared.Dispose()
+"""
+
+            try
+                let! result =
+                    if required then
+                        runAsyncWithOutputLimitAfterRequiredContainment
+                            (resolveDotnetHost ())
+                            [ "fsi"; "--exec"; script ]
+                            "session-probe-start"
+                            (TimeSpan.FromSeconds(30.0))
+                            CancellationToken.None
+                            1024
+                    else
+                        runAsyncWithManagedUnixSessionWrapper
+                            (resolveDotnetHost ())
+                            [ "fsi"; "--exec"; script ]
+                            (TimeSpan.FromSeconds(30.0))
+                            CancellationToken.None
+
+                Assert.True(result.ExitCode = 0, result.StandardError)
+                let observed = result.StandardOutput.Trim().Split('|')
+                Assert.Equal(3, observed.Length)
+                let childSession = Int32.Parse(observed[0])
+                let childGroup = Int32.Parse(observed[1])
+                let createdDifferentMutex = Boolean.Parse(observed[2])
+                Assert.True(childGroup > 0)
+                Assert.NotEqual(parentGroup, childGroup)
+
+                if required then
+                    Assert.Equal(parentSession, childSession)
+                    Assert.False(createdDifferentMutex, "The helper lost the host's named-mutex namespace.")
+                else
+                    // Preserve the pre-existing detached-session policy for general callers.
+                    Assert.NotEqual(parentSession, childSession)
+                    Assert.True(createdDifferentMutex)
+            finally
+                File.Delete(script)
+    }
 
 [<Theory>]
 [<InlineData(false)>]

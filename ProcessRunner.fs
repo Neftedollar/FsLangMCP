@@ -147,14 +147,21 @@ extern bool private CloseHandle(nativeint handle)
 extern int private setsid()
 
 [<DllImport("libc", SetLastError = true)>]
+extern int private setpgid(int pid, int processGroup)
+
+[<DllImport("libc", SetLastError = true)>]
 extern int private kill(int pid, int signal)
 
 [<Literal>]
 let internal InternalProcessSessionWrapperArgument = "--internal-process-session-wrapper"
 
+[<Literal>]
+let internal InternalProcessGroupWrapperArgument = "--internal-process-group-wrapper"
+
 type internal UnixSessionWrapperPreference =
     | Automatic
     | Managed
+    | ManagedProcessGroup
 
 let private executableExists (fileName: string) =
     if Path.IsPathRooted fileName || fileName.Contains(Path.DirectorySeparatorChar) then
@@ -193,7 +200,7 @@ let internal resolveDotnetHostWith
 let internal resolveDotnetHost () =
     resolveDotnetHostWith (OperatingSystem.IsWindows()) Environment.GetEnvironmentVariable File.Exists
 
-let private configureManagedUnixSessionWrapper (startInfo: ProcessStartInfo) =
+let private configureManagedUnixSessionWrapper wrapperArgument (startInfo: ProcessStartInfo) =
     let assemblyPath = typeof<ProcessOutput>.Assembly.Location
 
     if String.IsNullOrWhiteSpace assemblyPath || not (File.Exists assemblyPath) then
@@ -204,7 +211,7 @@ let private configureManagedUnixSessionWrapper (startInfo: ProcessStartInfo) =
     startInfo.FileName <- resolveDotnetHost ()
     startInfo.ArgumentList.Clear()
     startInfo.ArgumentList.Add(assemblyPath)
-    startInfo.ArgumentList.Add(InternalProcessSessionWrapperArgument)
+    startInfo.ArgumentList.Add(wrapperArgument)
     startInfo.ArgumentList.Add(command)
 
     for argument in arguments do
@@ -219,12 +226,19 @@ let private configureUnixSessionWrapper
     else
         let externalSetsid =
             match preference with
-            | Managed -> None
+            | Managed
+            | ManagedProcessGroup -> None
             | Automatic -> [| "/usr/bin/setsid"; "/bin/setsid" |] |> Array.tryFind File.Exists
 
         match externalSetsid with
         | None ->
-            configureManagedUnixSessionWrapper startInfo
+            let wrapperArgument =
+                match preference with
+                | ManagedProcessGroup -> InternalProcessGroupWrapperArgument
+                | Automatic
+                | Managed -> InternalProcessSessionWrapperArgument
+
+            configureManagedUnixSessionWrapper wrapperArgument startInfo
             true
         | Some wrapper ->
             let command = startInfo.FileName
@@ -321,7 +335,7 @@ type internal ProcessContainment private (
     let signalContainedProcesses () =
         match unixProcessGroup with
         | Some groupId ->
-            // The managed session wrapper may not have completed setsid(2) when
+            // The managed wrapper may not have created its process group when
             // termination is first requested. A later signal after the direct
             // wrapper exits closes that launch race without widening containment.
             kill (-groupId, 9) |> ignore
@@ -391,7 +405,7 @@ type internal ProcessContainment private (
                         )
                     )
 
-            // Termination can race the managed wrapper's setsid(2): the first
+            // Termination can race the managed wrapper's setsid(2)/setpgid(2): the first
             // group signal then sees no group, while the wrapper creates it just
             // before its own asynchronous kill completes. Once the direct wrapper
             // is reaped, the group identity is stable, so signal it again before
@@ -863,9 +877,11 @@ let internal runAsyncWithOutputLimit
 
 /// Starts a controlled helper behind required process containment, then sends
 /// exactly one UTF-8 authorization line terminated by a literal LF. On Unix the
-/// managed wrapper establishes setsid(2) before it starts the helper, so the
+/// managed wrapper establishes setpgid(0,0) before it starts the helper, so the
 /// buffered authorization cannot let that helper run first. This ordering is a
-/// helper protocol, not a sandbox for untrusted descendants.
+/// helper protocol, not a sandbox for untrusted descendants. Retaining the parent
+/// session also retains session-scoped synchronization with the host: Coverlet's
+/// injected tracker, for example, uses a named mutex to merge one shared hits file.
 let internal runAsyncWithOutputLimitAfterRequiredContainment
     (fileName: string)
     (args: string seq)
@@ -880,7 +896,7 @@ let internal runAsyncWithOutputLimitAfterRequiredContainment
         timeout
         cancellationToken
         outputLimitCharacters
-        UnixSessionWrapperPreference.Managed
+        UnixSessionWrapperPreference.ManagedProcessGroup
         (ReleaseAfterRequiredContainment startLine)
         None
 
@@ -899,7 +915,7 @@ let internal runAsyncWithOutputLimitAfterRequiredContainmentForTest
         timeout
         cancellationToken
         outputLimitCharacters
-        UnixSessionWrapperPreference.Managed
+        UnixSessionWrapperPreference.ManagedProcessGroup
         (ReleaseAfterRequiredContainment startLine)
         (Some testHooks)
 
@@ -919,16 +935,16 @@ let internal runAsyncWithManagedUnixSessionWrapper
         NoInput
         None
 
-let internal runUnixSessionWrapper (fileName: string) (args: string array) =
+let private runUnixWrapper createIsolation isolationName (fileName: string) (args: string array) =
     if OperatingSystem.IsWindows() then
-        Console.Error.WriteLine("The internal process-session wrapper is only supported on Unix.")
+        Console.Error.WriteLine($"The internal {isolationName} wrapper is only supported on Unix.")
         64
     elif String.IsNullOrWhiteSpace fileName then
-        Console.Error.WriteLine("The internal process-session wrapper requires a command.")
+        Console.Error.WriteLine($"The internal {isolationName} wrapper requires a command.")
         64
-    elif setsid () < 0 then
+    elif createIsolation () < 0 then
         Console.Error.WriteLine(
-            $"Unable to create a Unix process session (errno %d{Marshal.GetLastPInvokeError()})."
+            $"Unable to create a Unix {isolationName} (errno %d{Marshal.GetLastPInvokeError()})."
         )
 
         125
@@ -953,6 +969,12 @@ let internal runUnixSessionWrapper (fileName: string) (args: string array) =
         with ex ->
             Console.Error.WriteLine($"Unable to start process '%s{fileName}': %s{ex.Message}")
             127
+
+let internal runUnixSessionWrapper (fileName: string) (args: string array) =
+    runUnixWrapper setsid "process session" fileName args
+
+let internal runUnixProcessGroupWrapper (fileName: string) (args: string array) =
+    runUnixWrapper (fun () -> setpgid (0, 0)) "process group" fileName args
 
 let internal runAsync
     (fileName: string)
