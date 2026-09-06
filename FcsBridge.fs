@@ -1916,6 +1916,19 @@ module internal AnalysisSnapshotKey =
         appendProject "root" "" projectOptions
         aggregate.GetHashAndReset() |> Convert.ToHexString
 
+/// Single construction path for user-supplied project-outline filters. Tests
+/// assert these engine guarantees directly instead of treating host speed as a
+/// correctness property.
+module internal ProjectOutlineFilter =
+    let private matchTimeout = TimeSpan.FromMilliseconds(250.0)
+
+    let compile (pattern: string) =
+        let options =
+            System.Text.RegularExpressions.RegexOptions.NonBacktracking
+            ||| System.Text.RegularExpressions.RegexOptions.IgnoreCase
+
+        new System.Text.RegularExpressions.Regex(pattern, options, matchTimeout)
+
 /// Adapts Ionide.ProjInfo's evaluated MSBuild result to the small, stable model
 /// shared by project_health and fsharp_project_inspect.
 module private EvaluatedProjectModel =
@@ -2777,13 +2790,27 @@ type internal FcsBridge
         ?projectOptionsCacheValidationBeforeComputeOverride: (string -> unit),
         ?trustedFileCheckAnswerOverride: (FSharpCheckFileAnswer -> FSharpCheckFileAnswer),
         // Deterministic test seam for the otherwise fixed production find ceiling.
-        ?findResponseBudgetCharsOverride: int
+        ?findResponseBudgetCharsOverride: int,
+        // Test-only ownership boundary for synthetic snippet files. Production
+        // continues to use the OS temp directory.
+        ?snippetTempDirectoryOverride: string
     ) =
     let findResponseBudgetChars =
         match findResponseBudgetCharsOverride with
         | Some value when value > 0 -> value
         | Some value -> invalidArg (nameof findResponseBudgetCharsOverride) $"find response budget must be positive; got {value}."
         | None -> FindResponseBudget.MaxSerializedChars
+
+    let snippetTempDirectory =
+        match snippetTempDirectoryOverride with
+        | Some path when String.IsNullOrWhiteSpace(path) ->
+            invalidArg (nameof snippetTempDirectoryOverride) "snippet temp directory must not be blank."
+        | Some path -> Path.GetFullPath(path)
+        | None -> Path.GetTempPath()
+
+    let createSnippetFile prefix extension =
+        Directory.CreateDirectory(snippetTempDirectory) |> ignore
+        Path.Combine(snippetTempDirectory, $"{prefix}_{Guid.NewGuid():N}{extension}")
 
     // FCS default projectCacheSize is 3. The `find` multi-project union sweep
     // (issue #128) re-checks EVERY member project of the active solution on each
@@ -5241,8 +5268,7 @@ type internal FcsBridge
 
                 let ext = if mode = "fsi" then ".fsi" else ".fs"
 
-                let snippetFile =
-                    Path.Combine(Path.GetTempPath(), $"fslangmcp_snippet_{Guid.NewGuid():N}{ext}")
+                let snippetFile = createSnippetFile "fslangmcp_snippet" ext
 
                 try
                     File.WriteAllText(snippetFile, args.content)
@@ -10679,8 +10705,7 @@ type internal FcsBridge
                         let! options, optionsSource = this.ResolveFsprojOptions(fsproj)
                         let ext = if mode = "fsi" then ".fsi" else ".fs"
 
-                        let snippetFile =
-                            Path.Combine(Path.GetTempPath(), $"fslangmcp_check_{Guid.NewGuid():N}{ext}")
+                        let snippetFile = createSnippetFile "fslangmcp_check" ext
 
                         try
                             File.WriteAllText(snippetFile, snippetText)
@@ -12402,11 +12427,7 @@ type internal FcsBridge
                             // NonBacktracking eliminates catastrophic-backtracking risk for
                             // user-supplied patterns like (a+)+$. A 250ms timeout is a belt-
                             // and-suspenders guard; NonBacktracking should never time out.
-                            let opts =
-                                System.Text.RegularExpressions.RegexOptions.NonBacktracking
-                                ||| System.Text.RegularExpressions.RegexOptions.IgnoreCase
-
-                            Some(System.Text.RegularExpressions.Regex(pattern, opts, TimeSpan.FromMilliseconds 250.0))
+                            Some(ProjectOutlineFilter.compile pattern)
                         with ex ->
                             invalidArg (nameof args.filter) $"Invalid filter regex: %s{ex.Message}"
 

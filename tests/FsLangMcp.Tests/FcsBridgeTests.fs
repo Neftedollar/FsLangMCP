@@ -3558,26 +3558,20 @@ let ``ValidateSnippet cleans up the temp file after running`` () : Task =
     task {
         let root = findRepoRoot ()
         let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
-        let bridge = FcsBridge()
+        let ownedRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_snippet_test_{Guid.NewGuid():N}")
+        let bridge = FcsBridge(snippetTempDirectoryOverride = ownedRoot)
 
-        let beforeFiles =
-            Directory.GetFiles(Path.GetTempPath(), "fslangmcp_snippet_*")
-            |> Set.ofArray
+        try
+            let! _ =
+                bridge.ValidateSnippet(
+                    { content = "module M\nlet x = 1\n"
+                      mode = Some "fs"
+                      projectPath = Some projectPath }
+                )
 
-        let! _ =
-            bridge.ValidateSnippet(
-                { content = "module M\nlet x = 1\n"
-                  mode = Some "fs"
-                  projectPath = Some projectPath }
-            )
-
-        let afterFiles =
-            Directory.GetFiles(Path.GetTempPath(), "fslangmcp_snippet_*")
-            |> Set.ofArray
-
-        // No new snippet temp files left behind.
-        let leftover = Set.difference afterFiles beforeFiles
-        Assert.Empty(leftover)
+            Assert.Empty(Directory.GetFiles(ownedRoot))
+        finally
+            TestRunTrace.deleteOwnedDirectory "ValidateSnippet cleanup test" ownedRoot
     }
 
 // ─── fcs_referenced_symbols + fcs_nuget_types (#113) ─────────────────────────
