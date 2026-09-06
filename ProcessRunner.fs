@@ -166,23 +166,32 @@ let private executableExists (fileName: string) =
         |> fun value -> value.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
         |> Array.exists (fun directory -> File.Exists(Path.Combine(directory, fileName)))
 
-let internal resolveDotnetHost () =
+let internal resolveDotnetHostWith
+    (isWindows: bool)
+    (getEnvironmentVariable: string -> string)
+    (fileExists: string -> bool)
+    =
+    let hostName = if isWindows then "dotnet.exe" else "dotnet"
+
     let existingEnvironmentPath name =
-        Environment.GetEnvironmentVariable(name)
+        getEnvironmentVariable name
         |> Option.ofObj
         |> Option.filter (String.IsNullOrWhiteSpace >> not)
-        |> Option.filter File.Exists
+        |> Option.filter fileExists
 
     let dotnetRootHost =
-        Environment.GetEnvironmentVariable("DOTNET_ROOT")
+        getEnvironmentVariable "DOTNET_ROOT"
         |> Option.ofObj
         |> Option.filter (String.IsNullOrWhiteSpace >> not)
-        |> Option.map (fun root -> Path.Combine(root, "dotnet"))
-        |> Option.filter File.Exists
+        |> Option.map (fun root -> Path.Combine(root, hostName))
+        |> Option.filter fileExists
 
     existingEnvironmentPath "DOTNET_HOST_PATH"
     |> Option.orElse dotnetRootHost
-    |> Option.defaultValue "dotnet"
+    |> Option.defaultValue hostName
+
+let internal resolveDotnetHost () =
+    resolveDotnetHostWith (OperatingSystem.IsWindows()) Environment.GetEnvironmentVariable File.Exists
 
 let private configureManagedUnixSessionWrapper (startInfo: ProcessStartInfo) =
     let assemblyPath = typeof<ProcessOutput>.Assembly.Location
@@ -777,6 +786,14 @@ let private runAsyncWithOutputLimitCore
                     // Waiting for the parent alone is insufficient: a grandchild may keep an
                     // inherited stdout/stderr handle open after the parent exits (#164).
                     do! proc.WaitForExitAsync(timeoutCts.Token)
+
+                    // The direct process has finished its work. Stop its owned
+                    // descendants BEFORE waiting for EOF: on Windows a descendant
+                    // may retain an inherited pipe handle even when its own standard
+                    // output was redirected. Waiting for EOF before signalling the
+                    // job would turn a successful exit into a timeout. Keep readers
+                    // open so already-buffered output is still drained normally.
+                    containment.Terminate()
                     let! stdout, stdoutTruncated = stdoutTask.WaitAsync(timeoutCts.Token)
                     let! stderr, stderrTruncated = stderrTask.WaitAsync(timeoutCts.Token)
 

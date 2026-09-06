@@ -80,6 +80,37 @@ let private stopRecordedProcesses pids =
 
 let private escapeVerbatimString (value: string) = value.Replace("\"", "\"\"")
 
+[<Theory>]
+[<InlineData(false)>]
+[<InlineData(true)>]
+let ``Dotnet host resolver honors the platform root without PATH and preserves explicit host priority`` isWindows =
+    let hostName = if isWindows then "dotnet.exe" else "dotnet"
+    let root = Path.Combine(Path.GetTempPath(), "sdk with spaces")
+    let rootHost = Path.Combine(root, hostName)
+    let explicitHost = Path.Combine(Path.GetTempPath(), "explicit-sdk", hostName)
+    let available = Set.ofList [ rootHost; explicitHost ]
+
+    let environment explicitPath name =
+        match name with
+        | "DOTNET_HOST_PATH" -> explicitPath
+        | "DOTNET_ROOT" -> root
+        | "PATH" -> ""
+        | _ -> null
+
+    for missingExplicitHost in [ null; ""; " "; Path.Combine(root, "missing-host") ] do
+        Assert.Equal(
+            rootHost,
+            resolveDotnetHostWith isWindows (environment missingExplicitHost) available.Contains
+        )
+
+    Assert.Equal(
+        explicitHost,
+        resolveDotnetHostWith isWindows (environment explicitHost) available.Contains
+    )
+
+    Assert.Equal(hostName, resolveDotnetHostWith isWindows (fun _ -> null) available.Contains)
+    Assert.Equal(hostName, resolveDotnetHostWith isWindows (environment null) (fun _ -> false))
+
 let private processTreeScripts pidPath exitCode keepParentAlive =
     let childScript = tempScript "System.Threading.Thread.Sleep(30000)\n"
     let escapedPidPath = escapeVerbatimString pidPath
@@ -549,28 +580,31 @@ let ``Containment wait reports an undrained process instead of silently succeedi
     }
 
 [<Fact>]
-let ``Runner timeout also bounds pipe drain after the direct child exits`` () : Task =
+let ``Runner finishes an ordinary exit without waiting for inherited pipe holders`` () : Task =
     task {
         if not (OperatingSystem.IsWindows()) then
             // The shell exits immediately, while the background child keeps the
             // inherited stdout/stderr pipe handles open. Waiting only for the shell
             // process therefore succeeds but ReadToEndAsync has no EOF (#164).
+            // Ownership now ends descendants before EOF, preserving the direct
+            // process result instead of spending the deadline on their handles.
             let stopwatch = Stopwatch.StartNew()
 
-            let operation =
+            let! result =
                 runAsync
                     "/bin/sh"
-                    [ "-c"; "sleep 30 &" ]
-                    (TimeSpan.FromMilliseconds(500.0))
+                    [ "-c"; "printf buffered-out; printf buffered-err >&2; sleep 30 &" ]
+                    (TimeSpan.FromSeconds(10.0))
                     CancellationToken.None
 
-            let! error = Assert.ThrowsAsync<TimeoutException>(fun () -> operation :> Task)
             stopwatch.Stop()
 
-            Assert.Contains("timed out", error.Message)
+            Assert.Equal(0, result.ExitCode)
+            Assert.Equal("buffered-out", result.StandardOutput)
+            Assert.Equal("buffered-err", result.StandardError)
             Assert.True(
                 stopwatch.Elapsed < TimeSpan.FromSeconds(5.0),
-                $"Pipe-drain timeout took {stopwatch.Elapsed}; the inherited handle was not bounded."
+                $"Normal-exit pipe drainage took {stopwatch.Elapsed}; an inherited handle delayed completion."
             )
     }
 
@@ -622,7 +656,7 @@ let ``Managed Unix session wrapper preserves arguments output and exit code`` ()
     }
 
 [<Fact>]
-let ``Managed Unix session wrapper kills descendants on timeout`` () : Task =
+let ``Managed Unix session wrapper drains descendants after the command exits`` () : Task =
     task {
         if not (OperatingSystem.IsWindows()) then
             let id = Guid.NewGuid().ToString("N")
@@ -630,21 +664,22 @@ let ``Managed Unix session wrapper kills descendants on timeout`` () : Task =
             let mutable descendantPid = None
 
             try
-                let operation =
+                let! result =
                     runAsyncWithManagedUnixSessionWrapper
                         "/bin/sh"
                         [ "-c"; "sleep 30 & echo $! > \"$1\"; exit 0"; "fslangmcp-wrapper"; pidPath ]
-                        (TimeSpan.FromSeconds(2.0))
+                        (TimeSpan.FromSeconds(10.0))
                         CancellationToken.None
 
-                let! error = Assert.ThrowsAsync<TimeoutException>(fun () -> operation :> Task)
-                Assert.Contains("timed out", error.Message)
-                Assert.True(File.Exists(pidPath), "The descendant did not start before the timeout.")
+                Assert.Equal(0, result.ExitCode)
+                Assert.True(File.Exists(pidPath), "The descendant did not start before the command exited.")
 
                 let pid = File.ReadAllText(pidPath) |> Int32.Parse
                 descendantPid <- Some pid
-                let! stopped = waitForProcessExit pid
-                Assert.True(stopped, $"Timed-out descendant process %d{pid} is still running.")
+                Assert.False(
+                    isProcessRunning pid,
+                    $"Descendant process %d{pid} is still running after normal completion."
+                )
             finally
                 match descendantPid with
                 | Some pid when isProcessRunning pid ->
