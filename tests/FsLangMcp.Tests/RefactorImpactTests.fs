@@ -150,6 +150,7 @@ let private slnx =
 type ImpactFixture() =
     let runId = Guid.NewGuid().ToString("N")
     let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_impact_{runId}")
+    do TestRunTrace.fixture "fixture_initialize_start" "ImpactFixture" root
 
     let write (rel: string) (content: string) =
         let full = Path.Combine(root, rel)
@@ -197,6 +198,7 @@ type ImpactFixture() =
             buildWithRetry (attempt + 1)
 
     let buildExit, buildLog = buildWithRetry 1
+    do TestRunTrace.fixture "fixture_initialize_complete" "ImpactFixture" root
 
     member _.Root = root
     member _.Slnx = slnxPath
@@ -206,12 +208,7 @@ type ImpactFixture() =
     member _.BuildLog = buildLog
 
     interface IDisposable with
-        member _.Dispose() =
-            if Directory.Exists root then
-                try
-                    Directory.Delete(root, true)
-                with _ ->
-                    ()
+        member _.Dispose() = TestRunTrace.deleteOwnedDirectory "ImpactFixture" root
 
 // ── MoveFixture: the compile-order Wrong/Right pair, RESTORED only ────────────────
 
@@ -234,6 +231,7 @@ let private projectWithOrder (firstFile: string) (secondFile: string) =
 type MoveFixture() =
     let runId = Guid.NewGuid().ToString("N")
     let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_impactmove_{runId}")
+    do TestRunTrace.fixture "fixture_initialize_start" "MoveFixture" root
 
     let write (rel: string) (content: string) =
         let full = Path.Combine(root, rel)
@@ -269,6 +267,7 @@ type MoveFixture() =
             restoreWithRetry fsproj (attempt + 1)
 
     let wrongExit, wrongLog = restoreWithRetry wrongFsproj 1
+    do TestRunTrace.fixture "fixture_initialize_complete" "MoveFixture" root
 
     member _.Root = root
     member _.WrongFsproj = wrongFsproj
@@ -276,12 +275,7 @@ type MoveFixture() =
     member _.RestoreLog = wrongLog
 
     interface IDisposable with
-        member _.Dispose() =
-            if Directory.Exists root then
-                try
-                    Directory.Delete(root, true)
-                with _ ->
-                    ()
+        member _.Dispose() = TestRunTrace.deleteOwnedDirectory "MoveFixture" root
 
 // ── JSON helpers ──────────────────────────────────────────────────────────────────
 
