@@ -8,7 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+## [0.18.0] - 2026-09-07
+
+0.18.0 makes `find` continuations query/snapshot-bound and isolates project-options
+reloads from the long-lived host. The 35-tool surface remains, but the `find` cursor
+wire contract changes: restart searches without a cursor after upgrading from 0.17.x.
+This is still a pre-1.0 release, not a contract freeze.
+
+### Changed
 
 - `find` now issues strict stateless v2 cursors bound to both the canonical request and the
   complete pre-pagination result, coverage, diagnostic, and bounded-source stream (#259).
@@ -18,8 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same cursor. Legacy offset-only cursors are rejected by `find`; all other tools retain their
   legacy minting while rejecting tagged `find` cursors. Tokens contain only version/tool/offset
   plus SHA-256 identities, retain no per-cursor server state, and make no atomic-filesystem-
-  snapshot claim. This wire-contract change **must ship in the next minor release**; the #259
-  integration lane intentionally does not change the product version.
+  snapshot claim. Old `find` cursors return `cursor_version_unsupported`; discard them and
+  repeat the original request without `cursor`. Other tools keep their existing cursor formats.
 - Unchanged `find` continuations restart as stale when the last or selected declared solution
   member is removed, while initial missing targets and malformed/mismatched cursors keep their
   distinct errors. The final error-response size guard checks the existing deadline before and
@@ -32,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offset. Regression coverage includes full alternating-budget linked-row traversal, stable
   failure recovery with identical sites, and refreshed diagnostics beyond the response prefix.
 
+### Added
+
+- `check` accepts `snippetPosition="start"|"end"` and reports its effective placement.
+  Omitted/null placement stays `end`, preserving access to the final project source file.
+  The explicit source-order contract keeps project references/compiler options and returns
+  snippet-only diagnostics; it does not claim a reproduced regression in the old default (#196).
+
 ### Fixed
 
 - Genuine project-options reloads evaluate ProjInfo/MSBuild in short-lived
@@ -41,6 +55,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and cancellation drains the helper tree before releasing admission. Runtime
   status identifies `evaluationMode="isolated_helper"`; cache hits launch no
   helper (#150, #224).
+- Definition lookup now resolves compiled backtick-bound names by their source spelling,
+  including unquoted queries, while preserving semantic identity, qualifier boundaries,
+  exact/case-insensitive matching, and ambiguity (#267).
+- Test fixtures retain and drain nested outline workers before deleting their files; hostile
+  regex correctness checks no longer depend on a one-second wall-clock assertion. Flushed
+  lifecycle traces improve evidence for future stalls. This is bounded test hardening, not
+  proof that the historical intermittent testhost hang has been eliminated (#199, PR #278).
+
+### Documentation
+
+- README separates project NuGet audits from libraries bundled inside external runtime tools,
+  explains exact bootstrap pins/downgrades and updates, and records the known dependency risk.
+  Closing #170 documents that risk; this release does not change those external-tool pins or
+  claim that their advisory-listed assemblies have been patched.
 
 ## [0.17.1] - 2026-09-05
 
@@ -1156,7 +1184,8 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
   above), so it has no link definition either — 0.15.0 compares from the
   last version that actually was tagged, 0.13.2.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.1...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.15.0...v0.16.0

@@ -1,6 +1,6 @@
 # Agent Integration Guide
 
-This document describes a recommended workflow for AI coding agents (Claude Code, Cursor, GitHub Copilot CLI, Codex, etc.) that delegate F# work to subagents and use FsLangMCP as the semantic-query layer. It targets the 35-tool v0.17.1 surface and is opinionated — the patterns here came from real production multi-agent runs and have been refined through ~12 subagent sessions and ~700 tool calls against this server.
+This document describes a recommended workflow for AI coding agents (Claude Code, Cursor, GitHub Copilot CLI, Codex, etc.) that delegate F# work to subagents and use FsLangMCP as the semantic-query layer. It targets the 35-tool v0.18.0 surface and is opinionated — the patterns here came from real production multi-agent runs and have been refined through ~12 subagent sessions and ~700 tool calls against this server.
 
 ## Why this guide exists
 
