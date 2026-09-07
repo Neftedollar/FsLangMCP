@@ -339,7 +339,9 @@ let canonicalFindQueryBytesV2 (query: FindQueryV2) =
 let findQueryIdentityV2 query =
     canonicalFindQueryBytesV2 query |> hashBytes
 
-let rec private writeCanonicalJson (writer: Utf8JsonWriter) (node: JsonNode) =
+let rec private writeCanonicalJson (ensureCanContinue: unit -> unit) (writer: Utf8JsonWriter) (node: JsonNode) =
+    ensureCanContinue ()
+
     match node with
     | null -> writer.WriteNullValue()
     | :? JsonObject as objectNode ->
@@ -349,27 +351,37 @@ let rec private writeCanonicalJson (writer: Utf8JsonWriter) (node: JsonNode) =
         |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left.Key, right.Key))
         |> Seq.iter (fun property ->
             writer.WritePropertyName(property.Key)
-            writeCanonicalJson writer property.Value)
+            writeCanonicalJson ensureCanContinue writer property.Value)
 
         writer.WriteEndObject()
     | :? JsonArray as arrayNode ->
         writer.WriteStartArray()
-        arrayNode |> Seq.iter (writeCanonicalJson writer)
+        arrayNode |> Seq.iter (writeCanonicalJson ensureCanContinue writer)
         writer.WriteEndArray()
     | value -> value.WriteTo(writer)
 
-let private canonicalJsonBytes (node: JsonNode) =
+let private canonicalJsonBytes ensureCanContinue (node: JsonNode) =
     use stream = new MemoryStream()
     use writer = new Utf8JsonWriter(stream)
-    writeCanonicalJson writer node
+    writeCanonicalJson ensureCanContinue writer node
     writer.Flush()
+    ensureCanContinue ()
     stream.ToArray()
 
 /// Hash a complete canonical find snapshot model. Object properties are sorted
 /// ordinally while array order is preserved, so construction order is irrelevant
 /// but the ordered result stream remains identity-bearing.
 let findSnapshotIdentityV2 (snapshot: JsonNode) =
-    canonicalJsonBytes snapshot |> hashBytes
+    canonicalJsonBytes ignore snapshot |> hashBytes
+
+/// The runtime uses the same canonical bytes with cooperative checks between
+/// JSON nodes, so hashing a full stream cannot silently outlive its deadline.
+let findSnapshotIdentityV2WithinBudget ensureCanContinue (snapshot: JsonNode) =
+    let bytes = canonicalJsonBytes ensureCanContinue snapshot
+    ensureCanContinue ()
+    let identity = hashBytes bytes
+    ensureCanContinue ()
+    identity
 
 /// Fixed-size identity for free-form text such as compiler diagnostic messages.
 let textIdentityV2 (text: string) =

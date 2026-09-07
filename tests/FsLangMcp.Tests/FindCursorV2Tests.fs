@@ -143,3 +143,34 @@ let ``find pagination cursor advances by delivered rows and carries both identit
         Assert.Equal(5, decoded.Offset)
         Assert.Equal(hashA, decoded.Query)
         Assert.Equal(hashB, decoded.Snapshot)
+
+[<Fact>]
+let ``budgeted snapshot hashing preserves bytes and stops at the exact cancelled JSON node`` () =
+    let snapshot =
+        JsonObject(
+            [ System.Collections.Generic.KeyValuePair<string, JsonNode>("sites", JsonArray([| for index in 0..255 -> JsonValue.Create(index) :> JsonNode |]))
+              System.Collections.Generic.KeyValuePair<string, JsonNode>("nested", JsonNode.Parse("{\"z\":1,\"a\":null}")) ])
+        :> JsonNode
+
+    let mutable visited = 0
+    let identity = findSnapshotIdentityV2WithinBudget (fun () -> visited <- visited + 1) snapshot
+    let siteNumbers = [ 0..255 ] |> List.map string |> String.concat ","
+    let canonicalJson = "{\"nested\":{\"a\":null,\"z\":1},\"sites\":[" + siteNumbers + "]}"
+    let expectedIdentity =
+        System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(canonicalJson))
+        |> Convert.ToBase64String
+        |> fun value -> value.TrimEnd('=').Replace('+', '-').Replace('/', '_')
+
+    Assert.Equal(expectedIdentity, identity)
+    Assert.Equal(findSnapshotIdentityV2 snapshot, identity)
+    Assert.True(visited > 256, "The positive control must actually visit the complete nested stream.")
+
+    let expected = TimeoutException("controlled node cutoff")
+    let mutable attempted = 0
+    let ensureCanContinue () =
+        attempted <- attempted + 1
+        if attempted = 7 then raise expected
+
+    let error = Assert.Throws<TimeoutException>(fun () -> findSnapshotIdentityV2WithinBudget ensureCanContinue snapshot |> ignore)
+    Assert.Same(expected, error)
+    Assert.Equal(7, attempted)

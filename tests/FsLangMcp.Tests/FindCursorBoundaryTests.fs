@@ -43,6 +43,56 @@ type FindCursorBoundaryTests(fixture: FindCursorFixture) =
     interface IClassFixture<FindCursorFixture>
 
     [<Theory>]
+    [<InlineData("snapshot-start", false)>]
+    [<InlineData("snapshot-start", true)>]
+    [<InlineData("snapshot-project-ledger", false)>]
+    [<InlineData("snapshot-project-ledger", true)>]
+    [<InlineData("snapshot-project-order", false)>]
+    [<InlineData("snapshot-project-order", true)>]
+    [<InlineData("snapshot-sites", false)>]
+    [<InlineData("snapshot-sites", true)>]
+    [<InlineData("snapshot-json", false)>]
+    [<InlineData("snapshot-json", true)>]
+    [<InlineData("snapshot-complete", false)>]
+    [<InlineData("snapshot-complete", true)>]
+    member _.``snapshot construction expiry never delivers an unvalidated page``(phase: string, continuation: bool) : Task =
+        task {
+            Assert.True(fixture.BuildExitCode = 0, fixture.BuildLog)
+            let request = args fixture.AProject
+            let! first = FcsBridge().Find(request)
+            let next =
+                if continuation then { request with cursor = Some(text first "nextCursor") }
+                else request
+
+            let expired = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let deadline = FindRequestDeadline(30_000, responseExpirySignal = expired.Task)
+            let mutable reached = false
+            let bridge = FcsBridge(findResponseConstructionBeforeStepOverride = (fun step _ ->
+                if step = phase then
+                    reached <- true
+                    expired.TrySetResult(()) |> ignore))
+
+            let! result = bridge.FindWithinDeadline(next, deadline, CancellationToken.None, ignore, None)
+            Assert.True(reached, $"The {phase} control must reach the actual snapshot builder.")
+            Assert.Empty(result["sites"].AsArray())
+            Assert.Null(result["nextCursor"])
+
+            if continuation then
+                rejected "cursor_validation_incomplete" false result
+            else
+                Assert.Equal("find_response_timeout", text result "errorKind")
+                Assert.True(result["paginationRestartRequired"].GetValue<bool>())
+                Assert.False(result["retrySameCursor"].GetValue<bool>())
+                Assert.True(result["truncated"].GetValue<bool>())
+                Assert.False((result["resolution"]["complete"]).GetValue<bool>())
+
+            let! retried = FcsBridge().Find(next)
+            Assert.Equal("succeeded", text retried "status")
+            Assert.Equal((if continuation then 1 else 0), retried["pageOffset"].GetValue<int>())
+            Assert.Single(retried["sites"].AsArray()) |> ignore
+        }
+
+    [<Theory>]
     [<InlineData("slnx", "workspace")>]
     [<InlineData("slnx", "auto")>]
     [<InlineData("slnx", "project")>]

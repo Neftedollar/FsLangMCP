@@ -7222,6 +7222,11 @@ type internal FcsBridge
                     Some "kind='position' requires 'path' (and 'line')."
                 elif kind = "position" && args.line.IsNone then
                     Some "kind='position' requires 'line' (0-based)."
+                elif
+                    (args.projectPath |> Option.forall String.IsNullOrWhiteSpace)
+                    && (args.path |> Option.forall String.IsNullOrWhiteSpace)
+                then
+                    Some "find needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first."
                 else
                     None
 
@@ -7239,18 +7244,42 @@ type internal FcsBridge
                     | Ok payload -> Ok(Some payload)
                     | Error error -> Error(FindCursorContract.decodeRejected error)
 
-            let queryModel =
-                FindCursorContract.queryModel
-                    args
-                    query0
-                    kind
-                    scope
-                    exact
-                    contextLines
-                    includeDeclaration
-                    includeInfo
-                    includePerProject
-                    includeSiteTypes
+            // Basic errors and an already exhausted initial request must be answered
+            // before canonical path normalization can inspect malformed user input.
+            match validationError, cursorResult with
+            | Some message, _ -> return invalidArgs message
+            | None, Error envelope -> return envelope
+            | None, Ok _ when args.cursor.IsNone && deadline.SemanticExpired ->
+                return
+                    incompleteBeforeDiscovery
+                        (if kind = "position" then "position_resolution" else "admission")
+                        "timed_out"
+                        "find_timeout"
+                        "The find end-to-end deadline was already exhausted."
+            | None, Ok _ ->
+
+            let queryModelResult =
+                try
+                    FindCursorContract.queryModel
+                        args
+                        query0
+                        kind
+                        scope
+                        exact
+                        contextLines
+                        includeDeclaration
+                        includeInfo
+                        includePerProject
+                        includeSiteTypes
+                    |> Ok
+                with
+                | :? ArgumentException as ex -> Error ex.Message
+                | :? NotSupportedException as ex -> Error ex.Message
+                | :? PathTooLongException as ex -> Error ex.Message
+
+            match queryModelResult with
+            | Error message -> return invalidArgs $"find received an invalid path: {message}"
+            | Ok queryModel ->
 
             let queryIdentity = Cursor.findQueryIdentityV2 queryModel
 
@@ -7828,27 +7857,6 @@ type internal FcsBridge
                 targetDiscoveryMaterializationTimedOut <- true
                 stopStartingProjects <- true
 
-                // Discovery already established these declared members as missing.
-                // Finish the bounded coverage ledger without resuming filesystem work;
-                // a cursor is never minted from this deadline-incomplete sweep.
-                while missingProjectIndex < missingProjects.Count do
-                    let normalizedProject = normalizePath missingProjects[missingProjectIndex]
-
-                    perProject.Add(
-                        jobj
-                            [ "project", jstr (Path.GetFileNameWithoutExtension normalizedProject)
-                              "fsproj", jstr normalizedProject
-                              "status", jstr "missing"
-                              "errorKind", jstr "project_not_found"
-                              "retryable", jbool false
-                              "error", jstr $"Declared solution member does not exist: %s{normalizedProject}"
-                              "elapsedMs", jint 0 ]
-                        :> JsonNode
-                    )
-
-                    perProjectKeep.Add(true)
-                    missingProjectIndex <- missingProjectIndex + 1
-
             let locationKey (r: range) =
                 $"%s{normalizePath r.FileName}:%d{r.StartLine}:%d{r.StartColumn}:%d{r.EndLine}:%d{r.EndColumn}"
 
@@ -8201,24 +8209,9 @@ type internal FcsBridge
                 sweepProjectIndex <- sweepProjectIndex + 1
 
             if sweepProjectIndex < projectsToSweep.Count then
-                while sweepProjectIndex < projectsToSweep.Count do
-                    let fsproj = normalizePath projectsToSweep[sweepProjectIndex]
-                    projectsNotStarted <- projectsNotStarted + 1
-
-                    perProject.Add(
-                        jobj
-                            [ "project", jstr (Path.GetFileNameWithoutExtension fsproj)
-                              "fsproj", jstr fsproj
-                              "status", jstr "not_started"
-                              "errorKind", jstr "deadline_not_started"
-                              "retryable", jbool true
-                              "error", jstr "The end-to-end find deadline expired before this project started."
-                              "elapsedMs", jint 0 ]
-                        :> JsonNode
-                    )
-
-                    perProjectKeep.Add(true)
-                    sweepProjectIndex <- sweepProjectIndex + 1
+                // Scalar coverage remains exact without materializing an unbounded
+                // tail after expiry. This partial ledger cannot produce a cursor.
+                projectsNotStarted <- projectsNotStarted + projectsToSweep.Count - sweepProjectIndex
 
             sweepSw.Stop()
 
@@ -9005,48 +8998,6 @@ type internal FcsBridge
             let perProjectNodes = retainedPerProject.ToArray()
             let emitPerProject = includePerProject || perProjectNodes.Length > 0
 
-            let projectPathComparer =
-                if OperatingSystem.IsWindows() then
-                    StringComparer.OrdinalIgnoreCase
-                else
-                    StringComparer.Ordinal
-
-            let canonicalProjectRowsByPath =
-                System.Collections.Generic.Dictionary<string, JsonNode>(projectPathComparer)
-
-            perProject
-            |> Seq.iter (fun node ->
-                let project = node :?> JsonObject
-
-                let canonical =
-                    project
-                    |> Seq.choose (fun property ->
-                        // Attempt telemetry and free-form recovery text are not part of
-                        // the reusable stream identity. Stable coverage/category fields are.
-                        if property.Key = "elapsedMs" || property.Key = "error" then
-                            None
-                        else
-                            Some(property.Key, property.Value.DeepClone()))
-                    |> Seq.toList
-                    |> jobj
-                    :> JsonNode
-
-                canonicalProjectRowsByPath.Add(project["fsproj"].GetValue<string>(), canonical))
-
-            let requestedProjectsInOrder =
-                match scope with
-                | "file"
-                | "project" -> projectsToSweep :> seq<string>
-                | _ -> projectDiscovery.MemberProjectsInOrder :> seq<string>
-
-            let canonicalProjectRows =
-                requestedProjectsInOrder
-                |> Seq.choose (fun projectPath ->
-                    match canonicalProjectRowsByPath.TryGetValue(normalizePath projectPath) with
-                    | true, row -> Some row
-                    | false, _ -> None)
-                |> Seq.toArray
-
             let deadlineIncomplete =
                 targetDiscoveryMaterializationTimedOut
                 || projectsTimedOut > 0
@@ -9056,55 +9007,127 @@ type internal FcsBridge
                 || fsacFallbackNotStarted
                 || responseConstructionTimedOut
 
-            let snapshotResolution =
-                jobj
-                    [ "resolvedQuery", jstr query
-                      "resolvedKind", jstr kindResolved
-                      "resolvedScope", jstr scopeResolved
-                      "positionSymbolIdentity",
-                      (positionSymbolIdentity |> Option.map jstr |> Option.defaultValue null)
-                      "matched",
-                      (match matchedNode with
-                       | null -> null
-                       | node -> node.DeepClone())
-                      "outcome", jstr outcome
-                      "via", jstr via
-                      "fcsSiteCount", jint totalSites
-                      "fsacFallbackHits", jint fsacHits
-                      "fsacFallbackState", jstr fsacFallbackState
-                      "fieldSites", jint fieldSiteCount
-                      "typedSites", jint typedSites
-                      "degradedSites", jint degradedSites
-                      "multiTypedSites", jint multiTypedSites ]
-                :> JsonNode
+            let buildSnapshotIdentity () =
+                ensureResponseStep "snapshot-start" 0
+                let projectPathComparer =
+                    if OperatingSystem.IsWindows() then
+                        StringComparer.OrdinalIgnoreCase
+                    else
+                        StringComparer.Ordinal
 
-            let snapshotModel =
-                jobj
-                    [ "schema", jint 2
-                      "projects", JsonArray(canonicalProjectRows) :> JsonNode
-                      "coverage", coverage.DeepClone()
-                      "resolution", snapshotResolution
-                      "diagnostics", JsonArray(canonicalDiagnosticRows.ToArray()) :> JsonNode
-                      "sites", JsonArray(allCanonicalSiteNodes |> Array.map _.DeepClone()) :> JsonNode
-                      "totalSites", jint totalSites
-                      "breakdown", breakdown.DeepClone() ]
-                :> JsonNode
+                let canonicalProjectRowsByPath =
+                    System.Collections.Generic.Dictionary<string, JsonNode>(projectPathComparer)
 
-            let snapshotIdentity = Cursor.findSnapshotIdentityV2 snapshotModel
+                perProject
+                |> Seq.iteri (fun index node ->
+                    ensureResponseStep "snapshot-project-ledger" index
+                    let project = node :?> JsonObject
+
+                    let canonical =
+                        project
+                        |> Seq.choose (fun property ->
+                            // Attempt telemetry and free-form recovery text are not part of
+                            // the reusable stream identity. Stable coverage/category fields are.
+                            if property.Key = "elapsedMs" || property.Key = "error" then
+                                None
+                            else
+                                Some(property.Key, property.Value.DeepClone()))
+                        |> Seq.toList
+                        |> jobj
+                        :> JsonNode
+
+                    canonicalProjectRowsByPath.Add(project["fsproj"].GetValue<string>(), canonical))
+
+                let requestedProjectsInOrder =
+                    match scope with
+                    | "file"
+                    | "project" -> projectsToSweep :> seq<string>
+                    | _ -> projectDiscovery.MemberProjectsInOrder :> seq<string>
+
+                let canonicalProjectRows =
+                    requestedProjectsInOrder
+                    |> Seq.mapi (fun index projectPath ->
+                        ensureResponseStep "snapshot-project-order" index
+                        match canonicalProjectRowsByPath.TryGetValue(normalizePath projectPath) with
+                        | true, row -> Some row
+                        | false, _ -> None)
+                    |> Seq.choose id
+                    |> Seq.toArray
+
+                let snapshotResolution =
+                    jobj
+                        [ "resolvedQuery", jstr query
+                          "resolvedKind", jstr kindResolved
+                          "resolvedScope", jstr scopeResolved
+                          "positionSymbolIdentity",
+                          (positionSymbolIdentity |> Option.map jstr |> Option.defaultValue null)
+                          "matched",
+                          (match matchedNode with
+                           | null -> null
+                           | node -> node.DeepClone())
+                          "outcome", jstr outcome
+                          "via", jstr via
+                          "fcsSiteCount", jint totalSites
+                          "fsacFallbackHits", jint fsacHits
+                          "fsacFallbackState", jstr fsacFallbackState
+                          "fieldSites", jint fieldSiteCount
+                          "typedSites", jint typedSites
+                          "degradedSites", jint degradedSites
+                          "multiTypedSites", jint multiTypedSites ]
+                    :> JsonNode
+
+                let snapshotSites =
+                    allCanonicalSiteNodes
+                    |> Array.mapi (fun index node ->
+                        ensureResponseStep "snapshot-sites" index
+                        node.DeepClone())
+
+                let snapshotModel =
+                    jobj
+                        [ "schema", jint 2
+                          "projects", JsonArray(canonicalProjectRows) :> JsonNode
+                          "coverage", coverage.DeepClone()
+                          "resolution", snapshotResolution
+                          "diagnostics", JsonArray(canonicalDiagnosticRows.ToArray()) :> JsonNode
+                          "sites", JsonArray(snapshotSites) :> JsonNode
+                          "totalSites", jint totalSites
+                          "breakdown", breakdown.DeepClone() ]
+                    :> JsonNode
+
+                let mutable jsonIndex = 0
+                let ensureSnapshotJson () =
+                    ensureResponseStep "snapshot-json" jsonIndex
+                    jsonIndex <- jsonIndex + 1
+
+                let identity = Cursor.findSnapshotIdentityV2WithinBudget ensureSnapshotJson snapshotModel
+                ensureResponseStep "snapshot-complete" 0
+                identity
+
+            // Incomplete evidence has no reusable snapshot identity. Avoid rebuilding
+            // the full declared ledger merely to construct a cursorless timeout.
+            let snapshotIdentity =
+                if deadlineIncomplete then
+                    None
+                else
+                    try
+                        Some(buildSnapshotIdentity ())
+                    with :? TimeoutException ->
+                        responseConstructionTimedOut <- true
+                        None
 
             let continuationError =
-                match cursorPayload with
-                | Some _ when deadlineIncomplete ->
+                match cursorPayload, snapshotIdentity with
+                | Some _, None ->
                     Some(
                         FindCursorContract.validationIncomplete
                             deadline
                             "The find deadline expired before the complete result stream could be reconstructed. Retry the same cursor with a larger timeoutMs."
                     )
-                | Some payload when
-                    not (String.Equals(payload.Snapshot, snapshotIdentity, StringComparison.Ordinal))
+                | Some payload, Some identity when
+                    not (String.Equals(payload.Snapshot, identity, StringComparison.Ordinal))
                     ->
                     Some(FindCursorContract.stale ())
-                | Some _ when pageOffset > totalSites -> Some(FindCursorContract.outOfRange ())
+                | Some _, Some _ when pageOffset > totalSites -> Some(FindCursorContract.outOfRange ())
                 | _ -> None
 
             let pageStart = min pageOffset allCanonicalSiteNodes.Length
@@ -9242,14 +9265,15 @@ type internal FcsBridge
                     []
 
             let paginationFields =
-                Cursor.findPaginationFieldsV2
-                    "sites"
-                    totalSites
-                    pageOffset
-                    pageSize
-                    0
-                    queryIdentity
-                    snapshotIdentity
+                match snapshotIdentity with
+                | Some identity ->
+                    Cursor.findPaginationFieldsV2 "sites" totalSites pageOffset pageSize 0 queryIdentity identity
+                | None ->
+                    [ "truncated", jbool true
+                      "nextCursor", null
+                      "totalEstimate", jobj [ "sites", jint totalSites ]
+                      "pageOffset", jint pageOffset
+                      "pageSize", jint pageSize ]
 
             let baseFields =
                 [ "status", jstr finalResponseStatus
@@ -9377,10 +9401,10 @@ type internal FcsBridge
                 response["truncated"] <- jbool truncated
 
                 response["nextCursor"] <-
-                    if not deadlineIncomplete && truncated && deliveredSites > 0 then
-                        jstr (Cursor.encodeFindV2 nextOffset queryIdentity snapshotIdentity)
-                    else
-                        null
+                    match snapshotIdentity with
+                    | Some identity when not deadlineIncomplete && truncated && deliveredSites > 0 ->
+                        jstr (Cursor.encodeFindV2 nextOffset queryIdentity identity)
+                    | _ -> null
 
                 if deadlineIncomplete then
                     response["deliveryStatus"] <- jstr "partial"
