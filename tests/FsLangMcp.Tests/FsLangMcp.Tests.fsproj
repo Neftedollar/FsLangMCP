@@ -66,7 +66,7 @@
       <IncludeAssets>analyzers</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="Ionide.Analyzers" Version="[0.16.0]" GeneratePathProperty="true">
+    <PackageReference Include="Ionide.Analyzers" Version="[0.17.0]" GeneratePathProperty="true">
       <IncludeAssets>analyzers</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
