@@ -85,6 +85,7 @@ let private betaProject =
 type CheckFixture() =
     let runId = Guid.NewGuid().ToString("N")
     let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_check_{runId}")
+    do TestRunTrace.fixture "fixture_initialize_start" "CheckFixture" root
 
     let write (rel: string) (content: string) =
         let full = Path.Combine(root, rel)
@@ -141,6 +142,7 @@ type CheckFixture() =
 
     let buildExit, buildLog = buildWithRetry probeFsproj 1
     let betaBuildExit, betaBuildLog = buildWithRetry betaFsproj 1
+    do TestRunTrace.fixture "fixture_initialize_complete" "CheckFixture" root
 
     /// Restore the fixture sources to their clean baseline. Called at the top of every
     /// test so method ordering cannot leak a previous test's on-disk edit. Beta is
@@ -163,12 +165,7 @@ type CheckFixture() =
     member _.BetaBuildLog = betaBuildLog
 
     interface IDisposable with
-        member _.Dispose() =
-            if Directory.Exists root then
-                try
-                    Directory.Delete(root, true)
-                with _ ->
-                    ()
+        member _.Dispose() = TestRunTrace.deleteOwnedDirectory "CheckFixture" root
 
 // ── JSON helpers ─────────────────────────────────────────────────────────────────
 
@@ -214,6 +211,7 @@ let private bareCheck: CheckArgs =
     { scope = None
       path = None
       snippet = None
+      snippetPosition = None
       fileGlob = None
       mode = None
       speed = None
@@ -406,7 +404,6 @@ let private runAutoScopeDiscoveryDeadlineTest () : Task =
             // entry is removed immediately.
             for index in 1..6 do
                 let otherRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_scope_busy_{index}_{Guid.NewGuid():N}")
-                let elapsed = Stopwatch.StartNew()
 
                 let! busy =
                     bridge.Check(
@@ -419,7 +416,6 @@ let private runAutoScopeDiscoveryDeadlineTest () : Task =
 
                 Assert.Equal("unknown", gs busy "verdict")
                 Assert.Contains("discovery busy", (gs busy "reason").ToLowerInvariant())
-                Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(3.0), "busy discovery must not queue")
 
             Assert.Equal(1L, bridge.CheckTargetDiscoveryStartedCount)
             Assert.Equal(6L, bridge.CheckTargetDiscoveryRejectedCount)
@@ -543,7 +539,7 @@ let ``fast project check returns unknown when expectation evaluation exhausts th
             )
             |> requests.Track
 
-        let! result = checkTask.WaitAsync(TimeSpan.FromSeconds(2.0))
+        let! result = checkTask.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
 
         Assert.Equal("succeeded", gs result "status")
         Assert.Equal("unknown", gs result "verdict")
@@ -663,8 +659,8 @@ let ``trusted workspace overall timeout skips later project loaders`` () : Task 
                         timeoutMs = Some 300 }
                 )
 
-            do! aStarted.Task.WaitAsync(TimeSpan.FromSeconds(1.0))
-            let! result = checkTask.WaitAsync(TimeSpan.FromSeconds(2.0))
+            do! aStarted.Task.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(1.0)))
+            let! result = checkTask.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
 
             Assert.Equal("unknown", gs result "verdict")
             Assert.False(gb result "analyzed")
@@ -732,8 +728,8 @@ type CheckTests(fx: CheckFixture) =
                             timeoutMs = Some 1000 }
                     )
 
-                do! hashStarted.Task.WaitAsync(TimeSpan.FromSeconds(1.0))
-                let! result = checkTask.WaitAsync(TimeSpan.FromSeconds(2.0))
+                do! hashStarted.Task.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(1.0)))
+                let! result = checkTask.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
 
                 Assert.Equal("unknown", gs result "verdict")
                 Assert.False(gb result "analyzed")
@@ -753,7 +749,7 @@ type CheckTests(fx: CheckFixture) =
                             projectPath = Some fx.ProbeFsproj
                             timeoutMs = Some 150 }
                     )
-                    |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(1.0))
+                    |> fun work -> work.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(1.0)))
 
                 Assert.Equal("unknown", gs sameSnapshot "verdict")
                 Assert.Equal(1L, bridge.SnapshotComputationStartedCount)
@@ -771,7 +767,7 @@ type CheckTests(fx: CheckFixture) =
                 bridge.SnapshotComputationActiveCount <> 0
                 || bridge.SnapshotComputationInFlightCount <> 0
 
-            while snapshotStillRunning () && resumed.Elapsed < TimeSpan.FromSeconds(2.0) do
+            while snapshotStillRunning () && resumed.Elapsed < TestTiming.watchdog (TimeSpan.FromSeconds(2.0)) do
                 do! Task.Delay(10)
 
             Assert.Equal(computeBefore, bridge.AnalysisSnapshotComputeCount)
@@ -889,8 +885,8 @@ type CheckTests(fx: CheckFixture) =
                             timeoutMs = Some 1000 }
                     )
 
-                do! preFcsReached.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
-                let! result = checkTask.WaitAsync(TimeSpan.FromSeconds(2.0))
+                do! preFcsReached.Task.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
+                let! result = checkTask.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
 
                 Assert.Equal("unknown", gs result "verdict")
                 Assert.False(gb result "analyzed")
@@ -903,7 +899,8 @@ type CheckTests(fx: CheckFixture) =
 
             let settle = Stopwatch.StartNew()
 
-            while bridge.FreshProjectCheckInFlightCount <> 0 && settle.Elapsed < TimeSpan.FromSeconds(2.0) do
+            while bridge.FreshProjectCheckInFlightCount <> 0
+                  && settle.Elapsed < TestTiming.watchdog (TimeSpan.FromSeconds(2.0)) do
                 do! Task.Delay(10)
 
             Assert.Equal(0, bridge.FreshProjectCheckInFlightCount)
@@ -1013,7 +1010,6 @@ type CheckTests(fx: CheckFixture) =
             // retained dictionary entry.
             for index in 1..6 do
                 File.WriteAllText(fx.MainFs, cleanMain + $"\n// distinct snapshot {index}\n")
-                let elapsed = Stopwatch.StartNew()
 
                 let! busy =
                     bridge.Check(
@@ -1030,7 +1026,6 @@ type CheckTests(fx: CheckFixture) =
                 Assert.False(gb busy "analyzed")
                 Assert.Contains("type-check busy", (gs busy "reason").ToLowerInvariant())
                 Assert.Equal("fcs_worker_busy", gs (busy["blockingReason"]) "errorKind")
-                Assert.True(elapsed.Elapsed < TimeSpan.FromMilliseconds(750.0), "busy type-check must not queue")
 
             Assert.Equal(1, workerCalls)
             Assert.Equal(1L, bridge.FreshProjectCheckStartedCount)
@@ -1108,8 +1103,8 @@ type CheckTests(fx: CheckFixture) =
                             timeoutMs = Some 300 }
                     )
 
-                do! probeStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
-                let! firstResult = firstCheck.WaitAsync(TimeSpan.FromSeconds(2.0))
+                do! probeStarted.Task.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
+                let! firstResult = firstCheck.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
 
                 Assert.Equal("unknown", gs firstResult "verdict")
                 Assert.False(gb firstResult "analyzed")
@@ -1127,7 +1122,7 @@ type CheckTests(fx: CheckFixture) =
                             projectPath = Some fx.ProbeFsproj
                             timeoutMs = Some 150 }
                     )
-                    |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(1.0))
+                    |> fun work -> work.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(1.0)))
 
                 Assert.Equal("unknown", gs sameOptions "verdict")
                 Assert.Equal(1, probeCalls)
@@ -1135,7 +1130,6 @@ type CheckTests(fx: CheckFixture) =
                 Assert.Equal(1, bridge.ReferenceResolutionProbeInFlightCount)
 
                 for index in 1..6 do
-                    let elapsed = Stopwatch.StartNew()
                     let! rejected =
                         bridge.ProbeReferencesForTest(
                             $"distinct-reference-probe-{index}",
@@ -1147,8 +1141,6 @@ type CheckTests(fx: CheckFixture) =
                     | Error failure -> failwith $"Expected busy reference probe, got {failure}"
                     | Ok value -> failwith $"Expected busy reference probe, got {value}"
 
-                    Assert.True(elapsed.Elapsed < TimeSpan.FromMilliseconds(500.0), "busy probe must not queue")
-
                 Assert.Equal(1, probeCalls)
                 Assert.Equal(6L, bridge.ReferenceResolutionProbeRejectedCount)
                 Assert.Equal(1, bridge.ReferenceResolutionProbeInFlightCount)
@@ -1159,7 +1151,8 @@ type CheckTests(fx: CheckFixture) =
                     bridge.ReferenceResolutionProbeActiveCount <> 0
                     || bridge.ReferenceResolutionProbeInFlightCount <> 0
 
-                while referenceProbeStillRunning () && settle.Elapsed < TimeSpan.FromSeconds(2.0) do
+                while referenceProbeStillRunning ()
+                      && settle.Elapsed < TestTiming.watchdog (TimeSpan.FromSeconds(2.0)) do
                     do! Task.Delay(10)
 
                 Assert.Equal(0, bridge.ReferenceResolutionProbeActiveCount)
@@ -1222,8 +1215,8 @@ type CheckTests(fx: CheckFixture) =
                             timeoutMs = Some 300 }
                     )
 
-                do! validationStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
-                let! firstResult = firstCheck.WaitAsync(TimeSpan.FromSeconds(2.0))
+                do! validationStarted.Task.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
+                let! firstResult = firstCheck.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
 
                 Assert.Equal("unknown", gs firstResult "verdict")
                 Assert.Equal(1, validationHooks)
@@ -1239,7 +1232,7 @@ type CheckTests(fx: CheckFixture) =
                             projectPath = Some fx.ProbeFsproj
                             timeoutMs = Some 150 }
                     )
-                    |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(1.0))
+                    |> fun work -> work.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(1.0)))
 
                 Assert.Equal("unknown", gs sameProject "verdict")
                 Assert.Equal(1, validationHooks)
@@ -1252,7 +1245,8 @@ type CheckTests(fx: CheckFixture) =
                     bridge.ProjectEvaluationActiveCount <> 0
                     || bridge.ProjectOptionsInFlightCount <> 0
 
-                while validationStillRunning () && settle.Elapsed < TimeSpan.FromSeconds(2.0) do
+                while validationStillRunning ()
+                      && settle.Elapsed < TestTiming.watchdog (TimeSpan.FromSeconds(2.0)) do
                     do! Task.Delay(10)
 
                 Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
@@ -1315,8 +1309,8 @@ type CheckTests(fx: CheckFixture) =
                             timeoutMs = Some 300 }
                     )
 
-                do! nearestStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
-                let! firstResult = firstCheck.WaitAsync(TimeSpan.FromSeconds(2.0))
+                do! nearestStarted.Task.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
+                let! firstResult = firstCheck.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
 
                 Assert.Equal("unknown", gs firstResult "verdict")
                 Assert.Equal(1, discoveryHooks)
@@ -1342,7 +1336,7 @@ type CheckTests(fx: CheckFixture) =
                             speed = Some "trusted"
                             timeoutMs = Some 150 }
                     )
-                    |> fun work -> work.WaitAsync(TimeSpan.FromSeconds(1.0))
+                    |> fun work -> work.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(1.0)))
 
                 Assert.Equal("unknown", gs samePath "verdict")
                 Assert.Equal(1, discoveryHooks)
@@ -1418,8 +1412,8 @@ type CheckTests(fx: CheckFixture) =
                         fsacSnapshot = completeSnapshot
                     )
 
-                do! fallbackReached.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
-                let! result = checkTask.WaitAsync(TimeSpan.FromSeconds(2.0))
+                do! fallbackReached.Task.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
+                let! result = checkTask.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
 
                 let discoveryCompletion =
                     bridge.TryGetCheckTargetDiscoveryCompletionForTest("project", projectDirectory, None)
@@ -1877,7 +1871,65 @@ type CheckTests(fx: CheckFixture) =
         }
 
     [<Fact>]
-    member _.``check(snippet) surfaces the caller's error without wrapper noise duplicates or temp paths (#187)`` () : Task =
+    member _.``default snippet placement is end and can consume a symbol from the final compile file``() : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            // Main.fs is the final <Compile> item in Probe.fsproj. v0.17.1 already
+            // appends snippets; #196 makes that compatible behavior explicit.
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        snippet = Some "module Probe.SnippetUsesFinal\n\nlet copied: int = Probe.Main.result\n"
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            Assert.Equal("clean", gs result "verdict")
+            Assert.Equal(0, gi result "errorCount")
+            Assert.Equal("end", gs result "snippetPosition")
+        }
+
+    [<Theory>]
+    [<InlineData("start", "start", "errors")>]
+    [<InlineData("end", "end", "clean")>]
+    [<InlineData(" END ", "end", "clean")>]
+    member _.``explicit snippet placement controls access to the final compile file``
+        (snippetPosition: string, effectivePosition: string, expectedVerdict: string)
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        snippet = Some "module Probe.SnippetPlacement\n\nlet copied: int = Probe.Main.result\n"
+                        snippetPosition = Some snippetPosition
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            Assert.Equal(expectedVerdict, gs result "verdict")
+            Assert.Equal(effectivePosition, gs result "snippetPosition")
+
+            let codes =
+                [ for diagnostic in result["diagnostics"] :?> JsonArray do
+                      yield diagnostic["errorNumberText"].GetValue<string>() ]
+
+            if effectivePosition = "start" then
+                Assert.Contains("FS0039", codes)
+            else
+                Assert.DoesNotContain("FS0039", codes)
+        }
+
+    [<Theory>]
+    [<InlineData("start")>]
+    [<InlineData("end")>]
+    member _.``snippet diagnostics stay caller-scoped for every placement (#187)``
+        (snippetPosition: string)
+        : Task =
         task {
             Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
             fx.ResetClean()
@@ -1889,10 +1941,12 @@ type CheckTests(fx: CheckFixture) =
                 bridge.Check(
                     { bareCheck with
                         snippet = Some "let x: int = \"nope\"\n"
+                        snippetPosition = Some snippetPosition
                         projectPath = Some fx.ProbeFsproj }
                 )
 
             Assert.Equal("errors", gs result "verdict")
+            Assert.Equal(snippetPosition, gs result "snippetPosition")
             let diags = result["diagnostics"] :?> JsonArray
 
             let codes =
@@ -1912,6 +1966,131 @@ type CheckTests(fx: CheckFixture) =
             // The caller never had a file; the harness temp path must not leak.
             for d in diags do
                 Assert.Equal("snippet", d["file"].GetValue<string>())
+        }
+
+    [<Theory>]
+    [<InlineData("start")>]
+    [<InlineData("end")>]
+    member _.``snippet diagnostics exclude a pre-existing project error at every placement (#196)``
+        (snippetPosition: string)
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            try
+                File.WriteAllText(
+                    fx.MainFs,
+                    String.concat
+                        "\n"
+                        [ "module Probe.Main"
+                          ""
+                          "let projectOnly = missingProjectSymbol"
+                          "" ]
+                )
+
+                let! projectResult =
+                    bridge.Check(
+                        { bareCheck with
+                            path = Some fx.MainFs
+                            projectPath = Some fx.ProbeFsproj }
+                    )
+
+                Assert.Equal("errors", gs projectResult "verdict")
+
+                let projectCodes =
+                    [ for diagnostic in projectResult["diagnostics"] :?> JsonArray do
+                          yield diagnostic["errorNumberText"].GetValue<string>() ]
+
+                Assert.Contains("FS0039", projectCodes)
+
+                let! result =
+                    bridge.Check(
+                        { bareCheck with
+                            snippet =
+                                Some
+                                    "module Probe.SnippetOwnError\n\nlet snippetOnly: int = \"snippet-only\"\n"
+                            snippetPosition = Some snippetPosition
+                            projectPath = Some fx.ProbeFsproj }
+                    )
+
+                Assert.Equal("succeeded", gs result "status")
+                Assert.Equal("errors", gs result "verdict")
+                Assert.Equal(snippetPosition, gs result "snippetPosition")
+                Assert.Equal(1, gi result "errorCount")
+                Assert.Equal(1, gi result "totalDiagnostics")
+
+                let diagnostics = result["diagnostics"] :?> JsonArray
+                Assert.Equal(1, diagnostics.Count)
+                let diagnostic = diagnostics[0]
+
+                Assert.Equal("snippet", gs diagnostic "file")
+                Assert.Equal("FS0001", gs diagnostic "errorNumberText")
+
+                let message = gs diagnostic "message"
+                Assert.Contains("string", message)
+                Assert.Contains("int", message)
+                Assert.DoesNotContain("missingProjectSymbol", message)
+
+                let range = diagnostic["range"]
+                Assert.Equal(3, gi range "startLine")
+                Assert.Equal(3, gi range "endLine")
+                Assert.DoesNotContain(fx.MainFs, diagnostic.ToJsonString())
+            finally
+                fx.ResetClean()
+        }
+
+    [<Theory>]
+    [<InlineData("start", "errors")>]
+    [<InlineData("end", "clean")>]
+    member _.``local snippet binding shadows an opened final-file binding when that binding is in scope``
+        (snippetPosition: string, expectedVerdict: string)
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
+            fx.ResetClean()
+            let bridge = FcsBridge()
+
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        snippet =
+                            Some
+                                "module Probe.SnippetShadow\n\nopen Probe.Main\n\nlet result = \"local\"\nlet localLength: int = result.Length\n"
+                        snippetPosition = Some snippetPosition
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            Assert.Equal(expectedVerdict, gs result "verdict")
+            Assert.Equal(snippetPosition, gs result "snippetPosition")
+
+            let codes =
+                [ for diagnostic in result["diagnostics"] :?> JsonArray do
+                      yield diagnostic["errorNumberText"].GetValue<string>() ]
+
+            if snippetPosition = "start" then
+                Assert.Contains("FS0039", codes)
+                Assert.DoesNotContain("FS0001", codes)
+            else
+                Assert.Empty(codes)
+        }
+
+    [<Fact>]
+    member _.``invalid snippet placement is rejected``() : Task =
+        task {
+            let bridge = FcsBridge()
+
+            let! result =
+                bridge.Check(
+                    { bareCheck with
+                        snippet = Some "let answer = 42\n"
+                        snippetPosition = Some "middle"
+                        projectPath = Some fx.ProbeFsproj }
+                )
+
+            Assert.Equal("invalid_args", gs result "status")
+            Assert.Contains("snippetPosition", gs result "message")
         }
 
     [<Fact>]

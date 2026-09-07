@@ -164,6 +164,14 @@
           "FSharp.Core": "5.0.2"
         }
       },
+      "FSharp.SystemTextJson": {
+        "type": "Transitive",
+        "resolved": "1.4.36",
+        "contentHash": "1xLk0SBF1nedD74B77rcArjD2d+DeZwbNI7BVCAyKwIBERo1VoX8Mf4AtX0OV2L3ZeM/XS1b6BuhXCyoh0KBnw==",
+        "dependencies": {
+          "FSharp.Core": "4.7.0"
+        }
+      },
       "FsMcp.Client": {
         "type": "Transitive",
         "resolved": "2.0.0",
@@ -689,6 +697,7 @@
         "dependencies": {
           "FSharp.Compiler.Service": "[43.12.400, 43.12.400]",
           "FSharp.Core": "[10.1.400, 10.1.400]",
+          "FSharp.SystemTextJson": "[1.4.36, 1.4.36]",
           "FsMcp.Server": "[2.0.0, 2.0.0]",
           "FsMcp.TaskApi": "[2.0.0, 2.0.0]",
           "Ionide.ProjInfo.FCS": "[0.74.2, 0.74.2]",

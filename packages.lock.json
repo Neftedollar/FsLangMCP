@@ -23,6 +23,15 @@
         "resolved": "10.1.400",
         "contentHash": "H9wlZ/tWgNp+Q4WQ5aUSi3XOBXrL6z+UkR0PNeyDFyoZR3c3PbtA21B9FqlthrhEwQ6f5AtQV0JLhBBDqjjscw=="
       },
+      "FSharp.SystemTextJson": {
+        "type": "Direct",
+        "requested": "[1.4.36, 1.4.36]",
+        "resolved": "1.4.36",
+        "contentHash": "1xLk0SBF1nedD74B77rcArjD2d+DeZwbNI7BVCAyKwIBERo1VoX8Mf4AtX0OV2L3ZeM/XS1b6BuhXCyoh0KBnw==",
+        "dependencies": {
+          "FSharp.Core": "4.7.0"
+        }
+      },
       "FsMcp.Server": {
         "type": "Direct",
         "requested": "[2.0.0, 2.0.0]",

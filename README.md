@@ -145,7 +145,7 @@ Prefer the semantic tools above for free-form agent flows.
 | Tool | What it does |
 |------|--------------|
 | `fslangmcp_version` | Returns installed version. Zero-arg. Use when filing UX feedback. |
-| `fsharp_runtime_status` | Read-only runtime snapshot: heap/GC, FCS cache, project-options load/reload telemetry, FSAC working set, and `process.threads`; emits a heuristic restart warning above the anomalous thread threshold. |
+| `fsharp_runtime_status` | Read-only runtime snapshot: heap/GC, FCS cache, project-options load/reload telemetry (`evaluationMode="isolated_helper"`), FSAC working set, and `process.threads`; emits a heuristic restart warning above the anomalous thread threshold. |
 
 ## Example Agent Session
 

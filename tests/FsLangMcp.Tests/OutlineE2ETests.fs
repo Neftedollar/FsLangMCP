@@ -8,7 +8,7 @@ module FsLangMcp.Tests.OutlineE2ETests
 /// Coverage:
 ///   F. No filter → all files returned
 ///   G. Filter regex → only matching entries pass through
-///   H. Evil pattern (a+)+$ — completes well under 1 s (DoS regression guard)
+///   H. Evil pattern (a+)+$ — bounded non-backtracking engine and owned workers
 ///   I. Overlong filter (>1024 chars) → InvalidArgException
 ///   J. Cursor pagination round-trip: page-1 has nextCursor + truncated=true;
 ///      page-2 with that cursor returns the rest, no overlap
@@ -331,43 +331,328 @@ let ``ProjectOutline with alternation filter 'Timer|Channel' matches both types`
             if Directory.Exists(root) then Directory.Delete(root, true)
     }
 
-// ─── H. Evil pattern — must complete in << 1 s (DoS regression guard) ────────
+// ─── H. Evil pattern — structural DoS regression guard ──────────────────────
+
+let private startOwnedOutline
+    (ownership: TestRunTrace.OwnedFixtureWork)
+    (bridge: FcsBridge)
+    (args: FcsProjectOutlineArgs)
+    cancellationToken
+    =
+    bridge.ProjectOutlineWithinDeadline(args, cancellationToken, ownership.RetainUntil)
+    |> ownership.TrackRequest
+
+[<Theory>]
+[<InlineData(false)>]
+[<InlineData(true)>]
+let ``outline fixture keeps nested worker alive after outer product timeout`` (filtered: bool) : Task =
+    task {
+        let projectPath, root = createFixtureProject ()
+        let fixtureName = "OutlineE2ETests.nested-worker"
+        let ownership = TestRunTrace.OwnedFixtureWork(fixtureName, root)
+        let worker = TaskCompletionSource<JsonNode>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let lateFailure = InvalidOperationException("nested outline worker fault marker")
+        let mutable workerStarts = 0
+
+        let bridge =
+            FcsBridge(
+                projectOutlineFileOutlineOverride = fun _ ->
+                    Interlocked.Increment(&workerStarts) |> ignore
+                    entered.TrySetResult(()) |> ignore
+                    worker.Task
+            )
+
+        let outer =
+            startOwnedOutline ownership bridge
+                { defaultArgs projectPath with
+                    filter = if filtered then Some "(a+)+$" else None
+                    timeoutMs = Some 500 }
+                CancellationToken.None
+
+        try
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            // Cleanup can begin before the product deadline registers its worker.
+            let cleanup = ownership.Cleanup()
+            let! result = outer
+            let workerPendingAtCleanup = not worker.Task.IsCompleted
+            let rootPresentAtCleanup = Directory.Exists(root)
+            let cleanupPendingAtDeadline = not cleanup.IsCompleted
+            let retained = ownership.Producers
+            worker.SetException(lateFailure)
+            let! cleanupResult = cleanup
+            let failedWorker, observed = Assert.Single(ownership.ProducerFailures)
+            Assert.Same(worker.Task, failedWorker)
+            Assert.Same(lateFailure, observed)
+            Assert.Contains(retained, fun work -> Object.ReferenceEquals(work, worker.Task))
+            Assert.Contains(retained, fun work -> Object.ReferenceEquals(work, outer))
+            Assert.Equal("unknown", result["status"].GetValue<string>())
+            let coverage = result["coverage"]
+            Assert.Equal(1, coverage["filesTimedOut"].GetValue<int>())
+            Assert.Equal(1, Volatile.Read(&workerStarts))
+            Assert.True(workerPendingAtCleanup)
+            Assert.True(cleanupPendingAtDeadline)
+            Assert.True(cleanupResult.CleanupFailure.IsNone)
+            Assert.True(
+                rootPresentAtCleanup,
+                "The exact nested worker still owns the project after its outer request returns unknown."
+            )
+            Assert.False(Directory.Exists(root))
+        finally
+            worker.TrySetException(lateFailure) |> ignore
+            ownership.Cleanup() |> ignore
+    }
+
+[<Theory>]
+[<InlineData(false)>]
+[<InlineData(true)>]
+let ``outline fixture drains every nested worker after watchdog failure`` (firstWorkerFails: bool) : Task =
+    task {
+        let projectPath, root = createFixtureProject ()
+        let fixtureName = "OutlineE2ETests.multiple-nested-workers"
+        let ownership = TestRunTrace.OwnedFixtureWork(fixtureName, root)
+        use cancellation = new CancellationTokenSource()
+        let first = TaskCompletionSource<JsonNode>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let second = TaskCompletionSource<JsonNode>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let bothStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let firstFailure = InvalidOperationException("first retained worker fault marker")
+        let lateFailure = InvalidOperationException("second retained worker fault marker")
+        let mutable starts = 0
+
+        let bridge =
+            FcsBridge(
+                projectOutlineFileOutlineOverride = fun _ ->
+                    match Interlocked.Increment(&starts) with
+                    | 1 -> first.Task
+                    | 2 ->
+                        bothStarted.SetResult(())
+                        second.Task
+                    | _ -> failwith "An outline started work after cancellation."
+            )
+
+        let args = { defaultArgs projectPath with timeoutMs = Some 5_000 }
+        let warmup = startOwnedOutline ownership bridge args cancellation.Token
+        let filtered =
+            startOwnedOutline ownership bridge { args with filter = Some "(a+)+$" } cancellation.Token
+
+        let failWithWatchdog () =
+            task {
+                try
+                    return!
+                        TestTiming.awaitProducerWithWatchdogTask
+                            "multiple nested workers"
+                            (TimeSpan.FromSeconds(10.0))
+                            Task.CompletedTask
+                            ownership.RetainUntil
+                            filtered
+                finally
+                    ownership.Cleanup() |> ignore
+            }
+
+        try
+            do! bothStarted.Task.WaitAsync(TimeSpan.FromSeconds(5.0))
+            let! watchdogFailure =
+                Assert.ThrowsAsync<TestTiming.WatchdogTimeoutException>(fun () -> failWithWatchdog () :> Task)
+
+            Assert.Equal("multiple nested workers", watchdogFailure.OperationName)
+            Assert.Null(watchdogFailure.InnerException)
+            // Product cancellation happens after the failure's finally started cleanup.
+            cancellation.Cancel()
+            let! warmupResult = warmup
+            let! filteredResult = filtered
+            Assert.Equal("unknown", warmupResult["status"].GetValue<string>())
+            Assert.Equal("unknown", filteredResult["status"].GetValue<string>())
+            Assert.Contains(ownership.Producers, fun work -> Object.ReferenceEquals(work, first.Task))
+            Assert.Contains(ownership.Producers, fun work -> Object.ReferenceEquals(work, second.Task))
+            Assert.Equal(4, ownership.Producers.Length)
+
+            if firstWorkerFails then
+                first.SetException(firstFailure)
+            else
+                first.SetResult(JsonObject() :> JsonNode)
+
+            let cleanup = ownership.Cleanup()
+            Assert.False(second.Task.IsCompleted)
+            Assert.False(cleanup.IsCompleted)
+            Assert.True(Directory.Exists(root))
+            second.SetException(lateFailure)
+            let! cleanupResult = cleanup
+            let failures = ownership.ProducerFailures
+            Assert.Equal((if firstWorkerFails then 2 else 1), failures.Length)
+
+            if firstWorkerFails then
+                let firstFailedWorker, firstObserved =
+                    failures |> Array.find (fun (work, _) -> Object.ReferenceEquals(work, first.Task))
+
+                Assert.Same(first.Task, firstFailedWorker)
+                Assert.Same(firstFailure, firstObserved)
+
+            let failedWorker, observed =
+                failures |> Array.find (fun (work, _) -> Object.ReferenceEquals(work, second.Task))
+
+            Assert.Same(second.Task, failedWorker)
+            Assert.Same(lateFailure, observed)
+            Assert.True(cleanupResult.CleanupFailure.IsNone)
+            Assert.Equal(2, Volatile.Read(&starts))
+            Assert.False(Directory.Exists(root))
+        finally
+            cancellation.Cancel()
+            first.TrySetResult(JsonObject() :> JsonNode) |> ignore
+            second.TrySetException(lateFailure) |> ignore
+            ownership.Cleanup() |> ignore
+    }
 
 [<Fact>]
-let ``ProjectOutline with catastrophic-backtracking pattern completes in under 1 second`` () : System.Threading.Tasks.Task =
+let ``outline watchdog retains and observes a late-faulting producer`` () : Task =
+    task {
+        let fixtureName = "OutlineE2ETests.watchdog-regression"
+
+        let root =
+            Path.Combine(Path.GetTempPath(), $"fslangmcp_watchdog_regression_{Guid.NewGuid():N}")
+
+        Directory.CreateDirectory(root) |> ignore
+        TestRunTrace.fixture "fixture_init" fixtureName root
+
+        let releaseProducer =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let watchdogSignal =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let lateFailure = InvalidOperationException("late producer fault marker")
+        let mutable deferredCleanup: Task<TestRunTrace.DeferredCleanupResult> option = None
+
+        let producer =
+            task {
+                do! releaseProducer.Task
+                return raise lateFailure
+            }
+
+        let transferProducerOwnership producerTask =
+            deferredCleanup <-
+                Some(
+                    TestRunTrace.deferOwnedDirectoryUntilProducerCompletes
+                        fixtureName
+                        root
+                        producerTask
+                )
+
+        let guarded =
+            TestTiming.awaitProducerWithWatchdogTask
+                "outline hostile-filter probe"
+                (TimeSpan.FromSeconds(17.0))
+                watchdogSignal.Task
+                transferProducerOwnership
+                producer
+
+        watchdogSignal.SetResult(())
+
+        let! watchdogFailure =
+            Assert.ThrowsAsync<TestTiming.WatchdogTimeoutException>(fun () -> guarded :> Task)
+
+        let producerWasRetained = deferredCleanup.IsSome
+        let producerWasStillRunning = not producer.IsCompleted
+        let fixtureExistedWhileProducerRan = Directory.Exists(root)
+        releaseProducer.SetResult(())
+
+        let! cleanupResult = deferredCleanup.Value
+
+        Assert.Equal("outline hostile-filter probe", watchdogFailure.OperationName)
+        Assert.Equal(TimeSpan.FromSeconds(17.0), watchdogFailure.WatchdogDuration)
+        Assert.Null(watchdogFailure.InnerException)
+
+        Assert.Equal(
+            "Test watchdog 'outline hostile-filter probe' expired after 00:00:17; underlying producer ownership was transferred for observation and deferred fixture cleanup.",
+            watchdogFailure.Message
+        )
+
+        Assert.True(producerWasRetained)
+        Assert.True(producerWasStillRunning)
+        Assert.True(fixtureExistedWhileProducerRan)
+        Assert.Same(lateFailure, cleanupResult.ProducerFailure.Value)
+        Assert.True(cleanupResult.CleanupFailure.IsNone)
+        Assert.True(producer.IsFaulted)
+        Assert.False(Directory.Exists(root))
+    }
+
+[<Fact>]
+let ``outline watchdog preserves a producer TimeoutException identity`` () : Task =
+    task {
+        let productTimeout = TimeoutException("product timeout marker")
+        let producer = Task.FromException<int>(productTimeout)
+
+        let watchdogSignal =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let guarded =
+            TestTiming.awaitProducerWithWatchdogTask
+                "producer timeout identity probe"
+                (TimeSpan.FromSeconds(17.0))
+                watchdogSignal.Task
+                (fun _ -> Assert.Fail("A producer timeout must not be treated as watchdog expiry."))
+                producer
+
+        let! observed =
+            Assert.ThrowsAsync<TimeoutException>(fun () -> guarded :> Task)
+
+        Assert.Same(productTimeout, observed)
+        Assert.Equal("product timeout marker", observed.Message)
+    }
+
+[<Fact>]
+let ``ProjectOutline uses a bounded non-backtracking regex for hostile filters`` () : System.Threading.Tasks.Task =
     task {
         let projectPath, root = createFixtureProject ()
         let bridge = FcsBridge()
+        let fixtureName = "OutlineE2ETests.hostile-filter"
+        let ownership = TestRunTrace.OwnedFixtureWork(fixtureName, root)
 
         try
+            let hostileFilter = ProjectOutlineFilter.compile "(a+)+$"
+            let hostileOptions = hostileFilter.Options
+
+            Assert.Equal(
+                System.Text.RegularExpressions.RegexOptions.NonBacktracking,
+                hostileOptions &&& System.Text.RegularExpressions.RegexOptions.NonBacktracking
+            )
+
+            Assert.Equal(
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase,
+                hostileOptions &&& System.Text.RegularExpressions.RegexOptions.IgnoreCase
+            )
+
+            Assert.Equal(TimeSpan.FromMilliseconds(250.0), hostileFilter.MatchTimeout)
+
             // Warm up FCS: parse the project once without a filter so that
-            // projectResultsCache is populated.  FCS cold-start (JIT + project
-            // compilation) easily takes 1–2 s and must not be charged to the
-            // regex-guard measurement.
-            let! _ = bridge.ProjectOutline({ defaultArgs projectPath with maxFiles = Some 100 })
+            // projectResultsCache is populated. The watchdog below detects a real
+            // hang; it is deliberately not a host-performance assertion.
+            let! warmupResult =
+                startOwnedOutline ownership bridge
+                    { defaultArgs projectPath with maxFiles = Some 100 }
+                    CancellationToken.None
+
+            Assert.Equal("ok", warmupResult["status"].GetValue<string>())
 
             // (a+)+$ is the canonical catastrophic-backtracking pattern.
             // Against a long-ish string without NonBacktracking this would hang.
-            // The FCS cache is warm, so only regex work is timed here.
-            let sw = System.Diagnostics.Stopwatch.StartNew()
-
-            let! result =
-                bridge.ProjectOutline(
+            let producer =
+                startOwnedOutline ownership bridge
                     { defaultArgs projectPath with
                         maxFiles = Some 100
                         filter = Some "(a+)+$" }
-                )
+                    CancellationToken.None
 
-            sw.Stop()
+            let! result =
+                TestTiming.awaitProducer
+                    "ProjectOutline hostile-filter probe"
+                    (TimeSpan.FromSeconds(10.0))
+                    ownership.RetainUntil
+                    producer
 
             Assert.Equal("ok", result["status"].GetValue<string>())
-            // NonBacktracking makes the regex portion instant; assert well under 1 s.
-            Assert.True(
-                sw.Elapsed.TotalSeconds < 1.0,
-                $"Pattern (a+)+$ took {sw.Elapsed.TotalMilliseconds:F0}ms — NonBacktracking not applied?"
-            )
+            do! ownership.CompleteCleanup()
         finally
-            if Directory.Exists(root) then Directory.Delete(root, true)
+            ownership.Cleanup() |> ignore
     }
 
 // ─── I. Overlong filter → InvalidArgException ─────────────────────────────────
@@ -621,6 +906,7 @@ let ``ProjectOutline rejects negative timeout and zero is deterministic unknown 
 let ``ProjectOutline times out after a completed file retains worker and never starts the next file`` () =
     task {
         let projectPath, root = createFilteredPaginationProject ()
+        let ownership = TestRunTrace.OwnedFixtureWork("OutlineE2ETests.file-timeout", root)
 
         let secondStarted =
             TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -649,8 +935,11 @@ let ``ProjectOutline times out after a completed file retains worker and never s
                         nameContains = Some [ "Needle" ]
                         timeoutMs = Some 150 },
                     CancellationToken.None,
-                    fun operation -> retained <- Some operation
+                    fun operation ->
+                        retained <- Some operation
+                        ownership.RetainUntil operation
                 )
+                |> ownership.TrackRequest
 
             do! secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
             let! result = pending
@@ -669,17 +958,17 @@ let ``ProjectOutline times out after a completed file retains worker and never s
             blockedOutline.TrySetResult(successfulControlledOutline ()) |> ignore
             do! retained.Value.WaitAsync(TimeSpan.FromSeconds(2.0))
             Assert.Equal(2, Volatile.Read(&starts))
+            do! ownership.CompleteCleanup()
         finally
             blockedOutline.TrySetResult(successfulControlledOutline ()) |> ignore
-
-            if Directory.Exists(root) then
-                Directory.Delete(root, true)
+            ownership.Cleanup() |> ignore
     }
 
 [<Fact>]
 let ``ProjectOutline cancellation returns partial coverage retains worker and starts no later file`` () =
     task {
         let projectPath, root = createFilteredPaginationProject ()
+        let ownership = TestRunTrace.OwnedFixtureWork("OutlineE2ETests.file-cancellation", root)
         use cancellation = new CancellationTokenSource()
 
         let secondStarted =
@@ -708,8 +997,11 @@ let ``ProjectOutline cancellation returns partial coverage retains worker and st
                         maxFiles = Some 3
                         timeoutMs = Some 5_000 },
                     cancellation.Token,
-                    fun operation -> retained <- Some operation
+                    fun operation ->
+                        retained <- Some operation
+                        ownership.RetainUntil operation
                 )
+                |> ownership.TrackRequest
 
             do! secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
             cancellation.Cancel()
@@ -725,11 +1017,10 @@ let ``ProjectOutline cancellation returns partial coverage retains worker and st
             blockedOutline.TrySetResult(successfulControlledOutline ()) |> ignore
             do! retained.Value.WaitAsync(TimeSpan.FromSeconds(2.0))
             Assert.Equal(2, Volatile.Read(&starts))
+            do! ownership.CompleteCleanup()
         finally
             blockedOutline.TrySetResult(successfulControlledOutline ()) |> ignore
-
-            if Directory.Exists(root) then
-                Directory.Delete(root, true)
+            ownership.Cleanup() |> ignore
     }
 
 [<Fact>]
@@ -791,6 +1082,8 @@ let ``ProjectOutline pre-wait cancellation retains hot worker and outer FCS gate
 let ``ProjectOutline options timeout returns unknown and retains actual evaluation`` () =
     task {
         let projectPath, root = createFixtureProject ()
+        let fixtureName = "OutlineE2ETests.options-timeout"
+        let ownership = TestRunTrace.OwnedFixtureWork(fixtureName, root)
 
         let evaluationStarted =
             TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -810,16 +1103,19 @@ let ``ProjectOutline options timeout returns unknown and retains actual evaluati
         let bridge = FcsBridge(projectEvaluationBeforeLoadOverride = beforeLoad)
 
         try
-            let pending =
+            let request =
                 bridge.ProjectOutlineWithinDeadline(
                     { defaultArgs projectPath with
                         timeoutMs = Some 150 },
                     CancellationToken.None,
-                    fun operation -> retained <- Some operation
+                    fun operation ->
+                        retained <- Some operation
+                        ownership.RetainUntil operation
                 )
+                |> ownership.TrackRequest
 
             do! evaluationStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
-            let! result = pending
+            let! result = request
             Assert.Equal("unknown", result["status"].GetValue<string>())
             let operationalCoverage = result["coverage"]
             Assert.Equal(0, operationalCoverage["filesScanned"].GetValue<int>())
@@ -829,17 +1125,27 @@ let ``ProjectOutline options timeout returns unknown and retains actual evaluati
 
             releaseEvaluation.TrySetResult(()) |> ignore
 
-            try
-                do! retained.Value.WaitAsync(TimeSpan.FromSeconds(10.0))
-            with :? TimeoutException ->
-                ()
+            let retainedProducer =
+                task {
+                    do! retained.Value
+                }
 
+            let! productTimeout =
+                Assert.ThrowsAsync<TimeoutException>(fun () ->
+                    TestTiming.awaitProducer
+                        "ProjectOutline retained options evaluation"
+                        (TimeSpan.FromSeconds(10.0))
+                        ownership.RetainUntil
+                        retainedProducer
+                    :> Task)
+
+            Assert.Equal("The project-options worker has no active callers.", productTimeout.Message)
+            Assert.Null(productTimeout.InnerException)
             Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
+            do! ownership.CompleteCleanup()
         finally
             releaseEvaluation.TrySetResult(()) |> ignore
-
-            if Directory.Exists(root) then
-                Directory.Delete(root, true)
+            ownership.Cleanup() |> ignore
     }
 
 [<Fact>]

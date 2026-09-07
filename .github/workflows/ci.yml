@@ -52,12 +52,19 @@ jobs:
       - name: Test (with coverage)
         # coverlet.msbuild instruments FsLangMcp.dll via the ProjectReference graph (ADR-0001).
         # IncludeTestAssembly is no longer needed — prod and test code are in separate assemblies.
+        env:
+          FSLANGMCP_TEST_TIME_MULTIPLIER: 4
+          FSLANGMCP_TEST_TRACE: ${{ github.workspace }}/TestResults/testhost-events.ndjson
         run: |
+          mkdir -p "$GITHUB_WORKSPACE/TestResults"
           dotnet test FsLangMcp.slnx --no-build --no-restore --configuration Release \
             --blame-hang \
             --blame-hang-timeout 3m \
             --blame-hang-dump-type none \
             --logger "console;verbosity=normal" \
+            --logger "trx;LogFileName=test-results.trx" \
+            --results-directory "$GITHUB_WORKSPACE/TestResults" \
+            --diag "$GITHUB_WORKSPACE/TestResults/vstest-diagnostics.log" \
             /p:CollectCoverage=true \
             /p:CoverletOutputFormat=cobertura \
             /p:CoverletOutput=./coverage/

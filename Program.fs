@@ -801,7 +801,7 @@ let private mainCore argv =
                 tool (
                     TypedTool.define<CheckArgs>
                         "check"
-                        "Fresh F# verdict for the active context. Bare check() returns clean|errors|unknown from an in-process type-check. Optional: scope, path, snippet, speed, severity. trusted (default) is fresh; fast uses cached FSAC. Counts reconcile: totalDiagnostics=errors+warnings+info. Project scope marks downstream consumers unchecked; workspace requires a solution or directory. Prefer for yes/no validation."
+                        "Fresh F# verdict for the active context. Bare check() returns clean|errors|unknown from an in-process type-check. For scope=snippet, snippetPosition=start|end (default end) controls compile-order placement and is echoed; end sees all project sources. trusted is fresh; fast uses cached FSAC. Project scope marks downstream consumers unchecked; workspace requires a solution or directory."
                         (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -1321,12 +1321,24 @@ let private mainCore argv =
 
 [<EntryPoint>]
 let main argv =
-    if argv.Length > 0 && argv[0] = InternalProcessSessionWrapperArgument then
+    if argv.Length > 0 && argv[0] = InternalProcessGroupWrapperArgument then
+        if argv.Length < 2 then
+            Console.Error.WriteLine("The internal process-group wrapper requires a command.")
+            64
+        else
+            runUnixProcessGroupWrapper argv[1] argv[2..]
+    elif argv.Length > 0 && argv[0] = InternalProcessSessionWrapperArgument then
         if argv.Length < 2 then
             Console.Error.WriteLine("The internal process-session wrapper requires a command.")
             64
         else
             runUnixSessionWrapper argv[1] argv[2..]
+    elif argv.Length > 0 && argv[0] = ProjectEvaluation.InternalArgument then
+        if argv.Length <> 2 then
+            Console.Error.WriteLine("The internal project-evaluation helper requires exactly one project path.")
+            64
+        else
+            ProjectEvaluation.runHelper argv[1]
     else
         try
             mainCore argv

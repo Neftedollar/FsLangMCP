@@ -12,6 +12,7 @@
 
   <ItemGroup>
     <Compile Include="VerifyModuleInitializer.fs" />
+    <Compile Include="TestHostTrace.fs" />
     <Compile Include="StartupTests.fs" />
     <Compile Include="RuntimeStatusTests.fs" />
     <Compile Include="TypesToolsTests.fs" />
@@ -23,6 +24,7 @@
     <Compile Include="ProjectHealthTests.fs" />
     <Compile Include="BoundedCacheTests.fs" />
     <Compile Include="ProcessRunnerTests.fs" />
+    <Compile Include="ProjectEvaluationTests.fs" />
     <Compile Include="FcsBridgeTests.fs" />
     <Compile Include="OutlinePaginationTests.fs" />
     <Compile Include="CursorPropertyTests.fs" />
@@ -32,6 +34,7 @@
     <Compile Include="ToolDescriptionSchemaTests.fs" />
     <Compile Include="FieldSiteTypesTests.fs" />
     <Compile Include="FindTests.fs" />
+    <Compile Include="FindBacktickDefinitionTests.fs" />
     <Compile Include="FindCursorIntegrationTests.fs" />
     <Compile Include="FindCursorReviewTests.fs" />
     <Compile Include="FindCursorBoundaryTests.fs" />

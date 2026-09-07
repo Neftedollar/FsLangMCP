@@ -126,6 +126,7 @@ project-bound FSAC coverage before it can return `clean`.
 - `scope` — `auto` | `file` | `project` | `workspace` | `snippet` (default: `auto`)
 - `path` — file path when `scope=file`
 - `snippet` — inline source when `scope=snippet`
+- `snippetPosition` — `start` | `end` (default: `end`); compile-order placement for a snippet
 - `speed` — `trusted` (default; fresh check) | `fast` (cached FSAC snapshot)
 - `severity` — filter results by severity level
 
@@ -140,7 +141,11 @@ run `dotnet build -c Release --warnaserror`.
 without a `module` header is valid — the missing-module FS0222 and source-file-bookkeeping
 FS0225 are wrapper artifacts and are filtered out, along with diagnostics belonging to other
 project files. Each surviving diagnostic reports `file: "snippet"` (the caller sent text, not
-a file), and duplicates are collapsed.
+a file), and duplicates are collapsed. `snippetPosition=end` preserves v0.17.1 behavior and lets
+the snippet consume symbols from every evaluated project source file; `start` checks before all
+project source files. The response echoes the normalized effective placement. This does not run
+against a built assembly, so generated or emitted symbols absent from evaluated source files stay
+out of scope.
 
 In `speed=fast`, inspect `complete`, `expectedFiles`, `missingFiles`, `staleFiles`, and
 `sessionGeneration`. Current errors remain actionable with `complete=false`; an incomplete

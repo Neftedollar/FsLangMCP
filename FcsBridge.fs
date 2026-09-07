@@ -2042,6 +2042,19 @@ module internal AnalysisSnapshotKey =
         appendProject "root" "" projectOptions
         aggregate.GetHashAndReset() |> Convert.ToHexString
 
+/// Single construction path for user-supplied project-outline filters. Tests
+/// assert these engine guarantees directly instead of treating host speed as a
+/// correctness property.
+module internal ProjectOutlineFilter =
+    let private matchTimeout = TimeSpan.FromMilliseconds(250.0)
+
+    let compile (pattern: string) =
+        let options =
+            System.Text.RegularExpressions.RegexOptions.NonBacktracking
+            ||| System.Text.RegularExpressions.RegexOptions.IgnoreCase
+
+        new System.Text.RegularExpressions.Regex(pattern, options, matchTimeout)
+
 /// Adapts Ionide.ProjInfo's evaluated MSBuild result to the small, stable model
 /// shared by project_health and fsharp_project_inspect.
 module private EvaluatedProjectModel =
@@ -2904,13 +2917,27 @@ type internal FcsBridge
         ?projectOptionsCacheValidationBeforeComputeOverride: (string -> unit),
         ?trustedFileCheckAnswerOverride: (FSharpCheckFileAnswer -> FSharpCheckFileAnswer),
         // Deterministic test seam for the otherwise fixed production find ceiling.
-        ?findResponseBudgetCharsOverride: int
+        ?findResponseBudgetCharsOverride: int,
+        // Test-only ownership boundary for synthetic snippet files. Production
+        // continues to use the OS temp directory.
+        ?snippetTempDirectoryOverride: string
     ) =
     let findResponseBudgetChars =
         match findResponseBudgetCharsOverride with
         | Some value when value > 0 -> value
         | Some value -> invalidArg (nameof findResponseBudgetCharsOverride) $"find response budget must be positive; got {value}."
         | None -> FindResponseBudget.MaxSerializedChars
+
+    let snippetTempDirectory =
+        match snippetTempDirectoryOverride with
+        | Some path when String.IsNullOrWhiteSpace(path) ->
+            invalidArg (nameof snippetTempDirectoryOverride) "snippet temp directory must not be blank."
+        | Some path -> Path.GetFullPath(path)
+        | None -> Path.GetTempPath()
+
+    let createSnippetFile prefix extension =
+        Directory.CreateDirectory(snippetTempDirectory) |> ignore
+        Path.Combine(snippetTempDirectory, $"{prefix}_{Guid.NewGuid():N}{extension}")
 
     // FCS default projectCacheSize is 3. The `find` multi-project union sweep
     // (issue #128) re-checks EVERY member project of the active solution on each
@@ -4133,6 +4160,53 @@ type internal FcsBridge
               "before", JsonArray(before) :> JsonNode
               "after", JsonArray(after) :> JsonNode ]
 
+    let isDoubleBacktickIdentifier (value: string) =
+        not (isNull value)
+        && value.Length > 4
+        && value.StartsWith("``", StringComparison.Ordinal)
+        && value.EndsWith("``", StringComparison.Ordinal)
+
+    /// Return the length of the query suffix that spells this FCS source name.
+    /// FCS preserves double backticks in DisplayName, while callers naturally ask
+    /// for both the plain name and its double-backtick-delimited spelling. Compare
+    /// only the semantic identifier suffix; never scan source text or strip interior quotes.
+    let trySourceIdentifierSuffixLength comparison (sourceName: string) (query: string) =
+        if isNull sourceName || isNull query then
+            None
+        elif query.EndsWith(sourceName, comparison) then
+            Some sourceName.Length
+        elif isDoubleBacktickIdentifier sourceName then
+            let contentLength = sourceName.Length - 4
+
+            if
+                query.Length >= contentLength
+                && String.Compare(
+                    query,
+                    query.Length - contentLength,
+                    sourceName,
+                    2,
+                    contentLength,
+                    comparison
+                ) = 0
+            then
+                Some contentLength
+            else
+                None
+        else
+            let quotedLength = sourceName.Length + 4
+            let quotedStart = query.Length - quotedLength
+
+            if
+                quotedStart >= 0
+                && query[quotedStart] = '`'
+                && query[quotedStart + 1] = '`'
+                && query.EndsWith("``", StringComparison.Ordinal)
+                && String.Compare(query, quotedStart + 2, sourceName, 0, sourceName.Length, comparison) = 0
+            then
+                Some quotedLength
+            else
+                None
+
     let symbolMatches query exact (symbol: FSharpSymbol) =
         let displayName = symbol.DisplayName
         let fullName = symbol.FullName
@@ -4149,16 +4223,57 @@ type internal FcsBridge
             && fullName.Length > query.Length
             && fullName[fullName.Length - query.Length - 1] = '.'
 
+        // #267: GetAllUsesOfAllSymbols returns backtick-bound values and test methods
+        // with the delimiters in DisplayName/FullName. Match quoted and unquoted query
+        // spellings against that FCS identity, including a module-qualified final name.
+        // Qualifiers remain exact dot-delimited suffixes, so a punctuation near-miss
+        // cannot become a hit and duplicate source names continue to return every site.
+        let sourceNameMatch comparison =
+            match trySourceIdentifierSuffixLength comparison displayName query with
+            | None -> false
+            | Some suffixLength when suffixLength = query.Length -> true
+            | Some suffixLength when isNull fullName -> false
+            | Some suffixLength ->
+                let querySeparator = query.Length - suffixLength - 1
+                let fullDisplayStart = fullName.Length - displayName.Length
+
+                if
+                    querySeparator < 0
+                    || query[querySeparator] <> '.'
+                    || fullDisplayStart <= 0
+                    || not (fullName.EndsWith(displayName, StringComparison.Ordinal))
+                    || fullName[fullDisplayStart - 1] <> '.'
+                then
+                    false
+                else
+                    let queryQualifierLength = querySeparator
+                    let fullQualifierLength = fullDisplayStart - 1
+
+                    (fullQualifierLength = queryQualifierLength
+                     && String.Compare(fullName, 0, query, 0, queryQualifierLength, comparison) = 0)
+                    || (fullQualifierLength > queryQualifierLength
+                        && fullName[fullQualifierLength - queryQualifierLength - 1] = '.'
+                        && String.Compare(
+                            fullName,
+                            fullQualifierLength - queryQualifierLength,
+                            query,
+                            0,
+                            queryQualifierLength,
+                            comparison
+                        ) = 0)
+
         if exact then
             String.Equals(displayName, query, StringComparison.Ordinal)
             || String.Equals(fullName, query, StringComparison.Ordinal)
             || dottedSuffixMatch ()
+            || sourceNameMatch StringComparison.Ordinal
         else
             displayName.Contains(query, StringComparison.OrdinalIgnoreCase)
             || (if isNull fullName then
                     false
                 else
                     fullName.Contains(query, StringComparison.OrdinalIgnoreCase))
+            || sourceNameMatch StringComparison.OrdinalIgnoreCase
 
     let isIdentifierChar (ch: char) =
         Char.IsLetterOrDigit(ch) || ch = '_' || ch = '\'' || ch = '`'
@@ -4822,45 +4937,49 @@ type internal FcsBridge
             | None -> ()
 
             // A caller deadline may expire while a test/probe/cache phase is awaiting.
-            // Recheck immediately before the non-cancellable MSBuild worker starts.
+            // Recheck immediately before the isolated MSBuild worker starts.
             ensureCanContinue ()
 
-            // Offload to thread pool — MSBuild/SDK probing is CPU+IO bound. The
-            // caller owns the outer admission slot across this actual completion.
+            // Keep SDK probing and fingerprint work off the caller thread. MSBuild
+            // itself now runs in a short-lived process: genuine cache misses must
+            // not retain in-process MSBuild node threads in this long-lived host.
+            // The caller owns admission until the actual child has been drained.
             return!
-                Task.Run(fun () ->
-                    ensureCanContinue ()
-                    let projectDir = Path.GetDirectoryName(fsprojPath)
-
-                    // #192: outside the try on purpose. Init.init inherits this
-                    // directory's global.json, and an unsatisfiable `rollForward:
-                    // "disable"` pin is not a load failure to degrade into None —
-                    // it is a machine-configuration problem the agent must be told
-                    // about by name. Raising here also keeps MSBuild untouched.
-                    SdkPreflight.ensure [ projectDir ]
-                    InstallationHealth.ensureCurrent ()
-                    ensureCanContinue ()
-
-                    try
-                        let toolsPath = Init.init (DirectoryInfo(projectDir)) None
-                        let loader = WorkspaceLoader.Create(toolsPath, [])
+                Task.Run<(FSharpProjectOptions * ProjectOptionsFingerprint * EvaluatedProjectSnapshot) option>(fun () ->
+                    task {
                         ensureCanContinue ()
-                        Interlocked.Increment(&projectOptionsLoadCount) |> ignore
-                        let projects = loader.LoadProjects([ fsprojPath ]) |> Seq.toList
+                        let projectDir = Path.GetDirectoryName(fsprojPath)
 
-                        match projects with
-                        | proj :: _ ->
-                            let fcsOpts = FCS.mapToFSharpProjectOptions proj (projects |> Seq.map id)
-                            let fingerprint = captureProjectOptionsFingerprint projects
-                            let snapshot = EvaluatedProjectModel.create "ionide-proj-info" proj fcsOpts
-                            Some(fcsOpts, fingerprint, snapshot)
-                        | [] -> None
-                    with
-                    | :? TimeoutException as ex -> raise ex
-                    | :? OperationCanceledException as ex -> raise ex
-                    | ex ->
-                        Console.Error.WriteLine($"[proj-info] Failed to load %s{fsprojPath}: %s{ex.Message}")
-                        None)
+                        // #192: outside the try on purpose. Init.init inherits this
+                        // directory's global.json, and an unsatisfiable `rollForward:
+                        // "disable"` pin is not a load failure to degrade into None —
+                        // it is a machine-configuration problem the agent must be told
+                        // about by name. Raising here also keeps MSBuild untouched.
+                        SdkPreflight.ensure [ projectDir ]
+                        InstallationHealth.ensureCurrent ()
+                        ensureCanContinue ()
+
+                        try
+                            ensureCanContinue ()
+                            Interlocked.Increment(&projectOptionsLoadCount) |> ignore
+                            let! projects = ProjectEvaluation.loadProjectsAsync fsprojPath ensureCanContinue
+                            ensureCanContinue ()
+
+                            match projects with
+                            | proj :: _ ->
+                                let fcsOpts = FCS.mapToFSharpProjectOptions proj (projects |> Seq.map id)
+                                let fingerprint = captureProjectOptionsFingerprint projects
+                                let snapshot = EvaluatedProjectModel.create "ionide-proj-info" proj fcsOpts
+                                ensureCanContinue ()
+                                return Some(fcsOpts, fingerprint, snapshot)
+                            | [] -> return None
+                        with
+                        | :? TimeoutException as ex -> return raise ex
+                        | :? OperationCanceledException as ex -> return raise ex
+                        | ex ->
+                            Console.Error.WriteLine($"[proj-info] Failed to load %s{fsprojPath}: %s{ex.Message}")
+                            return None
+                    })
         }
 
     member private this.AcquireFsprojEntryWithinBudget
@@ -5280,8 +5399,7 @@ type internal FcsBridge
 
                 let ext = if mode = "fsi" then ".fsi" else ".fs"
 
-                let snippetFile =
-                    Path.Combine(Path.GetTempPath(), $"fslangmcp_snippet_{Guid.NewGuid():N}{ext}")
+                let snippetFile = createSnippetFile "fslangmcp_snippet" ext
 
                 try
                     File.WriteAllText(snippetFile, args.content)
@@ -10649,6 +10767,12 @@ type internal FcsBridge
         task {
             let speed = (args.speed |> Option.defaultValue "trusted").Trim().ToLowerInvariant()
             let mode = (args.mode |> Option.defaultValue "fs").Trim().ToLowerInvariant()
+            // v0.17.1 already appended snippets after SourceFiles. Keep that useful
+            // behavior as the explicit default while allowing callers to request the
+            // pre-project position when they need to model an early compile file.
+            let snippetPosition =
+                (args.snippetPosition |> Option.defaultValue "end").Trim().ToLowerInvariant()
+
             let severityFloor = (args.severity |> Option.defaultValue "error").Trim().ToLowerInvariant()
             let scopeRaw = (args.scope |> Option.defaultValue "auto").Trim().ToLowerInvariant()
             let timeoutMs = args.timeoutMs |> Option.defaultValue 60000
@@ -10685,6 +10809,8 @@ type internal FcsBridge
                 return invalid $"speed must be 'trusted' or 'fast' (got '{speed}')"
             elif mode <> "fs" && mode <> "fsi" then
                 return invalid $"mode must be 'fs' or 'fsi' (got '{mode}')"
+            elif snippetPosition <> "start" && snippetPosition <> "end" then
+                return invalid $"snippetPosition must be 'start' or 'end' (got '{snippetPosition}')"
             elif not (List.contains severityFloor severityNames) then
                 return invalid $"severity must be one of error|warning|information|hint|all (got '{severityFloor}')"
             elif not (List.contains scopeRaw [ "auto"; "file"; "project"; "workspace"; "snippet" ]) then
@@ -11049,7 +11175,7 @@ type internal FcsBridge
                         [||]
                         (Some discoveryReason)
                         ([ ("projectsSwept", jint 0) ] @ blockingFields discoveryFailure)
-            // ── snippet: always FRESH (ignores speed); old ValidateSnippet logic ──
+            // ── snippet: always FRESH (ignores speed); placement-aware validation ──
             | "snippet" ->
                 match args.snippet with
                 | Some snippetText when not (String.IsNullOrWhiteSpace snippetText) ->
@@ -11073,15 +11199,19 @@ type internal FcsBridge
                         let! options, optionsSource = this.ResolveFsprojOptions(fsproj)
                         let ext = if mode = "fsi" then ".fsi" else ".fs"
 
-                        let snippetFile =
-                            Path.Combine(Path.GetTempPath(), $"fslangmcp_check_{Guid.NewGuid():N}{ext}")
+                        let snippetFile = createSnippetFile "fslangmcp_check" ext
 
                         try
                             File.WriteAllText(snippetFile, snippetText)
 
+                            let snippetSourceFiles =
+                                match snippetPosition with
+                                | "start" -> Array.append [| snippetFile |] options.SourceFiles
+                                | _ -> Array.append options.SourceFiles [| snippetFile |]
+
                             let modifiedOptions =
                                 { options with
-                                    SourceFiles = Array.append options.SourceFiles [| snippetFile |] }
+                                    SourceFiles = snippetSourceFiles }
 
                             let sourceText = SourceText.ofString snippetText
 
@@ -11145,6 +11275,7 @@ type internal FcsBridge
                                     [||] // synthetic temp file — no meaningful source path to surface
                                     reason
                                     [ "mode", jstr mode
+                                      "snippetPosition", jstr snippetPosition
                                       "projectFileName", jstr options.ProjectFileName
                                       "optionsSource", jstr optionsSource ]
                         finally
@@ -12790,11 +12921,7 @@ type internal FcsBridge
                             // NonBacktracking eliminates catastrophic-backtracking risk for
                             // user-supplied patterns like (a+)+$. A 250ms timeout is a belt-
                             // and-suspenders guard; NonBacktracking should never time out.
-                            let opts =
-                                System.Text.RegularExpressions.RegexOptions.NonBacktracking
-                                ||| System.Text.RegularExpressions.RegexOptions.IgnoreCase
-
-                            Some(System.Text.RegularExpressions.Regex(pattern, opts, TimeSpan.FromMilliseconds 250.0))
+                            Some(ProjectOutlineFilter.compile pattern)
                         with ex ->
                             invalidArg (nameof args.filter) $"Invalid filter regex: %s{ex.Message}"
 

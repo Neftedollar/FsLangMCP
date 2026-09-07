@@ -180,10 +180,10 @@ let internal threadHealthJson
               "restartRecommended", jbool true
               "warning",
               jstr
-                  $"FsLangMCP has %d{count} OS-visible threads. Retained in-process Ionide.ProjInfo/MSBuild nodes are one known cause in long-lived sessions, but this count alone does not prove attribution. This process has attempted %d{projectOptions.LoadAttempts} project-options load(s), including %d{projectOptions.StaleReloads} stale-cache reload(s)."
+                  $"FsLangMCP has %d{count} OS-visible threads. This count alone does not prove attribution or a leak. Project evaluation runs in short-lived helper processes, not in this host. This process has attempted %d{projectOptions.LoadAttempts} project-options load(s), including %d{projectOptions.StaleReloads} stale-cache reload(s)."
               "recommendation",
               jstr
-                  "Restart the fslangmcp MCP server process to reclaim retained MSBuild threads. `set_project(restartLsp=true)` restarts only fsautocomplete." ]
+                  "If the high thread count persists, restart the fslangmcp MCP server process to release its resources. `set_project(restartLsp=true)` restarts only fsautocomplete." ]
         :> JsonNode
     | Some _ ->
         jobj
@@ -226,13 +226,14 @@ let currentThreadWarning (projectOptions: ProjectOptionsTelemetry) : JsonNode op
 
 let private projectOptionsJson (telemetry: ProjectOptionsTelemetry) : JsonNode =
     jobj
-        [ "loadAttempts", jint64 telemetry.LoadAttempts
+        [ "evaluationMode", jstr "isolated_helper"
+          "loadAttempts", jint64 telemetry.LoadAttempts
           "staleReloads", jint64 telemetry.StaleReloads
           "cacheValidations", jint64 telemetry.CacheValidations
           "inFlight", jint telemetry.InFlight
           "note",
           jstr
-              "loadAttempts counts actual Ionide.ProjInfo/MSBuild evaluations; cache hits are excluded. staleReloads counts cached entries invalidated by a changed project-options input fingerprint." ]
+              "loadAttempts counts Ionide.ProjInfo/MSBuild evaluation attempts in short-lived helper processes; cache hits are excluded and no evaluation runs in the parent. staleReloads counts cached entries invalidated by a changed project-options input fingerprint." ]
     :> JsonNode
 
 let private fcsStatusJson (config: FcsCheckerConfig) (projectOptions: ProjectOptionsTelemetry) : JsonNode =
