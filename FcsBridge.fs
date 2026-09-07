@@ -9271,7 +9271,7 @@ type internal FcsBridge
                 | None ->
                     [ "truncated", jbool true
                       "nextCursor", null
-                      "totalEstimate", jobj [ "sites", jint totalSites ]
+                      "totalEstimate", jobj [ ("sites", jint totalSites) ]
                       "pageOffset", jint pageOffset
                       "pageSize", jint pageSize ]
 
