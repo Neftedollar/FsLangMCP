@@ -90,7 +90,7 @@ Response shape:
 {
   "status": "ok",
   "result": {
-    "fslangmcpVersion": "0.17.1",
+    "fslangmcpVersion": "0.18.0",
     "lspRestartRequested": true,
     "lspRestarted": true,
     "lspReplacedExistingProcess": false,
@@ -315,6 +315,6 @@ dotnet run --project App/App.fsproj
 
 - **Response field names are exact**: `totalSites`, `breakdown`, `sites[].kind`,
   `sites[].symbolFullName`, `sites[].lineText`, `resolution.projectsSwept` all
-  match the v0.17.1 tool implementation.
+  match the v0.18.0 tool implementation.
 
 - **Time to first success: ~3 minutes** (install + bootstrap + four tool calls).

@@ -2,11 +2,11 @@
 
 ## Status
 
-**Proposed for v0.18.0.** This ADR defines the compatibility contract. Implementation
-and the public schema/version change remain a separate change set tracked by #259.
-It is deliberately excluded from the v0.17.1 correctness patch.
+**Accepted and implemented for v0.18.0.** The runtime contract tracked in #259
+landed in PR #279. It was deliberately excluded from the v0.17.1 correctness
+patch and ships as a minor-version wire-contract change.
 
-Implementation is blocked on three v0.17.1 prerequisites:
+Implementation followed three prerequisites shipped in v0.17.1:
 
 - #165 must preserve declared `.sln`/`.slnx` members, including missing members, in
   `find` coverage.
@@ -15,9 +15,9 @@ Implementation is blocked on three v0.17.1 prerequisites:
 - #258 must define bounded site/context shaping and the exact zero-row response
   budget behavior before a continuation is minted.
 
-## Context
+## Original context (before v0.18.0)
 
-`find` currently uses the repository-wide offset cursor from `Cursor.fs`:
+`find` used the repository-wide offset cursor from `Cursor.fs`:
 
 ```json
 {"offset": 100}
@@ -404,7 +404,7 @@ adds installation lifecycle without solving result-stream consistency.
   deadline.
 - The cursor payload grows by two SHA-256 values while remaining small and bounded.
 - Other tools keep their legacy cursor contract in v0.18.0.
-- #165, #255, and #258 must land before implementation.
+- #165, #255, and #258 landed in v0.17.1 before implementation.
 - The design does not pull any cursor contract change into v0.17.1.
 
 ## Cross-references
