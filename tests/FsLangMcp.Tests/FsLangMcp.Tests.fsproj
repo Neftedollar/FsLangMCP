@@ -28,12 +28,16 @@
     <Compile Include="FcsBridgeTests.fs" />
     <Compile Include="OutlinePaginationTests.fs" />
     <Compile Include="CursorPropertyTests.fs" />
+    <Compile Include="FindCursorV2Tests.fs" />
     <Compile Include="OutlineE2ETests.fs" />
     <Compile Include="SymbolPaginationTests.fs" />
     <Compile Include="ToolDescriptionSchemaTests.fs" />
     <Compile Include="FieldSiteTypesTests.fs" />
     <Compile Include="FindTests.fs" />
     <Compile Include="FindBacktickDefinitionTests.fs" />
+    <Compile Include="FindCursorIntegrationTests.fs" />
+    <Compile Include="FindCursorReviewTests.fs" />
+    <Compile Include="FindCursorBoundaryTests.fs" />
     <Compile Include="FindResponseBudgetTests.fs" />
     <Compile Include="TestsForSymbolTests.fs" />
     <Compile Include="CompileOrderTests.fs" />

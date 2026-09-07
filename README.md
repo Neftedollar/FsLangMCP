@@ -62,7 +62,7 @@ Full setup: [`docs/getting-started.md`](docs/getting-started.md) · Per-client c
 
 | Tool | What it does |
 |------|--------------|
-| `find` | Multi-project semantic search with explicit sweep and delivery completeness. A failed/timed-out/busy project makes absence indeterminate; pagination keeps `resolution.complete=false` until one response contains the whole site set. |
+| `find` | Multi-project semantic search with explicit sweep and delivery completeness. Stateless v2 cursors bind every page to the same request and complete canonical result stream; a changed request, source, or coverage state is rejected instead of mixed. |
 | `check` | One trustworthy verdict (`clean`/`errors`/`unknown`) for the current FCS/check profile. Default mode is a fresh FCS check; fast FSAC mode returns `clean` only with complete current coverage. An `unknown` caused by SDK/preflight failure includes a typed `blockingReason`. Project scope warns that downstream consumers were not checked; workspace scope requires a solution or directory. |
 
 `check` is the fast semantic edit loop, not the final Release gate. A `clean` verdict covers the
@@ -259,9 +259,21 @@ found but some projects were not analyzed; `status="unknown"` plus
 `coverage.complete` says whether the project sweep finished, while
 `resolution.complete` says whether this response delivered the entire site set; follow
 `truncated` / `nextCursor` and verify `totalEstimate.sites` before treating a refactor count as
-exhaustive. `check(speed="fast")`
+exhaustive. A v2 cursor may be retried with a different `maxResults` or `timeoutMs`, but changing
+any result-shaping input returns `cursor_query_mismatch`; a changed source/result/coverage stream
+returns `cursor_stale`, including removal of the last or selected declared solution member.
+Deadline-incomplete initial pages have no cursor and require a restart; deadline-incomplete
+continuations return no sites with `retrySameCursor=true`. This also applies when constructing
+the final validation-error response exhausts the deadline: a well-formed continuation returns
+`cursor_validation_incomplete` and can be retried to obtain the actual validation result.
+Malformed cursors and invalid/missing-context requests keep their typed rejection routes.
+`check(speed="fast")`
 similarly exposes expected/received/missing/stale file coverage and never turns an
 incomplete empty snapshot into `clean`.
+
+For capped linked-field type alternatives, `siteTypeAlternativesOmitted` reports how many
+alternatives were omitted and `siteTypeAlternativesOffset` identifies the first omitted index.
+These per-site values are independent of page size and response budget.
 
 LSP positions (`line`, `character`) are **0-based**.
 

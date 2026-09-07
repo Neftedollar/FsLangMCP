@@ -121,9 +121,19 @@ remain distinct. An incomplete zero-result answer stays indeterminate.
 
 If response construction expires after the sweep, `errorKind="find_response_timeout"` preserves
 the available semantic evidence but sets `resultSetComplete=false`,
-`paginationRestartRequired=true`, and `nextCursor=null`. Restart without a cursor after narrowing
-the request. `coverage.complete` may still be true: completing analysis does not imply successful
-delivery of every site.
+`paginationRestartRequired=true`, and `nextCursor=null` for an initial request. Restart without a
+cursor after narrowing that request. A continuation instead follows the no-sites same-cursor
+retry contract below. `coverage.complete` may still be true: completing analysis does not imply
+successful delivery of every site.
+
+When the semantic deadline leaves a positive initial result incomplete, the response is an
+explicit cursorless partial: `deliveryStatus="partial"`, `truncated=true`,
+`totalEstimateIsLowerBound=true`, `paginationRestartRequired=true`,
+`retrySameCursor=false`, and `paginationIncompleteReason="deadline_incomplete"`. The known sites
+remain useful, but the complete stream must be restarted from page zero with a larger deadline.
+An incomplete continuation is stricter: it returns no sites and no new cursor with
+`errorKind="cursor_validation_incomplete"`, `paginationRestartRequired=false`, and
+`retrySameCursor=true`.
 
 `breakdownComplete` independently says whether all per-kind counts were computed. If the response
 deadline interrupts that counting pass, `breakdown` retains the counted prefix as lower bounds and
@@ -182,10 +192,52 @@ incomplete even when it is the final page and `truncated=false`, because that pa
 sites. For an exhaustive refactor count, follow `nextCursor`, reconcile against
 `totalEstimate.sites`, and treat only an unpaged offset-zero response as complete in isolation.
 
+### Stateless v2 cursor consistency (#259)
+
+`find` cursors contain only `v=2`, `tool="find"`, the next offset, and fixed-size SHA-256
+identities for the canonical query and complete canonical stream. The query identity includes
+materialized defaults, normalized target/path and position inputs, and every result-shaping flag.
+It deliberately excludes `cursor`, `maxResults`, and `timeoutMs`, so callers may alternate page
+sizes or increase the remaining-time budget without changing the logical query.
+
+The stream identity covers the ordered declared project/coverage ledger, resolved query/kind/
+scope and position-symbol identity, response-affecting diagnostic identities, and every sorted
+site after deterministic bounded source/context and site-type-alternative shaping but before page
+slicing. Page size, page offset, and the final 60,000-character envelope cannot reshape a row.
+This recomputation retains no per-cursor result state and puts no plaintext query, local path,
+diagnostic, or source text in the token. The hash is a consistency identity, not an authorization
+mechanism and not a claim that FCS observed an atomic filesystem snapshot.
+
+For position requests, the identity binds the actual resolved symbol's assembly, declaration/
+signature locations, and untruncated semantic type/signature, not just its name. Retyping a call
+to select another overload therefore invalidates the cursor even if every site row is identical.
+A removed identifier or line is stale; unavailable type checking returns incomplete validation.
+The same-cursor retry route also applies to deadline expiry during final page planning and
+serialization, after the snapshot hash has already matched.
+
+Continuation failures are typed and never return sites:
+
+| `errorKind` | Caller action |
+|---|---|
+| `cursor_query_mismatch` | The request changed; repeat it without a cursor. |
+| `cursor_stale` | Source, solution, coverage, diagnostics, or result rows changed; restart at page zero. |
+| `cursor_out_of_range` | Discard the cursor and restart at page zero. |
+| `cursor_version_unsupported` | Discard a legacy/unknown-version cursor and restart under v2. |
+| `cursor_malformed` | Discard the invalid token and restart. |
+| `cursor_tool_mismatch` | Use the cursor only with the tool that issued it. |
+| `cursor_validation_incomplete` | Retry the same cursor, normally with a larger `timeoutMs`; no page was delivered. |
+
+After a process restart, an explicit `projectPath` can be validated directly. A request that
+relied on active context must repeat `set_project` first. With neither, `find` returns its normal
+missing-context error and does not claim that the cursor was validated. Other paginated tools
+continue to mint and accept their legacy offset-only cursors, but their strict legacy decoder
+rejects a tagged v2 `find` token instead of extracting its offset.
+
 ### Serialized response budget (#258)
 
-`maxResults` is an upper bound on sites considered, not a promise that every candidate fits on the
-page. `find` assembles the real response and measures it with the same indented
+`maxResults` is an upper bound on sites delivered on the requested page, not a promise that every
+requested row fits. `find` first constructs and hashes every canonical pre-pagination row, then
+assembles the requested page and measures it with the same indented
 `System.Text.Json` options used by `Tools.renderToken`. The hard ceiling is **60,000 UTF-16 code
 units** (`System.String.Length` after production serialization), so Unicode is measured in the
 same unit the transport string uses rather than estimated bytes or tokens. The measurement covers
@@ -230,8 +282,9 @@ or admission behavior. Its generic recovery requires restarting without a cursor
 (`reuseOriginalCursor=false`), because shortening a query/path can change cursor identity; the
 site-aware late planner recovery remains separate and retains its more precise cursor semantics.
 
-Each site is projected to a canonical JSON row before that planner runs. Its `project`, source
-snippet metadata, and deterministic per-site `siteTypeAlternatives` projection do not depend on
+Every site in the complete sorted stream is projected to a canonical JSON row before page slicing
+or planning. Its `project`, source snippet metadata, and deterministic per-site
+`siteTypeAlternatives` projection do not depend on
 cursor offset, `maxResults`, neighbouring rows, or remaining response budget. The planner may
 select only an in-order prefix of those already-formed rows; it never removes or reshapes fields
 inside a delivered site.
@@ -358,7 +411,9 @@ are absent/zero on a normal single-project sweep.
 **Why it is bounded and page-invariant.** Unlike `siteType`, the alternatives column grows with the
 number of projects a linked file is compiled by. Deterministic per-site limits keep it bounded in
 cardinality: at most 3 distinct types per row and 3 projects per type. The remainder becomes
-`siteTypeAlternativesOmitted` on the row and `projectsOmitted` on the entry. These limits depend
+`siteTypeAlternativesOmitted` on the row and `projectsOmitted` on the entry. A capped row also
+records `siteTypeAlternativesOffset`, the zero-based index of the first omitted alternative
+(not a separate cursor or an input parameter). These limits depend
 only on the site's sorted alternatives, so the same site serializes identically at different
 `maxResults` and page boundaries. `siteTypes.alternativesTruncatedRows` counts delivered rows that
 hit either cap, and the `siteTypesNote` says so. The final 60,000-unit response guard handles total

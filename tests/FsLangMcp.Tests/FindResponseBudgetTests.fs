@@ -497,9 +497,9 @@ type FindResponseBudgetIntegrationTests(fixture: FindBudgetFixture) =
                     | node ->
                         let next = node.GetValue<string>()
 
-                        match tryDecode next with
-                        | Ok payload -> Assert.Equal(deliveredCount, payload.offset)
-                        | Error reason -> Assert.Fail($"find emitted an invalid cursor: {reason}")
+                        match tryDecodeFind next with
+                        | Ok payload -> Assert.Equal(deliveredCount, payload.Offset)
+                        | Error error -> Assert.Fail($"find emitted an invalid cursor: {error.Message}")
 
                         Some next
 
@@ -579,7 +579,14 @@ type FindResponseBudgetIntegrationTests(fixture: FindBudgetFixture) =
 
             let tinyBudget = 6_000
             let bridge = FcsBridge(findResponseBudgetCharsOverride = tinyBudget)
-            let continuation = encode 1
+            let initialArgs =
+                { findArgs fixture None with
+                    maxResults = Some 1
+                    scope = Some "workspace"
+                    projectPath = Some fixture.SolutionPath }
+
+            let! first = FcsBridge().Find(initialArgs)
+            let continuation = first["nextCursor"].GetValue<string>()
 
             let! result =
                 bridge.Find(

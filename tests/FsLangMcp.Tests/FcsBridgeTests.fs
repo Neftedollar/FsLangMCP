@@ -271,6 +271,68 @@ let ``find immediate expiry with malformed project path stays typed`` () : Task 
         Assert.True(project["retryable"].GetValue<bool>())
     }
 
+[<Theory>]
+[<InlineData(false, false)>]
+[<InlineData(false, true)>]
+[<InlineData(true, false)>]
+[<InlineData(true, true)>]
+let ``find malformed paths remain invalid inputs during final continuation expiry`` (fileScope: bool, continuation: bool) : Task =
+    task {
+        let malformed = "\u0000broken.fsproj"
+        let expired = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable measured = false
+        let bridge =
+            FcsBridge(findFinalResponseBeforeMeasureOverride = (fun () ->
+                measured <- true
+                expired.TrySetResult(()) |> ignore))
+
+        let request =
+            { admissionFindArgs malformed 20_000 with
+                scope = Some(if fileScope then "file" else "project")
+                projectPath = if fileScope then None else Some malformed
+                path = if fileScope then Some malformed else None
+                cursor =
+                    if continuation then
+                        let identity = String.replicate 43 "A"
+                        Some(FsLangMcp.Cursor.encodeFindV2 1 identity identity)
+                    else
+                        None }
+
+        let deadline = FindRequestDeadline(20_000, responseExpirySignal = expired.Task)
+        let! result = bridge.FindWithinDeadline(request, deadline, CancellationToken.None, ignore, None)
+        Assert.True(measured)
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("invalid path", result["message"].GetValue<string>())
+        Assert.Null(result["retrySameCursor"])
+        Assert.Null(result["nextCursor"])
+        Assert.Equal(0L, bridge.ProjectOptionsLoadCount)
+        Assert.Equal(0L, bridge.ProjectUsesStartedCount)
+    }
+
+[<Theory>]
+[<InlineData("missing-context")>]
+[<InlineData("page-size")>]
+[<InlineData("position-line")>]
+let ``find expired continuations do not override mandatory request errors`` (reason: string) : Task =
+    task {
+        let identity = String.replicate 43 "A"
+        let initial =
+            { admissionFindArgs "\u0000broken.fsproj" 0 with
+                cursor = Some(FsLangMcp.Cursor.encodeFindV2 1 identity identity) }
+
+        let request =
+            match reason with
+            | "missing-context" -> { initial with projectPath = None; scope = Some "workspace" }
+            | "page-size" -> { initial with maxResults = Some 0 }
+            | "position-line" -> { initial with kind = Some "position"; path = Some "\u0000broken.fs" }
+            | _ -> failwith "Unknown mandatory-input control."
+
+        let! result = FcsBridge().FindWithinDeadline(request, FindRequestDeadline(0), CancellationToken.None, ignore, None)
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Null(result["retrySameCursor"])
+        Assert.Null(result["nextCursor"])
+    }
+
 [<Fact>]
 let ``project evaluation rejects distinct keys without queueing and admits retry after completion`` () : Task =
     task {
@@ -996,13 +1058,16 @@ let ``find expiry during nearest project discovery stops before the next directo
                 Directory.Delete(root, true)
     }
 
-[<Fact>]
-let ``find expiry during missing project rows stops shaping and reports honest phases`` () : Task =
+[<Theory>]
+[<InlineData(8)>]
+[<InlineData(128)>]
+let ``find expiry during missing project rows stops shaping and reports honest phases`` (missingCount: int) : Task =
     task {
         let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_find_missing_rows_{Guid.NewGuid():N}")
         let expiry = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
         let mutable missingRowSteps = 0
         let mutable sweepStarts = 0
+        let mutable snapshotStarts = 0
 
         let beforeDiscoveryStep phase _ =
             if phase = "missing-project-row" then
@@ -1018,14 +1083,16 @@ let ``find expiry during missing project rows stops shaping and reports honest p
         let bridge =
             FcsBridge(
                 findTargetDiscoveryBeforeStepOverride = beforeDiscoveryStep,
-                projectSweepWorkerOverride = controlledSweep
+                projectSweepWorkerOverride = controlledSweep,
+                findResponseConstructionBeforeStepOverride = (fun phase _ ->
+                    if phase = "snapshot-start" then snapshotStarts <- snapshotStarts + 1)
             )
 
         try
             let _, loadableProject = writeSimpleProject root "Loadable" "value"
 
             let missingProjects =
-                [ for index in 1..8 -> Path.Combine(root, $"Missing{index}.fsproj") ]
+                [ for index in 1..missingCount -> Path.Combine(root, $"Missing{index}.fsproj") ]
 
             let solutionPath =
                 writeSolution root "MissingRows.sln" (loadableProject :: missingProjects)
@@ -1043,9 +1110,10 @@ let ``find expiry during missing project rows stops shaping and reports honest p
             Assert.Equal("find_timeout", result["errorKind"].GetValue<string>())
             Assert.Equal(3, Volatile.Read(&missingRowSteps))
             Assert.Equal(0, Volatile.Read(&sweepStarts))
-            Assert.Equal(9, result["projectsRequested"].GetValue<int>())
+            Assert.Equal(0, snapshotStarts)
+            Assert.Equal(missingCount + 1, result["projectsRequested"].GetValue<int>())
             Assert.Equal(1, result["projectsSwept"].GetValue<int>())
-            Assert.Equal(8, result["projectsMissing"].GetValue<int>())
+            Assert.Equal(missingCount, result["projectsMissing"].GetValue<int>())
             Assert.Equal(1, result["projectsNotStarted"].GetValue<int>())
             Assert.Equal(2, result["perProject"].AsArray().Count)
             Assert.Equal("project", (result["resolution"]["scopeResolved"]).GetValue<string>())
@@ -1057,6 +1125,11 @@ let ``find expiry during missing project rows stops shaping and reports honest p
             Assert.Equal("complete", findPhaseStatus result "response_construction")
             Assert.False((result["coverage"]["complete"]).GetValue<bool>())
             Assert.False(result["resultSetComplete"].GetValue<bool>())
+            Assert.Null(result["nextCursor"])
+            Assert.Empty(result["sites"].AsArray())
+            Assert.True(result["totalEstimateIsLowerBound"].GetValue<bool>())
+            Assert.True(result["paginationRestartRequired"].GetValue<bool>())
+            Assert.Equal("deadline_incomplete", result["paginationIncompleteReason"].GetValue<string>())
         finally
             if Directory.Exists root then
                 Directory.Delete(root, true)

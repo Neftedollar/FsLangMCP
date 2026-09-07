@@ -247,7 +247,7 @@ type FindArgs =
       includeSiteTypes: bool option
       /// .fsproj / .sln / .slnx / directory to sweep. Falls back to active set_project.
       projectPath: string option
-      /// Maximum sites considered per page. Default 80; valid range 1..1000. The final
+      /// Maximum sites delivered per page. Default 80; valid range 1..1000. The final
       /// production-serialized response has a 60,000 UTF-16-code-unit hard ceiling, so
       /// fewer sites may be delivered; nextCursor advances by delivered sites only.
       maxResults: int option
@@ -256,7 +256,8 @@ type FindArgs =
       /// budget so a huge/cold solution surfaces a partial result instead of hanging.
       /// Must be non-negative; 0 requests an immediate, typed timeout result.
       timeoutMs: int option
-      /// Opaque cursor from a prior call's nextCursor. Omit for the first page.
+      /// Stateless v2 cursor from a prior Find call's nextCursor. It binds the canonical
+      /// request and complete stream; omit for the first page. Legacy offset cursors are rejected.
       cursor: string option }
 
 type FcsTestsForSymbolArgs =
@@ -826,10 +827,13 @@ module internal FindResponseBudget =
                   "outcome", jstr "indeterminate"
                   "deliveryStatus", jstr "blocked"
                   "errorCode", jstr "find_response_exceeds_budget"
+                  "errorKind", jstr "find_response_exceeds_budget"
                   "message",
                   jstr
                       "The complete find result exceeded the hard production-serialized response ceiling. Caller-controlled details were omitted; retry with narrower inputs."
                   "retryable", jbool true
+                  "paginationRestartRequired", jbool true
+                  "retrySameCursor", jbool false
                   "responseTruncatedByBudget", jbool true
                   "responseBudgetChars", jint MaxSerializedChars
                   "responseSizeUnit", jstr SizeUnit

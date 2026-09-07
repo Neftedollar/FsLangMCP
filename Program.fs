@@ -939,12 +939,15 @@ let private mainCore argv =
                 tool (
                     TypedTool.define<FindArgs>
                         "find"
-        "F# semantic search across solution projects: definitions/references, field sites, and member calls. Bare find(query) returns bounded snippets; contextLines adds up to 8 lines per side. Production JSON is capped at 60,000 UTF-16 code units, and cursors advance by delivered sites. Narrow with kind (symbol|members|field|definition|position), scope, path, or projectPath. Member calls: kind=members + member=Name. Field impact: kind=field + includeSiteTypes. scopeNote reports breadth."
+        "Multi-project F# semantic search for definitions/references, field sites, and member calls. Bare find(query) returns bounded snippets; contextLines adds up to 8 lines per side. Production JSON is capped at 60,000 UTF-16 code units. Stateless v2 cursors bind the request and complete stream: mismatch/stale errors require restart; incomplete validation allows same-cursor retry. Narrow with kind + scope. Member calls: kind=members + member=Name. Field impact: kind=field + includeSiteTypes."
                         (fun args (ct: CancellationToken) ->
+                            // Start the one monotonic deadline at public-handler entry,
+                            // before active-project fallback or gate admission.
+                            let timeoutMs = args.timeoutMs |> Option.defaultValue 120_000
+                            let deadline = FindRequestDeadline(max 0 timeoutMs)
+
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
-
-                            let timeoutMs = args.timeoutMs |> Option.defaultValue 120_000
 
                             toolResult (fun () ->
                                 if timeoutMs < 0 then
@@ -952,8 +955,6 @@ let private mainCore argv =
                                         Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.Find args))
                                 else
                                     task {
-                                        let deadline = FindRequestDeadline(timeoutMs)
-
                                         let! result =
                                             runLimitedWithFindDeadlineRetained
                                                 fcsGate
@@ -975,15 +976,21 @@ let private mainCore argv =
                                                 errorKind.GetValue<string>() = "fcs_admission_timeout"
 
                                         if isAdmissionTimeout then
-                                            return
-                                                FindDeadlineResponse.beforeDiscovery
-                                                    args
-                                                    deadline
-                                                    "admission"
-                                                    "timed_out"
-                                                    "fcs_admission_timeout"
-                                                    (result["message"].GetValue<string>())
-                                                |> FindResponseBudget.guardFinalResponse
+                                            let timeoutResponse =
+                                                if args.cursor.IsSome then
+                                                    FindCursorContract.validationIncomplete
+                                                        deadline
+                                                        "The find deadline expired during gate admission before the continuation could be validated. Retry the same cursor with a larger timeoutMs."
+                                                else
+                                                    FindDeadlineResponse.beforeDiscovery
+                                                        args
+                                                        deadline
+                                                        "admission"
+                                                        "timed_out"
+                                                        "fcs_admission_timeout"
+                                                        (result["message"].GetValue<string>())
+
+                                            return FindResponseBudget.guardFinalResponse timeoutResponse
                                         else
                                             return result
                                     }))

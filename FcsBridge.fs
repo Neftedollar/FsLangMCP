@@ -407,7 +407,8 @@ module internal FieldSiteTypes =
 
             [ ("siteTypeAlternatives", JsonArray(entryNodes |> List.toArray) :> JsonNode) ]
             @ (if typesOmitted > 0 then
-                   [ ("siteTypeAlternativesOmitted", jint typesOmitted) ]
+                   [ "siteTypeAlternativesOmitted", jint typesOmitted
+                     "siteTypeAlternativesOffset", jint entries.Length ]
                else
                    [])
 
@@ -520,6 +521,128 @@ exception private FindProjectNotStartedException
 type private FindTargetDiscoveryResult =
     | Paths of string array
     | Projects of SolutionParsing.FindProjectDiscovery
+
+[<NoEquality; NoComparison>]
+type private FindResolvedPosition =
+    { Query: string
+      SymbolIdentity: string }
+
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type private FindPositionFailure =
+    | InvalidRequest of JsonNode
+    | Changed of JsonNode
+    | Incomplete of JsonNode
+
+[<RequireQualifiedAccess>]
+module internal FindCursorContract =
+
+    let private normalizedStablePath value =
+        value
+        |> Option.filter (String.IsNullOrWhiteSpace >> not)
+        |> Option.map normalizePath
+
+    let queryModel
+        (args: FindArgs)
+        (query: string)
+        (kind: string)
+        (scope: string)
+        (exact: bool)
+        (contextLines: int)
+        (includeDeclaration: bool)
+        (includeInfo: bool)
+        (includePerProject: bool)
+        (includeSiteTypes: bool)
+        : Cursor.FindQueryV2 =
+        let path = normalizedStablePath args.path
+
+        // Public MCP dispatch materializes active-project fallback before this point.
+        // Direct bridge callers without projectPath use their normalized source path as
+        // the stable target identity; target discovery still resolves the owning project.
+        let target =
+            normalizedStablePath args.projectPath
+            |> Option.orElse path
+            |> Option.defaultValue ""
+
+        let position =
+            if kind = "position" then
+                Some
+                    { Cursor.FindPositionRequestV2.Path = path |> Option.defaultValue ""
+                      Line = args.line
+                      Character = args.character
+                      Word = args.word
+                      Occurrence = Some(args.occurrence |> Option.defaultValue -1) }
+            else
+                None
+
+        { Cursor.FindQueryV2.Schema = 2
+          Query = query
+          RequestedKind = kind
+          RequestedScope = scope
+          Target = target
+          Path = path
+          Position = position
+          Exact = exact
+          Member = args.``member``
+          Field = args.field
+          ContextLines = contextLines
+          IncludeDeclaration = includeDeclaration
+          IncludeInfo = includeInfo
+          IncludePerProject = includePerProject
+          IncludeSiteTypes = includeSiteTypes }
+
+    let rejected errorKind message =
+        jobj
+            [ "status", jstr "invalid_cursor"
+              "errorKind", jstr errorKind
+              "paginationRestartRequired", jbool true
+              "retrySameCursor", jbool false
+              "nextCursor", null
+              "sites", JsonArray() :> JsonNode
+              "message", jstr message ]
+        :> JsonNode
+
+    let decodeRejected (error: Cursor.FindCursorDecodeError) =
+        let errorKind = Cursor.findCursorErrorKind error
+
+        let message =
+            match errorKind with
+            | "cursor_version_unsupported" ->
+                "This find cursor uses an unsupported version; repeat the same request without cursor and use the current protocol."
+            | "cursor_tool_mismatch" ->
+                "This cursor belongs to another tool; use only a cursor issued by find."
+            | _ ->
+                "The find cursor is malformed; discard it and repeat the request without cursor."
+
+        rejected errorKind message
+
+    let queryMismatch () =
+        rejected
+            "cursor_query_mismatch"
+            "The find request differs from the cursor query; repeat this query without cursor."
+
+    let stale () =
+        rejected
+            "cursor_stale"
+            "The find result changed; repeat the request without cursor."
+
+    let outOfRange () =
+        rejected
+            "cursor_out_of_range"
+            "The find cursor offset is beyond the matching result stream; repeat the request without cursor."
+
+    let validationIncomplete (deadline: FindRequestDeadline) message =
+        jobj
+            [ "status", jstr "invalid_cursor"
+              "errorKind", jstr "cursor_validation_incomplete"
+              "paginationRestartRequired", jbool false
+              "retrySameCursor", jbool true
+              "retryable", jbool true
+              "timeoutMs", jint deadline.TimeoutMs
+              "elapsedMs", jint deadline.ElapsedMilliseconds
+              "nextCursor", null
+              "sites", JsonArray() :> JsonNode
+              "message", jstr message ]
+        :> JsonNode
 
 [<RequireQualifiedAccess>]
 module internal FindDeadlineResponse =
@@ -653,6 +776,7 @@ module internal FindDeadlineResponse =
 
         jobj
             [ "status", jstr "unknown"
+              "deliveryStatus", jstr "partial"
               "errorKind", jstr errorKind
               "message", jstr message
               "timeoutMs", jint deadline.TimeoutMs
@@ -692,11 +816,13 @@ module internal FindDeadlineResponse =
               "sweepElapsedMs", jint deadline.ElapsedMilliseconds
               "projectDiagnostics", JsonArray() :> JsonNode
               "resultSetComplete", jbool false
-              "truncated", jbool false
+              "truncated", jbool true
               "nextCursor", null
               "totalEstimate", jobj [ ("sites", jint 0) ] :> JsonNode
               "totalEstimateIsLowerBound", jbool true
               "paginationRestartRequired", jbool true
+              "retrySameCursor", jbool false
+              "paginationIncompleteReason", jstr "deadline_incomplete"
               "scopeNote",
               jstr
                   $"find timed out during {phase}; no later semantic phase was started. Retry with a larger timeoutMs after any retained worker completes." ]
@@ -2779,6 +2905,7 @@ type internal FcsBridge
         ?findResponseConstructionBeforeStartOverride: (unit -> Task),
         ?findResponseConstructionBeforeStepOverride: (string -> int -> unit),
         ?findFinalResponseBeforeMeasureOverride: (unit -> unit),
+        ?findFinalResponseAfterMeasureOverride: (unit -> unit),
         // #207: test-only seam for find's PER-SITE siteType deadline. The production check
         // reads the shared FindRequestDeadline, which cannot target one site deterministically
         // without a seam: timeoutMs=0 is exhausted BEFORE the sweep and yields no sites.
@@ -2904,7 +3031,7 @@ type internal FcsBridge
         BoundedCheckWorkAdmission("find position resolution", freshProjectCheckCapacity)
 
     let findPositionResolutionsInFlight =
-        ConcurrentDictionary<string, WaiterAwareSingleFlight<Result<string, JsonNode>>>()
+        ConcurrentDictionary<string, WaiterAwareSingleFlight<Result<FindResolvedPosition, FindPositionFailure>>>()
 
     let findTargetDiscoveryAdmission = BoundedCheckWorkAdmission("find target discovery", 1)
 
@@ -3150,7 +3277,7 @@ type internal FcsBridge
     let runFindPositionResolution
         (args: FindArgs)
         (remainingBudget: unit -> TimeSpan)
-        (work: (unit -> bool) -> Task<Result<string, JsonNode>>)
+        (work: (unit -> bool) -> Task<Result<FindResolvedPosition, FindPositionFailure>>)
         =
         let key = findPositionResolutionKey args
 
@@ -6615,8 +6742,8 @@ type internal FcsBridge
         }
 
     // ── find: resolve the symbol name under a cursor (kind=position) ─────────────
-    // Returns Ok displayName (fed to the union sweep as an exact query) or Error
-    // envelope. Mirrors fcs_symbol_at_word's tolerant resolution: line + optional
+    // Returns the sweep key AND the actual resolved symbol identity, or a typed
+    // failure. Mirrors fcs_symbol_at_word's tolerant resolution: line + optional
     // word/occurrence/character.
     //
     // Extracted from ResolveQueryAtPosition to keep the outer task {} state machine
@@ -6628,7 +6755,7 @@ type internal FcsBridge
          source: string,
          checkedResults: FSharpCheckFileResults option,
          args: FindArgs)
-        : Result<string, JsonNode> =
+        : Result<FindResolvedPosition, FindPositionFailure> =
         match checkedResults with
         | None ->
             Error(
@@ -6636,6 +6763,7 @@ type internal FcsBridge
                     [ "status", jstr "aborted"
                       "message", jstr "Type checking was aborted at the requested position." ]
                 :> JsonNode
+                |> FindPositionFailure.Incomplete
             )
         | Some checkResults ->
             let lines = sourceLines source
@@ -6647,6 +6775,7 @@ type internal FcsBridge
                           "message",
                           jstr $"line {line} is out of range (file has {lines.Length} lines)." ]
                     :> JsonNode
+                    |> FindPositionFailure.Changed
                 )
             else
                 let lineText = lines[line]
@@ -6658,6 +6787,7 @@ type internal FcsBridge
                             [ "status", jstr "no_candidate"
                               "message", jstr "No identifier found at the requested position." ]
                         :> JsonNode
+                        |> FindPositionFailure.Changed
                     )
                 else
                     let occurrence = args.occurrence |> Option.defaultValue -1
@@ -6682,9 +6812,10 @@ type internal FcsBridge
                     match symbolUse with
                     | Some u ->
                         // kind=position resolved THE specific symbol under the cursor.
-                        // Key the subsequent sweep on its FullName so the match stays
-                        // precise: DisplayName alone would also sweep an unrelated
-                        // `Config` in another namespace (or every same-named overload).
+                        // Keep the existing FullName sweep key: DisplayName alone
+                        // would also sweep an unrelated `Config` in another namespace.
+                        // Overloads can still share this key; the fingerprint below
+                        // binds the selected symbol without changing sweep matching.
                         // Locals / synthetic symbols may carry no useful FullName, so
                         // fall back to DisplayName there.
                         let key =
@@ -6696,7 +6827,40 @@ type internal FcsBridge
                             with _ ->
                                 u.Symbol.DisplayName
 
-                        Ok key
+                        // FullName is a search key, not a semantic identity: overloads
+                        // share it. Keep declaration/signature locations and full types
+                        // (never display-truncated) in the snapshot, not the query hash.
+                        // Property/formatting failures must not mint a weak identity.
+                        let symbol = u.Symbol
+                        let signature =
+                            match symbol with
+                            | :? FSharpMemberOrFunctionOrValue as value ->
+                                jobj
+                                    [ "type", jstr (value.FullType.Format(FSharpDisplayContext.Empty))
+                                      "xmlDocSig", jstr value.XmlDocSig ] :> JsonNode
+                            | :? FSharpField as field ->
+                                jstr (field.FieldType.Format(FSharpDisplayContext.Empty))
+                            | :? FSharpParameter as parameter ->
+                                jstr (parameter.Type.Format(FSharpDisplayContext.Empty))
+                            | :? FSharpUnionCase as unionCase ->
+                                jobj
+                                    [ "returnType", jstr (unionCase.ReturnType.Format(FSharpDisplayContext.Empty))
+                                      "fields", JsonArray(unionCase.Fields |> Seq.map (fun field ->
+                                          jstr (field.FieldType.Format(FSharpDisplayContext.Empty))) |> Seq.toArray) :> JsonNode ] :> JsonNode
+                            | :? FSharpEntity as entity -> jstr entity.XmlDocSig
+                            | _ -> null
+
+                        let identity =
+                            jobj
+                                [ "symbol", symbolToJson symbol
+                                  "kind", jstr (symbolKind symbol)
+                                  "assembly", jstr symbol.Assembly.QualifiedName
+                                  "signature", signature
+                                  "signatureLocation", symbol.SignatureLocation |> Option.map rangeToJson |> Option.defaultValue null
+                                  "implementationLocation", symbol.ImplementationLocation |> Option.map rangeToJson |> Option.defaultValue null ]
+                            |> Cursor.findSnapshotIdentityV2
+
+                        Ok { Query = key; SymbolIdentity = identity }
                     | None ->
                         Error(
                             jobj
@@ -6705,6 +6869,14 @@ type internal FcsBridge
                                   jstr
                                       $"Could not resolve a symbol at {Path.GetFileName path}:{line}." ]
                             :> JsonNode
+                            // A completed check can report FS0039 for a target
+                            // that has become unresolved. Errors do not make that
+                            // semantic evidence unavailable; only an incomplete
+                            // check warrants retrying the same continuation.
+                            |> (if checkResults.HasFullTypeCheckInfo then
+                                    FindPositionFailure.Changed
+                                else
+                                    FindPositionFailure.Incomplete)
                         )
 
     // Outer shell: validates args and awaits type-check, then delegates the purely
@@ -6713,7 +6885,7 @@ type internal FcsBridge
     // (FS3511 fix — same technique as ProjectSweepUses).
     member private this.ResolveQueryAtPosition
         (args: FindArgs, ensureCanContinue: unit -> unit)
-        : Task<Result<string, JsonNode>> =
+        : Task<Result<FindResolvedPosition, FindPositionFailure>> =
         task {
             match args.path with
             | None ->
@@ -6723,6 +6895,7 @@ type internal FcsBridge
                             [ "status", jstr "invalid_args"
                               "message", jstr "kind='position' requires 'path' (and 'line')." ]
                         :> JsonNode
+                        |> FindPositionFailure.InvalidRequest
                     )
             | Some path when String.IsNullOrWhiteSpace path ->
                 return
@@ -6731,6 +6904,7 @@ type internal FcsBridge
                             [ "status", jstr "invalid_args"
                               "message", jstr "kind='position' requires 'path' (and 'line')." ]
                         :> JsonNode
+                        |> FindPositionFailure.InvalidRequest
                     )
             | Some path ->
                 match args.line with
@@ -6741,11 +6915,14 @@ type internal FcsBridge
                                 [ "status", jstr "invalid_args"
                                   "message", jstr "kind='position' requires 'line' (0-based)." ]
                             :> JsonNode
+                            |> FindPositionFailure.InvalidRequest
                         )
                 | Some line ->
                     // FindArgs carries no unsaved-buffer field; resolve position against on-disk content.
                     match validateSourcePath "find" None path with
-                    | Some err -> return Error err
+                    // An unreadable/missing file does not establish a new semantic
+                    // identity. A continuation can retry once the context is available.
+                    | Some err -> return Error(FindPositionFailure.Incomplete err)
                     | None ->
                         ensureCanContinue ()
 
@@ -6869,6 +7046,7 @@ type internal FcsBridge
             cancellationToken: CancellationToken,
             retainUntil: Task -> unit,
             fsacProbe: (string -> Task<FindFsacProbeResult>) option,
+            recordValidatedContinuationEnvelope: unit -> unit,
             recordMeasuredResponse: JsonNode -> unit
         )
         : Task<JsonNode> =
@@ -6952,7 +7130,12 @@ type internal FcsBridge
                 }
 
             let incompleteBeforeDiscovery phase phaseStatus errorKind message =
-                FindDeadlineResponse.beforeDiscovery args deadline phase phaseStatus errorKind message
+                if args.cursor.IsSome then
+                    FindCursorContract.validationIncomplete
+                        deadline
+                        "The find deadline expired before the continuation could be fully validated. Retry the same cursor with a larger timeoutMs."
+                else
+                    FindDeadlineResponse.beforeDiscovery args deadline phase phaseStatus errorKind message
 
             match ArgsValidation.requireNonBlank "query" args.query with
             | Error _ ->
@@ -7011,7 +7194,7 @@ type internal FcsBridge
             let invalidArgs message =
                 jobj [ "status", jstr "invalid_args"; "message", jstr message ] :> JsonNode
 
-            let mutable validationError =
+            let validationError =
                 if
                     not (
                         Set.ofList [ "auto"; "symbol"; "members"; "field"; "definition"; "position" ]
@@ -7039,24 +7222,113 @@ type internal FcsBridge
                     && (args.path |> Option.forall String.IsNullOrWhiteSpace)
                 then
                     Some "scope='file' requires a non-empty path."
+                elif kind = "position" && (args.path |> Option.forall String.IsNullOrWhiteSpace) then
+                    Some "kind='position' requires 'path' (and 'line')."
+                elif kind = "position" && args.line.IsNone then
+                    Some "kind='position' requires 'line' (0-based)."
+                elif
+                    (args.projectPath |> Option.forall String.IsNullOrWhiteSpace)
+                    && (args.path |> Option.forall String.IsNullOrWhiteSpace)
+                then
+                    Some "find needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first."
                 else
                     None
 
-            let mutable pageOffset = 0
+            let cursorResult =
+                match args.cursor with
+                | None -> Ok None
+                | Some _ when deadline.SemanticExpired ->
+                    Error(
+                        FindCursorContract.validationIncomplete
+                            deadline
+                            "The find deadline expired before the continuation cursor could be decoded. Retry the same cursor with a larger timeoutMs."
+                    )
+                | Some cursorStr ->
+                    match Cursor.tryDecodeFind cursorStr with
+                    | Ok payload -> Ok(Some payload)
+                    | Error error -> Error(FindCursorContract.decodeRejected error)
 
-            match args.cursor with
-            | None -> ()
-            | Some cursorStr ->
-                match Cursor.tryDecode cursorStr with
-                | Ok payload -> pageOffset <- payload.offset
-                | Error reason -> validationError <- Some $"Invalid cursor: %s{reason}"
+            // Basic errors and an already exhausted initial request must be answered
+            // before canonical path normalization can inspect malformed user input.
+            match validationError, cursorResult with
+            | Some message, _ -> return invalidArgs message
+            | None, Error envelope -> return envelope
+            | None, Ok _ when args.cursor.IsNone && deadline.SemanticExpired ->
+                return
+                    incompleteBeforeDiscovery
+                        (if kind = "position" then "position_resolution" else "admission")
+                        "timed_out"
+                        "find_timeout"
+                        "The find end-to-end deadline was already exhausted."
+            | None, Ok _ ->
+
+            let queryModelResult =
+                try
+                    FindCursorContract.queryModel
+                        args
+                        query0
+                        kind
+                        scope
+                        exact
+                        contextLines
+                        includeDeclaration
+                        includeInfo
+                        includePerProject
+                        includeSiteTypes
+                    |> Ok
+                with
+                | :? ArgumentException as ex -> Error ex.Message
+                | :? NotSupportedException as ex -> Error ex.Message
+                | :? PathTooLongException as ex -> Error ex.Message
+
+            match queryModelResult with
+            | Error message -> return invalidArgs $"find received an invalid path: {message}"
+            | Ok queryModel ->
+
+            let queryIdentity = Cursor.findQueryIdentityV2 queryModel
+
+            let cursorPayload =
+                match cursorResult with
+                | Ok payload -> payload
+                | Error _ -> None
+
+            let pageOffset = cursorPayload |> Option.map _.Offset |> Option.defaultValue 0
+
+            // Record only a decoded v2 envelope with valid inputs and context. This
+            // is per-call evidence for the final deadline guard, not proof that its
+            // query/snapshot match, nor state retained for a cursor. Malformed tokens
+            // and invalid initial requests keep their typed errors even on late expiry.
+            if validationError.IsNone && not (String.IsNullOrEmpty(queryModel.Target)) then
+                cursorPayload |> Option.iter (fun _ -> recordValidatedContinuationEnvelope ())
 
             // kind=position resolves the symbol under the cursor, then sweeps it as a symbol.
             let! queryResult =
                 task {
-                    match validationError with
-                    | Some message -> return Error(invalidArgs message)
-                    | None ->
+                    match validationError, cursorResult with
+                    | Some message, _ -> return Error(invalidArgs message)
+                    | None, Error envelope -> return Error envelope
+                    | None, Ok _ when String.IsNullOrEmpty(queryModel.Target) ->
+                        return
+                            Error(
+                                jobj
+                                    [ "status", jstr "invalid_args"
+                                      "message",
+                                      jstr
+                                          "find needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first." ]
+                                :> JsonNode
+                            )
+                    | None, Ok(Some _) when deadline.SemanticExpired ->
+                        return
+                            Error(
+                                FindCursorContract.validationIncomplete
+                                    deadline
+                                    "The find deadline expired before the cursor query identity could be validated. Retry the same cursor with a larger timeoutMs."
+                            )
+                    | None, Ok(Some payload) when
+                        not (String.Equals(payload.Query, queryIdentity, StringComparison.Ordinal))
+                        ->
+                        return Error(FindCursorContract.queryMismatch ())
+                    | None, Ok _ ->
                         if kind = "position" then
                             try
                                 ensureCanStart "position resolution"
@@ -7078,7 +7350,20 @@ type internal FcsBridge
                                             ))
 
                                 let! result = awaitRetainedSingleFlight "position resolution" waiter
-                                return result
+                                match result with
+                                | Ok resolved -> return Ok(resolved.Query, Some resolved.SymbolIdentity)
+                                | Error failure ->
+                                    let envelope =
+                                        match failure, cursorPayload with
+                                        | FindPositionFailure.Changed _, Some _ -> FindCursorContract.stale ()
+                                        | FindPositionFailure.Incomplete _, Some _ ->
+                                            FindCursorContract.validationIncomplete
+                                                deadline
+                                                "The symbol at the requested position could not be validated. Retry the same cursor when type checking is available, with a larger timeoutMs if needed."
+                                        | FindPositionFailure.InvalidRequest envelope, _
+                                        | FindPositionFailure.Changed envelope, _
+                                        | FindPositionFailure.Incomplete envelope, _ -> envelope
+                                    return Error envelope
                             with
                             | :? TimeoutException as ex ->
                                 return
@@ -7098,6 +7383,13 @@ type internal FcsBridge
                                             "fcs_worker_busy"
                                             ex.Message
                                     )
+                            | ex when cursorPayload.IsSome && not (ex :? OperationCanceledException) ->
+                                return
+                                    Error(
+                                        FindCursorContract.validationIncomplete
+                                            deadline
+                                            "The symbol at the requested position could not be reconstructed. Retry the same cursor when the project is available."
+                                    )
                         else
                             if deadline.SemanticExpired then
                                 return
@@ -7109,12 +7401,12 @@ type internal FcsBridge
                                             "The find end-to-end deadline was already exhausted."
                                     )
                             else
-                                return Ok query0
+                                return Ok(query0, None)
                 }
 
             match queryResult with
             | Error envelope -> return envelope
-            | Ok query ->
+            | Ok(query, positionSymbolIdentity) ->
 
             let kindResolved = if kind = "position" then "symbol" else kind
 
@@ -7374,6 +7666,16 @@ type internal FcsBridge
             if projectsToSweep.Count = 0 && missingProjects.Count = 0 then
                 match scopedProjectEarlyResponse with
                 | Some envelope -> return envelope
+                | None when cursorPayload.IsSome && deadline.SemanticExpired ->
+                    return
+                        FindCursorContract.validationIncomplete
+                            deadline
+                            "The find deadline expired while validating the requested project membership. Retry the same cursor with a larger timeoutMs."
+                | None when cursorPayload.IsSome ->
+                    // The envelope and canonical request already matched above. Losing
+                    // the last/selected declared member changes this stream, not the
+                    // request, even when discovery now has no project left to sweep.
+                    return FindCursorContract.stale ()
                 | None ->
                     let message =
                         projectResolutionError
@@ -7502,7 +7804,7 @@ type internal FcsBridge
             // error, so the output can drop pure-noise entries (one per swept project on a
             // large solution) without losing the matched/errored ones (#100 token-tax).
             let perProjectKeep = ResizeArray<bool>()
-            let aggregatedDiagnostics = ResizeArray<FSharpDiagnostic>()
+            let aggregatedDiagnostics = ResizeArray<string * FSharpDiagnostic>()
             let sweepSw = System.Diagnostics.Stopwatch.StartNew()
             let mutable projectsAnalyzed = 0
             let mutable projectsFailed = 0
@@ -7624,7 +7926,8 @@ type internal FcsBridge
                     let! allUses, projDiagnostics =
                         awaitWithinDeadline $"FCS sweep for '{projDisplay}'" true sweepOperation
 
-                    aggregatedDiagnostics.AddRange(projDiagnostics)
+                    for diagnostic in projDiagnostics do
+                        aggregatedDiagnostics.Add(normalizePath fsproj, diagnostic)
 
                     // Per-file record-field form classifier (literal vs with-update).
                     let parsingOptions, _ = checker.GetParsingOptionsFromProjectOptions(options)
@@ -7910,8 +8213,9 @@ type internal FcsBridge
                 sweepProjectIndex <- sweepProjectIndex + 1
 
             if sweepProjectIndex < projectsToSweep.Count then
-                projectsNotStarted <-
-                    projectsNotStarted + (projectsToSweep.Count - sweepProjectIndex)
+                // Scalar coverage remains exact without materializing an unbounded
+                // tail after expiry. This partial ledger cannot produce a cursor.
+                projectsNotStarted <- projectsNotStarted + projectsToSweep.Count - sweepProjectIndex
 
             sweepSw.Stop()
 
@@ -8208,7 +8512,7 @@ type internal FcsBridge
             let fieldSiteCount = fLit + fUpd + fMut + fPat + fRead
             let degradedSites = unresolvedSites + timedOutTypeSites
 
-            let requestedPageSites = ResizeArray<_>()
+            let canonicalSites = ResizeArray<_>()
 
             if not responseConstructionTimedOut then
                 use orderedSites = (sortedSiteIndex.Values :> seq<_>).GetEnumerator()
@@ -8217,35 +8521,33 @@ type internal FcsBridge
 
                 while
                     keepSelecting
-                    && requestedPageSites.Count < pageSize
                     && not responseConstructionTimedOut
                     do
                     if not (responseStep "page-selection" sortedIndex) then
                         keepSelecting <- false
                     elif orderedSites.MoveNext() then
-                        if sortedIndex >= pageOffset then
-                            requestedPageSites.Add(orderedSites.Current)
-
+                        canonicalSites.Add(orderedSites.Current)
                         sortedIndex <- sortedIndex + 1
                     else
                         keepSelecting <- false
 
             if responseConstructionTimedOut then
-                requestedPageSites.Clear()
+                canonicalSites.Clear()
 
-            // Union this page's source windows before reading. Reopening a file for each
-            // site would rescan every earlier line O(sites * file length) and consume the
-            // bounded response allowance on large files. Each file is streamed once;
-            // only requested lines survive, and each site's own columns shape its snippet.
+            // Union the complete canonical stream's source windows before reading.
+            // Reopening a file for each site would rescan every earlier line
+            // O(sites * file length) and consume the bounded response allowance on
+            // large files. Each file is streamed once; only requested lines survive,
+            // and each site's own columns shape its snippet.
             let appliedContextLines = min (max 0 contextLines) FindResponseBudget.MaxContextLines
             let requestedSourceLines =
                 System.Collections.Generic.Dictionary<string, System.Collections.Generic.SortedSet<int>>(StringComparer.Ordinal)
 
             let mutable sourceWindowIndex = 0
 
-            while sourceWindowIndex < requestedPageSites.Count && not responseConstructionTimedOut do
+            while sourceWindowIndex < canonicalSites.Count && not responseConstructionTimedOut do
                 if responseStep "line-context-selection" sourceWindowIndex then
-                    let site = requestedPageSites[sourceWindowIndex]
+                    let site = canonicalSites[sourceWindowIndex]
                     let filePath = normalizePath site.File
                     let selected =
                         match requestedSourceLines.TryGetValue(filePath) with
@@ -8392,11 +8694,11 @@ type internal FcsBridge
             let alternativesTruncatedBuffer = ResizeArray<bool>()
             let mutable responseSiteIndex = 0
 
-            while responseSiteIndex < requestedPageSites.Count && not responseConstructionTimedOut do
+            while responseSiteIndex < canonicalSites.Count && not responseConstructionTimedOut do
                 if not (responseStep "site-json" responseSiteIndex) then
                     responseConstructionTimedOut <- true
                 else
-                    let site = requestedPageSites[responseSiteIndex]
+                    let site = canonicalSites[responseSiteIndex]
 
                     match tryLineContextToJson site.File site.StartLine site.StartCol site.EndLine site.EndCol with
                     | None -> responseConstructionTimedOut <- true
@@ -8411,20 +8713,21 @@ type internal FcsBridge
             if deadline.ResponseExpired then
                 responseConstructionTimedOut <- true
 
-            let candidatePageSites = requestedPageSites.ToArray()
-            let siteNodes = siteNodeBuffer.ToArray()
-            let alternativesTruncatedBySite = alternativesTruncatedBuffer.ToArray()
+            let allCanonicalSites = canonicalSites.ToArray()
+            let allCanonicalSiteNodes = siteNodeBuffer.ToArray()
+            let allAlternativesTruncatedBySite = alternativesTruncatedBuffer.ToArray()
 
             let mutable resolutionComplete =
                 coverageComplete
                 && not fsacFallbackTimedOut
                 && not responseConstructionTimedOut
                 && pageOffset = 0
-                && siteNodes.Length = totalSites
+                && allCanonicalSiteNodes.Length = totalSites
 
             // Count every eligible raw diagnostic within the deadline, retaining at most
             // 200 rows before JSON projection. A timed-out count is explicitly incomplete.
             let diagnosticPrefix = ResizeArray<FSharpDiagnostic>(200)
+            let canonicalDiagnosticRows = ResizeArray<JsonNode>()
             let mutable projectDiagnosticsTotalCount = 0
             let mutable diagnosticIndex = 0
 
@@ -8432,7 +8735,7 @@ type internal FcsBridge
                 if not (responseStep "diagnostic-collection" diagnosticIndex) then
                     responseConstructionTimedOut <- true
                 else
-                    let diagnostic = aggregatedDiagnostics[diagnosticIndex]
+                    let diagnosticProject, diagnostic = aggregatedDiagnostics[diagnosticIndex]
 
                     if
                         diagnostic.Severity = FSharpDiagnosticSeverity.Error
@@ -8442,6 +8745,17 @@ type internal FcsBridge
                                 || diagnostic.Severity = FSharpDiagnosticSeverity.Info))
                     then
                         projectDiagnosticsTotalCount <- projectDiagnosticsTotalCount + 1
+
+                        canonicalDiagnosticRows.Add(
+                            jobj
+                                [ "project", jstr diagnosticProject
+                                  "file", jstr (normalizePath diagnostic.FileName)
+                                  "code", jstr diagnostic.ErrorNumberText
+                                  "severity", jstr (diagnostic.Severity.ToString())
+                                  "range", rangeToJsonNoFile diagnostic.Range
+                                  "messageIdentity", jstr (Cursor.textIdentityV2 diagnostic.Message) ]
+                            :> JsonNode
+                        )
 
                         if diagnosticPrefix.Count < 200 then
                             diagnosticPrefix.Add(diagnostic)
@@ -8688,6 +9002,155 @@ type internal FcsBridge
             let perProjectNodes = retainedPerProject.ToArray()
             let emitPerProject = includePerProject || perProjectNodes.Length > 0
 
+            let deadlineIncomplete =
+                targetDiscoveryMaterializationTimedOut
+                || projectsTimedOut > 0
+                || projectsBusy > 0
+                || projectsNotStarted > 0
+                || fsacFallbackTimedOut
+                || fsacFallbackNotStarted
+                || responseConstructionTimedOut
+
+            let buildSnapshotIdentity () =
+                ensureResponseStep "snapshot-start" 0
+                let projectPathComparer =
+                    if OperatingSystem.IsWindows() then
+                        StringComparer.OrdinalIgnoreCase
+                    else
+                        StringComparer.Ordinal
+
+                let canonicalProjectRowsByPath =
+                    System.Collections.Generic.Dictionary<string, JsonNode>(projectPathComparer)
+
+                perProject
+                |> Seq.iteri (fun index node ->
+                    ensureResponseStep "snapshot-project-ledger" index
+                    let project = node :?> JsonObject
+
+                    let canonical =
+                        project
+                        |> Seq.choose (fun property ->
+                            // Attempt telemetry and free-form recovery text are not part of
+                            // the reusable stream identity. Stable coverage/category fields are.
+                            if property.Key = "elapsedMs" || property.Key = "error" then
+                                None
+                            else
+                                Some(property.Key, property.Value.DeepClone()))
+                        |> Seq.toList
+                        |> jobj
+                        :> JsonNode
+
+                    canonicalProjectRowsByPath.Add(project["fsproj"].GetValue<string>(), canonical))
+
+                let requestedProjectsInOrder =
+                    match scope with
+                    | "file"
+                    | "project" -> projectsToSweep :> seq<string>
+                    | _ -> projectDiscovery.MemberProjectsInOrder :> seq<string>
+
+                let canonicalProjectRows =
+                    requestedProjectsInOrder
+                    |> Seq.mapi (fun index projectPath ->
+                        ensureResponseStep "snapshot-project-order" index
+                        match canonicalProjectRowsByPath.TryGetValue(normalizePath projectPath) with
+                        | true, row -> Some row
+                        | false, _ -> None)
+                    |> Seq.choose id
+                    |> Seq.toArray
+
+                let snapshotResolution =
+                    jobj
+                        [ "resolvedQuery", jstr query
+                          "resolvedKind", jstr kindResolved
+                          "resolvedScope", jstr scopeResolved
+                          "positionSymbolIdentity",
+                          (positionSymbolIdentity |> Option.map jstr |> Option.defaultValue null)
+                          "matched",
+                          (match matchedNode with
+                           | null -> null
+                           | node -> node.DeepClone())
+                          "outcome", jstr outcome
+                          "via", jstr via
+                          "fcsSiteCount", jint totalSites
+                          "fsacFallbackHits", jint fsacHits
+                          "fsacFallbackState", jstr fsacFallbackState
+                          "fieldSites", jint fieldSiteCount
+                          "typedSites", jint typedSites
+                          "degradedSites", jint degradedSites
+                          "multiTypedSites", jint multiTypedSites ]
+                    :> JsonNode
+
+                let snapshotSites =
+                    allCanonicalSiteNodes
+                    |> Array.mapi (fun index node ->
+                        ensureResponseStep "snapshot-sites" index
+                        node.DeepClone())
+
+                let snapshotModel =
+                    jobj
+                        [ "schema", jint 2
+                          "projects", JsonArray(canonicalProjectRows) :> JsonNode
+                          "coverage", coverage.DeepClone()
+                          "resolution", snapshotResolution
+                          "diagnostics", JsonArray(canonicalDiagnosticRows.ToArray()) :> JsonNode
+                          "sites", JsonArray(snapshotSites) :> JsonNode
+                          "totalSites", jint totalSites
+                          "breakdown", breakdown.DeepClone() ]
+                    :> JsonNode
+
+                let mutable jsonIndex = 0
+                let ensureSnapshotJson () =
+                    ensureResponseStep "snapshot-json" jsonIndex
+                    jsonIndex <- jsonIndex + 1
+
+                let identity = Cursor.findSnapshotIdentityV2WithinBudget ensureSnapshotJson snapshotModel
+                ensureResponseStep "snapshot-complete" 0
+                identity
+
+            // Incomplete evidence has no reusable snapshot identity. Avoid rebuilding
+            // the full declared ledger merely to construct a cursorless timeout.
+            let snapshotIdentity =
+                if deadlineIncomplete then
+                    None
+                else
+                    try
+                        Some(buildSnapshotIdentity ())
+                    with :? TimeoutException ->
+                        responseConstructionTimedOut <- true
+                        None
+
+            let continuationError =
+                match cursorPayload, snapshotIdentity with
+                | Some _, None ->
+                    Some(
+                        FindCursorContract.validationIncomplete
+                            deadline
+                            "The find deadline expired before the complete result stream could be reconstructed. Retry the same cursor with a larger timeoutMs."
+                    )
+                | Some payload, Some identity when
+                    not (String.Equals(payload.Snapshot, identity, StringComparison.Ordinal))
+                    ->
+                    Some(FindCursorContract.stale ())
+                | Some _, Some _ when pageOffset > totalSites -> Some(FindCursorContract.outOfRange ())
+                | _ -> None
+
+            let pageStart = min pageOffset allCanonicalSiteNodes.Length
+
+            let siteNodes =
+                allCanonicalSiteNodes
+                |> Array.skip pageStart
+                |> Array.truncate pageSize
+
+            let candidatePageSites =
+                allCanonicalSites
+                |> Array.skip (min pageOffset allCanonicalSites.Length)
+                |> Array.truncate pageSize
+
+            let alternativesTruncatedBySite =
+                allAlternativesTruncatedBySite
+                |> Array.skip (min pageOffset allAlternativesTruncatedBySite.Length)
+                |> Array.truncate pageSize
+
             // F1 (#100): a dotted query that resolved to nothing reads like "symbol absent".
             // symbolMatches now accepts a dotted suffix, so this only fires for a genuine miss
             // — point the caller at the bare identifier rather than leaving a silent empty.
@@ -8806,7 +9269,15 @@ type internal FcsBridge
                     []
 
             let paginationFields =
-                Cursor.paginationFields "sites" totalSites pageOffset pageSize 0
+                match snapshotIdentity with
+                | Some identity ->
+                    Cursor.findPaginationFieldsV2 "sites" totalSites pageOffset pageSize 0 queryIdentity identity
+                | None ->
+                    [ "truncated", jbool true
+                      "nextCursor", null
+                      "totalEstimate", jobj [ ("sites", jint totalSites) ]
+                      "pageOffset", jint pageOffset
+                      "pageSize", jint pageSize ]
 
             let baseFields =
                 [ "status", jstr finalResponseStatus
@@ -8930,28 +9401,39 @@ type internal FcsBridge
                         null
 
                 let nextOffset = pageOffset + deliveredSites
-                let truncated = nextOffset < totalSites
+                let truncated = deadlineIncomplete || nextOffset < totalSites
                 response["truncated"] <- jbool truncated
 
                 response["nextCursor"] <-
-                    if truncated && deliveredSites > 0 then
-                        jstr (Cursor.encode nextOffset)
-                    else
-                        null
+                    match snapshotIdentity with
+                    | Some identity when not deadlineIncomplete && truncated && deliveredSites > 0 ->
+                        jstr (Cursor.encodeFindV2 nextOffset queryIdentity identity)
+                    | _ -> null
+
+                if deadlineIncomplete then
+                    response["deliveryStatus"] <- jstr "partial"
+                    response["paginationRestartRequired"] <- jbool true
+                    response["retrySameCursor"] <- jbool false
+                    response["totalEstimateIsLowerBound"] <- jbool true
+                    response["paginationIncompleteReason"] <- jstr "deadline_incomplete"
 
                 ensureResponseStep "response-planning-complete" plannerProbe
                 response :> JsonNode
 
-            let responseTimeout () =
+            let initialResponseTimeout () =
                 let response = responseTemplate.DeepClone() :?> JsonObject
                 response["status"] <- jstr (if matched = Some true then "partial" else "unknown")
                 response["errorKind"] <- jstr "find_response_timeout"
                 response["message"] <-
                     jstr "The find response-construction deadline expired. Restart without a cursor after narrowing the request."
                 response["retryable"] <- jbool true
+                response["deliveryStatus"] <- jstr "partial"
                 response["elapsedMs"] <- jint deadline.ElapsedMilliseconds
                 response["resultSetComplete"] <- jbool false
                 response["paginationRestartRequired"] <- jbool true
+                response["retrySameCursor"] <- jbool false
+                response["totalEstimateIsLowerBound"] <- jbool true
+                response["paginationIncompleteReason"] <- jstr "deadline_incomplete"
                 response["truncated"] <- jbool true
                 response["nextCursor"] <- null
                 response["projectDiagnosticsTruncated"] <- jbool (projectDiagnosticsTotalCount > 0)
@@ -8965,6 +9447,17 @@ type internal FcsBridge
                         phase["status"] <- jstr "timed_out"
 
                 response :> JsonNode
+
+            // The same end-to-end deadline applies after snapshot validation too:
+            // planner/serializer expiry contributes no page and never discards an
+            // otherwise valid continuation. Only initial requests use partial restart.
+            let responseTimeout () =
+                match cursorPayload with
+                | Some _ ->
+                    FindCursorContract.validationIncomplete
+                        deadline
+                        "The find deadline expired while constructing the continuation response. Retry the same cursor with a larger timeoutMs."
+                | None -> initialResponseTimeout ()
 
             let budgetFailure errorCode message =
                 let failureMatchedNode =
@@ -9043,8 +9536,11 @@ type internal FcsBridge
                       "outcome", jstr outcome
                       "deliveryStatus", jstr "blocked"
                       "errorCode", jstr errorCode
+                      "errorKind", jstr errorCode
                       "message", jstr message
                       "retryable", jbool true
+                      "paginationRestartRequired", jbool true
+                      "retrySameCursor", jbool false
                       "resolution", failureResolution
                       "coverage", coverage.DeepClone()
                       "projectsSwept", jint projectsSwept
@@ -9086,7 +9582,11 @@ type internal FcsBridge
                       "recovery", recovery ]
                 :> JsonNode
 
-            if responseConstructionTimedOut || deadline.ResponseExpired then
+            let continuationErrorResponse = continuationError |> Option.defaultValue null
+
+            if not (isNull continuationErrorResponse) then
+                return continuationErrorResponse
+            elif responseConstructionTimedOut || deadline.ResponseExpired then
                 return responseTimeout ()
             else
                 try
@@ -9144,11 +9644,13 @@ type internal FcsBridge
         ) : Task<JsonNode> =
         task {
             let mutable measuredResponse: JsonNode = null
+            let mutable validatedContinuationEnvelope = false
 
             let! response =
                 this.FindCoreWithinDeadline(
                     args, deadline, cancellationToken, retainUntil, fsacProbe,
-                    fun measured -> measuredResponse <- measured
+                    (fun () -> validatedContinuationEnvelope <- true),
+                    (fun measured -> measuredResponse <- measured)
                 )
 
             if Object.ReferenceEquals(response, measuredResponse) then
@@ -9158,9 +9660,25 @@ type internal FcsBridge
                 return response
             else
                 // Early errors and timeout/budget envelopes were not measured by
-                // the planner, so they still need the universal hard-size guard.
+                // the planner. Begin its bounded response allowance if needed, without
+                // restarting the end-to-end deadline or an already-started allowance.
+                deadline.BeginResponseConstruction()
+                let validationIncomplete () =
+                    FindCursorContract.validationIncomplete
+                        deadline
+                        "The find deadline expired during continuation response construction. Retry the same cursor with a larger timeoutMs."
+                    |> FindResponseBudget.guardFinalResponse
+
                 findFinalResponseBeforeMeasureOverride |> Option.iter (fun hook -> hook ())
-                return FindResponseBudget.guardFinalResponse response
+                if validatedContinuationEnvelope && deadline.ResponseExpired then
+                    return validationIncomplete ()
+                else
+                    let guardedResponse = FindResponseBudget.guardFinalResponse response
+                    findFinalResponseAfterMeasureOverride |> Option.iter (fun hook -> hook ())
+                    if validatedContinuationEnvelope && deadline.ResponseExpired then
+                        return validationIncomplete ()
+                    else
+                        return guardedResponse
         }
 
     member this.Find(args: FindArgs, ?fsacProbe: string -> Task<FindFsacProbeResult>) : Task<JsonNode> =
