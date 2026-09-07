@@ -6869,10 +6869,14 @@ type internal FcsBridge
                                   jstr
                                       $"Could not resolve a symbol at {Path.GetFileName path}:{line}." ]
                             :> JsonNode
-                            |> (if checkResults.Diagnostics |> Array.exists (fun diagnostic -> diagnostic.Severity = FSharpDiagnosticSeverity.Error) then
-                                    FindPositionFailure.Incomplete
+                            // A completed check can report FS0039 for a target
+                            // that has become unresolved. Errors do not make that
+                            // semantic evidence unavailable; only an incomplete
+                            // check warrants retrying the same continuation.
+                            |> (if checkResults.HasFullTypeCheckInfo then
+                                    FindPositionFailure.Changed
                                 else
-                                    FindPositionFailure.Changed)
+                                    FindPositionFailure.Incomplete)
                         )
 
     // Outer shell: validates args and awaits type-check, then delegates the purely

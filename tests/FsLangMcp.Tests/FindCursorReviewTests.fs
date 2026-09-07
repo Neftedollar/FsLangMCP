@@ -137,6 +137,57 @@ type FindCursorReviewTests(fixture: FindCursorFixture) =
             Assert.Single(retry["sites"].AsArray()) |> ignore
         }
 
+    [<Theory>]
+    [<InlineData(false, false)>]
+    [<InlineData(true, false)>]
+    [<InlineData(false, true)>]
+    [<InlineData(true, true)>]
+    member _.``fully checked unresolved position target is stale even with compiler errors``
+        (useCharacter: bool, withUnrelatedError: bool) : Task =
+        task {
+            Assert.True(fixture.BuildExitCode = 0, fixture.BuildLog)
+            let sourceWith selectedLine =
+                String.concat "\n"
+                    ([ "module CursorUnresolvedReview"
+                       "let target () = ()"
+                       selectedLine
+                       "target ()"
+                       "target ()" ]
+                     @ if withUnrelatedError then [ "let unrelated = unknownElsewhere" ] else [])
+            try
+                File.WriteAllText(fixture.ASource, sourceWith "target ()")
+                let request =
+                    { args fixture.AProject with
+                        query = "requested-position"; kind = Some "position"
+                        path = Some fixture.ASource; line = Some 2; word = None
+                        character = if useCharacter then Some 2 else None }
+                let bridge = FcsBridge()
+                let! first = bridge.Find(request)
+                let cursor = text first "nextCursor"
+                Assert.Single(first["sites"].AsArray()) |> ignore
+
+                // Keep the exact request and location, but replace the selected
+                // target with an unresolved identifier. FS0039 is conclusive
+                // semantic evidence here, not an unavailable type-check.
+                File.WriteAllText(fixture.ASource, sourceWith "missing ()")
+                let! checkedSource =
+                    FcsBridge().ParseAndCheckFile(
+                        { path = fixture.ASource; text = None
+                          projectPath = Some fixture.AProject; projectOptions = None })
+                Assert.True(checkedSource["hasFullTypeCheckInfo"].GetValue<bool>())
+                Assert.Contains(checkedSource["checkDiagnostics"].AsArray(), fun diagnostic ->
+                    diagnostic["errorNumber"].GetValue<int>() = 39
+                    && diagnostic["message"].GetValue<string>().Contains("missing", StringComparison.Ordinal))
+                let! stale = bridge.Find({ request with cursor = Some cursor })
+                assertRejected "cursor_stale" true stale
+                // A fresh host-equivalent bridge must not advise an endless
+                // retry for this unchanged, successfully checked broken target.
+                let! repeated = FcsBridge().Find({ request with cursor = Some cursor })
+                assertRejected "cursor_stale" true repeated
+            finally
+                fixture.RestoreSource()
+        }
+
     [<Fact>]
     member _.``stable failed coverage paginates but recovered coverage invalidates identical sites``() : Task =
         task {
