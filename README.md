@@ -36,6 +36,9 @@ installs (or downgrades) FSAC, ProjInfo, and Fantomas to the exact reviewed
 versions for that release. It also creates the `dotnet-fantomas` command alias
 required by FSAC formatting.
 
+Review [dependency security and updates](#dependency-security-and-updates) before
+using the server.
+
 Add to your MCP client config:
 
 ```json
@@ -316,16 +319,6 @@ installation. The reviewed compatibility set is pinned in
 - `ionide.projinfo.tool` `0.74.2`
 - `fantomas` `7.0.5`
 
-The FsLangMCP package dependency graph is audited separately from those external
-tools. The supported external-tool pins above still carry advisory-listed
-MessagePack assemblies, although the supported FsLangMCP paths
-explicitly use JSON and do not select a MessagePack formatter. No patched
-upstream tool package is currently available, so the exact pins above are a
-documented, process-contained risk acceptance rather than a guarantee that every
-file shipped inside the external tools is advisory-free. See the `0.14.0`
-section of the changelog for the advisory links and scope (that work ships to
-consumers as part of `0.15.0`; `0.14.0` was never published).
-
 Install that exact set (including FSAC's required Fantomas command alias) for
 normal use:
 
@@ -337,3 +330,35 @@ For repository development, `just runtime-tools` materializes the same versions
 under `.runtime-tools/`, and `just live-fsac` performs a real MCP → FSAC and
 ProjInfo smoke. Both paths validate the same exact root manifest; the repository
 path is isolated from any other globally installed tools.
+
+### Dependency security and updates
+
+The FsLangMCP package graph and the libraries bundled inside separately installed
+runtime tools are different audit scopes. The pins above include advisory-listed
+MessagePack (FSAC/Fantomas) and System.Drawing.Common (ProjInfo) assemblies.
+[#170](https://github.com/Neftedollar/FsLangMCP/issues/170) records the affected
+versions and the reachability assessment. No exploit was demonstrated in the
+supported flows assessed there; that is **not proof of safety**. Running a tool
+as a child process is not a security sandbox.
+
+Changing a NuGet reference in FsLangMCP or your project does not replace those
+bundled assemblies. FsLangMCP can adopt compatible upstream fixes or a verified
+replacement, but documenting the risk does not remove the vulnerabilities.
+
+- Keep your .NET SDK and project dependencies updated. Use
+  [NuGet Audit](https://learn.microsoft.com/en-us/nuget/concepts/auditing-packages)
+  for direct and transitive project dependencies; a clean project audit does not
+  cover the libraries bundled inside installed tools.
+- Follow [FsLangMCP releases](https://github.com/Neftedollar/FsLangMCP/releases)
+  and security updates from FSAC, Fantomas, and ProjInfo. After updating FsLangMCP,
+  rerun `fslangmcp --bootstrap-tools` and restart your MCP connection. Bootstrap
+  selects the installed release's exact reviewed pins, not the latest upstream
+  versions, and can downgrade manually updated tools. Reinstalling unchanged pins
+  does not remediate their advisories; newer tool versions need compatibility and
+  dependency checks before they enter the supported set.
+- Load only projects you trust. Use an isolated environment for untrusted code;
+  do not treat the MCP server or its child processes as a security boundary.
+
+Treat this as a documented dependency risk, not an advisory-free toolchain. If
+your security policy disallows these dependencies, do not use the affected
+toolchain until a suitable remediation is available.
