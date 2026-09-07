@@ -1314,12 +1314,24 @@ let private mainCore argv =
 
 [<EntryPoint>]
 let main argv =
-    if argv.Length > 0 && argv[0] = InternalProcessSessionWrapperArgument then
+    if argv.Length > 0 && argv[0] = InternalProcessGroupWrapperArgument then
+        if argv.Length < 2 then
+            Console.Error.WriteLine("The internal process-group wrapper requires a command.")
+            64
+        else
+            runUnixProcessGroupWrapper argv[1] argv[2..]
+    elif argv.Length > 0 && argv[0] = InternalProcessSessionWrapperArgument then
         if argv.Length < 2 then
             Console.Error.WriteLine("The internal process-session wrapper requires a command.")
             64
         else
             runUnixSessionWrapper argv[1] argv[2..]
+    elif argv.Length > 0 && argv[0] = ProjectEvaluation.InternalArgument then
+        if argv.Length <> 2 then
+            Console.Error.WriteLine("The internal project-evaluation helper requires exactly one project path.")
+            64
+        else
+            ProjectEvaluation.runHelper argv[1]
     else
         try
             mainCore argv

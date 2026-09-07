@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Genuine project-options reloads evaluate ProjInfo/MSBuild in short-lived
+  helper processes, so retained MSBuild node threads do not accumulate in the
+  long-lived MCP host. The versioned bounded data protocol preserves F#/CLR
+  references and evaluated settings; shared callers keep independent budgets,
+  and cancellation drains the helper tree before releasing admission. Runtime
+  status identifies `evaluationMode="isolated_helper"`; cache hits launch no
+  helper (#150, #224).
+
 ## [0.17.1] - 2026-09-05
 
 0.17.1 is a correctness-hardening patch for project discovery and the `find` request lifecycle.
