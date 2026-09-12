@@ -115,9 +115,9 @@
       },
       "Nacara.Theme.Default": {
         "type": "Direct",
-        "requested": "[1.0.0-beta.5, 1.0.0-beta.5]",
-        "resolved": "1.0.0-beta.5",
-        "contentHash": "54ClgBfRgjWFfXoAzVHGmxY8Kt5KKd6HYrNo+9nnBBA7b9fS5LyRS3smQGW+vXLhjAHSfU6e5KmsSVLdlaZAzg==",
+        "requested": "[1.0.0-beta.6, 1.0.0-beta.6]",
+        "resolved": "1.0.0-beta.6",
+        "contentHash": "sDMcHr/6TystzXyxQB6wkczF20m7i13+qXMKtGr3+I8fhHYBrWV+fsLWmEzf+V0a9yAlKkxjZMLZ18FBjhvaLg==",
         "dependencies": {
           "FSharp.Core": "10.1.300",
           "Nacara.Core": "2.0.0-beta.4"
