@@ -88,7 +88,7 @@
     <!-- coverlet.msbuild instruments FsLangMcp.dll (referenced via <ProjectReference>).
          The default behaviour — exclude the test assembly from coverage — is correct now that
          prod and test code live in separate assemblies (per ADR-0001). -->
-    <PackageReference Include="coverlet.msbuild" Version="[10.0.1]">
+    <PackageReference Include="coverlet.msbuild" Version="[10.1.0]">
       <IncludeAssets>build; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
