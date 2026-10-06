@@ -937,9 +937,9 @@ let private mainCore argv =
                 )
 
                 tool (
-                    TypedTool.define<FindArgs>
+                    TypedTool.define<FindToolArgs>
                         "find"
-        "Multi-project F# semantic search for definitions/references, field sites, and member calls. Bare find(query) returns bounded snippets; contextLines adds up to 8 lines per side. Production JSON is capped at 60,000 UTF-16 code units. Stateless v2 cursors bind the request and complete stream: mismatch/stale errors require restart; incomplete validation allows same-cursor retry. Narrow with kind + scope. Member calls: kind=members + member=Name. Field impact: kind=field + includeSiteTypes."
+                        "F# definitions/references, field sites and member calls. query gives bounded snippets with v2 cursors; queries (1..50) gives count-only inventory in one sweep, kind=symbol/definition, no cursor. query+countsOnly=true also inventories. Narrow with scope=project + projectPath; cold FCS cost remains. Inspect coverage, phaseTimingsMs and cache before trusting zero. contextLines adds up to 8 lines/side; 60,000 UTF-16 ceiling. For covering tests prefer fcs_tests_for_symbol."
                         (fun args (ct: CancellationToken) ->
                             // Start the one monotonic deadline at public-handler entry,
                             // before active-project fallback or gate admission.
@@ -950,24 +950,34 @@ let private mainCore argv =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
                             toolResult (fun () ->
-                                if timeoutMs < 0 then
-                                    runLimitedWithTimeout fcsGate ct (Some timeoutMs) (fun _ ->
-                                        Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.Find args))
-                                else
+                                match FindInput.prepare args with
+                                | Error invalid ->
+                                    deadline.BeginResponseConstruction()
+                                    Task.FromResult(deadline.GuardResponse invalid)
+                                | Ok prepared ->
+                                    let seedArgs, request, inventoryQueries =
+                                        match prepared with
+                                        | FindInput.Sites args -> args, Dispatcher.Find args, None
+                                        | FindInput.Inventory(args, queries) -> args, Dispatcher.FindInventory(args, queries), Some queries
+
                                     task {
                                         let! result =
-                                            runLimitedWithFindDeadlineRetained
-                                                fcsGate
-                                                ct
-                                                deadline
-                                                (fun sharedDeadline retainUntil ->
-                                                    Dispatcher.FindDispatch.runWithinDeadline
-                                                        fcsBridge
-                                                        bridge
-                                                        sharedDeadline
-                                                        ct
-                                                        retainUntil
-                                                        (Dispatcher.Find args))
+                                            if timeoutMs < 0 then
+                                                runLimitedWithTimeout fcsGate ct (Some timeoutMs) (fun _ ->
+                                                    Dispatcher.FindDispatch.run fcsBridge bridge request)
+                                            else
+                                                runLimitedWithFindDeadlineRetained
+                                                    fcsGate
+                                                    ct
+                                                    deadline
+                                                    (fun sharedDeadline retainUntil ->
+                                                        Dispatcher.FindDispatch.runWithinDeadline
+                                                            fcsBridge
+                                                            bridge
+                                                            sharedDeadline
+                                                            ct
+                                                            retainUntil
+                                                            request)
 
                                         let isAdmissionTimeout =
                                             match result["errorKind"] with
@@ -977,20 +987,30 @@ let private mainCore argv =
 
                                         if isAdmissionTimeout then
                                             let timeoutResponse =
-                                                if args.cursor.IsSome then
+                                                if seedArgs.cursor.IsSome then
                                                     FindCursorContract.validationIncomplete
                                                         deadline
                                                         "The find deadline expired during gate admission before the continuation could be validated. Retry the same cursor with a larger timeoutMs."
                                                 else
                                                     FindDeadlineResponse.beforeDiscovery
-                                                        args
+                                                        seedArgs
                                                         deadline
                                                         "admission"
                                                         "timed_out"
                                                         "fcs_admission_timeout"
                                                         (result["message"].GetValue<string>())
 
-                                            return FindResponseBudget.guardFinalResponse timeoutResponse
+                                            inventoryQueries |> Option.iter (fun queries ->
+                                                timeoutResponse["countsOnly"] <- jbool true
+                                                timeoutResponse["countsReturned"] <- jbool false
+                                                timeoutResponse["countsComplete"] <- jbool false
+                                                timeoutResponse["queriesRequested"] <- jint queries.Length
+                                                timeoutResponse["queriesReturned"] <- jint 0)
+                                            deadline.BeginResponseConstruction()
+                                            return deadline.GuardResponse timeoutResponse
+                                        elif timeoutMs < 0 then
+                                            deadline.BeginResponseConstruction()
+                                            return deadline.GuardResponse result
                                         else
                                             return result
                                     }))

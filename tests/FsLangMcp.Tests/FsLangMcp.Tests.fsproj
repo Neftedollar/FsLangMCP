@@ -34,6 +34,11 @@
     <Compile Include="ToolDescriptionSchemaTests.fs" />
     <Compile Include="FieldSiteTypesTests.fs" />
     <Compile Include="FindTests.fs" />
+    <Compile Include="FindCostTelemetryTests.fs" />
+    <Compile Include="FindInventoryTests.fs" />
+    <Compile Include="FindInputTests.fs" />
+    <Compile Include="FindInventoryIntegrationTests.fs" />
+    <Compile Include="FindInventoryWireTests.fs" />
     <Compile Include="FindBacktickDefinitionTests.fs" />
     <Compile Include="FindCursorIntegrationTests.fs" />
     <Compile Include="FindCursorReviewTests.fs" />

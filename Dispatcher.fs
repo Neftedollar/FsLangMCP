@@ -27,6 +27,8 @@ type FindRequest =
     /// FCS union sweep; after an empty FCS result the project-bound FSAC symbol index
     /// can still prove presence. It is injected here so the substrate stays LSP-agnostic.
     | Find of FindArgs
+    /// Count-only multi-query inventory over one shared project sweep.
+    | FindInventory of FindArgs * string array
 
 /// Internal request representation for the "check" tool cluster.
 /// check-cluster spans both FCS (fcsBridge) and FSAC (lspBridge); the dispatcher
@@ -161,6 +163,7 @@ module FindDispatch =
     let internal run (fcsBridge: FcsBridge) (lspBridge: FsAutoCompleteBridge) (request: FindRequest) : Task<JsonNode> =
         match request with
         | Find args -> fcsBridge.Find(args, fsacProbe = fsacProbeFor args lspBridge)
+        | FindInventory(args, queries) -> fcsBridge.Find(args, inventoryQueries = queries)
 
     /// Route the public MCP handler while preserving the one deadline created before
     /// FCS-gate admission and the retained lifetime callback owned by Program.fs.
@@ -181,6 +184,8 @@ module FindDispatch =
                 retainUntil,
                 Some(fsacProbeFor args lspBridge)
             )
+        | FindInventory(args, queries) ->
+            fcsBridge.FindWithinDeadline(args, deadline, cancellationToken, retainUntil, None, inventoryQueries = queries)
 
 [<RequireQualifiedAccess>]
 module CheckDispatch =

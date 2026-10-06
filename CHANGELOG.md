@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `find` accepts either the existing single `query` site search or a count-only inventory through
+  `queries` (1–50 distinct, trimmed names). Inventory evaluates every name during one shared
+  project-use sweep and returns independent per-query definition/reference/unique-site totals,
+  matched-symbol ambiguity evidence, and project-indexed recognized-test/unmarked-project counts
+  without snippets or pagination. `testProjectDetection="project_health_heuristic"` makes that
+  XML/package grouping explicit; it is not execution evidence. A single `query` with
+  `countsOnly=true` uses the same inventory response; all
+  existing single-query calls retain their site-search and cursor behavior (#227).
+- Handler-produced `find` responses now include ten fixed, non-overlapping `phaseTimingsMs` buckets whose sum
+  is `elapsedMs`, plus request-observed project-options and project-use cache hit/miss/incomplete
+  ledgers. These fields distinguish discovery, FCS work, classification, fallback, and response
+  construction without presenting one machine's timing as a latency guarantee (#227).
+
+### Changed
+
+- Inventory accepts `kind=symbol` (also omitted/`auto`) or `kind=definition` and exact matching by
+  default; `exact=false` is case-insensitive substring matching, not wildcard syntax. Incomplete
+  totals are explicit lower bounds, complete zero is `not_found`, and incomplete zero is
+  indeterminate. Oversized inventory output returns typed `find_inventory_response_budget`
+  guidance to split queries or narrow scope rather than emitting a partial unpageable response.
+
 ## [0.18.0] - 2026-09-07
 
 0.18.0 makes `find` continuations query/snapshot-bound and isolates project-options

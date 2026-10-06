@@ -23,6 +23,7 @@
     <Compile Include="BoundedCache.fs" />
     <Compile Include="ProcessRunner.fs" />
     <Compile Include="Types.fs" />
+    <Compile Include="FindInput.fs" />
     <Compile Include="SdkPreflight.fs" />
     <Compile Include="Version.fs" />
     <Compile Include="InstallationHealth.fs" />
@@ -34,6 +35,7 @@
     <Compile Include="AnalyzerDiagnostics.fs" />
     <Compile Include="LspBridge.fs" />
     <Compile Include="MetadataAccessibility.fs" />
+    <Compile Include="FindInventory.fs" />
     <Compile Include="FcsBridge.fs" />
     <Compile Include="Tools.fs" />
     <Compile Include="RuntimeStatus.fs" />
