@@ -31,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indeterminate. Oversized inventory output returns typed `find_inventory_response_budget`
   guidance to split queries or narrow scope rather than emitting a partial unpageable response.
 
+### Fixed
+
+- `find(kind="field")` accepts exact `Type.Field` shorthand when no `field` selector is
+  supplied, using semantic record-field identity and preserving whole declaring-type
+  precedence, including module-qualified types. Field-only matches now require actual
+  FCS use sites; a declaration or FSAC symbol-index hit cannot produce a confident zero.
+  Zero-site hints explain the declaring-type contract without recommending ambiguous bare
+  field names. Incomplete sweeps withhold provisional shorthand sites (#227).
+
 ## [0.18.0] - 2026-09-07
 
 0.18.0 makes `find` continuations query/snapshot-bound and isolates project-options

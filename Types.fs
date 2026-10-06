@@ -199,10 +199,13 @@ type FcsFindSymbolArgs =
       cursor: string option }
 
 type FindArgs =
-    { /// Symbol, type, or member name to find. The ONLY required argument.
+    { /// Symbol, type, or member name to find. For kind=field, use the declaring record
+      /// type plus optional field=Name, or exact Type.Field with no field selector.
+      /// Bare field names are not resolved across records. The ONLY required argument.
       query: string
       /// Resolution mode: "auto" (default) | "symbol" | "members" | "field" | "definition" | "position".
       /// auto unions definitions + references + record-field sites + member-usage sites.
+      /// field finds use sites, not declarations: query=Card, field=Name or query=Card.Name.
       kind: string option
       /// Sweep breadth: "auto" (default) | "file" | "project" | "workspace".
       /// auto/workspace sweep every member project of the active solution; the response
@@ -215,6 +218,7 @@ type FindArgs =
       /// Restrict the member-usage union to this member name (used with kind=members).
       ``member``: string option
       /// Restrict the record-field union to this field name (used with kind=field).
+      /// When supplied, query remains the declaring type; dotted shorthand is disabled.
       field: string option
       /// File context: derives project options and anchors kind=position / scope=file.
       path: string option
@@ -264,6 +268,9 @@ type FindArgs =
 /// and internal consumers; inventory is an explicit alternative, not N calls.
 type FindToolArgs =
     { /// Supply query for legacy site search, or queries for count-only inventory, never both.
+      /// kind=field takes the declaring type; exact Type.Field shorthand is supported when
+      /// field is omitted. Whole declaring-type matches take precedence over shorthand.
+      /// Bare field names are not resolved; qualify same-named declaring types to disambiguate.
       query: string option
       /// 1..50 distinct non-blank names. Defaults to countsOnly=true, kind=symbol.
       queries: string list option
@@ -276,6 +283,8 @@ type FindToolArgs =
       /// Exact name match by default; false means case-insensitive substring, not a wildcard.
       exact: bool option
       ``member``: string option
+      /// kind=field selector within the query's declaring type; suppresses Type.Field shorthand.
+      /// Omit to find all fields on that type. Inventory does not support field selectors.
       field: string option
       /// File context for position resolution or scope=file; inventory can filter this file.
       path: string option

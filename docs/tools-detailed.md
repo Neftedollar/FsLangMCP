@@ -404,7 +404,7 @@ position, or any other identity input. Fixed metadata overflow uses
 | `auto` (default) | Union of `symbol` + `members` + `field` definitions/references/sites |
 | `symbol` | Grouped definitions + references |
 | `members` | Member-usage sites on a type; pair with `member` |
-| `field` | Record field sites — construction, copy-update, mutation, pattern, read; pair with `field` |
+| `field` | Record field use sites — `query="Card", field="Name"`, or exact `query="Card.Name"` without a selector |
 | `definition` | Definition sites only |
 | `position` | Exact-position resolution; needs `path` + `line` + `word`/`character` |
 
@@ -423,7 +423,8 @@ position, or any other identity input. Fixed metadata overflow uses
    member-usage sites.
 3. De-duplicates the union by `(file, range)` and groups by symbol identity.
 4. When FCS finds no sites, probes the project-bound FSAC `workspace/symbol` index without
-   treating a warming, disconnected, or mismatched FSAC session as a valid zero.
+   treating a warming, disconnected, or mismatched FSAC session as a valid zero. `kind=field`
+   skips this name-only fallback: an indexed declaration is not evidence of field use sites.
 5. Returns flat `sites` entries with `file`, `range`, `lineText`, plus scoped
    `projectDiagnostics` and explicit project-coverage counts.
 
@@ -431,8 +432,27 @@ position, or any other identity input. Fixed metadata overflow uses
 
 Changing a record field's type is a fan-out edit: every construction site, every copy-and-update,
 every mutation, every destructuring pattern, and every read may need a *different* change, and on a
-solution they are spread across projects. `find(kind='field', field='Name', includeSiteTypes=true)`
+solution they are spread across projects. `find(query='Card', kind='field', field='Name', includeSiteTypes=true)`
 is built for exactly that loop.
+
+**Query contract.** Use the declaring record type as `query`, with optional `field` to select
+one field. With `kind='field'`, `exact=true` (the default), and no `field` selector, `Card.Name`
+is shorthand for `query='Card', field='Name'`; module-qualified forms work too. Resolution
+uses actual record/field identities, not a blind last-dot split. If the entire query names a
+record type, that interpretation takes precedence, even if that type has no use sites.
+Short declaring-type names and dotted type suffixes retain legacy matching: all matching
+declaring types are included, not an arbitrary first record. Qualify the namespace/module
+when different records share the same type name.
+An explicit `field` selector always keeps `query` as the declaring type; `exact=false` retains
+declaring-type substring matching. Bare `query='Name'` is **not** a search across records sharing
+that field name. `auto` and other kinds retain their existing behavior.
+
+Field-only `matched=true` requires actual FCS use sites, never just a declaration or an FSAC
+index hit. A completed zero says no use sites were found in the selected scope, not that the
+declaration is absent. Zero-site hints explain the contract even without `includeSiteTypes`.
+Incomplete sweeps cannot exclude a later whole-type match, so provisional shorthand sites
+are withheld; read `coverage` and retry before inferring absence. Cursor continuations must
+repeat the original spelling and selector, even when another spelling would mean the same field.
 
 **Site kinds.** Field sites are classified from the parse tree into five kinds, each of which needs
 a different edit:
@@ -467,7 +487,7 @@ has **today** — the "before" half. `find` deliberately does **not** typecheck 
 record shape: knowing the "after" type requires compiling the modified code, which is what `check`
 does. The intended loop is therefore:
 
-1. `find(kind='field', field='Name', includeSiteTypes=true)` — enumerate every site with its kind,
+1. `find(query='Card', kind='field', field='Name', includeSiteTypes=true)` — enumerate every site with its kind,
    line text, and today's type;
 2. edit all of them;
 3. `check(scope='project')` — one verdict on the result.

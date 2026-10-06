@@ -939,7 +939,7 @@ let private mainCore argv =
                 tool (
                     TypedTool.define<FindToolArgs>
                         "find"
-                        "F# definitions/references, field sites and member calls. query gives bounded snippets with v2 cursors; queries (1..50) gives count-only inventory in one sweep, kind=symbol/definition, no cursor. query+countsOnly=true also inventories. Narrow with scope=project + projectPath; cold FCS cost remains. Inspect coverage, phaseTimingsMs and cache before trusting zero. contextLines adds up to 8 lines/side; 60,000 UTF-16 ceiling. For covering tests prefer fcs_tests_for_symbol."
+                        "F# definitions/references, field sites and member calls. query returns snippets with v2 cursors; queries (1..50) or query+countsOnly=true inventories counts in one sweep, kind=symbol/definition, no cursor. kind=field: query=Card + field=Name, or exact Card.Name without field; bare field names unsupported. Narrow scope=project + projectPath; inspect coverage, phaseTimingsMs and cache before trusting zero. 60,000 UTF-16 ceiling. For covering tests prefer fcs_tests_for_symbol."
                         (fun args (ct: CancellationToken) ->
                             // Start the one monotonic deadline at public-handler entry,
                             // before active-project fallback or gate admission.

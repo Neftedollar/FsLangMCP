@@ -7839,6 +7839,37 @@ type internal FcsBridge
             let fieldRestrict = args.field
             let memberRestrict = args.``member``
 
+            // Field shorthand is opt-in by kind and never reinterprets an explicit
+            // selector or the established non-exact declaring-type search. Match
+            // against actual field names (which may themselves contain dots), not
+            // an unconditional last-dot split of a module-qualified type name.
+            let allowDottedField =
+                kindResolved = "field" && exact && fieldRestrict.IsNone && query.Contains('.')
+
+            let mutable wholeFieldTypeMatched = false
+
+            let isDottedField (symbolUse: FSharpSymbolUse) =
+                match symbolUse.Symbol with
+                | :? FSharpField as field when allowDottedField ->
+                    try
+                        match field.DeclaringEntity with
+                        | Some entity when entity.IsFSharpRecord ->
+                            [ field.Name; $"``{field.Name}``" ]
+                            |> List.exists (fun fieldName ->
+                                let suffix = $".{fieldName}"
+                                if query.EndsWith(suffix, StringComparison.Ordinal) then
+                                    let prefix = query.Substring(0, query.Length - suffix.Length)
+                                    prefix.Length > 0
+                                    && (String.Equals(entity.DisplayName, prefix, StringComparison.Ordinal)
+                                        || String.Equals(entity.FullName, prefix, StringComparison.Ordinal)
+                                        || entity.FullName.EndsWith($".{prefix}", StringComparison.Ordinal))
+                                else
+                                    false)
+                        | Some _ | None -> false // Shorthand is for named record fields only.
+                    with _ ->
+                        false // FCS may expose an unresolved declaring entity in erroneous code.
+                | _ -> false // Other symbols cannot establish record-field identity.
+
             let isQueriedField (symbolUse: FSharpSymbolUse) =
                 match symbolUse.Symbol with
                 | :? FSharpField as field ->
@@ -7909,7 +7940,7 @@ type internal FcsBridge
             // `range` carries [<NoComparison>], and anonymous records auto-derive
             // comparison, which would fail under warnings-as-errors. The range JSON is
             // rebuilt from these fields in siteToJson.
-            let siteByKey =
+            let mutable siteByKey =
                 System.Collections.Generic.Dictionary<
                     string,
                     {| File: string
@@ -7931,6 +7962,12 @@ type internal FcsBridge
                        /// more than one .fsproj). Empty in the common single-project case.
                        TypeAlternatives: (string * string) list |}
                  >()
+
+            // A later project may declare a record whose full name is the entire
+            // query. Keep shorthand candidates separate until coverage proves that
+            // the existing declaring-type interpretation does not take precedence.
+            let dottedFieldSites = System.Collections.Generic.Dictionary<_, _>()
+            let dottedFieldProjectCounts = ResizeArray<int * int>()
 
             let perProject = JsonArray()
             // Lockstep with perProject: false for a project that matched nothing and didn't
@@ -8122,6 +8159,7 @@ type internal FcsBridge
 
                     let mutable nameCount = 0
                     let mutable fieldCount = 0
+                    let mutable dottedFieldCount = 0
                     let mutable memberCount = 0
 
                     // #207: type resolution shares `find`'s ONE wall-clock budget. Past the
@@ -8140,7 +8178,8 @@ type internal FcsBridge
                             FieldSiteTypes.outcome (siteTypeDeadlineExpired ()) (fun () ->
                                 tryFormatFieldSiteType symbolUse)
 
-                    let add (symbolUse: FSharpSymbolUse) (siteKind: string) (overwrite: bool) (siteType: string) (typeStatus: string) =
+                    let add (dottedField: bool) (symbolUse: FSharpSymbolUse) (siteKind: string) (overwrite: bool) (siteType: string) (typeStatus: string) =
+                        let siteByKey = if dottedField then dottedFieldSites else siteByKey
                         let r = symbolUse.Range
                         let normalizedFile = normalizePath r.FileName
 
@@ -8221,10 +8260,24 @@ type internal FcsBridge
                         while fieldIndex < allUses.Length && canClassifyNext () do
                             let u = allUses[fieldIndex]
 
+                            if allowDottedField && not wholeFieldTypeMatched then
+                                wholeFieldTypeMatched <-
+                                    match u.Symbol with
+                                    | :? FSharpEntity as entity ->
+                                        not entity.IsNamespace && not entity.IsFSharpModule && entityMatchesQuery entity
+                                    | :? FSharpField as field ->
+                                        field.DeclaringEntity
+                                        |> Option.exists entityMatchesQuery
+                                    | _ -> false // Values/members do not establish a declaring record type.
+
                             if not u.IsFromDefinition && isQueriedField u then
                                 fieldCount <- fieldCount + 1
                                 let siteType, typeStatus = resolveSiteType u
-                                add u (fieldKind u) true siteType typeStatus
+                                add false u (fieldKind u) true siteType typeStatus
+                            elif not u.IsFromDefinition && isDottedField u then
+                                dottedFieldCount <- dottedFieldCount + 1
+                                let siteType, typeStatus = resolveSiteType u
+                                add true u (fieldKind u) true siteType typeStatus
 
                             fieldIndex <- fieldIndex + 1
 
@@ -8236,7 +8289,7 @@ type internal FcsBridge
 
                             if not u.IsFromDefinition && isQueriedMember u then
                                 memberCount <- memberCount + 1
-                                add u "member-usage" true null null
+                                add false u "member-usage" true null null
 
                             memberIndex <- memberIndex + 1
 
@@ -8253,7 +8306,7 @@ type internal FcsBridge
                                 if passDefsOnly && passDecl then
                                     nameCount <- nameCount + 1
                                     let k = if u.IsFromDefinition then "definition" else "reference"
-                                    add u k false null null
+                                    add false u k false null null
 
                             nameIndex <- nameIndex + 1
 
@@ -8283,6 +8336,8 @@ type internal FcsBridge
                     )
 
                     perProjectKeep.Add(nameCount > 0 || fieldCount > 0 || memberCount > 0)
+                    if dottedFieldCount > 0 then
+                        dottedFieldProjectCounts.Add(perProject.Count - 1, dottedFieldCount)
                 with
                 | FindProjectNotStartedException ->
                     projSw.Stop()
@@ -8519,6 +8574,12 @@ type internal FcsBridge
                 with :? TimeoutException ->
                     return blocked "find_response_timeout" "unknown" "Inventory counts could not be delivered before the response deadline. No absence claim was made."
             else
+            let useDottedFields = allowDottedField && not wholeFieldTypeMatched && coverageComplete
+            if useDottedFields then
+                // O(1) selection; per-project response rows are adjusted below under
+                // the response deadline. Incomplete discovery cannot exclude a later
+                // whole-type match, so its provisional shorthand sites are withheld.
+                siteByKey <- dottedFieldSites
 
             // HEADLINE: a positive site is always useful, but absence is conclusive
             // only when every requested FCS project completed. FSAC outcomes remain
@@ -8535,7 +8596,10 @@ type internal FcsBridge
 
             let! fsacProbeResult =
                 task {
-                    if fcsMatched then
+                    if fcsMatched || kindResolved = "field" then
+                        // A workspace-symbol count is not evidence of a field USE.
+                        // Even a real unused declaration must not turn zero sites into
+                        // matched=true. Field-only results rely exclusively on FCS sites.
                         return FindFsacProbeResult.Unavailable "not_needed"
                     elif targetDiscoveryMaterializationTimedOut then
                         fsacFallbackNotStarted <- true
@@ -8617,6 +8681,14 @@ type internal FcsBridge
                     false
                 else
                     true
+
+            if useDottedFields then
+                let mutable projectIndex = 0
+                while projectIndex < dottedFieldProjectCounts.Count && responseStep "field-selection" projectIndex do
+                    let rowIndex, count = dottedFieldProjectCounts[projectIndex]
+                    perProject[rowIndex]["fieldMatchUses"] <- jint count
+                    perProjectKeep[rowIndex] <- true
+                    projectIndex <- projectIndex + 1
 
             let fsacHits, fsacFallbackState, fsacFallbackReason =
                 match fsacProbeResult with
@@ -9122,7 +9194,7 @@ type internal FcsBridge
                         "partial"
 
                 let fsacFallbackPhaseStatus =
-                    if fcsMatched then
+                    if fcsMatched || kindResolved = "field" then
                         "not_needed"
                     elif fsacFallbackNotStarted then
                         "not_started"
@@ -9234,7 +9306,9 @@ type internal FcsBridge
                         match kind, kindResolved with
                         | "position", _ ->
                             "kind='position' resolves the symbol under the cursor and then sweeps it as kind='symbol', which never unions field sites. Re-run with kind='field' and the resolved name as query (echoed above as `query`)."
-                        | _, ("field" | "auto") ->
+                        | _, "field" ->
+                            "Use the declaring record type as query and an optional field selector, for example query='Card', field='Name'; exact Type.Field shorthand is also accepted when no field selector is supplied. Bare field names are not resolved across records. Zero use sites do not prove that a field declaration is absent."
+                        | _, "auto" ->
                             $"The query already unioned field sites — '%s{query}' simply matches no record field here. Check the declaring type name (find matches fields by their DECLARING type, not the field name), drop field='…' if it is over-restricting, or pass exact=false for a substring match on the type."
                         | _ ->
                             "Re-run with kind='field' (optionally with field='Name') or kind='auto', which union record-field sites; this kind does not."
@@ -9440,7 +9514,14 @@ type internal FcsBridge
             // symbolMatches now accepts a dotted suffix, so this only fires for a genuine miss
             // — point the caller at the bare identifier rather than leaving a silent empty.
             let hintField =
-                if matched = Some false && not (String.IsNullOrEmpty query) && query.Contains('.') then
+                if kindResolved = "field" && totalSites = 0 then
+                    let coverageHint =
+                        if coverageComplete then
+                            "No field use sites were found in the selected scope; this does not prove that the field declaration is absent."
+                        else
+                            "The field sweep is incomplete; do not infer absence from zero sites. Dotted-field candidates are withheld until the sweep can exclude a whole declaring-type match. Retry after resolving the coverage limitations."
+                    [ "hint", jstr $"{coverageHint} For kind='field', query is the declaring record type, with an optional field selector: find(query='Card', kind='field', field='Name'). With exact=true and no field selector, query='Card.Name' is also accepted. Bare field names are not resolved across records; an explicit field selector does not reinterpret query as a field name." ]
+                elif matched = Some false && not (String.IsNullOrEmpty query) && query.Contains('.') then
                     let bare = query.Substring(query.LastIndexOf('.') + 1)
 
                     [ ("hint",
