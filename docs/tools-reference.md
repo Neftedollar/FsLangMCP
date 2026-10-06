@@ -23,7 +23,11 @@ These two tools replace the legacy search/check entry points removed in v0.11.0.
 **Purpose:** Multi-project semantic search — definitions, references, record-field set sites, and member call-sites — resolved by FCS, unioned across every solution `.fsproj`.
 
 **Key args:**
-- `query` (required) — symbol name, dotted suffix, or qualified name
+- `query` — symbol name, dotted suffix, or qualified name for legacy site search; pair with
+  `countsOnly=true` for a one-name count-only inventory
+- `queries` — 1–50 distinct non-blank names after trimming; selects count-only inventory and
+  cannot be combined with `query`
+- `countsOnly` — defaults to `true` with `queries`; omitted for legacy single-query site search
 - `kind` — `auto` | `symbol` | `members` | `field` | `definition` | `position` (default: `auto`; unions symbol/member/field sites)
 - `member` — narrow to a specific member name when `kind=members`
 - `scope` — `auto` | `file` | `project` | `workspace` (default: `auto`); file requires `path`, project requires one member `.fsproj`
@@ -39,11 +43,41 @@ These two tools replace the legacy search/check entry points removed in v0.11.0.
 
 **Use when:** "Where is `X` defined?", "What calls `OrderId`?", "Which files set this record field?"
 
-**Sweep breadth:** every response that completes a sweep carries `resolution.scopeResolved`,
-top-level `projectsSwept`, and a `scopeNote` explaining how many projects were actually swept
+**Inventory:** omitted/`auto` `kind` becomes `symbol`; `definition` is the only other supported
+kind. Exact matching is the default and `exact=false` means case-insensitive substring matching,
+not wildcards. Inventory returns no sites or snippets. Each query has independent
+definition/reference/unique-site totals, matched-symbol ambiguity evidence, and `perProject`
+counts pointing into the shared normalized `.fsproj` `projectLedger`. Linked physical
+ranges de-duplicate independently as definitions and references; `uniqueSites` is their union, so
+cross-project classification differences can make `definitions + references > uniqueSites`.
+They also count once in every compiling project, and overlapping query rows are not a union.
+`categoryCountsMayOverlap=true` records this rule. Incomplete counts are lower bounds: incomplete
+zero is indeterminate, while only complete zero is `not_found`. `ambiguous=true` is conclusive,
+`false` requires complete counts with at most one matched symbol, and incomplete non-ambiguous
+evidence returns `null`.
+
+Inventory has no v1 pagination and rejects member/field/position selectors, `includeSiteTypes=true`,
+positive `contextLines`, cursors, and `queries` with `countsOnly=false`. A complete serialized
+inventory above 60,000 UTF-16 code units returns `find_inventory_response_budget`; split the batch
+or narrow to one project, for example:
+
+```text
+find { "queries": ["OrderId", "OrderService"], "scope": "project", "projectPath": "src/Core/Core.fsproj" }
+```
+
+`testProjectDetection="project_health_heuristic"` identifies the syntactic XML/package grouping:
+`isTestProject=true` means recognized test project, `false` means unmarked project, and a missing
+project reports `null`. Inherited or conditional MSBuild properties may not be recognized, while
+unreadable XML currently falls back to `false`. Validate important groups; neither value proves
+test or production execution, and a reference does not prove behavioral coverage.
+
+**Sweep breadth:** every legacy site-search response that completes a sweep carries
+`resolution.scopeResolved`, top-level `projectsSwept`, and a `scopeNote` explaining how many projects were actually swept
 and the exact recipe to widen (`scope='workspace'` with a `.sln`/`.slnx` `projectPath`) or narrow
 (a single `.fsproj` `projectPath`) it — so you don't pay for a whole-workspace sweep just to
-discover which recipe would have been faster. See `docs/tools-detailed.md`.
+discover which recipe would have been faster. Inventory instead reports top-level `scopeResolved`
+plus project counters under `coverage` and the complete `projectLedger`. See
+`docs/tools-detailed.md`.
 
 **Field-impact mode:** `kind=field` classifies each site as `field-set-literal` | `field-set-update`
 | `field-set-mutation` | `field-pattern` | `field-read` — the five shapes a field-type change edits
@@ -98,6 +132,16 @@ retry. Diagnostic totals are exhaustive only when `projectDiagnosticsCountComple
 If `breakdownComplete=false`, per-kind counts are only the prefix counted before expiry, not a
 complete reconciliation of `totalSites`. A later response timeout can leave this flag true when
 the counting pass had already finished.
+
+**Cost evidence:** every response includes ten fixed, non-overlapping integer
+`phaseTimingsMs` fields (`admission`, `positionResolution`, `targetDiscovery`, `projectOptions`,
+`snapshot`, `fcsSweep`, `classification`, `fsacFallback`, `responseConstruction`, `unattributed`)
+whose sum is `elapsedMs`. Sampling precedes the last production size-check serialization and
+transport, so these are diagnostics rather than latency guarantees. `cacheState.projectOptions`
+and `cacheState.projectUses` each expose request-observed `hits`, `misses`, `incomplete`, and
+`state`; they do not describe FCS-internal caches. A warm hit can skip base compiler work, while
+kind narrowing alone cannot remove a cold FCS check. Later projects receive only the remaining
+shared timeout budget.
 
 **Serialized response ceiling:** the complete indented JSON shipped by the MCP transport is capped
 at 60,000 UTF-16 code units, measured with the same production serializer as the transport. The
@@ -430,6 +474,9 @@ An admission-limited project is `status="busy"`, `errorKind="fcs_worker_busy"`, 
 `retryable=true`; retry it after the active worker completes.
 
 **Use when:** "What tests cover this function?" — gives the test-coverage slice that `find` (which returns all uses) doesn't directly filter.
+
+Limiting the result to test projects is not a speed guarantee: FCS may still need to check project
+dependencies before it can resolve those test references.
 
 ---
 

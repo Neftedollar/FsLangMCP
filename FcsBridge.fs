@@ -443,6 +443,69 @@ type internal FindFsacProbeResult =
     | Failed of reason: string
     | Unavailable of reason: string
 
+/// Request-local, exclusive wall-clock attribution. A phase switch closes the previous
+/// interval: nested worker time is never added a second time, and retained workers stop
+/// contributing when their caller stops waiting. Cache decisions travel with results,
+/// never through process-global counter differences.
+type internal FindCostTelemetry(nowMilliseconds: unit -> int) =
+    let phaseNames =
+        [| "admission"; "positionResolution"; "targetDiscovery"; "projectOptions"
+           "snapshot"; "fcsSweep"; "classification"; "fsacFallback"
+           "responseConstruction"; "unattributed" |]
+    let phaseTotals = Array.zeroCreate<int> phaseNames.Length
+    let cacheNames = [| "projectOptions"; "projectUses" |]
+    let cacheAttempts = Array.zeroCreate<int> cacheNames.Length
+    let cacheHits = Array.zeroCreate<int> cacheNames.Length
+    let cacheMisses = Array.zeroCreate<int> cacheNames.Length
+    let mutable activePhase = 0
+    let mutable lastSample = 0
+
+    let sample () =
+        let elapsed = max lastSample (nowMilliseconds ())
+        phaseTotals[activePhase] <- phaseTotals[activePhase] + elapsed - lastSample
+        lastSample <- elapsed
+
+    member _.SetPhase(name: string) =
+        sample ()
+        activePhase <- phaseNames |> Array.findIndex ((=) name)
+
+    member _.BeginCacheObservation(name: string) =
+        let index = cacheNames |> Array.findIndex ((=) name)
+        cacheAttempts[index] <- cacheAttempts[index] + 1
+
+    member _.RecordCacheObservation(name: string, hit: bool) =
+        let index = cacheNames |> Array.findIndex ((=) name)
+        if hit then cacheHits[index] <- cacheHits[index] + 1
+        else cacheMisses[index] <- cacheMisses[index] + 1
+
+    /// Sample immediately before the final measured serialization. The final serializer
+    /// and transport are outside this sample; repeated planner serialization IS included.
+    /// Do not attach after a size check: the added fixed metadata must itself be measured.
+    member _.Attach(response: JsonNode) =
+        sample ()
+        response["elapsedMs"] <- jint lastSample
+        response["phaseTimingsMs"] <-
+            Array.zip phaseNames phaseTotals
+            |> Array.map (fun (name, elapsed) -> name, jint elapsed)
+            |> Array.toList
+            |> jobj
+        response["cacheState"] <-
+            cacheNames
+            |> Array.mapi (fun index name ->
+                let incomplete = cacheAttempts[index] - cacheHits[index] - cacheMisses[index]
+                let state =
+                    if cacheAttempts[index] = 0 then "not_observed"
+                    elif incomplete > 0 then "incomplete"
+                    else "observed"
+                name,
+                (jobj [ "hits", jint cacheHits[index]
+                        "misses", jint cacheMisses[index]
+                        "incomplete", jint incomplete
+                        "state", jstr state ] :> JsonNode))
+            |> Array.toList
+            |> jobj
+        response
+
 /// One monotonic request deadline shared by Program.fs admission and every find phase.
 /// Semantic work stops early enough to leave a small, explicit allowance for constructing
 /// the typed response. The optional signal is a deterministic test seam: production expiry
@@ -450,6 +513,7 @@ type internal FindFsacProbeResult =
 type internal FindRequestDeadline
     (timeoutMs: int, ?semanticExpirySignal: Task, ?responseExpirySignal: Task) =
     let elapsed = System.Diagnostics.Stopwatch.StartNew()
+    let telemetry = FindCostTelemetry(fun () -> int elapsed.ElapsedMilliseconds)
 
     let responseAllowanceMs =
         if timeoutMs <= 0 then
@@ -468,6 +532,15 @@ type internal FindRequestDeadline
     member _.TimeoutMs = timeoutMs
     member _.ResponseAllowanceMs = responseAllowanceMs
     member _.ElapsedMilliseconds = int elapsed.ElapsedMilliseconds
+    member _.Telemetry = telemetry
+
+    /// Early/timeout envelopes have no planner. If the guard replaces an oversized
+    /// envelope, attach to that small replacement and measure it as well.
+    member _.GuardResponse(response: JsonNode) =
+        let attached = telemetry.Attach response
+        let guarded = FindResponseBudget.guardFinalResponse attached
+        if Object.ReferenceEquals(attached, guarded) then guarded
+        else telemetry.Attach guarded |> FindResponseBudget.guardFinalResponse
     member _.SemanticExpirySignal = semanticExpirySignal
     member _.ResponseExpirySignal = responseExpirySignal
 
@@ -486,6 +559,7 @@ type internal FindRequestDeadline
 
     member _.BeginResponseConstruction() =
         if responseStartedAt.IsNone then
+            telemetry.SetPhase("responseConstruction")
             responseStartedAt <- Some elapsed.Elapsed
 
     member _.RemainingResponseBudget() =
@@ -2980,7 +3054,7 @@ type internal FcsBridge
         System.Collections.Generic.Dictionary<string, string>(StringComparer.Ordinal)
 
     let optionsInFlight =
-        ConcurrentDictionary<string, WaiterAwareSingleFlight<ProjectOptionsCacheEntry>>()
+        ConcurrentDictionary<string, WaiterAwareSingleFlight<ProjectOptionsCacheEntry * bool>>()
 
     // Project-cache validation performs recursive hashing and Ionide/MSBuild loads
     // race on process-global SDK state. Keep the entire exact-fsproj resolve behind
@@ -5045,7 +5119,7 @@ type internal FcsBridge
                                     | None -> None)
 
                             match cached with
-                            | Some entry -> return entry
+                            | Some entry -> return entry, true
                             | None ->
                                 ensureWorkerNeeded ()
                                 let! projInfoResult =
@@ -5062,7 +5136,7 @@ type internal FcsBridge
                                             (Some evaluatedSnapshot)
 
                                     optionsCache.Set(fsprojKey, entry)
-                                    return entry
+                                    return entry, false
                                 | None ->
                                     return
                                         raise (
@@ -5080,7 +5154,10 @@ type internal FcsBridge
             let fullPath = normalizePath fsprojPath
             use waiter =
                 this.AcquireFsprojEntryWithinBudget(fullPath, remainingBudget, ?callerIsNeeded = callerIsNeeded)
-            let work = waiter.Operation
+            let work = task {
+                let! entry, _cacheHit = waiter.Operation
+                return entry
+            }
             observeFault work
 
             match remainingBudget with
@@ -6966,12 +7043,15 @@ type internal FcsBridge
     // the real worker; legacy callers use the timeout wrapper below. In both cases
     // projectUsesInFlight deduplicates retries.
     member private _.ProjectSweepUsesActual
-        (usesKey: string, options: FSharpProjectOptions)
+        (usesKey: string, options: FSharpProjectOptions, ?observeCache: bool -> unit)
         : Task<FSharpSymbolUse array * FSharpDiagnostic array> =
         task {
             match projectUsesCache.TryGet(usesKey) with
-            | Some cached -> return cached
+            | Some cached ->
+                observeCache |> Option.iter (fun observe -> observe true)
+                return cached
             | None ->
+                observeCache |> Option.iter (fun observe -> observe false)
                 let generation = Volatile.Read(&projectUsesCacheGeneration)
 
                 let pending =
@@ -7047,7 +7127,8 @@ type internal FcsBridge
             retainUntil: Task -> unit,
             fsacProbe: (string -> Task<FindFsacProbeResult>) option,
             recordValidatedContinuationEnvelope: unit -> unit,
-            recordMeasuredResponse: JsonNode -> unit
+            recordMeasuredResponse: JsonNode -> unit,
+            inventoryQueries: string array option
         )
         : Task<JsonNode> =
         task {
@@ -7331,6 +7412,7 @@ type internal FcsBridge
                     | None, Ok _ ->
                         if kind = "position" then
                             try
+                                deadline.Telemetry.SetPhase("positionResolution")
                                 ensureCanStart "position resolution"
 
                                 let waiter =
@@ -7408,6 +7490,7 @@ type internal FcsBridge
             | Error envelope -> return envelope
             | Ok(query, positionSymbolIdentity) ->
 
+            deadline.Telemetry.SetPhase("targetDiscovery")
             let kindResolved = if kind = "position" then "symbol" else kind
 
             let findNearestProjectForRequest path shouldContinue =
@@ -7684,6 +7767,51 @@ type internal FcsBridge
                     return invalidArgs message
             else
 
+            // Inventory test labels are discovery work, never response-phase file
+            // reads. Keep a slow filesystem/XML worker within the same admission
+            // lifetime even after its waiter times out or is cancelled.
+            let! inventoryTestProjectsResult =
+                task {
+                    if inventoryQueries.IsNone then
+                        return Ok Set.empty
+                    else
+                        try
+                            deadline.Telemetry.SetPhase("targetDiscovery")
+                            ensureCanStart "inventory project classification"
+                            let selectedProjectsIdentity =
+                                String.Join("\u0000", projectsToSweep) |> Cursor.textIdentityV2
+                            let waiter =
+                                runFindTargetDiscovery
+                                    $"inventory-test-projects-{selectedProjectsIdentity}"
+                                    sweepTarget
+                                    remainingWorkerBudget
+                                    (fun shouldContinue ->
+                                        let tests = ResizeArray<string>()
+                                        for index in 0 .. projectsToSweep.Count - 1 do
+                                            if not (shouldContinue ()) then
+                                                raise (TimeoutException "The inventory project-classification deadline expired.")
+                                            findTargetDiscoveryBeforeStepOverride
+                                            |> Option.iter (fun beforeStep -> beforeStep "inventory-project-classification" index)
+                                            let project = projectsToSweep[index]
+                                            if FsLangMcp.ProjectHealth.isTestProjectFile project then
+                                                tests.Add(normalizePath project)
+                                        FindTargetDiscoveryResult.Paths(tests.ToArray()))
+                            let! result = awaitRetainedSingleFlight "inventory project classification" waiter
+                            match result with
+                            | FindTargetDiscoveryResult.Paths paths -> return Ok(Set.ofArray paths)
+                            | FindTargetDiscoveryResult.Projects _ ->
+                                return raise (InvalidOperationException "Unexpected inventory project-classification result.")
+                        with
+                        | :? TimeoutException as ex ->
+                            return Error(incompleteBeforeDiscovery "target_discovery" "timed_out" "find_timeout" ex.Message)
+                        | :? BoundedCheckWorkBusyException as ex ->
+                            return Error(incompleteBeforeDiscovery "target_discovery" "busy" "fcs_worker_busy" ex.Message)
+                }
+
+            match inventoryTestProjectsResult with
+            | Error envelope -> return envelope
+            | Ok inventoryTestProjects ->
+
             // ── Matching predicates (stable-string, cross-compilation-safe) ───────
             let fullNameBoundaryMatch (fullName: string) =
                 not (isNull fullName)
@@ -7765,11 +7893,16 @@ type internal FcsBridge
                 | _ -> false
 
             let wantName =
-                kindResolved = "auto" || kindResolved = "symbol" || kindResolved = "definition"
+                inventoryQueries.IsNone
+                && (kindResolved = "auto" || kindResolved = "symbol" || kindResolved = "definition")
 
             let wantDefsOnly = kindResolved = "definition"
-            let wantField = kindResolved = "auto" || kindResolved = "field"
-            let wantMember = kindResolved = "auto" || kindResolved = "members"
+            let wantField = inventoryQueries.IsNone && (kindResolved = "auto" || kindResolved = "field")
+            let wantMember = inventoryQueries.IsNone && (kindResolved = "auto" || kindResolved = "members")
+            let inventoryCollector =
+                inventoryQueries
+                |> Option.map (fun queries ->
+                    FindInventory.Collector(queries, exact, wantDefsOnly, includeDeclaration, fileScopePath))
 
             // De-dup accumulator keyed by stable source location.
             // NOTE: we store only primitive coordinates, NOT the FCS `range` struct —
@@ -7883,7 +8016,9 @@ type internal FcsBridge
                         stopStartingProjects <- true
                         raise FindProjectNotStartedException
 
+                    deadline.Telemetry.SetPhase("projectOptions")
                     ensureCanStart $"project-options resolution for '{projDisplay}'"
+                    deadline.Telemetry.BeginCacheObservation("projectOptions")
 
                     let optionsWaiter =
                         this.AcquireFsprojEntryWithinBudget(
@@ -7891,11 +8026,12 @@ type internal FcsBridge
                             Some remainingWorkerBudget
                         )
 
-                    let! optionsEntry =
+                    let! optionsEntry, optionsCacheHit =
                         awaitRetainedSingleFlight
                             $"project-options resolution for '{projDisplay}'"
                             optionsWaiter
 
+                    deadline.Telemetry.RecordCacheObservation("projectOptions", optionsCacheHit)
                     let options = optionsEntry.Options
 
                     // issue #131/#168 P1-07: memoize the whole-symbol-use enumeration by
@@ -7908,6 +8044,7 @@ type internal FcsBridge
                     // own method (ProjectSweepUses) so this outer state machine stays
                     // statically compilable under Release optimization (a nested task CE
                     // inside the loop trips FS3511).
+                    deadline.Telemetry.SetPhase("snapshot")
                     ensureCanStart $"snapshot computation for '{projDisplay}'"
 
                     let snapshotWaiter =
@@ -7919,13 +8056,19 @@ type internal FcsBridge
                             snapshotWaiter
 
                     commitAnalysisSnapshotKey options usesKey
+                    deadline.Telemetry.SetPhase("fcsSweep")
                     ensureCanStart $"FCS sweep for '{projDisplay}'"
 
-                    let sweepOperation = this.ProjectSweepUsesActual(usesKey, options)
+                    deadline.Telemetry.BeginCacheObservation("projectUses")
+                    let sweepOperation =
+                        this.ProjectSweepUsesActual(
+                            usesKey, options,
+                            observeCache = fun hit -> deadline.Telemetry.RecordCacheObservation("projectUses", hit))
 
                     let! allUses, projDiagnostics =
                         awaitWithinDeadline $"FCS sweep for '{projDisplay}'" true sweepOperation
 
+                    deadline.Telemetry.SetPhase("classification")
                     for diagnostic in projDiagnostics do
                         aggregatedDiagnostics.Add(normalizePath fsproj, diagnostic)
 
@@ -8059,11 +8202,18 @@ type internal FcsBridge
                     let mutable classificationExpired = false
 
                     let canClassifyNext () =
+                        cancellationToken.ThrowIfCancellationRequested()
                         if classificationExpired || deadline.SemanticExpired then
                             classificationExpired <- true
                             false
                         else
                             true
+
+                    match inventoryCollector with
+                    | Some collector ->
+                        if not (collector.ObserveProject(sweepProjectIndex, allUses, symbolMatches, canClassifyNext)) then
+                            classificationExpired <- true
+                    | None -> ()
 
                     if wantField then
                         let mutable fieldIndex = 0
@@ -8210,6 +8360,7 @@ type internal FcsBridge
 
                     perProjectKeep.Add(true)
 
+                deadline.Telemetry.SetPhase("unattributed")
                 sweepProjectIndex <- sweepProjectIndex + 1
 
             if sweepProjectIndex < projectsToSweep.Count then
@@ -8229,6 +8380,145 @@ type internal FcsBridge
                 && projectsTimedOut = 0
                 && projectsBusy = 0
                 && projectsNotStarted = 0
+
+            let scopeResolved =
+                if projectsSwept <= 1 then
+                    if scope = "file" then "file" else "project"
+                else
+                    "workspace"
+
+            if inventoryCollector.IsSome then
+                // Inventory shares discovery/options/snapshot/FCS once per project,
+                // but bypasses source snippets, site projection, FSAC and v2 cursors.
+                deadline.BeginResponseConstruction()
+                let collector = inventoryCollector.Value
+                let queries = inventoryQueries.Value
+
+                let coverage complete =
+                    jobj
+                        [ "complete", jbool complete
+                          "discoveryComplete", jbool (not targetDiscoveryMaterializationTimedOut)
+                          "projectsRequested", jint projectsRequested
+                          "projectsAnalyzed", jint projectsAnalyzed
+                          "projectsFailed", jint projectsFailed
+                          "projectsMissing", jint projectsMissing
+                          "projectsTimedOut", jint projectsTimedOut
+                          "projectsBusy", jint projectsBusy
+                          "projectsNotStarted", jint projectsNotStarted ]
+
+                let blocked errorKind status message =
+                    jobj
+                        [ "status", jstr status
+                          "errorKind", jstr errorKind
+                          "message", jstr message
+                          "countsOnly", jbool true
+                          "aggregation", jstr "per_query"
+                          "countsReturned", jbool false
+                          "countsComplete", jbool false
+                          "countsAreLowerBounds", jbool true
+                          "resultSetComplete", jbool false
+                          "queriesRequested", jint queries.Length
+                          "queriesReturned", jint 0
+                          "queries", JsonArray() :> JsonNode
+                          "coverage", coverage false :> JsonNode
+                          "timeoutMs", jint deadline.TimeoutMs
+                          "responseBudgetChars", jint findResponseBudgetChars
+                          "responseSizeUnit", jstr FindResponseBudget.SizeUnit
+                          "retryable", jbool true
+                          "nextCursor", null
+                          "recovery",
+                          jobj
+                              [ "action", jstr "split_queries_or_narrow_scope"
+                                "instruction",
+                                jstr "Split queries into smaller batches or use scope='project' with one .fsproj; maxResults does not page inventory counts." ]
+                          :> JsonNode ]
+                    :> JsonNode
+
+                let ensureInventoryResponse () =
+                    cancellationToken.ThrowIfCancellationRequested()
+                    if deadline.ResponseExpired then
+                        raise (TimeoutException "Inventory response construction exhausted the find deadline.")
+
+                try
+                    ensureInventoryResponse ()
+                    let pathComparer = if OperatingSystem.IsWindows() then StringComparer.OrdinalIgnoreCase else StringComparer.Ordinal
+                    let ledgerByPath = System.Collections.Generic.Dictionary<string, JsonNode>(pathComparer)
+
+                    for row in perProject do
+                        ensureInventoryResponse ()
+                        ledgerByPath[row["fsproj"].GetValue<string>()] <- row
+
+                    let projectLedger = JsonArray()
+
+                    let addProject index path missing =
+                        ensureInventoryResponse ()
+                        let normalized = normalizePath path
+                        let prior =
+                            match ledgerByPath.TryGetValue normalized with
+                            | true, row -> Some row
+                            | false, _ -> None
+                        let status =
+                            prior
+                            |> Option.map (fun row -> row["status"].GetValue<string>())
+                            |> Option.defaultValue (if missing then "missing" else "not_started")
+                        let node =
+                            jobj
+                                [ "projectIndex", jint index
+                                  "project", jstr (Path.GetFileNameWithoutExtension normalized)
+                                  "fsproj", jstr normalized
+                                  "isTestProject", (if missing then null else jbool (inventoryTestProjects.Contains normalized))
+                                  "status", jstr status
+                                  "countsComplete", jbool (status = "analyzed")
+                                  "elapsedMs",
+                                  prior |> Option.map (fun row -> row["elapsedMs"].DeepClone()) |> Option.defaultValue (jint 0) ]
+                        prior
+                        |> Option.iter (fun row ->
+                            for key in [ "errorKind"; "totalProjectSymbolUses" ] do
+                                if not (isNull row[key]) then node[key] <- row[key].DeepClone())
+                        projectLedger.Add(node :> JsonNode)
+
+                    for index in 0 .. projectsToSweep.Count - 1 do
+                        addProject index projectsToSweep[index] false
+
+                    for index in 0 .. missingProjects.Count - 1 do
+                        addProject (projectsToSweep.Count + index) missingProjects[index] true
+
+                    let response = collector.ToJson(coverageComplete, canContinue = (fun () ->
+                        cancellationToken.ThrowIfCancellationRequested()
+                        not deadline.ResponseExpired))
+                    let countsComplete = response["countsComplete"].GetValue<bool>()
+                    let matched = if collector.HasMatches then Some true elif countsComplete then Some false else None
+                    response["status"] <- jstr (if countsComplete then (if collector.HasMatches then "ok" else "not_found") elif collector.HasMatches then "partial" else "unknown")
+                    response["matched"] <- matched |> Option.map jbool |> Option.defaultValue null
+                    response["outcome"] <- jstr (if collector.HasMatches then "found" elif countsComplete then "not_found" else "indeterminate")
+                    response["resultSetComplete"] <- jbool countsComplete
+                    response["countsReturned"] <- jbool true
+                    response["queriesRequested"] <- jint queries.Length
+                    response["queriesReturned"] <- jint queries.Length
+                    response["projectLedger"] <- projectLedger
+                    response["testProjectDetection"] <- jstr "project_health_heuristic"
+                    response["coverage"] <- coverage countsComplete
+                    response["kindResolved"] <- jstr kindResolved
+                    response["scopeResolved"] <- jstr scopeResolved
+                    response["timeoutMs"] <- jint deadline.TimeoutMs
+                    response["responseConstructionAllowanceMs"] <- jint deadline.ResponseAllowanceMs
+                    response["responseBudgetChars"] <- jint findResponseBudgetChars
+                    response["responseSizeUnit"] <- jstr FindResponseBudget.SizeUnit
+                    response["nextCursor"] <- null
+                    response["fsacFallbackState"] <- jstr "not_applicable_inventory"
+                    ensureInventoryResponse ()
+                    deadline.Telemetry.Attach(response :> JsonNode) |> ignore
+                    let responseLength = response.ToJsonString(mcpRenderOptions).Length
+                    ensureInventoryResponse ()
+
+                    if responseLength > findResponseBudgetChars then
+                        return blocked "find_inventory_response_budget" "aborted" "The complete inventory exceeds the serialized response ceiling; no count rows were delivered."
+                    else
+                        recordMeasuredResponse (response :> JsonNode)
+                        return response :> JsonNode
+                with :? TimeoutException ->
+                    return blocked "find_response_timeout" "unknown" "Inventory counts could not be delivered before the response deadline. No absence claim was made."
+            else
 
             // HEADLINE: a positive site is always useful, but absence is conclusive
             // only when every requested FCS project completed. FSAC outcomes remain
@@ -8263,6 +8553,7 @@ type internal FcsBridge
                         match fsacProbe with
                         | Some probe ->
                             try
+                                deadline.Telemetry.SetPhase("fsacFallback")
                                 ensureCanStart "the zero-hit FSAC fallback"
                                 let operation = probe query
                                 return! awaitWithinDeadline "the zero-hit FSAC fallback" false operation
@@ -8813,12 +9104,6 @@ type internal FcsBridge
             if deadline.ResponseExpired then
                 responseConstructionTimedOut <- true
                 resolutionComplete <- false
-
-            let scopeResolved =
-                if projectsSwept <= 1 then
-                    if scope = "file" then "file" else "project"
-                else
-                    "workspace"
 
             let matchedNode =
                 match matched with
@@ -9418,7 +9703,7 @@ type internal FcsBridge
                     response["paginationIncompleteReason"] <- jstr "deadline_incomplete"
 
                 ensureResponseStep "response-planning-complete" plannerProbe
-                response :> JsonNode
+                deadline.Telemetry.Attach(response :> JsonNode)
 
             let initialResponseTimeout () =
                 let response = responseTemplate.DeepClone() :?> JsonObject
@@ -9640,9 +9925,11 @@ type internal FcsBridge
             deadline: FindRequestDeadline,
             cancellationToken: CancellationToken,
             retainUntil: Task -> unit,
-            fsacProbe: (string -> Task<FindFsacProbeResult>) option
+            fsacProbe: (string -> Task<FindFsacProbeResult>) option,
+            ?inventoryQueries: string array
         ) : Task<JsonNode> =
         task {
+            deadline.Telemetry.SetPhase("unattributed")
             let mutable measuredResponse: JsonNode = null
             let mutable validatedContinuationEnvelope = false
 
@@ -9650,8 +9937,16 @@ type internal FcsBridge
                 this.FindCoreWithinDeadline(
                     args, deadline, cancellationToken, retainUntil, fsacProbe,
                     (fun () -> validatedContinuationEnvelope <- true),
-                    (fun measured -> measuredResponse <- measured)
+                    (fun measured -> measuredResponse <- measured), inventoryQueries
                 )
+
+            if inventoryQueries.IsSome && isNull response["countsOnly"] then
+                response["countsOnly"] <- jbool true
+                response["aggregation"] <- jstr "per_query"
+                response["countsReturned"] <- jbool false
+                response["countsComplete"] <- jbool false
+                response["queriesRequested"] <- jint inventoryQueries.Value.Length
+                response["queriesReturned"] <- jint 0
 
             if Object.ReferenceEquals(response, measuredResponse) then
                 // Per-call reference identity is evidence from the core, never a
@@ -9667,13 +9962,13 @@ type internal FcsBridge
                     FindCursorContract.validationIncomplete
                         deadline
                         "The find deadline expired during continuation response construction. Retry the same cursor with a larger timeoutMs."
-                    |> FindResponseBudget.guardFinalResponse
+                    |> deadline.GuardResponse
 
                 findFinalResponseBeforeMeasureOverride |> Option.iter (fun hook -> hook ())
                 if validatedContinuationEnvelope && deadline.ResponseExpired then
                     return validationIncomplete ()
                 else
-                    let guardedResponse = FindResponseBudget.guardFinalResponse response
+                    let guardedResponse = deadline.GuardResponse response
                     findFinalResponseAfterMeasureOverride |> Option.iter (fun hook -> hook ())
                     if validatedContinuationEnvelope && deadline.ResponseExpired then
                         return validationIncomplete ()
@@ -9681,7 +9976,7 @@ type internal FcsBridge
                         return guardedResponse
         }
 
-    member this.Find(args: FindArgs, ?fsacProbe: string -> Task<FindFsacProbeResult>) : Task<JsonNode> =
+    member this.Find(args: FindArgs, ?fsacProbe: string -> Task<FindFsacProbeResult>, ?inventoryQueries: string array) : Task<JsonNode> =
         let timeoutMs = args.timeoutMs |> Option.defaultValue 120_000
 
         if timeoutMs < 0 then
@@ -9694,7 +9989,8 @@ type internal FcsBridge
                 deadline,
                 CancellationToken.None,
                 ignore,
-                fsacProbe
+                fsacProbe,
+                ?inventoryQueries = inventoryQueries
             )
         else
             let expirySignal = findDeadlineSignalOverride |> Option.map (fun signal -> signal ())
@@ -9715,7 +10011,8 @@ type internal FcsBridge
                 deadline,
                 CancellationToken.None,
                 ignore,
-                fsacProbe
+                fsacProbe,
+                ?inventoryQueries = inventoryQueries
             )
 
     // ── fcs_tests_for_symbol (#60): the test-coverage slice of `find` ───────────
@@ -13050,7 +13347,7 @@ type internal FcsBridge
                         this.AcquireFsprojEntryWithinBudget(projectPath, Some optionsRemainingBudget)
 
                     try
-                        let! entry = awaitWithinDeadline "project_options" optionsWaiter.Operation
+                        let! entry, _cacheHit = awaitWithinDeadline "project_options" optionsWaiter.Operation
                         resolvedProjectOptions <- Some(entry.Options, entry.Source)
                         optionsPhaseStatus <- "complete"
                     with

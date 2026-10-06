@@ -65,8 +65,24 @@ Full setup: [`docs/getting-started.md`](docs/getting-started.md) · Per-client c
 
 | Tool | What it does |
 |------|--------------|
-| `find` | Multi-project semantic search with explicit sweep and delivery completeness. Stateless v2 cursors bind every page to the same request and complete canonical result stream; a changed request, source, or coverage state is rejected instead of mixed. |
+| `find` | Multi-project semantic search, or count-only inventory for 1–50 names in one shared project sweep. Every response reports fixed phase timings and request-observed project-options/project-use cache decisions. Legacy site-search calls and their stateless v2 cursor contract are unchanged. |
 | `check` | One trustworthy verdict (`clean`/`errors`/`unknown`) for the current FCS/check profile. Default mode is a fresh FCS check; fast FSAC mode returns `clean` only with complete current coverage. An `unknown` caused by SDK/preflight failure includes a typed `blockingReason`. Project scope warns that downstream consumers were not checked; workspace scope requires a solution or directory. |
+
+Narrow an ordinary site search when you need only one project, or request counts for several
+names without source snippets:
+
+```text
+find { "query": "OrderId", "kind": "symbol", "scope": "project", "projectPath": "src/Core/Core.fsproj" }
+find { "queries": ["OrderId", "OrderService"], "projectPath": "src/Core/Core.fsproj", "scope": "project" }
+```
+
+The paths are illustrative. Inventory rows keep independent definition/reference/unique-site
+totals and point into the shared `projectLedger`. Its `testProjectDetection` value identifies the
+project-health XML/package heuristic: `isTestProject=true` means recognized test project,
+`false` means unmarked project, and a missing project reports `null`. These groups are not proof of
+test or production execution. An incomplete count is a lower bound; narrow the project, split the
+query batch, or retry with a larger `timeoutMs` before treating zero as absence. See the
+[`find` guide](docs/tools-detailed.md#count-only-inventory) for the full contract.
 
 `check` is the fast semantic edit loop, not the final Release gate. A `clean` verdict covers the
 compiler options in its current FCS/check profile; configuration-specific diagnostics such as
