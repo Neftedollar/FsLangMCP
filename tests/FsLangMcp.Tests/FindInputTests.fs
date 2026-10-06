@@ -56,6 +56,7 @@ let ``query alternative cardinality and name validation fail before admission`` 
           { input with query = Some "Name"; queries = Some [ "Other" ] }
           { input with queries = Some [] }
           { input with queries = Some [ " " ] }
+          { input with queries = Some [ null ] }
           { input with queries = Some [ "Name"; " Name " ] }
           { input with queries = Some [ for index in 0..50 -> $"Name{index}" ] }
           { input with queries = Some [ "Name" ]; countsOnly = Some false } ] do
@@ -91,14 +92,25 @@ let private arguments json =
     |> Seq.map (fun property -> property.Name, property.Value.Clone())
     |> Map.ofSeq
 
+let private assertSchemaType (expected: string) (schema: JsonElement) =
+    let declaredType = schema.GetProperty("type")
+    let types =
+        match declaredType.ValueKind with
+        | JsonValueKind.String -> [| declaredType.GetString() |]
+        | JsonValueKind.Array -> declaredType.EnumerateArray() |> Seq.map _.GetString() |> Seq.toArray
+        | _ -> failwith $"Unexpected schema type declaration: {declaredType}"
+    Assert.Contains<string>(expected, types)
+    Assert.All(types, fun actual -> Assert.True(actual = expected || actual = "null", $"Unexpected schema type: {actual}"))
+
 [<Fact>]
 let ``typed tool publishes an optional query and an array queries schema`` () =
     let tool = definition (fun _ _ -> Task.FromResult(Ok [ Text "{}" ]))
     let schema = tool.InputSchema.Value
     let properties = schema.GetProperty("properties")
-    Assert.Equal("array", properties.GetProperty("queries").GetProperty("type").GetString())
-    Assert.Equal("string", properties.GetProperty("queries").GetProperty("items").GetProperty("type").GetString())
-    Assert.True(properties.TryGetProperty("countsOnly") |> fst)
+    assertSchemaType "string" (properties.GetProperty("query"))
+    assertSchemaType "array" (properties.GetProperty("queries"))
+    assertSchemaType "string" (properties.GetProperty("queries").GetProperty("items"))
+    assertSchemaType "boolean" (properties.GetProperty("countsOnly"))
     let mutable required = Unchecked.defaultof<JsonElement>
     if schema.TryGetProperty("required", &required) then
         Assert.DoesNotContain("query", required.EnumerateArray() |> Seq.map _.GetString())
@@ -119,9 +131,17 @@ let ``typed tool binds array inventory and legacy query while rejecting malforme
         Assert.Equal(Some "A", received.Value.query)
         Assert.Equal(Some "token", received.Value.cursor)
 
-        for json in [ """{"queries":"A"}"""; """{"queries":["A",1]}"""; """{"queries":[null]}""" ] do
+        for json in [ """{"queries":"A"}"""; """{"queries":["A",1]}""" ] do
             received <- None
-            let! result = tool.Handler (arguments json) CancellationToken.None
-            Assert.True(Result.isError result, json)
+            let! _ = Assert.ThrowsAsync<ModelContextProtocol.McpProtocolException>(fun () ->
+                tool.Handler (arguments json) CancellationToken.None :> Task)
             Assert.True(received.IsNone, "Invalid arrays must not enter the public handler.")
+
+        // The SDK can bind a null string element. Domain validation must reject
+        // it before trimming or gate admission, even though binding succeeded.
+        received <- None
+        let! nullable = tool.Handler (arguments """{"queries":[null]}""") CancellationToken.None
+        Assert.True(Result.isOk nullable)
+        Assert.True(received.IsSome)
+        rejected received.Value
     }

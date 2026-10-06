@@ -127,6 +127,16 @@ let private assertInvalidInventoryArgs (body: JsonElement) =
     Assert.Equal("invalid_find_inventory_args", body.GetProperty("errorKind").GetString())
     assertCompleteTelemetry body
 
+let private assertSchemaType (expected: string) (schema: JsonElement) =
+    let declaredType = schema.GetProperty("type")
+    let types =
+        match declaredType.ValueKind with
+        | JsonValueKind.String -> [| declaredType.GetString() |]
+        | JsonValueKind.Array -> declaredType.EnumerateArray() |> Seq.map _.GetString() |> Seq.toArray
+        | _ -> failwith $"Unexpected schema type declaration: {declaredType}"
+    Assert.Contains<string>(expected, types)
+    Assert.All(types, fun actual -> Assert.True(actual = expected || actual = "null", $"Unexpected schema type: {actual}"))
+
 [<Fact>]
 let ``public find wire contract advertises inventory and rejects unsafe shapes before work`` () : Task =
     task {
@@ -156,10 +166,10 @@ let ``public find wire contract advertises inventory and rejects unsafe shapes b
 
             let schema = findTool.GetProperty("inputSchema")
             let schemaProperties = schema.GetProperty("properties")
-            Assert.Equal("string", schemaProperties.GetProperty("query").GetProperty("type").GetString())
-            Assert.Equal("array", schemaProperties.GetProperty("queries").GetProperty("type").GetString())
-            Assert.Equal("string", schemaProperties.GetProperty("queries").GetProperty("items").GetProperty("type").GetString())
-            Assert.Equal("boolean", schemaProperties.GetProperty("countsOnly").GetProperty("type").GetString())
+            assertSchemaType "string" (schemaProperties.GetProperty("query"))
+            assertSchemaType "array" (schemaProperties.GetProperty("queries"))
+            assertSchemaType "string" (schemaProperties.GetProperty("queries").GetProperty("items"))
+            assertSchemaType "boolean" (schemaProperties.GetProperty("countsOnly"))
 
             match tryProperty "required" schema with
             | Some required ->
@@ -179,7 +189,7 @@ let ``public find wire contract advertises inventory and rejects unsafe shapes b
 
             let classic = parseBody classicCall
             Assert.Equal("unknown", classic.GetProperty("status").GetString())
-            Assert.Equal("find_timeout", classic.GetProperty("errorKind").GetString())
+            Assert.Equal("fcs_admission_timeout", classic.GetProperty("errorKind").GetString())
             Assert.False(classic.GetProperty("resultSetComplete").GetBoolean())
             Assert.Equal(0, classic.GetProperty("sites").GetArrayLength())
             assertCompleteTelemetry classic
@@ -192,7 +202,7 @@ let ``public find wire contract advertises inventory and rejects unsafe shapes b
 
             let inventory = parseBody inventoryCall
             Assert.Equal("unknown", inventory.GetProperty("status").GetString())
-            Assert.Equal("find_timeout", inventory.GetProperty("errorKind").GetString())
+            Assert.Equal("fcs_admission_timeout", inventory.GetProperty("errorKind").GetString())
             Assert.True(inventory.GetProperty("countsOnly").GetBoolean())
             Assert.False(inventory.GetProperty("countsReturned").GetBoolean())
             Assert.False(inventory.GetProperty("countsComplete").GetBoolean())
@@ -217,12 +227,15 @@ let ``public find wire contract advertises inventory and rejects unsafe shapes b
 
             assertInvalidInventoryArgs (parseBody snippetsRequested)
 
+            let! nullName = callFind server 12 """{"queries":[null]}"""
+            assertInvalidInventoryArgs (parseBody nullName)
+
             for id, malformed in
                 [ 7, """{"queries":"A"}"""
                   8, """{"queries":["A",1]}""" ] do
                 let! rejected = callFind server id malformed
                 Assert.True(rejected.IsError, rejected.Text)
-                Assert.Contains("queries", rejected.Text, StringComparison.OrdinalIgnoreCase)
+                Assert.Equal("Invalid tool arguments.", rejected.Text)
 
             let! invalidTimeout =
                 callFind

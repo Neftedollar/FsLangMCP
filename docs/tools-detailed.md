@@ -118,7 +118,8 @@ with a 1 ms minimum for positive budgets) is reserved **inside** it for response
 projection, source-line streaming, JSON copying, and final serialization checks observe that same
 bounded allowance.
 
-An immediate or pre-discovery expiry returns `errorKind="find_timeout"` and never performs a new
+An expiry before outer admission returns `errorKind="fcs_admission_timeout"`; a pre-discovery
+expiry after admission returns `errorKind="find_timeout"`. Neither performs a new
 scan just to count missing projects. A known explicit `.fsproj` is `not_started`; an undiscovered
 solution has no invented member count. `coverage.phases` names the affected phase, while
 `projectsNotStarted`, `projectsTimedOut`, `projectsBusy`, `projectsMissing`, and `projectsFailed`
@@ -176,6 +177,16 @@ the base FCS project check. Compare like-for-like requests and coverage rather t
 general speed claim from one run. Legacy site search continues to omit successful zero-match
 projects from `perProject`; their work remains visible through these phase and cache ledgers.
 Inventory instead keeps every requested project in `projectLedger`.
+
+Expect the first sweep after `set_project` to be substantially more expensive than repeated
+searches over unchanged projects. One [0.18.0 dogfood report](https://github.com/Neftedollar/FsLangMCP/issues/227#issuecomment-6023560318)
+on an eight-project solution measured 101.3 seconds for the first workspace search, then
+0.3–5.6 seconds for subsequent searches in the same session. This is an observed cold/warm gap,
+not a promised speedup or baseline: project size, builds running concurrently, filesystem work,
+and cache invalidation can change it. `set_project` readiness and `symbolIndexState="warming"`
+describe FSAC startup/index observations; they do not prove that the FCS project-use caches are
+warm. Use `cacheState`, phase timings, and equal coverage to distinguish a cold sweep from a
+persistently expensive search before abandoning semantic inventory.
 
 ### Bare-call default
 

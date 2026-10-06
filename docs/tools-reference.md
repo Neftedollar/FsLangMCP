@@ -140,8 +140,11 @@ whose sum is `elapsedMs`. Sampling precedes the last production size-check seria
 transport, so these are diagnostics rather than latency guarantees. `cacheState.projectOptions`
 and `cacheState.projectUses` each expose request-observed `hits`, `misses`, `incomplete`, and
 `state`; they do not describe FCS-internal caches. A warm hit can skip base compiler work, while
-kind narrowing alone cannot remove a cold FCS check. Later projects receive only the remaining
-shared timeout budget.
+kind narrowing alone cannot remove a cold FCS check. The first sweep after `set_project` can be
+much slower than subsequent searches over unchanged projects; FSAC readiness/index warmth does
+not establish FCS project-use cache warmth. See the measured example and caveats in
+[Cost and cache evidence](tools-detailed.md#cost-and-cache-evidence). Later projects receive only
+the remaining shared timeout budget.
 
 **Serialized response ceiling:** the complete indented JSON shipped by the MCP transport is capped
 at 60,000 UTF-16 code units, measured with the same production serializer as the transport. The
