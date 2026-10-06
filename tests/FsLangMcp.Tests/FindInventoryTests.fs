@@ -294,4 +294,4 @@ let ``exception during matching preserves incompleteness of already observed pro
     let response = inventory.ToJson true
     Assert.True(inventory.HasMatches)
     Assert.False(boolean response "countsComplete")
-    Assert.False(boolean ((queryRow response 0)["perProject"][0]) "countsComplete")
+    Assert.False(boolean ((queryRow response 0).["perProject"].[0]) "countsComplete")
