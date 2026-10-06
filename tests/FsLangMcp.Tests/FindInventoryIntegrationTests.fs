@@ -33,7 +33,7 @@ type InventoryIntegration(fixture: FindFixture) =
             let before = bridge.ProjectUsesStartedCount
             let! inventory = bridge.Find(args fixture.Slnx queries[0], inventoryQueries = queries)
             Assert.True(inventory["countsComplete"].GetValue<bool>(), inventory.ToJsonString())
-            Assert.Equal(3, bridge.ProjectUsesStartedCount - before)
+            Assert.Equal(3L, bridge.ProjectUsesStartedCount - before)
             let ledger = inventory["projectLedger"] :?> JsonArray
             Assert.Equal(3, ledger.Count)
             Assert.Equal(3, number (inventory["cacheState"]["projectUses"]) "misses")
@@ -53,7 +53,7 @@ type InventoryIntegration(fixture: FindFixture) =
                     Assert.Equal(projectIndex, number (ledger[projectIndex]) "projectIndex")
                     Assert.True((ledger[projectIndex]["fsproj"]).GetValue<string>().EndsWith(".fsproj"))
 
-            Assert.Equal(before + 3, bridge.ProjectUsesStartedCount)
+            Assert.Equal(before + 3L, bridge.ProjectUsesStartedCount)
             Assert.True(renderedLength inventory <= FindResponseBudget.MaxSerializedChars)
             Assert.Equal(number inventory "elapsedMs", inventory["phaseTimingsMs"].AsObject() |> Seq.sumBy (fun pair -> pair.Value.GetValue<int>()))
         }
@@ -70,10 +70,10 @@ type InventoryIntegration(fixture: FindFixture) =
             Assert.Equal(fixture.DomainFsproj, (ledger[0]["fsproj"]).GetValue<string>())
             Assert.Equal("analyzed", text (ledger[0]) "status")
             Assert.Equal("missing", text (ledger[1]) "status")
-            let references = (result["queries"][0]["perProject"]).AsArray()
+            let references = result.["queries"].[0].["perProject"].AsArray()
             Assert.Equal(0, number (references[0]) "projectIndex")
             Assert.True((references[0]["countsComplete"]).GetValue<bool>())
-            Assert.Null(result["queries"][1]["matched"])
+            Assert.Null(result.["queries"].[1].["matched"])
             Assert.Equal("indeterminate", text (result["queries"][1]) "outcome")
         }
 
@@ -99,7 +99,7 @@ type InventoryIntegration(fixture: FindFixture) =
             Assert.True(result["countsOnly"].GetValue<bool>())
             Assert.False(result["countsReturned"].GetValue<bool>())
             Assert.False(result["countsComplete"].GetValue<bool>())
-            Assert.Equal(0, bridge.ProjectUsesStartedCount)
+            Assert.Equal(0L, bridge.ProjectUsesStartedCount)
         }
 
     [<Fact>]
@@ -140,7 +140,7 @@ type InventoryIntegration(fixture: FindFixture) =
                 expired.TrySetResult(()) |> ignore
                 let! result = operation.WaitAsync(TimeSpan.FromSeconds(5.0))
                 Assert.False(result["countsReturned"].GetValue<bool>())
-                Assert.Equal(0, bridge.ProjectUsesStartedCount)
+                Assert.Equal(0L, bridge.ProjectUsesStartedCount)
                 Assert.Equal(0, gate.CurrentCount)
             finally
                 release.TrySetResult(()) |> ignore
