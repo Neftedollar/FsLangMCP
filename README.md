@@ -65,7 +65,7 @@ Full setup: [`docs/getting-started.md`](docs/getting-started.md) · Per-client c
 
 | Tool | What it does |
 |------|--------------|
-| `find` | Multi-project semantic search, or count-only inventory for 1–50 names in one shared project sweep. Every response reports fixed phase timings and request-observed project-options/project-use cache decisions. Legacy site-search calls and their stateless v2 cursor contract are unchanged. |
+| `find` | Multi-project semantic search, or count-only inventory for 1–50 names in one shared project sweep. Handler-produced success and typed-error responses report fixed phase timings and request-observed project-options/project-use cache decisions; SDK binding, transport, and health responses are outside that contract. Legacy site-search calls and their stateless v2 cursor contract are unchanged. |
 | `check` | One trustworthy verdict (`clean`/`errors`/`unknown`) for the current FCS/check profile. Default mode is a fresh FCS check; fast FSAC mode returns `clean` only with complete current coverage. An `unknown` caused by SDK/preflight failure includes a typed `blockingReason`. Project scope warns that downstream consumers were not checked; workspace scope requires a solution or directory. |
 
 Narrow an ordinary site search when you need only one project, or request counts for several

@@ -38,9 +38,23 @@ let make () : Name = { Tag = 1 }
 let read (value: Name) = value.Tag
 """
 
+let private ambiguousSource = """module FieldRepro.Ambiguous
+
+module Left =
+    type Card = { Name: string }
+    let make () : Card = { Name = "left" }
+    let read (card: Card) = card.Name
+
+module Right =
+    type Card = { Name: string }
+    let make () : Card = { Name = "right" }
+    let read (card: Card) = card.Name
+"""
+
 type FieldResolutionFixture() =
     let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_field_resolution_{Guid.NewGuid():N}")
     let aProject = Path.Combine(root, "A", "A.fsproj")
+    let ambiguousProject = Path.Combine(root, "D", "D.fsproj")
     let sourcePath = Path.Combine(root, "A", "Source.fs")
     let collisionPath = Path.Combine(root, "B", "Source.fs")
     let solution = Path.Combine(root, "Fields.slnx")
@@ -49,7 +63,7 @@ type FieldResolutionFixture() =
     let missingSolution = Path.Combine(root, "Missing.slnx")
 
     do
-        for name, contents in [ "A", source; "B", collisionSource ] do
+        for name, contents in [ "A", source; "B", collisionSource; "D", ambiguousSource ] do
             let directory = Path.Combine(root, name)
             Directory.CreateDirectory(directory) |> ignore
             File.WriteAllText(Path.Combine(directory, "Source.fs"), contents)
@@ -62,7 +76,7 @@ type FieldResolutionFixture() =
         Directory.CreateDirectory(linkedDirectory) |> ignore
         File.WriteAllText(Path.Combine(linkedDirectory, "C.fsproj"), """<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><ItemGroup><Compile Include="../A/Source.fs" Link="Source.fs" /></ItemGroup></Project>""")
         File.WriteAllText(linkedSolution, """<Solution><Project Path="A/A.fsproj" /><Project Path="C/C.fsproj" /></Solution>""")
-        File.WriteAllText(buildSolution, """<Solution><Project Path="A/A.fsproj" /><Project Path="B/B.fsproj" /><Project Path="C/C.fsproj" /></Solution>""")
+        File.WriteAllText(buildSolution, """<Solution><Project Path="A/A.fsproj" /><Project Path="B/B.fsproj" /><Project Path="C/C.fsproj" /><Project Path="D/D.fsproj" /></Solution>""")
 
     let build =
         let dotnetHost =
@@ -87,6 +101,7 @@ type FieldResolutionFixture() =
 
     member internal _.Bridge = bridge
     member _.Project = aProject
+    member _.AmbiguousProject = ambiguousProject
     member _.Source = sourcePath
     member _.Solution = solution
     member _.LinkedSolution = linkedSolution
@@ -130,6 +145,75 @@ let private siteSet (response: JsonNode) =
     |> Seq.map _.ToJsonString()
     |> Set.ofSeq
 
+let private expectedCoordinates (fixtureSource: string) (section: string) (entries: (string * string * string * int) list) =
+    let lines = fixtureSource.Split('\n')
+    let sectionIndex =
+        lines
+        |> Array.tryFindIndex (fun line -> String.Equals(line, section, StringComparison.Ordinal))
+        |> Option.defaultWith (fun () -> failwith $"Fixture section was not found: {section}")
+
+    let coordinate (kind: string, lineText: string, field: string, occurrence: int) =
+        let lineIndex =
+            lines[sectionIndex..]
+            |> Array.tryFindIndex (fun line -> String.Equals(line, lineText, StringComparison.Ordinal))
+            |> Option.map ((+) sectionIndex)
+            |> Option.defaultWith (fun () -> failwith $"Fixture line was not found: {lineText}")
+
+        let mutable fieldIndex = -1
+        let mutable searchFrom = 0
+
+        for _ in 0 .. occurrence do
+            fieldIndex <- lineText.IndexOf(field, searchFrom, StringComparison.Ordinal)
+
+            if fieldIndex < 0 then
+                failwith $"Fixture field occurrence was not found: {field} #{occurrence} in {lineText}"
+
+            searchFrom <- fieldIndex + field.Length
+
+        let line = lineIndex + 1
+        kind, line, fieldIndex, line, fieldIndex + field.Length
+
+    entries |> List.map coordinate |> Set.ofList
+
+let private expectedFieldShapeCoordinates () =
+    expectedCoordinates
+        source
+        "module FieldRepro.Model"
+        [ "field-set-literal", "    { Name = \"a\"; Load = (fun _ -> async { return None }); Attempts = 0; ``Part.Name`` = \"p\" }", "Name", 0
+          "field-set-literal", "    { Name = \"a\"; Load = (fun _ -> async { return None }); Attempts = 0; ``Part.Name`` = \"p\" }", "Load", 0
+          "field-set-literal", "    { Name = \"a\"; Load = (fun _ -> async { return None }); Attempts = 0; ``Part.Name`` = \"p\" }", "Attempts", 0
+          "field-set-literal", "    { Name = \"a\"; Load = (fun _ -> async { return None }); Attempts = 0; ``Part.Name`` = \"p\" }", "``Part.Name``", 0
+          "field-read", "let read (card: Card) = card.Name, card.Load 1L", "card.Name", 0
+          "field-read", "let read (card: Card) = card.Name, card.Load 1L", "card.Load", 0
+          "field-set-update", "let renamed (card: Card) = { card with Name = \"b\" }", "Name", 0
+          "field-pattern", "let isA (card: Card) = match card with { Name = \"a\" } -> true | _ -> false", "Name", 0
+          "field-set-mutation", "let bump (card: Card) = card.Attempts <- card.Attempts + 1", "card.Attempts", 0
+          "field-read", "let bump (card: Card) = card.Attempts <- card.Attempts + 1", "card.Attempts", 1
+          "field-read", "let part (card: Card) = card.``Part.Name``", "card.``Part.Name``", 0 ]
+
+let private expectedAmbiguousCoordinates side value =
+    expectedCoordinates
+        ambiguousSource
+        $"module {side} ="
+        [ "field-set-literal", $"    let make () : Card = {{ Name = \"{value}\" }}", "Name", 0
+          "field-read", "    let read (card: Card) = card.Name", "card.Name", 0 ]
+
+let private actualFieldCoordinates (response: JsonNode) : Set<string * int * int * int * int> =
+    response["sites"].AsArray()
+    |> Seq.map (fun site ->
+        let range = site["range"]
+        stringValue site "kind",
+        range["startLine"].GetValue<int>(),
+        range["startColumn"].GetValue<int>(),
+        range["endLine"].GetValue<int>(),
+        range["endColumn"].GetValue<int>())
+    |> Set.ofSeq
+
+let private fieldSymbols (response: JsonNode) =
+    response["sites"].AsArray()
+    |> Seq.map (fun site -> stringValue site "symbolFullName")
+    |> Set.ofSeq
+
 type FindFieldResolutionTests(fixture: FieldResolutionFixture) =
     interface IClassFixture<FieldResolutionFixture>
 
@@ -155,12 +239,29 @@ type FindFieldResolutionTests(fixture: FieldResolutionFixture) =
     }
 
     [<Fact>]
-    member _.``field sites retain all five edit shapes without including another record``() : Task = task {
+    member _.``field sites exactly cover fixture-authored coordinates for all five edit shapes``() : Task = task {
         fixture.AssertBuilt()
         let! response = fixture.Bridge.Find(args fixture.Project "Model.Card")
-        let kinds = response["sites"].AsArray() |> Seq.map (fun site -> stringValue site "kind") |> Set.ofSeq
-        Assert.Equal<Set<string>>(set [ "field-set-literal"; "field-set-update"; "field-set-mutation"; "field-pattern"; "field-read" ], kinds)
+        Assert.Equal<Set<string * int * int * int * int>>(expectedFieldShapeCoordinates (), actualFieldCoordinates response)
         Assert.All(response["sites"].AsArray(), fun site -> Assert.Contains("Model.Card.", stringValue site "symbolFullName"))
+    }
+
+    [<Fact>]
+    member _.``short Card field shorthand unions same-named records while qualified prefixes stay separate``() : Task = task {
+        fixture.AssertBuilt()
+        let bridge = fixture.Bridge
+        let! left = bridge.Find(args fixture.AmbiguousProject "Left.Card.Name")
+        let! right = bridge.Find(args fixture.AmbiguousProject "Right.Card.Name")
+        let! both = bridge.Find(args fixture.AmbiguousProject "Card.Name")
+        let expectedLeft = expectedAmbiguousCoordinates "Left" "left"
+        let expectedRight = expectedAmbiguousCoordinates "Right" "right"
+
+        Assert.Equal<Set<string * int * int * int * int>>(expectedLeft, actualFieldCoordinates left)
+        Assert.Equal<Set<string * int * int * int * int>>(expectedRight, actualFieldCoordinates right)
+        Assert.Equal<Set<string * int * int * int * int>>(Set.union expectedLeft expectedRight, actualFieldCoordinates both)
+        Assert.Equal<Set<string>>(set [ "FieldRepro.Ambiguous.Left.Card.Name" ], fieldSymbols left)
+        Assert.Equal<Set<string>>(set [ "FieldRepro.Ambiguous.Right.Card.Name" ], fieldSymbols right)
+        Assert.Equal<Set<string>>(Set.union (fieldSymbols left) (fieldSymbols right), fieldSymbols both)
     }
 
     [<Theory>]
