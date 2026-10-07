@@ -246,6 +246,34 @@ type FindFieldResolutionTests(fixture: FieldResolutionFixture) =
         Assert.All(response["sites"].AsArray(), fun site -> Assert.Contains("Model.Card.", stringValue site "symbolFullName"))
     }
 
+    [<Theory>]
+    [<InlineData("let anonymous = {| Label = \"synthetic\" |}\nlet anonymousRead = anonymous.Label", false)>]
+    [<InlineData("let anonymous = {| Label = missingValue |}\nlet anonymousRead = anonymous.Label", true)>]
+    [<InlineData("type Broken = MissingType\nlet unresolved (value: Broken) = value.MissingMember", true)>]
+    [<InlineData("type BrokenRecord = { Missing: MissingType }\nlet unresolved = { Missing = missingValue }", true)>]
+    [<InlineData("let unresolved (value: MissingType) = {| Label = value.MissingMember |}", true)>]
+    member _.``synthetic or erroneous symbols preserve unrelated dotted field sites``(extraSource: string, hasErrors: bool) : Task = task {
+        fixture.AssertBuilt()
+        let expected =
+            expectedCoordinates
+                source
+                "module FieldRepro.Model"
+                [ "field-set-literal", "    { Name = \"a\"; Load = (fun _ -> async { return None }); Attempts = 0; ``Part.Name`` = \"p\" }", "Name", 0
+                  "field-read", "let read (card: Card) = card.Name, card.Load 1L", "card.Name", 0
+                  "field-set-update", "let renamed (card: Card) = { card with Name = \"b\" }", "Name", 0
+                  "field-pattern", "let isA (card: Card) = match card with { Name = \"a\" } -> true | _ -> false", "Name", 0 ]
+        try
+            File.WriteAllText(fixture.Source, source + extraSource + "\n")
+            let! response = fixture.Bridge.Find(args fixture.Project "Model.Card.Name")
+            Assert.True(response.["coverage"].["complete"].GetValue<bool>(), response.ToJsonString())
+            Assert.Equal("matched", stringValue response "outcome")
+            Assert.Equal(0, response["projectsFailed"].GetValue<int>())
+            Assert.Equal<Set<string * int * int * int * int>>(expected, actualFieldCoordinates response)
+            if hasErrors then Assert.True(response["projectDiagnosticsTotalCount"].GetValue<int>() > 0)
+        finally
+            File.WriteAllText(fixture.Source, source)
+    }
+
     [<Fact>]
     member _.``short Card field shorthand unions same-named records while qualified prefixes stay separate``() : Task = task {
         fixture.AssertBuilt()

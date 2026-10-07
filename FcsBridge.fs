@@ -8262,13 +8262,16 @@ type internal FcsBridge
 
                             if allowDottedField && not wholeFieldTypeMatched then
                                 wholeFieldTypeMatched <-
-                                    match u.Symbol with
-                                    | :? FSharpEntity as entity ->
-                                        not entity.IsNamespace && not entity.IsFSharpModule && entityMatchesQuery entity
-                                    | :? FSharpField as field ->
-                                        field.DeclaringEntity
-                                        |> Option.exists entityMatchesQuery
-                                    | _ -> false // Values/members do not establish a declaring record type.
+                                    try
+                                        match u.Symbol with
+                                        | :? FSharpEntity as entity ->
+                                            not entity.IsNamespace && not entity.IsFSharpModule && entityMatchesQuery entity
+                                        | :? FSharpField as field ->
+                                            field.DeclaringEntity
+                                            |> Option.exists entityMatchesQuery
+                                        | _ -> false // Values/members do not establish a declaring record type.
+                                    with _ ->
+                                        false // Unresolved FCS metadata must not fail the entire project sweep.
 
                             if not u.IsFromDefinition && isQueriedField u then
                                 fieldCount <- fieldCount + 1
