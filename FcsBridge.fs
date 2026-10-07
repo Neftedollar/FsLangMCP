@@ -9520,7 +9520,7 @@ type internal FcsBridge
                             "No field use sites were found in the selected scope; this does not prove that the field declaration is absent."
                         else
                             "The field sweep is incomplete; do not infer absence from zero sites. Dotted-field candidates are withheld until the sweep can exclude a whole declaring-type match. Retry after resolving the coverage limitations."
-                    [ "hint", jstr $"{coverageHint} For kind='field', query is the declaring record type, with an optional field selector: find(query='Card', kind='field', field='Name'). With exact=true and no field selector, query='Card.Name' is also accepted. Bare field names are not resolved across records; an explicit field selector does not reinterpret query as a field name." ]
+                    [ ("hint", jstr $"{coverageHint} For kind='field', query is the declaring record type, with an optional field selector: find(query='Card', kind='field', field='Name'). With exact=true and no field selector, query='Card.Name' is also accepted. Bare field names are not resolved across records; an explicit field selector does not reinterpret query as a field name.") ]
                 elif matched = Some false && not (String.IsNullOrEmpty query) && query.Contains('.') then
                     let bare = query.Substring(query.LastIndexOf('.') + 1)
 
