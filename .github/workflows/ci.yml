@@ -50,6 +50,7 @@ jobs:
         run: python -m unittest -v scripts.tests.test_sdk_pin_preflight_e2e
 
       - name: Test (with coverage)
+        id: coverage_tests
         # coverlet.msbuild instruments FsLangMcp.dll via the ProjectReference graph (ADR-0001).
         # IncludeTestAssembly is no longer needed — prod and test code are in separate assemblies.
         env:
@@ -68,6 +69,15 @@ jobs:
             /p:CollectCoverage=true \
             /p:CoverletOutputFormat=cobertura \
             /p:CoverletOutput=./coverage/
+
+      - name: Upload coverage test results
+        if: always() && steps.coverage_tests.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-coverage-test-results
+          path: '${{ github.workspace }}/TestResults/test-results.trx'
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload test hang diagnostics
         if: failure()
@@ -135,4 +145,17 @@ jobs:
         run: dotnet build FsLangMcp.slnx --no-restore --configuration Release --warnaserror
 
       - name: Test with minimum SDK
-        run: dotnet test FsLangMcp.slnx --no-build --no-restore --configuration Release
+        id: minimum_sdk_tests
+        run: |
+          dotnet test FsLangMcp.slnx --no-build --no-restore --configuration Release \
+            --logger "trx;LogFileName=minimum-sdk-test-results.trx" \
+            --results-directory "$GITHUB_WORKSPACE/TestResults/minimum-sdk"
+
+      - name: Upload minimum SDK test results
+        if: always() && steps.minimum_sdk_tests.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: minimum-sdk-test-results
+          path: '${{ github.workspace }}/TestResults/minimum-sdk/minimum-sdk-test-results.trx'
+          if-no-files-found: error
+          retention-days: 30
