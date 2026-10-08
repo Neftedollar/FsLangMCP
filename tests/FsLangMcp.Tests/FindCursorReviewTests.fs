@@ -6,6 +6,7 @@ open System.Text
 open System.Text.Json.Nodes
 open System.Threading.Tasks
 open Xunit
+open Xunit.Abstractions
 open FsLangMcp.FcsBridge
 open FsLangMcp.Types
 open FsLangMcp.Tests.FindCursorIntegrationTests
@@ -22,7 +23,293 @@ let private args project : FindArgs =
 let private text (node: JsonNode) (key: string) = node[key].GetValue<string>()
 let private rows (node: JsonNode) = node["sites"].AsArray() |> Seq.map _.ToJsonString() |> Seq.toArray
 
+let private tryValue<'T> (key: string) (node: JsonNode) : 'T option =
+    match node with
+    | :? JsonObject as fields ->
+        match fields[key] with
+        | :? JsonValue as value ->
+            match value.TryGetValue<'T>() with
+            | true, result -> Some result
+            | false, _ -> None
+        | _ -> None
+    | _ -> None
+
+let private requireEnvelope condition message (node: JsonNode) =
+    if not condition then
+        let envelope = if isNull node then "<null>" else node.ToJsonString()
+        raise (Xunit.Sdk.XunitException($"{message}\nFull find envelope: {envelope}"))
+
+let private hasEmptySites (node: JsonNode) =
+    match node with
+    | :? JsonObject as fields ->
+        match fields["sites"] with
+        | :? JsonArray as sites -> sites.Count = 0
+        | _ -> false
+    | _ -> false
+
+// Absent optional contract fields stay absent. Present null/mistyped values are
+// not equivalent to a compatible typed value.
+let private optionalValue<'T> key predicate (fields: JsonObject) =
+    not (fields.ContainsKey key) || (tryValue<'T> key fields |> Option.exists predicate)
+
+let private optionalEquals key expected fields = optionalValue key ((=) expected) fields
+
+let private typedMetadata (fields: JsonObject) =
+    ([ "retryable"; "paginationRestartRequired"; "retrySameCursor"; "resultSetComplete"; "truncated";
+      "totalEstimateIsLowerBound"; "breakdownComplete"; "sitesTruncatedByBudget"; "responseTruncatedByBudget";
+      "projectDiagnosticsCountComplete"; "projectDiagnosticsTruncated"; "projectDiagnosticsTruncatedByBudget";
+      "perProjectTruncatedByBudget" ]
+    |> List.forall (fun key -> optionalValue<bool> key (fun _ -> true) fields))
+    && ([ "timeoutMs"; "responseConstructionAllowanceMs"; "elapsedMs"; "totalSites"; "matchedUseCount"
+          "pageOffset"; "pageSize"; "returnedSiteCount"; "cursorAdvancedBy"; "responseBudgetChars"; "sweepElapsedMs"
+          "projectsSwept"; "projectsRequested"; "projectsAnalyzed"; "projectsFailed"; "projectsMissing"
+          "projectsTimedOut"; "projectsBusy"; "projectsNotStarted"; "projectDiagnosticsTotalCount"
+          "projectDiagnosticsReturnedCount"; "perProjectTotalCount"; "perProjectReturnedCount" ]
+        |> List.forall (fun key -> optionalValue<int> key (fun count -> count >= 0) fields))
+
+let private isInitialResponseTimeout (node: JsonNode) =
+    match node with
+    | :? JsonObject as fields ->
+        typedMetadata fields
+        &&
+        (tryValue<string> "status" node = Some "partial"
+         || tryValue<string> "status" node = Some "unknown")
+        && tryValue<string> "errorKind" node = Some "find_response_timeout"
+        && tryValue<bool> "retryable" node = Some true
+        && tryValue<bool> "paginationRestartRequired" node = Some true
+        && tryValue<bool> "retrySameCursor" node = Some false
+        && hasEmptySites node
+        && tryValue<int> "pageOffset" node = Some 0
+        && tryValue<int> "returnedSiteCount" node = Some 0
+        && tryValue<int> "cursorAdvancedBy" node = Some 0
+        && tryValue<bool> "resultSetComplete" node = Some false
+        && tryValue<string> "deliveryStatus" node = Some "partial"
+        && tryValue<bool> "truncated" node = Some true
+        && tryValue<bool> "totalEstimateIsLowerBound" node = Some true
+        && tryValue<string> "paginationIncompleteReason" node = Some "deadline_incomplete"
+        && fields.ContainsKey("nextCursor")
+        && isNull fields["nextCursor"]
+        && isNull fields["errorCode"]
+    | _ -> false
+
+let private isContinuationValidationIncomplete cursor offset (node: JsonNode) =
+    match cursor, node with
+    | Some token, (:? JsonObject as fields) when not (String.IsNullOrWhiteSpace token) ->
+        let unchangedProgress key expected =
+            not (fields.ContainsKey key) || tryValue<int> key node = Some expected
+
+        tryValue<string> "status" node = Some "invalid_cursor"
+        && tryValue<string> "errorKind" node = Some "cursor_validation_incomplete"
+        && tryValue<bool> "retryable" node = Some true
+        && tryValue<bool> "paginationRestartRequired" node = Some false
+        && tryValue<bool> "retrySameCursor" node = Some true
+        && hasEmptySites node
+        && fields.ContainsKey("nextCursor")
+        && isNull fields["nextCursor"]
+        && isNull fields["errorCode"]
+        && unchangedProgress "pageOffset" offset
+        && unchangedProgress "returnedSiteCount" 0
+        && unchangedProgress "cursorAdvancedBy" 0
+        && typedMetadata fields
+        && optionalEquals "resultSetComplete" false fields
+        && optionalEquals "deliveryStatus" "partial" fields
+        && optionalEquals "truncated" true fields
+        && optionalEquals "totalEstimateIsLowerBound" true fields
+        && optionalEquals "paginationIncompleteReason" "deadline_incomplete" fields
+    | _ -> false
+
+let private isSucceededFind (node: JsonNode) =
+    match node with
+    | :? JsonObject as fields ->
+        tryValue<string> "status" node = Some "succeeded"
+        && isNull fields["errorKind"]
+        && isNull fields["errorCode"]
+        && typedMetadata fields
+        && optionalEquals "paginationRestartRequired" false fields
+        && optionalEquals "retrySameCursor" false fields
+        && optionalEquals "retryable" false fields
+        && optionalEquals "totalEstimateIsLowerBound" false fields
+        && optionalEquals "deliveryStatus" "complete" fields
+        && (not (fields.ContainsKey "paginationIncompleteReason") || isNull fields["paginationIncompleteReason"])
+        && (tryValue<int> "pageOffset" node |> Option.exists (fun count -> count >= 0))
+        && (tryValue<int> "totalSites" node |> Option.exists (fun count -> count > 0))
+        && (tryValue<int> "returnedSiteCount" node |> Option.exists (fun count -> count > 0))
+        && tryValue<int> "cursorAdvancedBy" node = tryValue<int> "returnedSiteCount" node
+        && (tryValue<bool> "resultSetComplete" node |> Option.isSome)
+        && (tryValue<bool> "truncated" node |> Option.isSome)
+        && (match fields["coverage"] with | :? JsonObject as coverage -> tryValue<bool> "complete" coverage = Some true && typedMetadata coverage | _ -> false)
+        && fields.ContainsKey "nextCursor"
+        && (isNull fields["nextCursor"] || (tryValue<string> "nextCursor" node |> Option.exists (String.IsNullOrWhiteSpace >> not)))
+        && (match fields["sites"] with | :? JsonArray as sites -> Some sites.Count = tryValue<int> "returnedSiteCount" node | _ -> false)
+    | _ -> false
+
+// Only a fully typed, zero-progress deadline envelope permits one identical
+// request. A stale cursor, missing evidence, or a second expiry remains a failure.
+let private successfulPageWithOneRetry emit description cursor offset (request: unit -> Task<JsonNode>) =
+    task {
+        let evidence = ResizeArray<string>()
+
+        let attempt number =
+            task {
+                try
+                    let! page = request ()
+                    let envelope = if isNull page then "<null>" else page.ToJsonString()
+                    evidence.Add($"{description} attempt={number}: {envelope}")
+                    emit evidence[evidence.Count - 1]
+                    return page
+                with error ->
+                    evidence.Add($"{description} attempt={number} threw: {error}")
+                    return raise error
+            }
+
+        let fail () =
+            let responses = String.concat "\n" evidence
+            raise (Xunit.Sdk.XunitException($"Expected a successful find page.\n{responses}"))
+
+        let! first = attempt 1
+        if isSucceededFind first then
+            return first
+        else
+            let retryable =
+                match cursor with
+                | None -> isInitialResponseTimeout first
+                | Some _ -> isContinuationValidationIncomplete cursor offset first
+
+            if not retryable then
+                return fail ()
+            else
+                let! second = attempt 2
+                if isSucceededFind second then return second else return fail ()
+    }
+
+[<NoEquality; NoComparison>]
+type private CompleteFind =
+    { FirstPage: JsonNode
+      Envelopes: string array
+      Rows: string array }
+
+let private cursorIdentity offset token =
+    let decoded = JsonNode.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(token)))
+    requireEnvelope (tryValue<int> "v" decoded = Some 2 && tryValue<string> "tool" decoded = Some "find") "Expected a v2 find cursor." decoded
+    requireEnvelope (tryValue<int> "offset" decoded = Some offset) "Cursor offset differs from delivered site count." decoded
+    let query, snapshot = tryValue<string> "query" decoded, tryValue<string> "snapshot" decoded
+    requireEnvelope (query |> Option.exists (fun value -> value.Length = 43)) "Cursor omitted a valid query identity." decoded
+    requireEnvelope (snapshot |> Option.exists (fun value -> value.Length = 43)) "Cursor omitted a valid snapshot identity." decoded
+    query.Value, snapshot.Value
+
+let private collectCompletePositiveFind emit description expectedCount (request: string option -> Task<JsonNode>) =
+    task {
+        let collected = ResizeArray<string>()
+        let envelopes = ResizeArray<string>()
+        let seenCursors = Collections.Generic.HashSet<string>(StringComparer.Ordinal)
+        let mutable cursor = None
+        let mutable firstPage = null
+        let mutable identity = None
+        let mutable complete = false
+        let mutable pageNumber = 0
+
+        while not complete do
+            let offset = collected.Count
+            let requestedCursor = cursor
+            let! page =
+                successfulPageWithOneRetry
+                    emit
+                    $"{description} page={pageNumber} offset={offset}"
+                    requestedCursor
+                    offset
+                    (fun () -> request requestedCursor)
+
+            if isNull firstPage then firstPage <- page
+            envelopes.Add(page.ToJsonString())
+
+            let pageRows =
+                match page["sites"] with
+                | :? JsonArray -> rows page
+                | _ -> [||]
+
+            let nextCursor = tryValue<string> "nextCursor" page
+            let resultSetComplete = tryValue<bool> "resultSetComplete" page
+            let coverageComplete = tryValue<bool> "complete" page["coverage"]
+
+            requireEnvelope (pageRows.Length > 0) $"{description} returned no positive site evidence." page
+            requireEnvelope (tryValue<int> "pageOffset" page = Some offset) $"{description} returned the wrong page offset." page
+            requireEnvelope (tryValue<int> "returnedSiteCount" page = Some pageRows.Length) $"{description} returned an inconsistent site count." page
+            requireEnvelope (tryValue<int> "cursorAdvancedBy" page = Some pageRows.Length) $"{description} did not advance by the delivered sites." page
+            requireEnvelope (coverageComplete = Some true) $"{description} did not completely analyze project coverage." page
+            requireEnvelope (expectedCount > 0 && tryValue<int> "totalSites" page = Some expectedCount) $"{description} disagrees with independent expected site count." page
+            // resultSetComplete is per response, not an exhausted-traversal flag:
+            // production requires offset zero AND every site in that one page.
+            requireEnvelope (resultSetComplete = Some(offset = 0 && pageRows.Length = expectedCount)) $"{description} contradicted single-response completeness." page
+
+            collected.AddRange(pageRows)
+
+            match nextCursor with
+            | Some token ->
+                requireEnvelope (not (String.IsNullOrWhiteSpace token)) $"{description} returned a blank continuation cursor." page
+                requireEnvelope (tryValue<bool> "truncated" page = Some true) $"{description} hid remaining sites." page
+                requireEnvelope (collected.Count < expectedCount) $"{description} returned a cursor after all sites were delivered." page
+                requireEnvelope (seenCursors.Add token) $"{description} repeated a continuation cursor." page
+                let currentIdentity = cursorIdentity collected.Count token
+                requireEnvelope (identity.IsNone || identity = Some currentIdentity) $"{description} changed query/snapshot while paginating." page
+                identity <- Some currentIdentity
+                cursor <- Some token
+            | None ->
+                let fields = page.AsObject()
+                requireEnvelope (collected.Count = expectedCount && fields.ContainsKey("nextCursor") && isNull fields["nextCursor"]) $"{description} ended before all expected sites were delivered or returned a malformed cursor." page
+                requireEnvelope (tryValue<bool> "truncated" page = Some false) $"{description} ended with unresolved site truncation." page
+                complete <- true
+
+            pageNumber <- pageNumber + 1
+            requireEnvelope (pageNumber <= expectedCount) $"{description} exceeded the positive-site traversal bound." page
+
+        requireEnvelope (collected.Count > 0) $"{description} completed without expected positive sites." firstPage
+        requireEnvelope (Seq.distinct collected |> Seq.length = collected.Count) $"{description} repeated canonical site rows." firstPage
+
+        return
+            { FirstPage = firstPage
+              Envelopes = envelopes.ToArray()
+              Rows = collected.ToArray() }
+    }
+
+let private initialCursorWithPositiveEvidence emit description expectedCount (request: unit -> Task<JsonNode>) =
+    task {
+        let! page = successfulPageWithOneRetry emit description None 0 request
+        let pageRows = match page["sites"] with | :? JsonArray -> rows page | _ -> [||]
+        let cursor = tryValue<string> "nextCursor" page
+        requireEnvelope (pageRows.Length = 1) $"{description} did not return exactly one site." page
+        requireEnvelope (tryValue<int> "pageOffset" page = Some 0) $"{description} did not begin at offset zero." page
+        requireEnvelope (tryValue<int> "returnedSiteCount" page = Some 1) $"{description} returned an inconsistent site count." page
+        requireEnvelope (tryValue<int> "cursorAdvancedBy" page = Some 1) $"{description} did not advance by one site." page
+        requireEnvelope (tryValue<bool> "complete" page["coverage"] = Some true) $"{description} lacked complete project coverage." page
+        requireEnvelope (cursor |> Option.exists (String.IsNullOrWhiteSpace >> not)) $"{description} did not return the required continuation cursor." page
+        requireEnvelope (tryValue<int> "totalSites" page = Some expectedCount && expectedCount > 1 && tryValue<bool> "resultSetComplete" page = Some false) $"{description} lacked the expected additional sites." page
+        cursorIdentity 1 cursor.Value |> ignore
+        return cursor.Value, page
+    }
+
+// Ground truth comes from the physical fixture, not from find's reported total.
+let private expectedFixtureSites path =
+    File.ReadAllLines(path)
+    |> Array.mapi (fun index line ->
+        [| for occurrence in System.Text.RegularExpressions.Regex.Matches(line, @"\btarget\b") ->
+               Path.GetFullPath(path), index + 1, occurrence.Index, occurrence.Index + occurrence.Length |])
+    |> Array.concat
+
+let private assertFixtureSites expected (complete: CompleteFind) =
+    let actual =
+        complete.Rows |> Array.map (fun row ->
+            let site = JsonNode.Parse(row)
+            let range = site["range"]
+            Path.GetFullPath(text site "file"), range["startLine"].GetValue<int>(), range["startColumn"].GetValue<int>(), range["endColumn"].GetValue<int>())
+    Assert.True((expected = actual), String.concat "\n" complete.Envelopes)
+    Assert.Equal<(string * int * int * int) array>(expected, actual)
+
 let private assertRejected kind restart (node: JsonNode) =
+    requireEnvelope (tryValue<string> "status" node = Some "invalid_cursor") "Expected an invalid cursor response." node
+    requireEnvelope (tryValue<string> "errorKind" node = Some kind) $"Expected cursor error kind '{kind}'." node
+    requireEnvelope (tryValue<bool> "paginationRestartRequired" node = Some restart) "Unexpected restart guidance." node
+    requireEnvelope (tryValue<bool> "retrySameCursor" node = Some(not restart)) "Unexpected same-cursor retry guidance." node
+    requireEnvelope (hasEmptySites node) "Rejected cursor response returned sites." node
     Assert.Equal("invalid_cursor", text node "status")
     Assert.Equal(kind, text node "errorKind")
     Assert.Equal(restart, node["paginationRestartRequired"].GetValue<bool>())
@@ -42,7 +329,158 @@ let private overloadSource =
           "let call = C.target value"
           "let again = C.target 2" ]
 
-type FindCursorReviewTests(fixture: FindCursorFixture) =
+type FindCursorPositiveEvidencePolicyTests() =
+    [<Fact>]
+    member _.``positive evidence policy rejects malformed expiry and repeated expiry without a third call``() : Task =
+        task {
+            let initial = JsonNode.Parse("""{"status":"partial","errorKind":"find_response_timeout","retryable":true,"paginationRestartRequired":true,"retrySameCursor":false,"sites":[],"pageOffset":0,"returnedSiteCount":0,"cursorAdvancedBy":0,"resultSetComplete":false,"deliveryStatus":"partial","truncated":true,"totalEstimateIsLowerBound":true,"paginationIncompleteReason":"deadline_incomplete","nextCursor":null}""")
+            let continuation = JsonNode.Parse("""{"status":"invalid_cursor","errorKind":"cursor_validation_incomplete","retryable":true,"paginationRestartRequired":false,"retrySameCursor":true,"sites":[],"nextCursor":null}""")
+            let healthy = JsonNode.Parse("""{"status":"succeeded","sites":[{"id":1}],"totalSites":1,"pageOffset":0,"returnedSiteCount":1,"cursorAdvancedBy":1,"coverage":{"complete":true},"resultSetComplete":true,"truncated":false,"nextCursor":null}""")
+            for cursor, expiry in [ None, initial; Some "unchanged-input-token", continuation ] do
+                let variants = ResizeArray<JsonNode>()
+                for field in expiry.AsObject() do
+                    let missing = expiry.DeepClone()
+                    missing.AsObject().Remove(field.Key) |> ignore
+                    variants.Add(missing)
+                    let wrongType = expiry.DeepClone()
+                    wrongType[field.Key] <- JsonValue.Create(42)
+                    variants.Add(wrongType)
+                for key, value in
+                    [ "sites", "[{}]"; "pageOffset", "9"; "returnedSiteCount", "1"; "cursorAdvancedBy", "1"
+                      "nextCursor", "\"unexpected\""; "errorCode", "\"unexpected\""
+                      "status", "\"unknown\""; "errorKind", "\"cursor_stale\""; "errorKind", "\"find_timeout\""
+                      "resultSetComplete", "true"; "deliveryStatus", "\"complete\""; "truncated", "false"
+                      "totalEstimateIsLowerBound", "false"; "paginationIncompleteReason", "\"other\"" ] do
+                    // Unknown is a legal initial expiry, but never continuation success.
+                    if key <> "status" || cursor.IsSome then
+                        let malformed = expiry.DeepClone()
+                        malformed[key] <- JsonNode.Parse(value)
+                        variants.Add(malformed)
+                for malformed in variants do
+                    let mutable calls = 0
+                    let messages = ResizeArray<string>()
+                    let! error = Assert.ThrowsAsync<Xunit.Sdk.XunitException>(fun () ->
+                        successfulPageWithOneRetry messages.Add "negative expiry proof" cursor 0 (fun () ->
+                            calls <- calls + 1
+                            Task.FromResult(if calls = 1 then malformed else healthy)) :> Task)
+                    Assert.Equal(1, calls)
+                    Assert.Contains(malformed.ToJsonString(), error.Message)
+                let mutable calls = 0
+                let! repeated = Assert.ThrowsAsync<Xunit.Sdk.XunitException>(fun () ->
+                    successfulPageWithOneRetry ignore "repeated expiry proof" cursor 0 (fun () ->
+                        calls <- calls + 1
+                        Task.FromResult(expiry)) :> Task)
+                Assert.Equal(2, calls)
+                Assert.Contains("attempt=1", repeated.Message)
+                Assert.Contains("attempt=2", repeated.Message)
+        }
+
+    [<Fact>]
+    member _.``positive success rejects missing mistyped and contradictory contract evidence``() : Task =
+        task {
+            let healthy = JsonNode.Parse("""{"status":"succeeded","sites":[{"id":1}],"totalSites":1,"pageOffset":0,"returnedSiteCount":1,"cursorAdvancedBy":1,"coverage":{"complete":true},"resultSetComplete":true,"truncated":false,"nextCursor":null}""")
+            let variants = ResizeArray<JsonNode>()
+            // All required positive fields: absence, null and wrong type are distinct.
+            for key in [ "status"; "sites"; "totalSites"; "pageOffset"; "returnedSiteCount"; "cursorAdvancedBy"; "coverage"; "resultSetComplete"; "truncated"; "nextCursor" ] do
+                let missing = healthy.DeepClone()
+                missing.AsObject().Remove(key) |> ignore
+                variants.Add(missing)
+                if key <> "nextCursor" then
+                    let nullValue = healthy.DeepClone()
+                    nullValue[key] <- null
+                    variants.Add(nullValue)
+                let mistyped = healthy.DeepClone()
+                mistyped[key] <- JsonValue.Create("wrong")
+                variants.Add(mistyped)
+            // Routing flags are absent in real success pages; if supplied they must
+            // be typed false, never null, strings, numbers or contradictory true.
+            for key in [ "paginationRestartRequired"; "retrySameCursor"; "retryable"; "totalEstimateIsLowerBound" ] do
+                let compatible = healthy.DeepClone()
+                compatible[key] <- JsonValue.Create(false)
+                let! _ = collectCompletePositiveFind ignore "typed optional success flag" 1 (fun _ -> Task.FromResult(compatible))
+                for value in [ "null"; "\"true\""; "42"; "true" ] do
+                    let malformed = healthy.DeepClone()
+                    malformed[key] <- JsonNode.Parse(value)
+                    variants.Add(malformed)
+            for key in [ "breakdownComplete"; "sitesTruncatedByBudget"; "responseTruncatedByBudget"; "projectDiagnosticsCountComplete"; "projectDiagnosticsTruncated"; "projectDiagnosticsTruncatedByBudget"; "perProjectTruncatedByBudget" ] do
+                for value in [ "null"; "\"false\""; "42" ] do
+                    let malformed = healthy.DeepClone()
+                    malformed[key] <- JsonNode.Parse(value)
+                    variants.Add(malformed)
+            for key in [ "timeoutMs"; "responseConstructionAllowanceMs"; "elapsedMs"; "totalSites"; "matchedUseCount"; "pageOffset"; "pageSize"; "returnedSiteCount"; "cursorAdvancedBy"; "responseBudgetChars"; "sweepElapsedMs"; "projectsSwept"; "projectsRequested"; "projectsAnalyzed"; "projectsFailed"; "projectsMissing"; "projectsTimedOut"; "projectsBusy"; "projectsNotStarted"; "projectDiagnosticsTotalCount"; "projectDiagnosticsReturnedCount"; "perProjectTotalCount"; "perProjectReturnedCount" ] do
+                for value in [ "null"; "\"0\""; "false"; "-1" ] do
+                    let malformed = healthy.DeepClone()
+                    malformed[key] <- JsonNode.Parse(value)
+                    variants.Add(malformed)
+            for malformed in variants do
+                let mutable calls = 0
+                let! failure = Assert.ThrowsAsync<Xunit.Sdk.XunitException>(fun () ->
+                    collectCompletePositiveFind ignore "typed positive proof" 1 (fun _ ->
+                        calls <- calls + 1
+                        Task.FromResult(if calls = 1 then malformed else healthy)) :> Task)
+                Assert.Equal(1, calls)
+                Assert.Contains(malformed.ToJsonString(), failure.Message)
+            // Missing optional routing flags is the actual legal success schema.
+            let! control = collectCompletePositiveFind ignore "absent optional success flags" 1 (fun _ -> Task.FromResult(healthy))
+            Assert.Single(control.Rows) |> ignore
+        }
+
+    [<Fact>]
+    member _.``complete positive traversal rejects missing empty skipped duplicate and contradictory pages``() : Task =
+        task {
+            let hash = String.replicate 43 "A"
+            let token = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{{\"v\":2,\"tool\":\"find\",\"offset\":1,\"query\":\"{hash}\",\"snapshot\":\"{hash}\"}}"))
+            let first = JsonNode.Parse($"{{\"status\":\"succeeded\",\"sites\":[{{\"id\":1}}],\"totalSites\":2,\"pageOffset\":0,\"returnedSiteCount\":1,\"cursorAdvancedBy\":1,\"coverage\":{{\"complete\":true}},\"resultSetComplete\":false,\"truncated\":true,\"nextCursor\":\"{token}\"}}")
+            let last = JsonNode.Parse("""{"status":"succeeded","sites":[{"id":2}],"totalSites":2,"pageOffset":1,"returnedSiteCount":1,"cursorAdvancedBy":1,"coverage":{"complete":true},"resultSetComplete":false,"truncated":false,"nextCursor":null}""")
+            let messages = ResizeArray<string>()
+            let mutable calls = 0
+            let! complete = collectCompletePositiveFind messages.Add "healthy two-page control" 2 (fun cursor ->
+                calls <- calls + 1
+                Assert.Equal<string option>((if calls = 1 then None else Some token), cursor)
+                Task.FromResult(if calls = 1 then first else last))
+            Assert.Equal(2, complete.Rows.Length)
+            for key, value in
+                [ "sites", "[]"; "sites", "null"; "sites", "[{\"id\":1}]"
+                  "pageOffset", "0"; "returnedSiteCount", "0"; "cursorAdvancedBy", "0"
+                  "totalSites", "1"; "coverage", "{\"complete\":false}"
+                  "resultSetComplete", "true"; "truncated", "true"; "nextCursor", "42"
+                  "errorKind", "\"find_response_timeout\""; "paginationRestartRequired", "true" ] do
+                let malformed = last.DeepClone()
+                malformed[key] <- JsonNode.Parse(value)
+                let mutable attempts = 0
+                let! error = Assert.ThrowsAsync<Xunit.Sdk.XunitException>(fun () ->
+                    collectCompletePositiveFind ignore "invalid complete page" 2 (fun _ ->
+                        attempts <- attempts + 1
+                        Task.FromResult(if attempts = 1 then first else malformed)) :> Task)
+                Assert.Equal(2, attempts)
+                Assert.Contains("find", error.Message, StringComparison.OrdinalIgnoreCase)
+            let incomplete = last.DeepClone()
+            incomplete.AsObject().Remove("nextCursor") |> ignore
+            let mutable requests = 0
+            let! _ = Assert.ThrowsAsync<Xunit.Sdk.XunitException>(fun () ->
+                collectCompletePositiveFind ignore "missing terminal cursor" 2 (fun _ ->
+                    requests <- requests + 1
+                    Task.FromResult(if requests = 1 then first else incomplete)) :> Task)
+            Assert.Equal(2, requests)
+            // Changing either opaque identity on a minted continuation is not tolerated.
+            for key in [ "query"; "snapshot"; "offset" ] do
+                let decoded = JsonNode.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(token)))
+                decoded[key] <- if key = "offset" then JsonValue.Create(7) :> JsonNode else JsonValue.Create(String.replicate 43 "B") :> JsonNode
+                let malformed = first.DeepClone()
+                malformed["pageOffset"] <- JsonValue.Create(1)
+                malformed["totalSites"] <- JsonValue.Create(3)
+                malformed["nextCursor"] <- JsonValue.Create(Convert.ToBase64String(Encoding.UTF8.GetBytes(decoded.ToJsonString())))
+                let beginning = first.DeepClone()
+                beginning["totalSites"] <- JsonValue.Create(3)
+                let mutable attempts = 0
+                let! _ = Assert.ThrowsAsync<Xunit.Sdk.XunitException>(fun () ->
+                    collectCompletePositiveFind ignore "changed cursor identity" 3 (fun _ ->
+                        attempts <- attempts + 1
+                        Task.FromResult(if attempts = 1 then beginning else malformed)) :> Task)
+                Assert.Equal(2, attempts)
+        }
+
+type FindCursorReviewTests(fixture: FindCursorFixture, output: ITestOutputHelper) =
     interface IClassFixture<FindCursorFixture>
 
     [<Fact>]
@@ -82,6 +520,75 @@ type FindCursorReviewTests(fixture: FindCursorFixture) =
             let! retried = FcsBridge().Find({ request with cursor = Some cursor; maxResults = Some 100; timeoutMs = Some 60_000 })
             let! complete = FcsBridge().Find({ request with maxResults = Some 100 })
             Assert.Equal<string array>(rows complete, Array.append (rows first) (rows retried))
+        }
+
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    member _.``complete four-site diagnostic traversal recovers only the forced deadline page``(continuationExpiry: bool) : Task =
+        task {
+            Assert.True(fixture.BuildExitCode = 0, fixture.BuildLog)
+            let originalSource, originalProject = File.ReadAllText(fixture.ASource), File.ReadAllText(fixture.AProject)
+            let requestedCursors = ResizeArray<string option>()
+            let expected = expectedFixtureSites fixture.ASource
+            Assert.Equal(4, expected.Length)
+            let mutable expired = false
+            let mutable expireThisRequest = false
+            let mutable signal = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let bridge =
+                FcsBridge(
+                    findResponseDeadlineSignalOverride = (fun () ->
+                        signal <- TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+                        signal.Task :> Task),
+                    findResponseConstructionBeforeStepOverride = (fun phase _ ->
+                        if expireThisRequest && phase = "response-planning" then
+                            expired <- true
+                            signal.TrySetResult(()) |> ignore))
+            let requests = ResizeArray<FindArgs>()
+            let ledger = ResizeArray<string>()
+            let mutable failedRequest: (FindArgs * string array) option = None
+            try
+                File.WriteAllText(fixture.AProject, originalProject.Replace("</PropertyGroup>", "<OtherFlags>--maxerrors:500</OtherFlags></PropertyGroup>", StringComparison.Ordinal))
+                File.WriteAllText(fixture.ASource, originalSource + "\n" + String.concat "\n" [ for index in 0 .. 204 -> $"let diagnostic{index:D3} = missing{index:D3}" ])
+                let request = { args fixture.AProject with maxResults = Some 1 }
+                let messages = ResizeArray<string>()
+                let emit message = messages.Add(message); output.WriteLine(message)
+                let! complete =
+                    collectCompletePositiveFind emit "forced diagnostic response expiry" expected.Length (fun cursor ->
+                        task {
+                            requestedCursors.Add cursor
+                            let currentRequest =
+                                match failedRequest with
+                                | Some(previous, previousLedger) ->
+                                    Assert.Equal<string option>(previous.cursor, cursor)
+                                    Assert.Equal<string array>(previousLedger, ledger.ToArray())
+                                    previous // exactly the same immutable request instance
+                                | None -> { request with cursor = cursor }
+                            requests.Add(currentRequest)
+                            expireThisRequest <- not expired && cursor.IsSome = continuationExpiry
+                            let! page = bridge.Find(currentRequest)
+                            if isSucceededFind page then
+                                Assert.Equal(ledger.Count, page["pageOffset"].GetValue<int>())
+                                ledger.AddRange(rows page)
+                                failedRequest <- None
+                            else
+                                Assert.Empty(page["sites"].AsArray())
+                                failedRequest <- Some(currentRequest, ledger.ToArray())
+                            return page
+                        })
+                Assert.True(expired)
+                Assert.Equal(5, requestedCursors.Count) // four advancing pages, one zero-progress expiry
+                let failedIndex = if continuationExpiry then 1 else 0
+                Assert.Equal<string option>(requestedCursors[failedIndex], requestedCursors[failedIndex + 1])
+                Assert.Same(requests[failedIndex], requests[failedIndex + 1])
+                Assert.Equal(5, requests.Count)
+                Assert.Contains(messages, fun message -> message.Contains((if continuationExpiry then "cursor_validation_incomplete" else "find_response_timeout"), StringComparison.Ordinal))
+                Assert.Equal(expected.Length, complete.Rows.Length)
+                Assert.Equal<string array>(complete.Rows, ledger.ToArray())
+                assertFixtureSites expected complete
+            finally
+                File.WriteAllText(fixture.ASource, originalSource)
+                File.WriteAllText(fixture.AProject, originalProject)
         }
 
     [<Fact>]
@@ -248,19 +755,61 @@ type FindCursorReviewTests(fixture: FindCursorFixture) =
                 let source = originalSource + "\n" + errors
                 File.WriteAllText(fixture.ASource, source)
                 let request = args fixture.AProject
-                let! first = FcsBridge().Find(request)
+                let expected = expectedFixtureSites fixture.ASource
+                Assert.Equal(4, expected.Length)
+                let cursorBridge = FcsBridge()
+                let! cursor, first =
+                    initialCursorWithPositiveEvidence
+                        output.WriteLine
+                        "diagnostic refresh cursor source"
+                        expected.Length
+                        (fun () -> cursorBridge.Find(request))
+                requireEnvelope
+                    (tryValue<int> "projectDiagnosticsTotalCount" first = Some diagnosticCount)
+                    "The cursor source did not observe every diagnostic."
+                    first
                 Assert.Equal(diagnosticCount, first["projectDiagnosticsTotalCount"].GetValue<int>())
-                let cursor = text first "nextCursor"
-                let! original = FcsBridge().Find({ request with maxResults = Some 100 })
+
+                let originalBridge = FcsBridge()
+                let! original =
+                    collectCompletePositiveFind output.WriteLine "original diagnostic baseline" expected.Length (fun cursor ->
+                        originalBridge.Find({ request with maxResults = Some 100; cursor = cursor }))
+                assertFixtureSites expected original
+
                 File.WriteAllText(fixture.ASource, source.Replace($"missing{diagnosticCount - 1:D3}", "changedXYZ", StringComparison.Ordinal))
-                let! changed = FcsBridge().Find({ request with maxResults = Some 100 })
-                Assert.Equal<string array>(rows original, rows changed)
-                Assert.Equal(diagnosticCount, changed["projectDiagnosticsTotalCount"].GetValue<int>())
+                let changedBridge = FcsBridge()
+                let! changed =
+                    collectCompletePositiveFind output.WriteLine "changed diagnostic baseline" expected.Length (fun cursor ->
+                        changedBridge.Find({ request with maxResults = Some 100; cursor = cursor }))
+                Assert.Equal<(string * int * int * int) array>(expected, expectedFixtureSites fixture.ASource)
+                assertFixtureSites expected changed
+
+                let comparisonEvidence =
+                    String.concat "\n" ([| "Original full find envelopes:" |] |> Array.append original.Envelopes)
+                    + "\nChanged full find envelopes:\n"
+                    + String.concat "\n" changed.Envelopes
+                Assert.True(original.Rows = changed.Rows, comparisonEvidence)
+                Assert.Equal<string array>(original.Rows, changed.Rows)
+                requireEnvelope
+                    (tryValue<int> "projectDiagnosticsTotalCount" changed.FirstPage = Some diagnosticCount)
+                    "The changed baseline did not observe every diagnostic."
+                    changed.FirstPage
+                Assert.Equal(diagnosticCount, changed.FirstPage["projectDiagnosticsTotalCount"].GetValue<int>())
                 if diagnosticCount > 200 then
-                    Assert.True(original["projectDiagnosticsTruncated"].GetValue<bool>())
-                    Assert.Equal(original["projectDiagnostics"].ToJsonString(), changed["projectDiagnostics"].ToJsonString())
+                    requireEnvelope
+                        (tryValue<bool> "projectDiagnosticsTruncated" original.FirstPage = Some true)
+                        "The original diagnostic projection was expected to be truncated."
+                        original.FirstPage
+                    Assert.True(original.FirstPage["projectDiagnosticsTruncated"].GetValue<bool>())
+                    Assert.True(
+                        original.FirstPage["projectDiagnostics"].ToJsonString() = changed.FirstPage["projectDiagnostics"].ToJsonString(),
+                        comparisonEvidence)
+                    Assert.Equal(original.FirstPage["projectDiagnostics"].ToJsonString(), changed.FirstPage["projectDiagnostics"].ToJsonString())
                 else
-                    Assert.NotEqual<string>(original["projectDiagnostics"].ToJsonString(), changed["projectDiagnostics"].ToJsonString())
+                    Assert.True(
+                        original.FirstPage["projectDiagnostics"].ToJsonString() <> changed.FirstPage["projectDiagnostics"].ToJsonString(),
+                        comparisonEvidence)
+                    Assert.NotEqual<string>(original.FirstPage["projectDiagnostics"].ToJsonString(), changed.FirstPage["projectDiagnostics"].ToJsonString())
                 let! continuation = FcsBridge().Find({ request with cursor = Some cursor })
                 assertRejected "cursor_stale" true continuation
             finally
