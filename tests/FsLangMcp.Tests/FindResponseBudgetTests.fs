@@ -3,6 +3,7 @@ module FsLangMcp.Tests.FindResponseBudgetTests
 open System
 open System.Diagnostics
 open System.IO
+open System.Security.Cryptography
 open System.Text.Json.Nodes
 open System.Threading.Tasks
 open Xunit
@@ -142,6 +143,465 @@ let private findArgs (fixture: FindBudgetFixture) cursor =
       maxResults = Some 1000
       timeoutMs = None
       cursor = cursor }
+
+let private tryValue<'T> (key: string) (page: JsonNode) : 'T option =
+    match page with
+    | :? JsonObject as fields ->
+        match fields[key] with
+        | :? JsonValue as value ->
+            match value.TryGetValue<'T>() with
+            | true, result -> Some result
+            | false, _ -> None
+        | _ -> None
+    | _ -> None
+
+let private isInitialResponseTimeout (page: JsonNode) =
+    match page with
+    | :? JsonObject as fields ->
+        (tryValue<string> "status" page = Some "partial"
+         || tryValue<string> "status" page = Some "unknown")
+        && tryValue<string> "errorKind" page = Some "find_response_timeout"
+        && tryValue<bool> "retryable" page = Some true
+        && tryValue<bool> "paginationRestartRequired" page = Some true
+        && tryValue<bool> "retrySameCursor" page = Some false
+        && fields.ContainsKey("nextCursor")
+        && isNull fields["nextCursor"]
+        && isNull fields["errorCode"]
+    | _ -> false
+
+let private tryInitialCursor (page: JsonNode) =
+    match page with
+    | :? JsonObject as fields
+        when isNull fields["errorKind"]
+             && isNull fields["errorCode"]
+             && (tryValue<string> "status" page = Some "succeeded"
+                 || tryValue<string> "status" page = Some "partial")
+             && tryValue<int> "pageOffset" page = Some 0
+             && tryValue<int> "returnedSiteCount" page = Some 1
+             && tryValue<int> "cursorAdvancedBy" page = Some 1 ->
+        match fields["sites"], tryValue<string> "nextCursor" page with
+        | (:? JsonArray as sites), Some cursor when sites.Count = 1 && not (String.IsNullOrWhiteSpace cursor) ->
+            match tryDecodeFind cursor with
+            | Ok payload when payload.Offset = 1 -> Some cursor
+            | _ -> None
+        | _ -> None
+    | _ -> None
+
+// Only the ordinary one-site setup may make one additional request. The caller
+// closes over identical initial arguments; continuation/overflow calls never use this helper.
+let private initialCursorWithOneRetry (writeDiagnostic: string -> unit) (request: unit -> Task<JsonNode>) =
+    task {
+        let evidence = ResizeArray<string>()
+
+        let record message =
+            evidence.Add message
+            writeDiagnostic message
+
+        let attempt number =
+            task {
+                try
+                    let! page = request ()
+                    record $"initial-page attempt={number}: {renderToken page}"
+                    return page
+                with error ->
+                    record $"initial-page attempt={number} threw: {error}"
+                    return raise error
+            }
+
+        let fail () =
+            let responses = String.concat "\n" evidence
+            raise (Xunit.Sdk.XunitException($"Expected a one-site initial page with an offset-one cursor.\n{responses}"))
+
+        let! first = attempt 1
+
+        match tryInitialCursor first with
+        | Some cursor -> return cursor
+        | None when isInitialResponseTimeout first ->
+            let! second = attempt 2
+
+            match tryInitialCursor second with
+            | Some cursor -> return cursor
+            | None -> return fail ()
+        | None -> return fail ()
+    }
+
+let private scriptedInitialTimeout status =
+    jobj
+        [ "status", jstr status
+          "errorKind", jstr "find_response_timeout"
+          "retryable", jbool true
+          "paginationRestartRequired", jbool true
+          "retrySameCursor", jbool false
+          "nextCursor", null ]
+    :> JsonNode
+
+let private scriptedInitialPage status =
+    jobj
+        [ "status", jstr status
+          "pageOffset", jint 0
+          "returnedSiteCount", jint 1
+          "cursorAdvancedBy", jint 1
+          "sites", JsonArray(jobj [] :> JsonNode) :> JsonNode
+          "nextCursor", jstr (encodeFindV2 1 (textIdentityV2 "query") (textIdentityV2 "snapshot")) ]
+    :> JsonNode
+
+let private isContinuationValidationIncomplete cursor offset (page: JsonNode) =
+    match cursor, page with
+    | Some token, (:? JsonObject as fields) ->
+        let unchangedProgress key expected =
+            not (fields.ContainsKey key) || tryValue<int> key page = Some expected
+
+        let validInput =
+            match tryDecodeFind token with
+            | Ok payload -> payload.Offset = offset
+            | Error _ -> false
+
+        let emptySites =
+            match fields["sites"] with
+            | :? JsonArray as sites -> sites.Count = 0
+            | _ -> false
+
+        validInput
+        && tryValue<string> "status" page = Some "invalid_cursor"
+        && tryValue<string> "errorKind" page = Some "cursor_validation_incomplete"
+        && tryValue<bool> "retryable" page = Some true
+        && tryValue<bool> "paginationRestartRequired" page = Some false
+        && tryValue<bool> "retrySameCursor" page = Some true
+        && fields.ContainsKey("nextCursor")
+        && isNull fields["nextCursor"]
+        && isNull fields["errorCode"]
+        && emptySites
+        && unchangedProgress "pageOffset" offset
+        && unchangedProgress "returnedSiteCount" 0
+        && unchangedProgress "cursorAdvancedBy" 0
+    | _ -> false
+
+// The closure reuses the same bridge and immutable arguments. Neither failed
+// attempt enters the caller's site/offset ledger, and there is no restart path.
+let private traversalPageWithOneRetry writeDiagnostic cursor offset (request: unit -> Task<JsonNode>) =
+    task {
+        let succeeded (page: JsonNode) =
+            match page with
+            | :? JsonObject as fields ->
+                tryValue<string> "status" page = Some "succeeded"
+                && isNull fields["errorKind"]
+                && isNull fields["errorCode"]
+            | _ -> false
+
+        let! first = request ()
+        if succeeded first then
+            return first
+        else
+            writeDiagnostic $"traversal attempt=1: {renderToken first}"
+            if not (isContinuationValidationIncomplete cursor offset first) then
+                return raise (Xunit.Sdk.XunitException($"Unexpected traversal response: {renderToken first}"))
+            else
+                let! second = request ()
+                writeDiagnostic $"traversal attempt=2: {renderToken second}"
+                if not (succeeded second) then
+                    return raise (Xunit.Sdk.XunitException($"Continuation retry failed. First: {renderToken first}\nSecond: {renderToken second}"))
+                else
+                    return second
+    }
+
+let private scriptedValidationIncomplete () =
+    jobj
+        [ "status", jstr "invalid_cursor"
+          "errorKind", jstr "cursor_validation_incomplete"
+          "retryable", jbool true
+          "paginationRestartRequired", jbool false
+          "retrySameCursor", jbool true
+          "sites", JsonArray() :> JsonNode
+          "nextCursor", null ]
+    :> JsonNode
+
+[<Theory>]
+[<InlineData(false)>]
+[<InlineData(true)>]
+let ``traversal helper keeps the same token and ledger and records recovered expiry`` includeProgress : Task =
+    task {
+        let token = encodeFindV2 3 (textIdentityV2 "query") (textIdentityV2 "snapshot")
+        let first = scriptedValidationIncomplete ()
+        if includeProgress then
+            first["pageOffset"] <- jint 3
+            first["returnedSiteCount"] <- jint 0
+            first["cursorAdvancedBy"] <- jint 0
+        let second = jobj [ "status", jstr "succeeded" ] :> JsonNode
+        let diagnostics = ResizeArray<string>()
+        let ledger = Set.ofList [ "site-0"; "site-1"; "site-2" ]
+        let requests = ResizeArray<string option * int * Set<string>>()
+        let request () =
+            requests.Add(Some token, 3, ledger)
+            Task.FromResult(if requests.Count = 1 then first else second)
+
+        let! page = traversalPageWithOneRetry diagnostics.Add (Some token) 3 request
+        Assert.Same(second, page)
+        Assert.Equal(2, requests.Count)
+        Assert.Equal(requests[0], requests[1])
+        Assert.Equal(3, ledger.Count)
+        Assert.Equal(2, diagnostics.Count)
+        Assert.Contains(renderToken first, diagnostics[0])
+        Assert.Contains(renderToken second, diagnostics[1])
+
+        requests.Clear()
+        let! direct = traversalPageWithOneRetry ignore (Some token) 3 (fun () ->
+            requests.Add(Some token, 3, ledger)
+            Task.FromResult second)
+        Assert.Same(second, direct)
+        Assert.Single(requests) |> ignore
+    }
+
+[<Fact>]
+let ``traversal helper rejects malformed contradictory and non-retryable envelopes immediately`` () : Task =
+    task {
+        let token = encodeFindV2 3 (textIdentityV2 "query") (textIdentityV2 "snapshot")
+        let rejected = ResizeArray<JsonNode>()
+        rejected.Add null
+        for key in [ "status"; "errorKind"; "retryable"; "paginationRestartRequired"; "retrySameCursor"; "sites"; "nextCursor" ] do
+            let missing = scriptedValidationIncomplete () :?> JsonObject
+            missing.Remove(key) |> ignore
+            rejected.Add missing
+            let malformed = scriptedValidationIncomplete ()
+            malformed[key] <- jint 1
+            rejected.Add malformed
+        for key, value in
+            [ "status", jstr "succeeded"
+              "status", jstr "partial"
+              "errorKind", jstr "cursor_stale"
+              "errorKind", jstr "cursor_query_mismatch"
+              "errorKind", jstr "cursor_malformed"
+              "errorKind", jstr "cursor_out_of_range"
+              "errorKind", jstr "cursor_version_unsupported"
+              "errorKind", jstr "cursor_tool_mismatch"
+              "errorCode", jstr "find_site_exceeds_response_budget"
+              "paginationRestartRequired", jbool true
+              "retrySameCursor", jbool false
+              "retryable", jbool false
+              "sites", JsonArray(jobj [] :> JsonNode) :> JsonNode
+              "nextCursor", jstr token
+              "pageOffset", jint 0
+              "returnedSiteCount", jint 1
+              "cursorAdvancedBy", jint 1
+              "pageOffset", jstr "3"
+              "returnedSiteCount", null
+              "cursorAdvancedBy", jstr "0" ] do
+            let page = scriptedValidationIncomplete ()
+            page[key] <- value
+            rejected.Add page
+        for page in rejected do
+            let mutable calls = 0
+            let! _ = Assert.ThrowsAsync<Xunit.Sdk.XunitException>(fun () ->
+                traversalPageWithOneRetry ignore (Some token) 3 (fun () ->
+                    calls <- calls + 1
+                    Task.FromResult page) :> Task)
+            Assert.Equal(1, calls)
+        Assert.False(isContinuationValidationIncomplete None 3 (scriptedValidationIncomplete ()))
+        Assert.False(isContinuationValidationIncomplete (Some token) 4 (scriptedValidationIncomplete ()))
+    }
+
+[<Fact>]
+let ``traversal helper stops after one retry including repeated expiry`` () : Task =
+    task {
+        let token = encodeFindV2 3 (textIdentityV2 "query") (textIdentityV2 "snapshot")
+        for kind in [ "cursor_validation_incomplete"; "cursor_stale"; "cursor_query_mismatch"; "cursor_malformed" ] do
+            let mutable calls = 0
+            let diagnostics = ResizeArray<string>()
+            let! error = Assert.ThrowsAsync<Xunit.Sdk.XunitException>(fun () ->
+                traversalPageWithOneRetry diagnostics.Add (Some token) 3 (fun () ->
+                    calls <- calls + 1
+                    let page = scriptedValidationIncomplete ()
+                    if calls = 2 then page["errorKind"] <- jstr kind
+                    Task.FromResult page) :> Task)
+            Assert.Equal(2, calls)
+            Assert.Equal(2, diagnostics.Count)
+            Assert.Contains("First:", error.Message)
+            Assert.Contains("Second:", error.Message)
+            Assert.Contains(kind, error.Message)
+    }
+
+[<Theory>]
+[<InlineData("succeeded")>]
+[<InlineData("partial")>]
+let ``initial cursor helper accepts a valid first page without retry`` status : Task =
+    task {
+        let page = scriptedInitialPage status
+        let diagnostics = ResizeArray<string>()
+        let mutable calls = 0
+        let request () =
+            calls <- calls + 1
+            Task.FromResult page
+
+        let! cursor = initialCursorWithOneRetry diagnostics.Add request
+        Assert.Equal(page["nextCursor"].GetValue<string>(), cursor)
+        Assert.Equal(1, calls)
+        Assert.Single(diagnostics) |> ignore
+    }
+
+[<Theory>]
+[<InlineData("partial")>]
+[<InlineData("unknown")>]
+let ``initial cursor helper retries the exact timeout once and records both pages after recovery`` status : Task =
+    task {
+        let first = scriptedInitialTimeout status
+        let second = scriptedInitialPage "partial"
+        let diagnostics = ResizeArray<string>()
+        let mutable calls = 0
+        let request () =
+            calls <- calls + 1
+            Task.FromResult(if calls = 1 then first else second)
+
+        let! cursor = initialCursorWithOneRetry diagnostics.Add request
+        Assert.Equal(second["nextCursor"].GetValue<string>(), cursor)
+        Assert.Equal(2, calls)
+        Assert.Equal(2, diagnostics.Count)
+        Assert.Contains(renderToken first, diagnostics[0])
+        Assert.Contains(renderToken second, diagnostics[1])
+    }
+
+[<Fact>]
+let ``initial cursor helper stops after a second timeout and preserves both attempts`` () : Task =
+    task {
+        let mutable calls = 0
+        let request () =
+            calls <- calls + 1
+            Task.FromResult(scriptedInitialTimeout "partial")
+
+        let! error =
+            Assert.ThrowsAsync<Xunit.Sdk.XunitException>(fun () -> initialCursorWithOneRetry ignore request :> Task)
+
+        Assert.Equal(2, calls)
+        Assert.Contains("attempt=1", error.Message)
+        Assert.Contains("attempt=2", error.Message)
+    }
+
+[<Fact>]
+let ``initial cursor helper rejects malformed unexpected and cursorless responses without retry`` () : Task =
+    task {
+        let rejected = ResizeArray<JsonNode>()
+        rejected.Add null
+        rejected.Add(JsonArray())
+
+        // Missing, null, and wrong-type fields must not accidentally satisfy the retry contract.
+        for key in [ "status"; "errorKind"; "retryable"; "paginationRestartRequired"; "retrySameCursor"; "nextCursor" ] do
+            let missing = scriptedInitialTimeout "partial" :?> JsonObject
+            missing.Remove(key) |> ignore
+            rejected.Add missing
+            let wrongType = scriptedInitialTimeout "partial"
+            wrongType[key] <- jint 1
+            rejected.Add wrongType
+            if key <> "nextCursor" then
+                let nullField = scriptedInitialTimeout "partial"
+                nullField[key] <- null
+                rejected.Add nullField
+
+        for key, value in
+            [ "status", jstr "succeeded"
+              "errorKind", jstr "find_timeout"
+              "errorKind", jstr "cursor_validation_incomplete"
+              "errorKind", jstr "cursor_stale"
+              "errorKind", jstr "cursor_query_mismatch"
+              "errorKind", jstr "cursor_malformed"
+              "errorCode", jstr "find_site_exceeds_response_budget"
+              "retryable", jbool false
+              "paginationRestartRequired", jbool false
+              "retrySameCursor", jbool true
+              "nextCursor", jstr "unexpected" ] do
+            let page = scriptedInitialTimeout "partial"
+            page[key] <- value
+            rejected.Add page
+
+        for key, value in
+            [ "nextCursor", null
+              "nextCursor", jstr ""
+              "nextCursor", jstr "malformed"
+              "nextCursor", jstr (encodeFindV2 2 (textIdentityV2 "query") (textIdentityV2 "snapshot"))
+              "pageOffset", jint 1
+              "returnedSiteCount", jint 0
+              "cursorAdvancedBy", jint 0
+              "sites", JsonArray() :> JsonNode
+              "errorKind", jstr "find_response_timeout" ] do
+            let page = scriptedInitialPage "succeeded"
+            page[key] <- value
+            rejected.Add page
+
+        for page in rejected do
+            let mutable calls = 0
+            let request () =
+                calls <- calls + 1
+                Task.FromResult page
+
+            let! error =
+                Assert.ThrowsAsync<Xunit.Sdk.XunitException>(fun () -> initialCursorWithOneRetry ignore request :> Task)
+
+            Assert.Equal(1, calls)
+            Assert.Contains("attempt=1", error.Message)
+    }
+
+[<Theory>]
+[<InlineData(1)>]
+[<InlineData(2)>]
+let ``initial cursor helper never retries exceptions`` failingAttempt : Task =
+    task {
+        let expected = InvalidOperationException("scripted request failure")
+        let diagnostics = ResizeArray<string>()
+        let mutable calls = 0
+        let request () =
+            calls <- calls + 1
+            if calls = failingAttempt then
+                Task.FromException<JsonNode> expected
+            else
+                Task.FromResult(scriptedInitialTimeout "partial")
+
+        let! actual =
+            Assert.ThrowsAsync<InvalidOperationException>(fun () -> initialCursorWithOneRetry diagnostics.Add request :> Task)
+
+        Assert.Same(expected, actual)
+        Assert.Equal(failingAttempt, calls)
+        Assert.Equal(failingAttempt, diagnostics.Count)
+        Assert.Contains("scripted request failure", diagnostics[diagnostics.Count - 1])
+    }
+
+let private fixtureEvidence (fixture: FindBudgetFixture) =
+    let readEvidence read path =
+        try
+            if File.Exists path then read path else "<missing>"
+        with error -> $"<unavailable: {error.Message}>"
+
+    let paths =
+        [ fixture.SourcePath; fixture.ProjectPath; fixture.SolutionPath
+          Path.Combine(Path.GetDirectoryName(fixture.ProjectPath), "Missing.fsproj") ]
+
+    let files =
+        paths
+        |> List.map (fun path ->
+            let hash =
+                readEvidence (fun file -> File.ReadAllBytes file |> SHA256.HashData |> Convert.ToHexString) path
+            $"{path}: {hash}")
+        |> String.concat "\n"
+
+    let project = readEvidence File.ReadAllText fixture.ProjectPath
+    let solution = readEvidence File.ReadAllText fixture.SolutionPath
+    $"{files}\nproject={project}\nsolution={solution}"
+
+let private runtimeEvidence () =
+    let sdk =
+        try
+            let info = ProcessStartInfo(dotnetHost, "--version")
+            info.UseShellExecute <- false
+            info.RedirectStandardOutput <- true
+            info.RedirectStandardError <- true
+            use child = Process.Start(info)
+            if child.WaitForExit(5_000) then child.StandardOutput.ReadToEnd().Trim()
+            else
+                child.Kill(true)
+                "<SDK diagnostic timed out>"
+        with error -> $"<SDK diagnostic unavailable: {error.Message}>"
+
+    let multiplier = Environment.GetEnvironmentVariable("FSLANGMCP_TEST_TIME_MULTIPLIER")
+    let instrumented =
+        typeof<FcsBridge>.Assembly.GetTypes()
+        |> Array.exists (fun t -> t.FullName.Contains("Coverlet", StringComparison.OrdinalIgnoreCase))
+    $"SDK={sdk}; runtime={System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription}; multiplier={multiplier}; coverletInstrumented={instrumented}"
 
 [<Fact>]
 let ``bounded source slices stay valid Unicode and preserve UTF-16 source offsets`` () =
@@ -358,8 +818,19 @@ let ``final guard preserves bounded deadline results and can bound oversized dea
     |> FindResponseBudget.guardFinalResponse
     |> assertBoundedFinalRecovery
 
-type FindResponseBudgetIntegrationTests(fixture: FindBudgetFixture) =
+type FindResponseBudgetIntegrationTests(fixture: FindBudgetFixture, output: Xunit.Abstractions.ITestOutputHelper) =
     interface IClassFixture<FindBudgetFixture>
+
+    [<Fact>]
+    member _.``real initial response expiry satisfies the narrow setup retry contract`` () : Task =
+        task {
+            Assert.True(fixture.BuildExitCode = 0, fixture.BuildLog)
+            let bridge = FcsBridge(findResponseDeadlineSignalOverride = (fun () -> Task.CompletedTask))
+            let! page = bridge.Find({ findArgs fixture None with maxResults = Some 1 })
+            output.WriteLine(renderToken page)
+            Assert.True(isInitialResponseTimeout page, renderToken page)
+            Assert.True((tryInitialCursor page).IsNone)
+        }
 
     [<Fact>]
     member _.``oversized invalid input is replaced by bounded final recovery`` () : Task =
@@ -423,10 +894,50 @@ type FindResponseBudgetIntegrationTests(fixture: FindBudgetFixture) =
             let mutable identities = Set.empty<string>
             let mutable sawTruncatedLine = false
             let mutable sawBudgetClose = false
+            let beforeTraversal = fixtureEvidence fixture
+            let runtime = lazy (runtimeEvidence ())
+            let elapsed = Stopwatch.StartNew()
+            let mutable inputCursor = None
+            let mutable inputOffset = 0
+            let mutable attempt = 0
+            let mutable previousPage: JsonNode = null
+            let mutable currentPage: JsonNode = null
+            let mutable completed = false
+
+            let diagnostic message =
+                let decoded = inputCursor |> Option.map tryDecodeFind
+                output.WriteLine(message)
+                output.WriteLine($"logicalPage={pageCount}; attempt={attempt}; inputOffset={inputOffset}; deliveredCount={deliveredCount}; uniqueSites={identities.Count}; elapsedMs={elapsed.ElapsedMilliseconds}")
+                output.WriteLine($"inputCursor={inputCursor}; decoded={decoded}\npreviousPage={renderToken previousPage}\ncurrentPage={renderToken currentPage}")
+                output.WriteLine($"fixture before:\n{beforeTraversal}\nnow:\n{fixtureEvidence fixture}\n{runtime.Value}")
+
+            use _captureFailure =
+                { new IDisposable with
+                    member _.Dispose() =
+                        if not completed then
+                            try diagnostic "Traversal failed; no ledger reset or restart was performed."
+                            with error -> output.WriteLine($"Failure diagnostics unavailable: {error}") }
 
             while cursor.IsSome || pageCount = 0 do
                 Assert.True(pageCount < 100, "find cursor traversal must terminate")
-                let! page = bridge.Find(findArgs fixture cursor)
+                inputCursor <- cursor
+                inputOffset <- deliveredCount
+                attempt <- 0
+                currentPage <- null
+                let args = findArgs fixture inputCursor
+                let originalIdentities = identities
+                let request () =
+                    task {
+                        attempt <- attempt + 1
+                        let! response = bridge.Find(args)
+                        currentPage <- response
+                        Assert.Equal(inputOffset, deliveredCount)
+                        Assert.Equal<Set<string>>(originalIdentities, identities)
+                        Assert.Equal(inputCursor, cursor)
+                        return response
+                    }
+
+                let! page = traversalPageWithOneRetry diagnostic inputCursor inputOffset request
                 pageCount <- pageCount + 1
 
                 Assert.Equal("succeeded", page["status"].GetValue<string>())
@@ -503,11 +1014,14 @@ type FindResponseBudgetIntegrationTests(fixture: FindBudgetFixture) =
 
                         Some next
 
+                previousPage <- page
+
             Assert.True(pageCount > 1, "the response budget should force multiple pages")
             Assert.True(sawBudgetClose, "at least one page must close on serialized size")
             Assert.True(sawTruncatedLine, "long source lines must expose truncation metadata")
             Assert.Equal(totalSites, deliveredCount)
             Assert.Equal(totalSites, identities.Count)
+            completed <- true
         }
 
     [<Fact>]
@@ -585,8 +1099,13 @@ type FindResponseBudgetIntegrationTests(fixture: FindBudgetFixture) =
                     scope = Some "workspace"
                     projectPath = Some fixture.SolutionPath }
 
-            let! first = FcsBridge().Find(initialArgs)
-            let continuation = first["nextCursor"].GetValue<string>()
+            let initialBridge = FcsBridge()
+            let beforeSetup = fixtureEvidence fixture
+            let setupDiagnostic message =
+                output.WriteLine(message)
+                output.WriteLine($"setup fixture before:\n{beforeSetup}\nnow:\n{fixtureEvidence fixture}")
+
+            let! continuation = initialCursorWithOneRetry setupDiagnostic (fun () -> initialBridge.Find(initialArgs))
 
             let! result =
                 bridge.Find(
