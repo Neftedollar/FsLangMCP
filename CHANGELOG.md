@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-08
+
+0.19.0 expands `find` without adding tools: the 35-tool surface remains unchanged.
+Count-only inventory can evaluate 1–50 names in one shared project-use sweep, and fixed phase
+timings plus cache ledgers make the work observed by each request explicit. Exact `Type.Field`
+shorthand now resolves through semantic record-field identity while incomplete coverage and
+zero-site evidence remain conservative. This is still a pre-1.0 release, not a contract freeze.
+
 ### Added
 
 - `find` accepts either the existing single `query` site search or a count-only inventory through
@@ -1216,7 +1224,8 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
   above), so it has no link definition either — 0.15.0 compares from the
   last version that actually was tagged, 0.13.2.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.16.0...v0.17.0

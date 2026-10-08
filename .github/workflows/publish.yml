@@ -88,6 +88,7 @@ jobs:
             -p:ContinuousIntegrationBuild=true
 
       - name: Test release bits with tag version
+        id: release_bit_tests
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -95,9 +96,20 @@ jobs:
             --configuration Release \
             --no-build \
             --no-restore \
+            --logger "trx;LogFileName=release-bit-test-results.trx" \
+            --results-directory "$GITHUB_WORKSPACE/TestResults/release-bits" \
             -p:Version="${VERSION}" \
             -p:PackageVersion="${VERSION}" \
             -p:ContinuousIntegrationBuild=true
+
+      - name: Upload release-bit test results
+        if: always() && steps.release_bit_tests.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-bit-test-results
+          path: '${{ github.workspace }}/TestResults/release-bits/release-bit-test-results.trx'
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Pack the tested release bits
         env:
