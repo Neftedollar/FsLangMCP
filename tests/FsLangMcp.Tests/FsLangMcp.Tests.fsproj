@@ -39,6 +39,7 @@
     <Compile Include="FindInputTests.fs" />
     <Compile Include="FindInventoryIntegrationTests.fs" />
     <Compile Include="FindInventoryWireTests.fs" />
+    <Compile Include="FindFieldResolutionTests.fs" />
     <Compile Include="FindBacktickDefinitionTests.fs" />
     <Compile Include="FindCursorIntegrationTests.fs" />
     <Compile Include="FindCursorReviewTests.fs" />

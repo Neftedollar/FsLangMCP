@@ -30,6 +30,8 @@ These two tools replace the legacy search/check entry points removed in v0.11.0.
 - `countsOnly` — defaults to `true` with `queries`; omitted for legacy single-query site search
 - `kind` — `auto` | `symbol` | `members` | `field` | `definition` | `position` (default: `auto`; unions symbol/member/field sites)
 - `member` — narrow to a specific member name when `kind=members`
+- `field` — with `kind=field`, `query` is the declaring record type and `field` selects its field;
+  alternatively use exact `query="Card.Name"` without `field`. Bare field names are not resolved
 - `scope` — `auto` | `file` | `project` | `workspace` (default: `auto`); file requires `path`, project requires one member `.fsproj`
 - `contextLines` — non-negative requested surrounding source-line count (default: `0`);
   delivery is capped at 8 lines per side and every source-line snippet at 512 UTF-16 code units
@@ -79,7 +81,14 @@ discover which recipe would have been faster. Inventory instead reports top-leve
 plus project counters under `coverage` and the complete `projectLedger`. See
 `docs/tools-detailed.md`.
 
-**Field-impact mode:** `kind=field` classifies each site as `field-set-literal` | `field-set-update`
+**Field-impact mode:** use `query="Card", kind="field", field="Name"`, or exact
+`query="Card.Name", kind="field"` without a selector. A full declaring-type match takes
+precedence over dotted shorthand, including an unused type. Explicit selectors and
+`exact=false` retain declaring-type matching. Short type names/suffixes match all matching
+declaring types; qualify the namespace/module to disambiguate, rather than expecting a first-record choice.
+Only actual FCS use sites establish a field
+match; name-only FSAC fallback is skipped. A zero is not proof that a declaration is absent,
+and incomplete sweeps withhold provisional shorthand sites. `kind=field` classifies each site as `field-set-literal` | `field-set-update`
 | `field-set-mutation` | `field-pattern` | `field-read` — the five shapes a field-type change edits
 differently. Add `includeSiteTypes=true` for a `siteType` column carrying the field's type as the
 CURRENT typecheck resolves it at that site, plus a `siteTypes` ledger (`typed + degraded ==
@@ -133,10 +142,12 @@ If `breakdownComplete=false`, per-kind counts are only the prefix counted before
 complete reconciliation of `totalSites`. A later response timeout can leave this flag true when
 the counting pass had already finished.
 
-**Cost evidence:** every response includes ten fixed, non-overlapping integer
+**Cost evidence:** handler-produced `find` success and typed-error responses include ten fixed,
+non-overlapping integer
 `phaseTimingsMs` fields (`admission`, `positionResolution`, `targetDiscovery`, `projectOptions`,
 `snapshot`, `fcsSweep`, `classification`, `fsacFallback`, `responseConstruction`, `unattributed`)
-whose sum is `elapsedMs`. Sampling precedes the last production size-check serialization and
+whose sum is `elapsedMs`. SDK argument-binding errors, transport failures, and health responses
+are outside this contract. Sampling precedes the last production size-check serialization and
 transport, so these are diagnostics rather than latency guarantees. `cacheState.projectOptions`
 and `cacheState.projectUses` each expose request-observed `hits`, `misses`, `incomplete`, and
 `state`; they do not describe FCS-internal caches. A warm hit can skip base compiler work, while
