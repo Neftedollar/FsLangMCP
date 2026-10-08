@@ -274,6 +274,12 @@ let private isContinuationValidationIncomplete cursor offset (page: JsonNode) =
         let unchangedProgress key expected =
             not (fields.ContainsKey key) || tryValue<int> key page = Some expected
 
+        let compatibleFlag key expected =
+            not (fields.ContainsKey key) || tryValue<bool> key page = Some expected
+
+        let compatibleText key expected =
+            not (fields.ContainsKey key) || tryValue<string> key page = Some expected
+
         let validInput =
             match tryDecodeFind token with
             | Ok payload -> payload.Offset = offset
@@ -297,6 +303,11 @@ let private isContinuationValidationIncomplete cursor offset (page: JsonNode) =
         && unchangedProgress "pageOffset" offset
         && unchangedProgress "returnedSiteCount" 0
         && unchangedProgress "cursorAdvancedBy" 0
+        && compatibleFlag "resultSetComplete" false
+        && compatibleText "deliveryStatus" "partial"
+        && compatibleFlag "truncated" true
+        && compatibleFlag "totalEstimateIsLowerBound" true
+        && compatibleText "paginationIncompleteReason" "deadline_incomplete"
     | _ -> false
 
 // The closure reuses the same bridge and immutable arguments. Neither failed
@@ -341,14 +352,19 @@ let private scriptedValidationIncomplete () =
 [<Theory>]
 [<InlineData(false)>]
 [<InlineData(true)>]
-let ``traversal helper keeps the same token and ledger and records recovered expiry`` includeProgress : Task =
+let ``traversal helper keeps the same token and ledger and records recovered expiry`` includeMetadata : Task =
     task {
         let token = encodeFindV2 3 (textIdentityV2 "query") (textIdentityV2 "snapshot")
         let first = scriptedValidationIncomplete ()
-        if includeProgress then
+        if includeMetadata then
             first["pageOffset"] <- jint 3
             first["returnedSiteCount"] <- jint 0
             first["cursorAdvancedBy"] <- jint 0
+            first["resultSetComplete"] <- jbool false
+            first["deliveryStatus"] <- jstr "partial"
+            first["truncated"] <- jbool true
+            first["totalEstimateIsLowerBound"] <- jbool true
+            first["paginationIncompleteReason"] <- jstr "deadline_incomplete"
         let second = jobj [ "status", jstr "succeeded" ] :> JsonNode
         let diagnostics = ResizeArray<string>()
         let ledger = Set.ofList [ "site-0"; "site-1"; "site-2" ]
@@ -407,17 +423,35 @@ let ``traversal helper rejects malformed contradictory and non-retryable envelop
               "cursorAdvancedBy", jint 1
               "pageOffset", jstr "3"
               "returnedSiteCount", null
-              "cursorAdvancedBy", jstr "0" ] do
+              "cursorAdvancedBy", jstr "0"
+              "resultSetComplete", jbool true
+              "deliveryStatus", jstr "complete"
+              "truncated", jbool false
+              "totalEstimateIsLowerBound", jbool false
+              "paginationIncompleteReason", jstr "complete"
+              "resultSetComplete", jstr "false"
+              "deliveryStatus", jbool false
+              "truncated", jstr "true"
+              "totalEstimateIsLowerBound", jstr "true"
+              "paginationIncompleteReason", jbool false ] do
             let page = scriptedValidationIncomplete ()
             page[key] <- value
             rejected.Add page
+        // Optional means absent is legal; supplied null or wrong types are not.
+        for key in
+            [ "resultSetComplete"; "deliveryStatus"; "truncated"; "totalEstimateIsLowerBound"; "paginationIncompleteReason" ] do
+            for value in [ null; JsonObject() :> JsonNode; JsonArray() :> JsonNode; jint 1 ] do
+                let page = scriptedValidationIncomplete ()
+                page[key] <- value
+                rejected.Add page
         for page in rejected do
             let mutable calls = 0
-            let! _ = Assert.ThrowsAsync<Xunit.Sdk.XunitException>(fun () ->
+            let! error = Assert.ThrowsAsync<Xunit.Sdk.XunitException>(fun () ->
                 traversalPageWithOneRetry ignore (Some token) 3 (fun () ->
                     calls <- calls + 1
-                    Task.FromResult page) :> Task)
+                    Task.FromResult(if calls = 1 then page else jobj [ "status", jstr "succeeded" ] :> JsonNode)) :> Task)
             Assert.Equal(1, calls)
+            Assert.Contains(renderToken page, error.Message)
         Assert.False(isContinuationValidationIncomplete None 3 (scriptedValidationIncomplete ()))
         Assert.False(isContinuationValidationIncomplete (Some token) 4 (scriptedValidationIncomplete ()))
     }
