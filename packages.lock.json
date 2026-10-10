@@ -73,13 +73,13 @@
       },
       "Ionide.ProjInfo.FCS": {
         "type": "Direct",
-        "requested": "[0.74.2, 0.74.2]",
-        "resolved": "0.74.2",
-        "contentHash": "zAzItdSiIhq4V031YlKworGOv/918LZn2Iu+fJbJbgCunlIImLqH9C0T9T7aZCvMmHi3pDuRKNBgVwQjGzYtGg==",
+        "requested": "[0.75.2, 0.75.2]",
+        "resolved": "0.75.2",
+        "contentHash": "rYrbUT/fU5L5N3l8/qUCdeJizYCAd8PD+teBaQq/3AAUFcyfLj2ODBxuazYJuNDG3LgYoz1w4oX1srxWE0jedQ==",
         "dependencies": {
-          "FSharp.Compiler.Service": "43.10.100",
-          "FSharp.Core": "10.0.100",
-          "Ionide.ProjInfo": "0.74.2"
+          "FSharp.Compiler.Service": "43.12.201",
+          "FSharp.Core": "10.1.201",
+          "Ionide.ProjInfo": "0.75.2"
         }
       },
       "Microsoft.NET.StringTools": {
@@ -159,8 +159,8 @@
       },
       "Ionide.ProjInfo": {
         "type": "Transitive",
-        "resolved": "0.74.2",
-        "contentHash": "kjvt0fM3YQoyIVromp8y/TlKgiOaSNDhGuUdPxv6I6bKQBvJEAFgc4bWX8mfwBclHP5yRRCkC+i3q2cirDCM2w==",
+        "resolved": "0.75.2",
+        "contentHash": "a0ELIx8+5CMqeJaqY4UXkTzdt310z+efk08A6SUczlNXA+ZZdkyaHjQ01cbrYROH/ZYts8yd8T2qOhUOtLUtbQ==",
         "dependencies": {
           "FSharp.Core": "6.0.0",
           "Microsoft.VisualStudio.SolutionPersistence": "1.0.28",
