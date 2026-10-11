@@ -10,9 +10,9 @@
       },
       "Nacara.Core": {
         "type": "Direct",
-        "requested": "[2.0.0-beta.4, 2.0.0-beta.4]",
-        "resolved": "2.0.0-beta.4",
-        "contentHash": "ZLAGa+M6ySTdg4z9r9YK+Z7gT2y/TdxS29wwVeCu8OQEVUa258YlicQ8z6qxBauzT0l0LZfjBCAtPJQZEmoW7g==",
+        "requested": "[2.0.0-beta.6, 2.0.0-beta.6]",
+        "resolved": "2.0.0-beta.6",
+        "contentHash": "IvAtbADun05y/u7sX3U6to/+tyXUq0VC7y31eWtNKa96nPI1XZRqUeR/T2RpNr2OvASd0gznVJfcldWcZrKVMA==",
         "dependencies": {
           "FSharp.Core": "10.1.300",
           "Feliz.ViewEngine": "1.0.3",
@@ -84,13 +84,13 @@
       },
       "Nacara.Plugin.Markdown": {
         "type": "Direct",
-        "requested": "[1.0.0-beta.1, 1.0.0-beta.1]",
-        "resolved": "1.0.0-beta.1",
-        "contentHash": "re59LzZyJk6HuTHwveODOHqIMYSGnUmVEF5IeHAHJoXIrEMnmgL/2RDAx/hY1y6pBKmsUDixWUCJMS97x8KABQ==",
+        "requested": "[1.0.0-beta.2, 1.0.0-beta.2]",
+        "resolved": "1.0.0-beta.2",
+        "contentHash": "TkGArjH5hRQabgUUEgl9iOJLRzxwLoYrSGzfbHGT5A9QHmlp76yZSua53pPm0NzHVmO1kecTITZ3UuLf5CIFGg==",
         "dependencies": {
           "FSharp.Core": "10.1.300",
           "Markdig": "1.3.2",
-          "Nacara.Core": "2.0.0-beta.1"
+          "Nacara.Core": "2.0.0-beta.6"
         }
       },
       "Nacara.Plugin.Search": {
