@@ -333,7 +333,7 @@ class WorkflowGateContractTests(unittest.TestCase):
                 self.assertIn(f'--logger "trx;LogFileName={filename}"', test)
                 self.assertIn(f'--results-directory "$GITHUB_WORKSPACE/{directory}"', test)
                 self.assertIn(f"if: always() && steps.{step_id}.outcome != 'skipped'", upload)
-                self.assertIn("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", upload)
+                self.assertIn("actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9", upload)
                 self.assertIn(f"name: {artifact_name}", upload)
                 self.assertIn(f"path: '${{{{ github.workspace }}}}/{directory}/{filename}'", upload)
                 self.assertIn("if-no-files-found: error", upload)
