@@ -27,11 +27,11 @@
       },
       "FSharp.Compiler.Service": {
         "type": "Direct",
-        "requested": "[43.12.400, 43.12.400]",
-        "resolved": "43.12.400",
-        "contentHash": "Ydo8HRHMewaGL6N1jFwFunI6aqyrv0Ndy1en3tT2jq3rGEDX53H2xqihD6mvbuIODB9TtLZi5hB2BZa2nVDnXg==",
+        "requested": "[43.12.402, 43.12.402]",
+        "resolved": "43.12.402",
+        "contentHash": "YRF/K6q535x1LL6JzjEI5cEnPkrpDe+WN/p+X6egKHXaS9J+SQGqMMV9mcznBDQdU+lfvCLLPmvPfVGmgsn7Lw==",
         "dependencies": {
-          "FSharp.Core": "[10.1.400]"
+          "FSharp.Core": "[10.1.402]"
         }
       },
       "FSharp.Core": {
@@ -695,7 +695,7 @@
       "fslangmcp": {
         "type": "Project",
         "dependencies": {
-          "FSharp.Compiler.Service": "[43.12.400, 43.12.400]",
+          "FSharp.Compiler.Service": "[43.12.402, 43.12.402]",
           "FSharp.Core": "[10.1.400, 10.1.400]",
           "FSharp.SystemTextJson": "[1.4.36, 1.4.36]",
           "FsMcp.Server": "[2.0.0, 2.0.0]",
