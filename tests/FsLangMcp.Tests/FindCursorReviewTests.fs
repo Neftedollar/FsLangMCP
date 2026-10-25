@@ -376,6 +376,70 @@ type FindCursorPositiveEvidencePolicyTests() =
         }
 
     [<Fact>]
+    member _.``four-page traversal accepts two bounded expiry retries and rejects invalid retry evidence``() : Task =
+        task {
+            let hash = String.replicate 43 "A"
+            let cursor offset =
+                Convert.ToBase64String(Encoding.UTF8.GetBytes($"{{\"v\":2,\"tool\":\"find\",\"offset\":{offset},\"query\":\"{hash}\",\"snapshot\":\"{hash}\"}}"))
+            let cursors = [| cursor 1; cursor 2; cursor 3 |]
+            let success (id: int) (offset: int) (nextCursor: string option) =
+                let next = nextCursor |> Option.map (fun value -> $"\"{value}\"") |> Option.defaultValue "null"
+                let truncated = if Option.isSome nextCursor then "true" else "false"
+                JsonNode.Parse($"{{\"status\":\"succeeded\",\"sites\":[{{\"id\":{id}}}],\"totalSites\":4,\"pageOffset\":{offset},\"returnedSiteCount\":1,\"cursorAdvancedBy\":1,\"coverage\":{{\"complete\":true}},\"resultSetComplete\":false,\"truncated\":{truncated},\"nextCursor\":{next}}}")
+            let initialExpiry =
+                JsonNode.Parse("""{"status":"partial","errorKind":"find_response_timeout","retryable":true,"paginationRestartRequired":true,"retrySameCursor":false,"sites":[],"pageOffset":0,"returnedSiteCount":0,"cursorAdvancedBy":0,"resultSetComplete":false,"deliveryStatus":"partial","truncated":true,"totalEstimateIsLowerBound":true,"paginationIncompleteReason":"deadline_incomplete","nextCursor":null}""")
+            let continuationExpiry =
+                JsonNode.Parse("""{"status":"invalid_cursor","errorKind":"cursor_validation_incomplete","retryable":true,"paginationRestartRequired":false,"retrySameCursor":true,"sites":[],"pageOffset":3,"returnedSiteCount":0,"cursorAdvancedBy":0,"resultSetComplete":false,"deliveryStatus":"partial","truncated":true,"totalEstimateIsLowerBound":true,"paginationIncompleteReason":"deadline_incomplete","nextCursor":null}""")
+            let responses =
+                [| initialExpiry
+                   success 1 0 (Some(cursors[0]))
+                   success 2 1 (Some(cursors[1]))
+                   success 3 2 (Some(cursors[2]))
+                   continuationExpiry
+                   success 4 3 None |]
+            let expectedCursors = [| None; None; Some(cursors[0]); Some(cursors[1]); Some(cursors[2]); Some(cursors[2]) |]
+
+            let run (values: JsonNode array) =
+                task {
+                    let observed = ResizeArray<string option>()
+                    let mutable index = 0
+                    let! complete =
+                        collectCompletePositiveFind ignore "two legal expiry retries" 4 (fun requestedCursor ->
+                            observed.Add(requestedCursor)
+                            let response = values[index]
+                            index <- index + 1
+                            Task.FromResult(response))
+                    return complete, index, observed.ToArray()
+                }
+
+            let! complete, calls, observedCursors = run responses
+            Assert.Equal<string option array>(expectedCursors, observedCursors)
+            Assert.Equal(4, complete.Rows.Length)
+            let validatedZeroProgressRetries =
+                observedCursors
+                |> Array.pairwise
+                |> Array.sumBy (fun (previous, current) -> if previous = current then 1 else 0)
+            Assert.Equal(2, validatedZeroProgressRetries)
+            Assert.Equal(4 + validatedZeroProgressRetries, calls)
+
+            for label, expectedCalls, mutate in
+                [ "stale cursor", 5, (fun (values: JsonNode array) -> values[4]["errorKind"] <- JsonValue.Create("cursor_stale"))
+                  "advancing expiry", 5, (fun values -> values[4]["cursorAdvancedBy"] <- JsonValue.Create(1))
+                  "disabled same-cursor retry", 5, (fun values -> values[4]["retrySameCursor"] <- JsonValue.Create(false))
+                  "second expiry", 6, (fun values -> values[5] <- values[4].DeepClone())
+                  "duplicate successful retry", 6, (fun values -> (values[5])["sites"] <- ((values[1])["sites"]).DeepClone()) ] do
+                let altered = responses |> Array.map _.DeepClone()
+                mutate altered
+                let mutable attempted = 0
+                let! _ = Assert.ThrowsAsync<Xunit.Sdk.XunitException>(fun () ->
+                    collectCompletePositiveFind ignore label 4 (fun _ ->
+                        let response = altered[attempted]
+                        attempted <- attempted + 1
+                        Task.FromResult(response)) :> Task)
+                Assert.Equal(expectedCalls, attempted)
+        }
+
+    [<Fact>]
     member _.``positive success rejects missing mistyped and contradictory contract evidence``() : Task =
         task {
             let healthy = JsonNode.Parse("""{"status":"succeeded","sites":[{"id":1}],"totalSites":1,"pageOffset":0,"returnedSiteCount":1,"cursorAdvancedBy":1,"coverage":{"complete":true},"resultSetComplete":true,"truncated":false,"nextCursor":null}""")
@@ -525,7 +589,7 @@ type FindCursorReviewTests(fixture: FindCursorFixture, output: ITestOutputHelper
     [<Theory>]
     [<InlineData(false)>]
     [<InlineData(true)>]
-    member _.``complete four-site diagnostic traversal recovers only the forced deadline page``(continuationExpiry: bool) : Task =
+    member _.``complete four-site diagnostic traversal recovers forced and validated incidental deadline pages``(continuationExpiry: bool) : Task =
         task {
             Assert.True(fixture.BuildExitCode = 0, fixture.BuildLog)
             let originalSource, originalProject = File.ReadAllText(fixture.ASource), File.ReadAllText(fixture.AProject)
@@ -535,18 +599,26 @@ type FindCursorReviewTests(fixture: FindCursorFixture, output: ITestOutputHelper
             let mutable expired = false
             let mutable expireThisRequest = false
             let mutable signal = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let requests = ResizeArray<FindArgs>()
+            let ledger = ResizeArray<string>()
+            let mutable failedRequest: (FindArgs * string array) option = None
+            let mutable validatedZeroProgressRetries = 0
+            let mutable armedForcedRequest: (int * FindArgs * string option * int) option = None
+            let mutable forcedRequest: (int * FindArgs * string option * int) option = None
+            let mutable forcedTriggerCount = 0
             let bridge =
                 FcsBridge(
                     findResponseDeadlineSignalOverride = (fun () ->
                         signal <- TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
                         signal.Task :> Task),
                     findResponseConstructionBeforeStepOverride = (fun phase _ ->
-                        if expireThisRequest && phase = "response-planning" then
+                        if expireThisRequest && not expired && phase = "response-planning" then
+                            Assert.True(armedForcedRequest.IsSome, "Forced deadline fired without an armed request.")
+                            Assert.True(forcedRequest.IsNone, "Forced deadline fired more than once.")
+                            forcedRequest <- armedForcedRequest
+                            forcedTriggerCount <- forcedTriggerCount + 1
                             expired <- true
                             signal.TrySetResult(()) |> ignore))
-            let requests = ResizeArray<FindArgs>()
-            let ledger = ResizeArray<string>()
-            let mutable failedRequest: (FindArgs * string array) option = None
             try
                 File.WriteAllText(fixture.AProject, originalProject.Replace("</PropertyGroup>", "<OtherFlags>--maxerrors:500</OtherFlags></PropertyGroup>", StringComparison.Ordinal))
                 File.WriteAllText(fixture.ASource, originalSource + "\n" + String.concat "\n" [ for index in 0 .. 204 -> $"let diagnostic{index:D3} = missing{index:D3}" ])
@@ -562,11 +634,25 @@ type FindCursorReviewTests(fixture: FindCursorFixture, output: ITestOutputHelper
                                 | Some(previous, previousLedger) ->
                                     Assert.Equal<string option>(previous.cursor, cursor)
                                     Assert.Equal<string array>(previousLedger, ledger.ToArray())
+                                    validatedZeroProgressRetries <- validatedZeroProgressRetries + 1
                                     previous // exactly the same immutable request instance
                                 | None -> { request with cursor = cursor }
+                            let requestIndex = requests.Count
                             requests.Add(currentRequest)
                             expireThisRequest <- not expired && cursor.IsSome = continuationExpiry
+                            armedForcedRequest <-
+                                if expireThisRequest then Some(requestIndex, currentRequest, cursor, ledger.Count)
+                                else None
                             let! page = bridge.Find(currentRequest)
+                            match forcedRequest with
+                            | Some(index, _, forcedCursor, offset) when index = requestIndex ->
+                                let validForcedExpiry =
+                                    match forcedCursor with
+                                    | None -> isInitialResponseTimeout page
+                                    | Some _ -> isContinuationValidationIncomplete forcedCursor offset page
+                                Assert.True(validForcedExpiry, page.ToJsonString())
+                            | _ -> ()
+                            armedForcedRequest <- None
                             if isSucceededFind page then
                                 Assert.Equal(ledger.Count, page["pageOffset"].GetValue<int>())
                                 ledger.AddRange(rows page)
@@ -577,11 +663,20 @@ type FindCursorReviewTests(fixture: FindCursorFixture, output: ITestOutputHelper
                             return page
                         })
                 Assert.True(expired)
-                Assert.Equal(5, requestedCursors.Count) // four advancing pages, one zero-progress expiry
-                let failedIndex = if continuationExpiry then 1 else 0
-                Assert.Equal<string option>(requestedCursors[failedIndex], requestedCursors[failedIndex + 1])
-                Assert.Same(requests[failedIndex], requests[failedIndex + 1])
-                Assert.Equal(5, requests.Count)
+                Assert.Equal(1, forcedTriggerCount)
+                Assert.Equal(expected.Length + validatedZeroProgressRetries, requestedCursors.Count)
+                Assert.Equal(requestedCursors.Count, requests.Count)
+                let forcedIndex, forcedRequestObject, forcedCursor, forcedOffset =
+                    match forcedRequest with
+                    | Some forced -> forced
+                    | None -> raise (Xunit.Sdk.XunitException("Forced deadline did not record its request."))
+                Assert.Equal(continuationExpiry, forcedCursor.IsSome)
+                Assert.Equal((if continuationExpiry then 1 else 0), forcedOffset)
+                Assert.Equal<string option>(forcedCursor, requestedCursors[forcedIndex])
+                Assert.Same(forcedRequestObject, requests[forcedIndex])
+                Assert.InRange(forcedIndex + 1, 1, requestedCursors.Count - 1)
+                Assert.Equal<string option>(requestedCursors[forcedIndex], requestedCursors[forcedIndex + 1])
+                Assert.Same(requests[forcedIndex], requests[forcedIndex + 1])
                 Assert.Contains(messages, fun message -> message.Contains((if continuationExpiry then "cursor_validation_incomplete" else "find_response_timeout"), StringComparison.Ordinal))
                 Assert.Equal(expected.Length, complete.Rows.Length)
                 Assert.Equal<string array>(complete.Rows, ledger.ToArray())

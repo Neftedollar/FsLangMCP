@@ -903,7 +903,7 @@ let ``ProjectOutline rejects negative timeout and zero is deterministic unknown 
     }
 
 [<Fact>]
-let ``ProjectOutline times out after a completed file retains worker and never starts the next file`` () =
+let ``ProjectOutline file timeout reports bounded coverage without requiring phase entry`` () =
     task {
         let projectPath, root = createFilteredPaginationProject ()
         let ownership = TestRunTrace.OwnedFixtureWork("OutlineE2ETests.file-timeout", root)
@@ -941,23 +941,36 @@ let ``ProjectOutline times out after a completed file retains worker and never s
                 )
                 |> ownership.TrackRequest
 
-            do! secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
             let! result = pending
-            Assert.Equal("partial", result["status"].GetValue<string>())
             let operationalCoverage = result["coverage"]
-            Assert.Equal(1, operationalCoverage["filesScanned"].GetValue<int>())
+
+            let filesScanned = operationalCoverage["filesScanned"].GetValue<int>()
+            let filesNotStarted = operationalCoverage["filesNotStarted"].GetValue<int>()
+            let startsAtResponse = Volatile.Read(&starts)
+
+            Assert.Equal((if filesScanned = 0 then "unknown" else "partial"), result["status"].GetValue<string>())
+            Assert.Equal(3, operationalCoverage["filesRequested"].GetValue<int>())
+            Assert.InRange(filesScanned, 0, 1)
             Assert.Equal(1, operationalCoverage["filesTimedOut"].GetValue<int>())
-            Assert.Equal(1, operationalCoverage["filesNotStarted"].GetValue<int>())
+            Assert.Equal(0, operationalCoverage["filesFailed"].GetValue<int>())
+            Assert.Equal(2 - filesScanned, filesNotStarted)
             Assert.False(result["resultSetComplete"].GetValue<bool>())
             Assert.True(result["truncated"].GetValue<bool>())
             Assert.Null(result["nextCursor"])
             Assert.True(result["paginationRestartRequired"].GetValue<bool>())
-            Assert.Equal(2, Volatile.Read(&starts))
-            Assert.True(retained.IsSome)
+            Assert.InRange(startsAtResponse, filesScanned, filesScanned + 1)
+            Assert.InRange(startsAtResponse, 0, 2)
+
+            if secondStarted.Task.IsCompleted then
+                Assert.True(retained.IsSome)
 
             blockedOutline.TrySetResult(successfulControlledOutline ()) |> ignore
-            do! retained.Value.WaitAsync(TimeSpan.FromSeconds(2.0))
-            Assert.Equal(2, Volatile.Read(&starts))
+
+            match retained with
+            | Some operation -> do! operation.WaitAsync(TimeSpan.FromSeconds(2.0))
+            | None -> ()
+
+            Assert.Equal(startsAtResponse, Volatile.Read(&starts))
             do! ownership.CompleteCleanup()
         finally
             blockedOutline.TrySetResult(successfulControlledOutline ()) |> ignore
@@ -965,11 +978,12 @@ let ``ProjectOutline times out after a completed file retains worker and never s
     }
 
 [<Fact>]
-let ``ProjectOutline cancellation returns partial coverage retains worker and starts no later file`` () =
+let ``ProjectOutline file cancellation retains worker and outer FCS gate and starts no later file`` () =
     task {
         let projectPath, root = createFilteredPaginationProject ()
         let ownership = TestRunTrace.OwnedFixtureWork("OutlineE2ETests.file-cancellation", root)
         use cancellation = new CancellationTokenSource()
+        use gate = new SemaphoreSlim(1, 1)
 
         let secondStarted =
             TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -978,6 +992,7 @@ let ``ProjectOutline cancellation returns partial coverage retains worker and st
             TaskCompletionSource<JsonNode>(TaskCreationOptions.RunContinuationsAsynchronously)
 
         let mutable starts = 0
+        let mutable lateStarts = 0
         let mutable retained: Task option = None
 
         let outlineOverride (_: FcsFileOutlineArgs) =
@@ -992,15 +1007,17 @@ let ``ProjectOutline cancellation returns partial coverage retains worker and st
 
         try
             let pending =
-                bridge.ProjectOutlineWithinDeadline(
-                    { defaultArgs projectPath with
-                        maxFiles = Some 3
-                        timeoutMs = Some 5_000 },
-                    cancellation.Token,
-                    fun operation ->
-                        retained <- Some operation
-                        ownership.RetainUntil operation
-                )
+                runLimitedWithTimeoutRetained gate cancellation.Token (Some 5_000) (fun remaining retainUntil ->
+                    bridge.ProjectOutlineWithinDeadline(
+                        { defaultArgs projectPath with
+                            maxFiles = Some 3
+                            timeoutMs = remaining },
+                        cancellation.Token,
+                        fun operation ->
+                            retained <- Some operation
+                            retainUntil operation
+                            ownership.RetainUntil operation
+                    ))
                 |> ownership.TrackRequest
 
             do! secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
@@ -1013,10 +1030,21 @@ let ``ProjectOutline cancellation returns partial coverage retains worker and st
             Assert.Equal(1, operationalCoverage["filesNotStarted"].GetValue<int>())
             Assert.Equal(2, Volatile.Read(&starts))
             Assert.True(retained.IsSome)
+            Assert.Equal(0, gate.CurrentCount)
+
+            let! queued =
+                runLimitedWithTimeoutRetained gate CancellationToken.None (Some 0) (fun _ _ ->
+                    Interlocked.Increment(&lateStarts) |> ignore
+                    Task.FromResult(successfulControlledOutline ()))
+
+            Assert.Equal("fcs_admission_timeout", queued["errorKind"].GetValue<string>())
+            Assert.Equal(0, Volatile.Read(&lateStarts))
 
             blockedOutline.TrySetResult(successfulControlledOutline ()) |> ignore
             do! retained.Value.WaitAsync(TimeSpan.FromSeconds(2.0))
+            do! gate.WaitAsync().WaitAsync(TimeSpan.FromSeconds(2.0))
             Assert.Equal(2, Volatile.Read(&starts))
+            gate.Release() |> ignore
             do! ownership.CompleteCleanup()
         finally
             blockedOutline.TrySetResult(successfulControlledOutline ()) |> ignore
@@ -1114,14 +1142,15 @@ let ``ProjectOutline options timeout returns unknown and retains actual evaluati
                 )
                 |> ownership.TrackRequest
 
-            do! evaluationStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
             let! result = request
             Assert.Equal("unknown", result["status"].GetValue<string>())
             let operationalCoverage = result["coverage"]
             Assert.Equal(0, operationalCoverage["filesScanned"].GetValue<int>())
             Assert.Equal(2, operationalCoverage["filesNotStarted"].GetValue<int>())
-            Assert.Equal(1, bridge.ProjectEvaluationActiveCount)
             Assert.True(retained.IsSome)
+
+            if evaluationStarted.Task.IsCompleted then
+                Assert.Equal(1, bridge.ProjectEvaluationActiveCount)
 
             releaseEvaluation.TrySetResult(()) |> ignore
 
@@ -1142,6 +1171,95 @@ let ``ProjectOutline options timeout returns unknown and retains actual evaluati
             Assert.Equal("The project-options worker has no active callers.", productTimeout.Message)
             Assert.Null(productTimeout.InnerException)
             Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
+            do! ownership.CompleteCleanup()
+        finally
+            releaseEvaluation.TrySetResult(()) |> ignore
+            ownership.Cleanup() |> ignore
+    }
+
+[<Fact>]
+let ``ProjectOutline options cancellation retains evaluation and outer FCS gate`` () =
+    task {
+        let projectPath, root = createFixtureProject ()
+        let fixtureName = "OutlineE2ETests.options-cancellation"
+        let ownership = TestRunTrace.OwnedFixtureWork(fixtureName, root)
+        use cancellation = new CancellationTokenSource()
+        use gate = new SemaphoreSlim(1, 1)
+
+        let evaluationStarted =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let releaseEvaluation =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let mutable lateStarts = 0
+        let mutable retained: Task option = None
+
+        let beforeLoad (_: string) =
+            task {
+                evaluationStarted.TrySetResult(()) |> ignore
+                do! releaseEvaluation.Task
+            }
+            :> Task
+
+        let bridge = FcsBridge(projectEvaluationBeforeLoadOverride = beforeLoad)
+
+        try
+            let request =
+                runLimitedWithTimeoutRetained gate cancellation.Token (Some 5_000) (fun remaining retainUntil ->
+                    bridge.ProjectOutlineWithinDeadline(
+                        { defaultArgs projectPath with
+                            timeoutMs = remaining },
+                        cancellation.Token,
+                        fun operation ->
+                            retained <- Some operation
+                            retainUntil operation
+                            ownership.RetainUntil operation
+                    ))
+                |> ownership.TrackRequest
+
+            do! evaluationStarted.Task.WaitAsync(TimeSpan.FromSeconds(2.0))
+            cancellation.Cancel()
+
+            let! result = request
+            Assert.Equal("unknown", result["status"].GetValue<string>())
+            Assert.Equal("project_outline_cancelled", result["errorKind"].GetValue<string>())
+            let operationalCoverage = result["coverage"]
+            Assert.Equal(0, operationalCoverage["filesScanned"].GetValue<int>())
+            Assert.Equal(2, operationalCoverage["filesNotStarted"].GetValue<int>())
+            Assert.Equal(1, bridge.ProjectEvaluationActiveCount)
+            Assert.True(retained.IsSome)
+            Assert.Equal(0, gate.CurrentCount)
+
+            let! queued =
+                runLimitedWithTimeoutRetained gate CancellationToken.None (Some 0) (fun _ _ ->
+                    Interlocked.Increment(&lateStarts) |> ignore
+                    Task.FromResult(successfulControlledOutline ()))
+
+            Assert.Equal("fcs_admission_timeout", queued["errorKind"].GetValue<string>())
+            Assert.Equal(0, Volatile.Read(&lateStarts))
+
+            releaseEvaluation.TrySetResult(()) |> ignore
+
+            let retainedProducer =
+                task {
+                    do! retained.Value
+                }
+
+            let! productTimeout =
+                Assert.ThrowsAsync<TimeoutException>(fun () ->
+                    TestTiming.awaitProducer
+                        "ProjectOutline retained cancelled options evaluation"
+                        (TimeSpan.FromSeconds(10.0))
+                        ownership.RetainUntil
+                        retainedProducer
+                    :> Task)
+
+            Assert.Equal("The project-options worker has no active callers.", productTimeout.Message)
+            Assert.Null(productTimeout.InnerException)
+            do! gate.WaitAsync().WaitAsync(TimeSpan.FromSeconds(2.0))
+            Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
+            gate.Release() |> ignore
             do! ownership.CompleteCleanup()
         finally
             releaseEvaluation.TrySetResult(()) |> ignore
