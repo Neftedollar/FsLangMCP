@@ -81,7 +81,7 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="Ionide.ProjInfo.FCS" Version="[0.75.3]" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="[18.9.0]" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="[18.11.0]" />
     <PackageReference Include="StreamJsonRpc" Version="[2.26.150]" />
     <!-- Pin StringTools to 18.4.0; see FsLangMcp.fsproj for rationale
          (MessagePack's transitive 17.6.3 breaks Ionide.ProjInfo project loading). -->
