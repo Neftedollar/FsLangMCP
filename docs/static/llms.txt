@@ -1,0 +1,36 @@
+# FsLangMCP
+
+> Semantic F# compiler tooling for AI coding agents over MCP.
+
+Canonical: https://neftedollar.com/FsLangMCP/
+Repository: https://github.com/Neftedollar/FsLangMCP
+NuGet: https://www.nuget.org/packages/FsLangMcp/
+
+## Author
+
+- [Roman Melnikov (Neftedollar)](https://neftedollar.com/)
+
+## Start here
+
+- Getting started: https://neftedollar.com/FsLangMCP/guide/getting-started/
+- MCP client configuration: https://neftedollar.com/FsLangMCP/guide/configuration/
+- Troubleshooting: https://neftedollar.com/FsLangMCP/guide/troubleshooting/
+- Tools reference: https://neftedollar.com/FsLangMCP/tools/reference/
+- Detailed tool mechanics: https://neftedollar.com/FsLangMCP/tools/details/
+- Why semantic F# matters: https://neftedollar.com/FsLangMCP/concepts/why-semantic-fsharp/
+- Release notes: https://neftedollar.com/FsLangMCP/changelog/releases/
+- Full LLM context: https://neftedollar.com/FsLangMCP/llms-full.txt
+
+## Core workflow
+
+1. Install with `dotnet tool install -g FsLangMcp`.
+2. Run `fslangmcp --bootstrap-tools` to install the reviewed FSAC, ProjInfo, and Fantomas versions.
+3. Connect the `fslangmcp` stdio server to an MCP client.
+4. Call `set_project` once with a project, solution, or workspace directory.
+5. Lead with `find` for semantic navigation and `check` for a compiler verdict.
+
+## Correctness notes
+
+- Treat a search as exhaustive only when both `coverage.complete=true` and `resolution.complete=true`.
+- A `check` verdict of `clean` covers the current FCS/check profile, not every Release configuration.
+- Before merge or release, run `dotnet build -c Release --warnaserror`.

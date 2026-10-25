@@ -8,7 +8,7 @@
 [![Target](https://img.shields.io/badge/target-net10.0-blue.svg)](https://dotnet.microsoft.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-[Documentation](https://neftedollar.github.io/FsLangMCP/) · [Getting started](https://neftedollar.github.io/FsLangMCP/guide/getting-started/) · [Tools reference](https://neftedollar.github.io/FsLangMCP/tools/reference/)
+[Documentation](https://neftedollar.com/FsLangMCP/) · [Getting started](https://neftedollar.com/FsLangMCP/guide/getting-started/) · [Tools reference](https://neftedollar.com/FsLangMCP/tools/reference/)
 
 <p align="center">
   <img src="docs/static/agent-session.gif" width="840"
@@ -36,6 +36,9 @@ installs (or downgrades) FSAC, ProjInfo, and Fantomas to the exact reviewed
 versions for that release. It also creates the `dotnet-fantomas` command alias
 required by FSAC formatting.
 
+Review [dependency security and updates](#dependency-security-and-updates) before
+using the server.
+
 Add to your MCP client config:
 
 ```json
@@ -62,8 +65,24 @@ Full setup: [`docs/getting-started.md`](docs/getting-started.md) · Per-client c
 
 | Tool | What it does |
 |------|--------------|
-| `find` | Multi-project semantic search with explicit sweep and delivery completeness. A failed/timed-out/busy project makes absence indeterminate; pagination keeps `resolution.complete=false` until one response contains the whole site set. |
+| `find` | Multi-project semantic search, or count-only inventory for 1–50 names in one shared project sweep. Handler-produced success and typed-error responses report fixed phase timings and request-observed project-options/project-use cache decisions; SDK binding, transport, and health responses are outside that contract. Legacy site-search calls and their stateless v2 cursor contract are unchanged. |
 | `check` | One trustworthy verdict (`clean`/`errors`/`unknown`) for the current FCS/check profile. Default mode is a fresh FCS check; fast FSAC mode returns `clean` only with complete current coverage. An `unknown` caused by SDK/preflight failure includes a typed `blockingReason`. Project scope warns that downstream consumers were not checked; workspace scope requires a solution or directory. |
+
+Narrow an ordinary site search when you need only one project, or request counts for several
+names without source snippets:
+
+```text
+find { "query": "OrderId", "kind": "symbol", "scope": "project", "projectPath": "src/Core/Core.fsproj" }
+find { "queries": ["OrderId", "OrderService"], "projectPath": "src/Core/Core.fsproj", "scope": "project" }
+```
+
+The paths are illustrative. Inventory rows keep independent definition/reference/unique-site
+totals and point into the shared `projectLedger`. Its `testProjectDetection` value identifies the
+project-health XML/package heuristic: `isTestProject=true` means recognized test project,
+`false` means unmarked project, and a missing project reports `null`. These groups are not proof of
+test or production execution. An incomplete count is a lower bound; narrow the project, split the
+query batch, or retry with a larger `timeoutMs` before treating zero as absence. See the
+[`find` guide](docs/tools-detailed.md#count-only-inventory) for the full contract.
 
 `check` is the fast semantic edit loop, not the final Release gate. A `clean` verdict covers the
 compiler options in its current FCS/check profile; configuration-specific diagnostics such as
@@ -145,13 +164,13 @@ Prefer the semantic tools above for free-form agent flows.
 | Tool | What it does |
 |------|--------------|
 | `fslangmcp_version` | Returns installed version. Zero-arg. Use when filing UX feedback. |
-| `fsharp_runtime_status` | Read-only runtime snapshot: heap/GC, FCS cache, project-options load/reload telemetry, FSAC working set, and `process.threads`; emits a heuristic restart warning above the anomalous thread threshold. |
+| `fsharp_runtime_status` | Read-only runtime snapshot: heap/GC, FCS cache, project-options load/reload telemetry (`evaluationMode="isolated_helper"`), FSAC working set, and `process.threads`; emits a heuristic restart warning above the anomalous thread threshold. |
 
 ## Example Agent Session
 
 ```
 1. set_project  {"projectPath": "/abs/path/MyApp.sln"}
-   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.17.0"
+   → readiness.lsp=true, loadedProjects=[...], fslangmcpVersion="0.19.0"
 
 2. check  {}
    → verdict="clean"
@@ -259,9 +278,21 @@ found but some projects were not analyzed; `status="unknown"` plus
 `coverage.complete` says whether the project sweep finished, while
 `resolution.complete` says whether this response delivered the entire site set; follow
 `truncated` / `nextCursor` and verify `totalEstimate.sites` before treating a refactor count as
-exhaustive. `check(speed="fast")`
+exhaustive. A v2 cursor may be retried with a different `maxResults` or `timeoutMs`, but changing
+any result-shaping input returns `cursor_query_mismatch`; a changed source/result/coverage stream
+returns `cursor_stale`, including removal of the last or selected declared solution member.
+Deadline-incomplete initial pages have no cursor and require a restart; deadline-incomplete
+continuations return no sites with `retrySameCursor=true`. This also applies when constructing
+the final validation-error response exhausts the deadline: a well-formed continuation returns
+`cursor_validation_incomplete` and can be retried to obtain the actual validation result.
+Malformed cursors and invalid/missing-context requests keep their typed rejection routes.
+`check(speed="fast")`
 similarly exposes expected/received/missing/stale file coverage and never turns an
 incomplete empty snapshot into `clean`.
+
+For capped linked-field type alternatives, `siteTypeAlternativesOmitted` reports how many
+alternatives were omitted and `siteTypeAlternativesOffset` identifies the first omitted index.
+These per-site values are independent of page size and response budget.
 
 LSP positions (`line`, `character`) are **0-based**.
 
@@ -304,16 +335,6 @@ installation. The reviewed compatibility set is pinned in
 - `ionide.projinfo.tool` `0.74.2`
 - `fantomas` `7.0.5`
 
-The FsLangMCP package dependency graph is audited separately from those external
-tools. The supported external-tool pins above still carry advisory-listed
-MessagePack assemblies, although the supported FsLangMCP paths
-explicitly use JSON and do not select a MessagePack formatter. No patched
-upstream tool package is currently available, so the exact pins above are a
-documented, process-contained risk acceptance rather than a guarantee that every
-file shipped inside the external tools is advisory-free. See the `0.14.0`
-section of the changelog for the advisory links and scope (that work ships to
-consumers as part of `0.15.0`; `0.14.0` was never published).
-
 Install that exact set (including FSAC's required Fantomas command alias) for
 normal use:
 
@@ -325,3 +346,35 @@ For repository development, `just runtime-tools` materializes the same versions
 under `.runtime-tools/`, and `just live-fsac` performs a real MCP → FSAC and
 ProjInfo smoke. Both paths validate the same exact root manifest; the repository
 path is isolated from any other globally installed tools.
+
+### Dependency security and updates
+
+The FsLangMCP package graph and the libraries bundled inside separately installed
+runtime tools are different audit scopes. The pins above include advisory-listed
+MessagePack (FSAC/Fantomas) and System.Drawing.Common (ProjInfo) assemblies.
+[#170](https://github.com/Neftedollar/FsLangMCP/issues/170) records the affected
+versions and the reachability assessment. No exploit was demonstrated in the
+supported flows assessed there; that is **not proof of safety**. Running a tool
+as a child process is not a security sandbox.
+
+Changing a NuGet reference in FsLangMCP or your project does not replace those
+bundled assemblies. FsLangMCP can adopt compatible upstream fixes or a verified
+replacement, but documenting the risk does not remove the vulnerabilities.
+
+- Keep your .NET SDK and project dependencies updated. Use
+  [NuGet Audit](https://learn.microsoft.com/en-us/nuget/concepts/auditing-packages)
+  for direct and transitive project dependencies; a clean project audit does not
+  cover the libraries bundled inside installed tools.
+- Follow [FsLangMCP releases](https://github.com/Neftedollar/FsLangMCP/releases)
+  and security updates from FSAC, Fantomas, and ProjInfo. After updating FsLangMCP,
+  rerun `fslangmcp --bootstrap-tools` and restart your MCP connection. Bootstrap
+  selects the installed release's exact reviewed pins, not the latest upstream
+  versions, and can downgrade manually updated tools. Reinstalling unchanged pins
+  does not remediate their advisories; newer tool versions need compatibility and
+  dependency checks before they enter the supported set.
+- Load only projects you trust. Use an isolated environment for untrusted code;
+  do not treat the MCP server or its child processes as a security boundary.
+
+Treat this as a documented dependency risk, not an advisory-free toolchain. If
+your security policy disallows these dependencies, do not use the affected
+toolchain until a suitable remediation is available.

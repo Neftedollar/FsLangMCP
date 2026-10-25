@@ -10,7 +10,7 @@ open Nacara.Theme
 let RepositoryUrl = "https://github.com/Neftedollar/FsLangMCP"
 
 [<Literal>]
-let SiteOrigin = "https://neftedollar.github.io"
+let SiteOrigin = "https://neftedollar.com"
 
 [<Literal>]
 let SiteBaseUrl = "/FsLangMCP/"
@@ -74,6 +74,13 @@ let theme =
     |> Theme.favIcon "/favicon.svg"
     |> Theme.headExtra
         [
+            Html.link
+                [
+                    prop.custom ("rel", "alternate")
+                    prop.custom ("type", "text/plain")
+                    prop.custom ("href", $"%s{SiteBaseUrl}llms.txt")
+                    prop.custom ("title", "LLMs.txt")
+                ]
             metaProperty "og:image" $"%s{SiteOrigin}%s{SiteBaseUrl}og.png"
             metaProperty "og:image:width" "1280"
             metaProperty "og:image:height" "640"
@@ -165,7 +172,7 @@ let site =
         { options with
             CheckExternal = Environment.GetEnvironmentVariable "FSLANGMCP_DOCS_CHECK_EXTERNAL" = "1"
             FailOnExternal = false
-            Ignore = [ @"^https://neftedollar\.github\.io/FsLangMCP/" ]
+            Ignore = [ @"^https://neftedollar\.com/FsLangMCP/" ]
         }
     )
     |> LightningCss.register

@@ -23,6 +23,7 @@ open System.Threading.Tasks
 open Xunit
 open Xunit.Abstractions
 open FsLangMcp.Types
+open FsLangMcp.Tools
 open FsLangMcp.FcsBridge
 open FsLangMcp.Dispatcher
 
@@ -188,6 +189,26 @@ let private partialSlnx =
           "  <Project Path=\"Broken/Broken.fsproj\" />"
           "</Solution>" ]
 
+let private solutionContents (extension: string) (members: string list) =
+    if extension = ".slnx" then
+        [ "<Solution>"
+          yield! members |> List.map (fun path -> $"  <Project Path=\"{path}\" />")
+          "</Solution>" ]
+        |> String.concat "\n"
+    else
+        let projectTypeGuid = "{F2A71F9B-5D33-465A-A702-920D77279786}"
+
+        [ "Microsoft Visual Studio Solution File, Format Version 12.00"
+          yield!
+              members
+              |> List.mapi (fun index path ->
+                  let windowsPath = path.Replace('/', '\\')
+                  let projectGuid = $"{{00000000-0000-0000-0000-{index:D12}}}"
+                  $"Project(\"{projectTypeGuid}\") = \"Project{index}\", \"{windowsPath}\", \"{projectGuid}\"\nEndProject")
+          "Global"
+          "EndGlobal" ]
+        |> String.concat "\n"
+
 // ── Class fixture: written + built ONCE, shared by every test in the class ───────
 
 type FindFixture() =
@@ -216,7 +237,38 @@ type FindFixture() =
     // be interpreted as a zero-match project.
     do write "Broken/Broken.fsproj" "<Project><ItemGroup>" |> ignore
     let slnxPath = write "FindSolution.slnx" slnx
+    let slnPath =
+        write
+            "FindSolution.sln"
+            (solutionContents
+                ".sln"
+                [ "Domain/Domain.fsproj"; "Stubs/Stubs.fsproj"; "App/App.fsproj" ])
+
     let partialSlnxPath = write "PartialFindSolution.slnx" partialSlnx
+
+    let missingMemberSlnxPath =
+        write
+            "MissingMemberFindSolution.slnx"
+            (solutionContents ".slnx" [ "Domain/Domain.fsproj"; "Missing/Missing.fsproj" ])
+
+    let missingMemberSlnPath =
+        write
+            "MissingMemberFindSolution.sln"
+            (solutionContents ".sln" [ "Domain/Domain.fsproj"; "Missing/Missing.fsproj" ])
+
+    let allMissingSlnxPath =
+        write
+            "AllMissingFindSolution.slnx"
+            (solutionContents
+                ".slnx"
+                [ "MissingOne/MissingOne.fsproj"; "MissingTwo/MissingTwo.fsproj" ])
+
+    let allMissingSlnPath =
+        write
+            "AllMissingFindSolution.sln"
+            (solutionContents
+                ".sln"
+                [ "MissingOne/MissingOne.fsproj"; "MissingTwo/MissingTwo.fsproj" ])
 
     // dotnet build is ground truth and also produces Domain.dll so per-project FCS
     // sweeps resolve the cross-project TraderRole reference. -m:1 serializes MSBuild
@@ -257,8 +309,13 @@ type FindFixture() =
     do buildSw.Stop()
 
     member _.Root = root
+    member _.Sln = slnPath
     member _.Slnx = slnxPath
     member _.PartialSlnx = partialSlnxPath
+    member _.MissingMemberSln = missingMemberSlnPath
+    member _.MissingMemberSlnx = missingMemberSlnxPath
+    member _.AllMissingSln = allMissingSlnPath
+    member _.AllMissingSlnx = allMissingSlnxPath
     member _.DomainFsproj = domainFsproj
     member _.DomainFs = domainSource
     member _.ImpactFs = impactSource
@@ -827,7 +884,7 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
         }
 
     [<Fact>]
-    member _.``#207: an empty typed result on an incomplete sweep blames coverage, not the caller's kind``() : Task =
+    member _.``#207: an already-expired typed find blames the deadline not the caller's kind``() : Task =
         task {
             Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
             let bridge = FcsBridge()
@@ -845,10 +902,12 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                 )
 
             Assert.Equal("unknown", gs find "status")
-            Assert.Equal(0, gi find["siteTypes"] "fieldSites")
+            Assert.Equal("find_timeout", gs find "errorKind")
+            Assert.Null(find["siteTypes"])
+            Assert.Null(find["siteTypesNote"])
 
-            let note = gs find "siteTypesNote"
-            Assert.Contains("sweep is incomplete", note)
+            let note = gs find "scopeNote"
+            Assert.Contains("timed out during admission", note)
             Assert.Contains("timeoutMs", note)
             Assert.DoesNotContain("Use kind='field'", note)
         }
@@ -1046,8 +1105,7 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                   "character", { baseline with character = Some -1 }, "character"
                   "occurrence", { baseline with occurrence = Some -2 }, "occurrence"
                   "file-path", { baseline with scope = Some "file" }, "requires a non-empty path"
-                  "project-context", { baseline with scope = Some "project" }, "whole solution"
-                  "cursor", { baseline with cursor = Some "not-base64" }, "Invalid cursor" ]
+                  "project-context", { baseline with scope = Some "project" }, "whole solution" ]
 
             for (label, invalidArgs, expectedMessage) in cases do
                 let! result = bridge.Find(invalidArgs)
@@ -1058,6 +1116,13 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                 )
 
                 Assert.Contains(expectedMessage, gs result "message")
+
+            let! malformedCursor = bridge.Find({ baseline with cursor = Some "not-base64" })
+            Assert.Equal("invalid_cursor", gs malformedCursor "status")
+            Assert.Equal("cursor_malformed", gs malformedCursor "errorKind")
+            Assert.True(gb malformedCursor "paginationRestartRequired")
+            Assert.False(gb malformedCursor "retrySameCursor")
+            Assert.Empty(malformedCursor["sites"] :?> JsonArray)
         }
 
     [<Fact>]
@@ -1113,9 +1178,13 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
 
                 Assert.Equal("unknown", gs result "status")
                 Assert.Equal(1, gi result "projectsRequested")
+                Assert.Equal(0, gi result "projectsSwept")
+                Assert.Equal(0, gi result "projectsMissing")
+                Assert.Equal(1, gi result "projectsNotStarted")
                 let perProject = result["perProject"].AsArray()
                 Assert.Single(perProject) |> ignore
                 Assert.Equal(Path.GetFullPath(fx.DomainFsproj), gs perProject[0] "fsproj")
+                Assert.Equal("not_started", gs perProject[0] "status")
                 Assert.False(
                     String.Equals(
                         Path.GetFullPath(outsideProject),
@@ -1124,14 +1193,8 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                     )
                 )
 
-                // #193 round 2: this is scope='file' AND incomplete coverage at once — the
-                // note must combine both honestly: it cannot claim the project was "swept"
-                // (it timed out), and it must still name the file-level filter, not just the
-                // sibling-project blind spot.
-                Assert.Equal(
-                    $"find could not fully analyze this project (0 failed, 1 timed out, 0 busy) — this response is incomplete; see coverage/message before trusting an absence of matches. Sites, where present, are also filtered to '{Path.GetFullPath(outsideSource)}'; other files in this project, and all sibling projects, are not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.",
-                    gs result "scopeNote"
-                )
+                Assert.Contains("timed out during admission", gs result "scopeNote")
+                Assert.Contains("no later semantic phase was started", gs result "scopeNote")
             finally
                 if Directory.Exists outsideRoot then
                     Directory.Delete(outsideRoot, true)
@@ -1318,7 +1381,7 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
         }
 
     [<Fact>]
-    member _.``#193 round 2: a single-project sweep with incomplete coverage and no file filter combines both honestly``
+    member _.``#193 round 2: an expired single-project request reports the project as not started``
         ()
         : Task =
         task {
@@ -1340,15 +1403,18 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
 
             Assert.Equal("unknown", gs find "status")
             Assert.Equal(1, gi find "projectsRequested")
+            Assert.Equal(0, gi find "projectsSwept")
+            Assert.Equal(0, gi find "projectsMissing")
             Assert.Equal(0, gi find "projectsAnalyzed")
             Assert.Equal(0, gi find "projectsFailed")
-            Assert.Equal(1, gi find "projectsTimedOut")
+            Assert.Equal(0, gi find "projectsTimedOut")
             Assert.Equal(0, gi find "projectsBusy")
+            Assert.Equal(1, gi find "projectsNotStarted")
 
-            Assert.Equal(
-                "find could not fully analyze this project (0 failed, 1 timed out, 0 busy) — this response is incomplete; see coverage/message before trusting an absence of matches. Cross-project usages in sibling projects are also not visible. To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'.",
-                gs find "scopeNote"
-            )
+            let perProject = find["perProject"].AsArray()
+            Assert.Single(perProject) |> ignore
+            Assert.Equal("not_started", gs perProject[0] "status")
+            Assert.Contains("timed out during admission", gs find "scopeNote")
         }
 
     [<Fact>]
@@ -1373,6 +1439,112 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
             Assert.Equal(0, gi find "projectsTimedOut")
             Assert.Equal("none", gs resolution "via")
             Assert.Equal(3, gi resolution "projectsSwept")
+        }
+
+    [<Theory>]
+    [<InlineData(".sln")>]
+    [<InlineData(".slnx")>]
+    member _.``find counts declared solution members and keeps missing projects as typed coverage failures``
+        (extension: string)
+        : Task =
+        task {
+            Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit %d{fx.BuildExitCode}):\n%s{fx.BuildLog}")
+
+            let allPresentPath, oneMissingPath, allMissingPath =
+                if extension = ".sln" then
+                    fx.Sln, fx.MissingMemberSln, fx.AllMissingSln
+                else
+                    fx.Slnx, fx.MissingMemberSlnx, fx.AllMissingSlnx
+
+            let bridge = FcsBridge()
+
+            // No declared member exists, so no project-options/FCS work may start.
+            let! allMissing =
+                bridge.Find(
+                    { findArgs allMissingPath "ZzzNoSuchSymbol_AllMissing" with
+                        includePerProject = Some false }
+                )
+
+            Assert.Equal("unknown", gs allMissing "status")
+            Assert.Equal("indeterminate", gs allMissing "outcome")
+            Assert.Null(allMissing["resolution"]["matched"])
+            Assert.False(gb allMissing["coverage"] "complete")
+            Assert.Equal(0, gi allMissing "projectsSwept")
+            Assert.Equal(2, gi allMissing "projectsRequested")
+            Assert.Equal(0, gi allMissing "projectsAnalyzed")
+            Assert.Equal(0, gi allMissing "projectsFailed")
+            Assert.Equal(2, gi allMissing "projectsMissing")
+            Assert.Equal(0L, bridge.ProjectOptionsLoadCount)
+
+            let allMissingProjects = allMissing["perProject"].AsArray()
+            Assert.Equal(2, allMissingProjects.Count)
+
+            for project in allMissingProjects do
+                Assert.Equal("missing", gs project "status")
+                Assert.Equal("project_not_found", gs project "errorKind")
+                Assert.False(File.Exists(gs project "fsproj"))
+
+            // A positive match in the surviving independent project remains useful,
+            // but the missing sibling keeps the site set explicitly incomplete.
+            let! positive = bridge.Find(findArgs oneMissingPath "TraderRole")
+
+            Assert.Equal("partial", gs positive "status")
+            Assert.Equal("matched", gs positive "outcome")
+            Assert.True(gb positive["resolution"] "matched")
+            Assert.True((gi positive "totalSites" > 0))
+            Assert.False(gb positive["coverage"] "complete")
+            Assert.Equal(1, gi positive "projectsSwept")
+            Assert.Equal(2, gi positive "projectsRequested")
+            Assert.Equal(1, gi positive "projectsAnalyzed")
+            Assert.Equal(0, gi positive "projectsFailed")
+            Assert.Equal(1, gi positive "projectsMissing")
+            Assert.Equal("project", gs positive["resolution"] "scopeResolved")
+            Assert.Equal(1, gi positive["resolution"] "projectsSwept")
+
+            let missingEntry =
+                positive["perProject"].AsArray()
+                |> Seq.find (fun project -> gs project "status" = "missing")
+
+            Assert.Equal("project_not_found", gs missingEntry "errorKind")
+
+            // The same incomplete membership cannot prove a zero result.
+            let! incompleteZero = bridge.Find(findArgs oneMissingPath "ZzzNoSuchSymbol_DeclaredMissing")
+
+            Assert.Equal("unknown", gs incompleteZero "status")
+            Assert.Equal("indeterminate", gs incompleteZero "outcome")
+            Assert.Null(incompleteZero["resolution"]["matched"])
+            Assert.Equal(2, gi incompleteZero "projectsRequested")
+            Assert.Equal(1, gi incompleteZero "projectsAnalyzed")
+            Assert.Equal(1, gi incompleteZero "projectsMissing")
+
+            // Intentional project scope remains narrow: a missing sibling outside the
+            // selected project's coverage must not poison this explicitly limited result.
+            let! narrowed =
+                bridge.Find(
+                    { findArgs oneMissingPath "TraderRole" with
+                        scope = Some "project"
+                        path = Some fx.DomainFs }
+                )
+
+            Assert.Equal("succeeded", gs narrowed "status")
+            Assert.True(gb narrowed["coverage"] "complete")
+            Assert.Equal(1, gi narrowed "projectsSwept")
+            Assert.Equal(1, gi narrowed "projectsRequested")
+            Assert.Equal(1, gi narrowed "projectsAnalyzed")
+            Assert.Equal(0, gi narrowed "projectsMissing")
+
+            // Control: every declared member exists and is analyzed, so zero is conclusive.
+            let! allPresent = bridge.Find(findArgs allPresentPath "ZzzNoSuchSymbol_AllPresent")
+
+            Assert.Equal("succeeded", gs allPresent "status")
+            Assert.Equal("not_found", gs allPresent "outcome")
+            Assert.False(gb allPresent["resolution"] "matched")
+            Assert.True(gb allPresent["coverage"] "complete")
+            Assert.Equal(3, gi allPresent "projectsSwept")
+            Assert.Equal(3, gi allPresent "projectsRequested")
+            Assert.Equal(3, gi allPresent "projectsAnalyzed")
+            Assert.Equal(0, gi allPresent "projectsMissing")
+            Assert.Equal("workspace", gs allPresent["resolution"] "scopeResolved")
         }
 
     [<Fact>]
@@ -1445,7 +1617,7 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
         }
 
     [<Fact>]
-    member _.``P1-01 exhausted find budget classifies every skipped project as timed out``() : Task =
+    member _.``P1-01 exhausted find budget skips discovery and all later work``() : Task =
         task {
             Assert.True((fx.BuildExitCode = 0), $"Fixture build failed (exit {fx.BuildExitCode}):\n{fx.BuildLog}")
             let bridge = FcsBridge()
@@ -1459,28 +1631,28 @@ type FindTests(fx: FindFixture, output: ITestOutputHelper) =
                 )
 
             Assert.Equal("unknown", gs result "status")
+            Assert.Equal("find_timeout", gs result "errorKind")
             Assert.Equal("indeterminate", gs result "outcome")
             Assert.Null(result["resolution"]["matched"])
-            Assert.Equal(3, gi result "projectsRequested")
+            Assert.Equal(0, gi result "projectsRequested")
+            Assert.Equal(0, gi result "projectsSwept")
+            Assert.Equal(0, gi result "projectsMissing")
             Assert.Equal(0, gi result "projectsAnalyzed")
             Assert.Equal(0, gi result "projectsFailed")
-            Assert.Equal(3, gi result "projectsTimedOut")
+            Assert.Equal(0, gi result "projectsTimedOut")
             Assert.Equal(0, gi result "projectsBusy")
+            Assert.Equal(0, gi result "projectsNotStarted")
+            Assert.Equal(0L, bridge.FindTargetDiscoveryStartedCount)
+            Assert.Equal(0L, bridge.ProjectOptionsLoadCount)
+            Assert.Equal(0L, bridge.ProjectUsesStartedCount)
 
-            let perProject = result["perProject"].AsArray()
-            Assert.Equal(3, perProject.Count)
+            let perProject = (result["perProject"]).AsArray()
+            Assert.Empty(perProject)
 
-            for project in perProject do
-                Assert.Equal("timed_out", gs project "status")
-                Assert.Equal("timeout", gs project "errorKind")
-
-            // #193 round 2: this response's coverage is INCOMPLETE (0 of 3 analyzed) —
-            // scopeNote must say so honestly ("analyzed 0 of 3") rather than claiming
-            // "find swept 3 member projects", which would overstate work that never ran.
-            Assert.Equal(
-                $"find analyzed 0 of 3 member projects of '{Path.GetFullPath(fx.Slnx)}' (0 failed, 3 timed out, 0 busy) — this response is incomplete; see coverage/message before trusting an absence of matches. To narrow to just one project (faster, but misses cross-project usages), pass its .fsproj as projectPath.",
-                gs result "scopeNote"
-            )
+            let phases = (result["coverage"]["phases"]).AsArray()
+            Assert.Equal("timed_out", gs (phases[0]) "status")
+            Assert.Equal("not_started", gs (phases[2]) "status")
+            Assert.Contains("no later semantic phase was started", gs result "scopeNote")
         }
 
     [<Fact>]
@@ -2052,9 +2224,9 @@ type FindPositionTests(fx: ConfigFixture) =
             Assert.Contains("ConfigProbe.Beta.Config", plainNames)
         }
 
-// ── #207 review: one linked file, two projects, two different types ─────────────
+// ── #207 review: one linked file, several projects, different types ─────────────
 //
-// find de-duplicates sites by physical source location, so a `.fs` linked into two
+// find de-duplicates sites by physical source location, so a `.fs` linked into several
 // `.fsproj` files is swept once per project — and `#if` (or any other per-project type
 // context) can make the SAME range resolve to different field types. Before the fix the
 // last project swept overwrote the row outright: the payload reported ProjB's `string`,
@@ -2063,23 +2235,44 @@ type FindPositionTests(fx: ConfigFixture) =
 // The fixture needs no `dotnet build`: neither project references anything, so ProjInfo
 // resolves options on its own and the whole sweep is a couple of seconds.
 
+let private crowdedUses =
+    [ for index in 0..49 ->
+          $"let crowded{index:D2} value : CrowdedParcel = {{ CrowdedValue = value }}" ]
+
 let private linkedSharedFs =
     String.concat
         "\n"
-        [ "module Shared"
-          ""
-          "type Parcel ="
-          "    { Weight:"
-          "#if ALT"
-          "        string"
-          "#else"
-          "        int"
-          "#endif"
-          "    }"
-          ""
-          "// ONE physical site, compiled by BOTH projects — `int` in ProjA, `string` in ProjB."
-          "let create w = { Weight = w }"
-          "" ]
+        ([ "module Shared"
+           ""
+           "type Parcel ="
+           "    { Weight:"
+           "#if ALT_B"
+           "        string"
+           "#else"
+           "        int"
+           "#endif"
+           "    }"
+           ""
+           "// ONE physical site, compiled by every project — only ProjB differs."
+           "let create w = { Weight = w }"
+           ""
+           "type CrowdedParcel ="
+           "    { CrowdedValue:"
+           "#if ALT_B"
+           "        bool"
+           "#elif ALT_C"
+           "        byte"
+           "#elif ALT_D"
+           "        decimal"
+           "#elif ALT_E"
+           "        string"
+           "#else"
+           "        int"
+           "#endif"
+           "    }"
+           "" ]
+         @ crowdedUses
+         @ [ "" ])
 
 let private linkedProject (defineConstants: string option) =
     let defines =
@@ -2105,8 +2298,16 @@ type LinkedSourceFixture() =
         full
 
     let sharedSource = write "Shared/Shared.fs" linkedSharedFs
+    let projectB = "ProjBWithAnIntentionallyLongNameForCanonicalSiteSerialization"
+    let projectC = "ProjCWithAnIntentionallyLongNameForCanonicalSiteSerialization"
+    let projectD = "ProjDWithAnIntentionallyLongNameForCanonicalSiteSerialization"
+    let projectE = "ProjEWithAnIntentionallyLongNameForCanonicalSiteSerialization"
+
     do write "ProjA/ProjA.fsproj" (linkedProject None) |> ignore
-    do write "ProjB/ProjB.fsproj" (linkedProject (Some "ALT")) |> ignore
+    do write $"ProjB/{projectB}.fsproj" (linkedProject (Some "ALT_B")) |> ignore
+    do write $"ProjC/{projectC}.fsproj" (linkedProject (Some "ALT_C")) |> ignore
+    do write $"ProjD/{projectD}.fsproj" (linkedProject (Some "ALT_D")) |> ignore
+    do write $"ProjE/{projectE}.fsproj" (linkedProject (Some "ALT_E")) |> ignore
 
     let slnxPath =
         write
@@ -2115,11 +2316,20 @@ type LinkedSourceFixture() =
                 "\n"
                 [ "<Solution>"
                   "  <Project Path=\"ProjA/ProjA.fsproj\" />"
-                  "  <Project Path=\"ProjB/ProjB.fsproj\" />"
+                  $"  <Project Path=\"ProjB/{projectB}.fsproj\" />"
+                  $"  <Project Path=\"ProjC/{projectC}.fsproj\" />"
+                  $"  <Project Path=\"ProjD/{projectD}.fsproj\" />"
+                  $"  <Project Path=\"ProjE/{projectE}.fsproj\" />"
                   "</Solution>" ])
 
     member _.Slnx = slnxPath
     member _.SharedSource = sharedSource
+    member _.AlternativeProject = projectB
+
+    member _.CrowdedTargetLine =
+        linkedSharedFs.Split('\n')
+        |> Array.findIndex (fun line -> line.Contains("crowded20", StringComparison.Ordinal))
+        |> (+) 1
 
     interface IDisposable with
         member _.Dispose() =
@@ -2147,7 +2357,7 @@ type FindLinkedSourceTests(fx: LinkedSourceFixture) =
                 )
 
             Assert.Equal("succeeded", gs find "status")
-            Assert.Equal(2, gi find "projectsAnalyzed")
+            Assert.Equal(5, gi find "projectsAnalyzed")
 
             // De-duplication by physical location is intact: ONE row, not one per project.
             let sites = find["sites"] :?> JsonArray
@@ -2173,7 +2383,7 @@ type FindLinkedSourceTests(fx: LinkedSourceFixture) =
                 |> Seq.map (fun value -> value.GetValue<string>())
                 |> Seq.toList
 
-            Assert.Equal<string list>([ "ProjB" ], alternativeProjects)
+            Assert.Equal<string list>([ fx.AlternativeProject ], alternativeProjects)
             Assert.False(site.AsObject().ContainsKey("siteTypeAlternativesOmitted"))
 
             // Ledger: the row is still `typed` — the identity typed + degraded = fieldSites
@@ -2184,6 +2394,59 @@ type FindLinkedSourceTests(fx: LinkedSourceFixture) =
             Assert.Equal(0, gi ledger "degraded")
             Assert.Equal(1, gi ledger "typedDifferentlyByAnotherProject")
             Assert.Contains("resolved to DIFFERENT types", gs find "siteTypesNote")
+        }
+
+    [<Fact>]
+    member _.``#258: canonical site row is invariant across maxResults and page boundaries`` () : Task =
+        task {
+            let largeBridge = FcsBridge()
+
+            let request maxResults cursor =
+                { findArgs fx.Slnx "CrowdedParcel" with
+                    kind = Some "field"
+                    includeSiteTypes = Some true
+                    maxResults = Some maxResults
+                    cursor = cursor }
+
+            let! largePage = largeBridge.Find(request 1000 None)
+            Assert.Equal("succeeded", gs largePage "status")
+
+            let targetFromLargePage =
+                (largePage["sites"] :?> JsonArray)
+                |> Seq.find (fun site -> gi site["range"] "startLine" = fx.CrowdedTargetLine)
+
+            // Production fields required for per-project planning survive the canonical cap.
+            Assert.Equal("ProjA", gs targetFromLargePage "project")
+            Assert.NotNull(targetFromLargePage["siteTypeAlternatives"])
+            Assert.Equal(1, gi targetFromLargePage "siteTypeAlternativesOmitted")
+
+            let expectedRow = renderToken targetFromLargePage
+            let mutable cursor = None
+            let mutable targetFromSmallPages: JsonNode = null
+            let mutable pages = 0
+            let mutable sawBudgetBoundary = false
+            let smallBridge = FcsBridge(findResponseBudgetCharsOverride = 12_000)
+
+            while isNull targetFromSmallPages && (cursor.IsSome || pages = 0) do
+                Assert.True(pages < 50, "small-page traversal must terminate")
+                let! page = smallBridge.Find(request 7 cursor)
+                pages <- pages + 1
+                sawBudgetBoundary <- sawBudgetBoundary || page["sitesTruncatedByBudget"].GetValue<bool>()
+
+                targetFromSmallPages <-
+                    (page["sites"] :?> JsonArray)
+                    |> Seq.tryFind (fun site -> gi site["range"] "startLine" = fx.CrowdedTargetLine)
+                    |> Option.defaultValue null
+
+                cursor <-
+                    match page["nextCursor"] with
+                    | null -> None
+                    | value -> Some(value.GetValue<string>())
+
+            Assert.True(pages > 1, "regression must cross at least one maxResults boundary")
+            Assert.True(sawBudgetBoundary, "regression must also cross a serialized response-budget boundary")
+            Assert.NotNull(targetFromSmallPages)
+            Assert.Equal(expectedRow, renderToken targetFromSmallPages)
         }
 
     [<Fact>]

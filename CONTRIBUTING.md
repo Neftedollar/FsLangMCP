@@ -45,7 +45,7 @@ The deployment job writes the generated site to the `gh-pages` branch. After tha
 
 ## Adding a new MCP tool
 
-The v0.17.0 surface ships 35 tools that all follow the same registration shape. To add another:
+The v0.19.0 surface ships 35 tools that all follow the same registration shape. To add another:
 
 1. **Define the args record in `Types.fs`** with `///` doc-comments on every field. Use current records such as `FindArgs` and `CheckArgs` as style templates. Defaults stated in `///` text must match the actual `defaultArg` call site in the handler.
 
@@ -95,10 +95,13 @@ The v0.17.0 surface ships 35 tools that all follow the same registration shape. 
   `just restore-update` and commit both lock files with the fsproj change;
   `--force-evaluate` regenerates locks but does not discover an update. Routine
   version bumps arrive via Dependabot PRs.
-- **Pinned toolchain**: development and CI use SDK `10.0.400` from `global.json`.
-  Runtime FSAC/ProjInfo/Fantomas versions come only from `dotnet-tools.json`. Run
-  `just live-fsac` before changing LSP startup, project loading, or those pins;
-  GitHub Actions repeats the live smoke on Linux, macOS, and Windows.
+- **SDK floor and release pin**: `global.json` accepts stable .NET 10 SDKs from
+  `10.0.100` onward via `latestFeature`. CI tests that minimum separately, while
+  the primary, live-FSAC, and release jobs remain pinned to the reviewed SDK
+  `10.0.400`. Runtime FSAC/ProjInfo/Fantomas versions come only from
+  `dotnet-tools.json`. Run `just live-fsac` before changing LSP startup, project
+  loading, or those pins; GitHub Actions repeats the live smoke on Linux, macOS,
+  and Windows.
 
 ## PR process
 

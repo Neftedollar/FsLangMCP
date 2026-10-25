@@ -8,7 +8,7 @@ toc:
 
 The MCP description tells you *whether* to call a tool; this file tells you *how it works internally*.
 
-**Start here.** `find` and `check` are the primary entry points in the 35-tool v0.17.0 surface.
+**Start here.** `find` and `check` are the primary entry points in the 35-tool v0.19.0 surface.
 The consolidation aliases below were removed in v0.11.0 and are no longer registered:
 
 | Removed names | Current route |
@@ -89,13 +89,17 @@ elapsed time means.
 **Routing description:** Multi-project symbol search. Sweeps every member `.fsproj` of the
 solution and unions definitions, references, record-field set sites, and member-usage sites.
 Bare `find(query)` suffices; optional `kind`
-(`auto`|`symbol`|`members`|`field`|`definition`|`position`) and `scope` narrow it. `scopeNote`
-rides exactly the sweep-outcome responses and names how many projects were actually swept and how
-to widen/narrow (#193 — see below); every pre-sweep return carries no note. Prefer over text search
+(`auto`|`symbol`|`members`|`field`|`definition`|`position`) and `scope` narrow it. For legacy site
+search, `scopeNote` names how many projects were actually swept and how to widen/narrow (#193 — see below); a
+deadline before discovery instead explains which phase could not finish. Prefer over text search
 for cross-project refactors.
 
-**Signature:** `query` is the only required argument. `kind` (default `auto`) and `scope` (default
-`auto`) shape the sweep. `exact` (default `true`) toggles exact-vs-substring matching. `member` /
+**Signature:** Supply either `query` for the existing site search or `queries` for count-only
+inventory, never both. `queries` accepts 1–50 distinct non-blank strings after trimming and
+defaults `countsOnly` to `true`; `query` plus `countsOnly=true` requests the same inventory shape.
+Without `countsOnly=true`, the legacy single-`query` behavior is unchanged. `kind` (default `auto`)
+and `scope` (default `auto`) shape the sweep. `exact` (default `true`) toggles exact-vs-substring
+matching; it never enables wildcard syntax. `member` /
 `field` restrict the member-usage / record-field unions. `path` + `line` + `word` + `occurrence` +
 `character` anchor `kind=position`. `contextLines` (default 0), `includeDeclaration` (default true),
 `includeInfo` (default false), `includeSiteTypes` (default false — see *Field-impact mode*),
@@ -104,22 +108,158 @@ for cross-project refactors.
 out the surface. `scope=file` requires `path`; `scope=project` requires a direct `.fsproj` target or
 a `path` that resolves to one member project of the requested solution.
 
+### One request deadline
+
+`timeoutMs` is one monotonic end-to-end budget, including queue admission, position resolution,
+project discovery, project-options loading, the FCS sweep, classification, FSAC fallback, and
+response construction. No phase restarts that clock. Up to 250 ms (5% of the requested budget,
+with a 1 ms minimum for positive budgets) is reserved **inside** it for response construction;
+`responseConstructionAllowanceMs` reports the reservation. The response planner, diagnostic
+projection, source-line streaming, JSON copying, and final serialization checks observe that same
+bounded allowance.
+
+An expiry before outer admission returns `errorKind="fcs_admission_timeout"`; a pre-discovery
+expiry after admission returns `errorKind="find_timeout"`. Neither performs a new
+scan just to count missing projects. A known explicit `.fsproj` is `not_started`; an undiscovered
+solution has no invented member count. `coverage.phases` names the affected phase, while
+`projectsNotStarted`, `projectsTimedOut`, `projectsBusy`, `projectsMissing`, and `projectsFailed`
+remain distinct. An incomplete zero-result answer stays indeterminate.
+
+If response construction expires after the sweep, `errorKind="find_response_timeout"` preserves
+the available semantic evidence but sets `resultSetComplete=false`,
+`paginationRestartRequired=true`, and `nextCursor=null` for an initial request. Restart without a
+cursor after narrowing that request. A continuation instead follows the no-sites same-cursor
+retry contract below. `coverage.complete` may still be true: completing analysis does not imply
+successful delivery of every site.
+
+When the semantic deadline leaves a positive initial result incomplete, the response is an
+explicit cursorless partial: `deliveryStatus="partial"`, `truncated=true`,
+`totalEstimateIsLowerBound=true`, `paginationRestartRequired=true`,
+`retrySameCursor=false`, and `paginationIncompleteReason="deadline_incomplete"`. The known sites
+remain useful, but the complete stream must be restarted from page zero with a larger deadline.
+An incomplete continuation is stricter: it returns no sites and no new cursor with
+`errorKind="cursor_validation_incomplete"`, `paginationRestartRequired=false`, and
+`retrySameCursor=true`.
+
+`breakdownComplete` independently says whether all per-kind counts were computed. If the response
+deadline interrupts that counting pass, `breakdown` retains the counted prefix as lower bounds and
+sets the flag to false, even though `totalSites` already names the full known site set. Later
+context/planner expiry does not invalidate a completed breakdown.
+
+Requests sharing an in-flight worker retain independent deadlines. A short-lived caller cannot
+cancel work still needed by a live caller; when all waiters expire, avoidable continuations stop.
+Uncancellable work already running retains its admission slot until it actually completes, so an
+early timeout cannot create an unbounded worker backlog. A synchronous filesystem or compiler
+call already in progress is not forcibly interrupted.
+
+Projects are processed sequentially against the same remaining budget. A later project therefore
+receives only the time left after admission, discovery, project options, and earlier project work;
+it does not get a fresh `timeoutMs`.
+
+### Cost and cache evidence
+
+Every handler-produced success and typed search error carries `elapsedMs`, `phaseTimingsMs`, and
+`cacheState`. SDK argument-binding, transport, and installation-health failures can occur outside
+that handler and do not carry this search telemetry.
+`phaseTimingsMs` always contains these ten non-overlapping integer buckets:
+`admission`, `positionResolution`, `targetDiscovery`, `projectOptions`, `snapshot`, `fcsSweep`,
+`classification`, `fsacFallback`, `responseConstruction`, and `unattributed`. Their sum equals
+`elapsedMs`. The sample is taken before the last production size-check serialization and transport,
+so it is not total client-observed latency and should not be treated as a latency guarantee.
+
+`cacheState.projectOptions` and `cacheState.projectUses` each report `hits`, `misses`, `incomplete`,
+and `state` (`not_observed`, `observed`, or `incomplete`). They count only cache lookups this request
+actually reached: they do not expose FCS's internal caches or project-options work nested inside
+position resolution. A `projectUses` miss remains a known miss even if its worker later fails. On a
+warm request these caches can avoid project evaluation and FCS parse/check/use enumeration. On a
+cold request, narrowing `kind` can reduce classification and snippet work, but it does not remove
+the base FCS project check. Compare like-for-like requests and coverage rather than inferring a
+general speed claim from one run. Legacy site search continues to omit successful zero-match
+projects from `perProject`; their work remains visible through these phase and cache ledgers.
+Inventory instead keeps every requested project in `projectLedger`.
+
+Expect the first sweep after `set_project` to be substantially more expensive than repeated
+searches over unchanged projects. One [0.18.0 dogfood report](https://github.com/Neftedollar/FsLangMCP/issues/227#issuecomment-6023560318)
+on an eight-project solution measured 101.3 seconds for the first workspace search, then
+0.3–5.6 seconds for subsequent searches in the same session. This is an observed cold/warm gap,
+not a promised speedup or baseline: project size, builds running concurrently, filesystem work,
+and cache invalidation can change it. `set_project` readiness and `symbolIndexState="warming"`
+describe FSAC startup/index observations; they do not prove that the FCS project-use caches are
+warm. Use `cacheState`, phase timings, and equal coverage to distinguish a cold sweep from a
+persistently expensive search before abandoning semantic inventory.
+
 ### Bare-call default
 
 `find(query)` runs `kind=auto` over `scope=auto` — i.e. it sweeps **every** member project of the
 active solution and unions all four site kinds. No position, no project path, no flags needed; the
 common case is a single argument.
 
-### scopeNote (#193)
+To constrain that legacy search to one project:
+
+```text
+find { "query": "OrderId", "kind": "symbol", "scope": "project", "projectPath": "src/Core/Core.fsproj" }
+```
+
+`src/Core/Core.fsproj` is an illustrative path. This avoids sibling-project classification and
+snippet work, but a cold request still has to load and check that project's FCS context.
+
+### Count-only inventory
+
+Inventory answers “how many semantic sites do these names have?” without returning `sites`, source
+snippets, or one cursor stream per name:
+
+```text
+find { "queries": ["OrderId", "OrderService"], "projectPath": "src/Core/Core.fsproj", "scope": "project" }
+```
+
+The tool enumerates each requested project's symbol uses once and evaluates every query against
+that enumeration. Omitted/`auto` `kind` is normalized to `symbol`; `definition` counts definitions
+only. Matching is the same as legacy search: exact by default, or case-insensitive substring with
+`exact=false`. Asterisks and other wildcard syntax have no special meaning.
+
+Each query row reports `definitions`, `references`, `uniqueSites`, `matchedSymbolCount`,
+`ambiguous`, and a bounded illustrative `symbols` list. `ambiguous=true` is conclusive as soon as
+two symbol identities are observed; it is `false` only when complete counts contain at most one,
+and `null` when incomplete counts have not yet proved ambiguity. Its `perProject` counts refer by
+`projectIndex` to the shared `projectLedger`, which uses normalized `.fsproj` identities.
+Projects with no match may be absent from that per-query array, but every requested project remains
+visible in `projectLedger` and coverage. `testProjectDetection="project_health_heuristic"` says
+that `isTestProject` is the project-health syntactic XML/package heuristic: `true` means a
+recognized test project, `false` means an unmarked project, and a missing project has `null`.
+Inherited or conditional MSBuild properties can evade the heuristic, and unreadable XML currently
+falls back to `false`. Use it to group evidence, then validate important classifications; neither
+value proves test or production execution, and a reference does not prove behavioral coverage.
+
+A linked physical source range counts once per project that compiled it and once in each applicable
+global category. Definitions and references de-duplicate independently, while `uniqueSites` is
+their physical-range union. If different project contexts classify the same linked range
+differently, `definitions + references` can therefore exceed `uniqueSites`; do not assume the two
+categories partition that union. Per-project totals can likewise sum above global `uniqueSites`.
+The response makes this explicit with `categoryCountsMayOverlap=true`. Every query owns its own
+deduplication sets: overlapping query rows are independent results, not pieces of a union.
+
+Inventory has no pagination in v1. It rejects `member`/`field`/position selectors,
+`includeSiteTypes=true`, `contextLines>0`, `cursor`, unsupported kinds, and
+`queries` with `countsOnly=false`. If the complete production-serialized response would exceed
+60,000 UTF-16 code units, `errorKind="find_inventory_response_budget"` advises splitting the query
+batch or narrowing `scope`/`projectPath`; `maxResults` cannot page it.
+
+`countsComplete=false` means all reported totals are lower bounds. A positive lower bound remains
+useful, but an incomplete zero has `outcome="indeterminate"` and `matched=null`; only a complete
+zero is `not_found`. On timeout, first inspect coverage and `phaseTimingsMs`, then narrow to a
+project such as `src/Core/Core.fsproj`, split the query list, warm the same request, or increase
+`timeoutMs`. Do not add incomplete rows together as if they were exhaustive.
+
+### Legacy site-search `scopeNote` (#193)
 
 Sweep breadth is unchanged by any `scope` value — `auto`/`workspace` always sweep every member
 project the resolved sweep target actually has, exactly as `file`/`project` always narrow to one.
-What's new is that **every response that completes a sweep carries a top-level `scopeNote`**
+For legacy site search, **every response that completes a sweep carries a top-level `scopeNote`**
 (`succeeded`, `partial`, and `unknown` all get one) reporting the real outcome (driven by
 `projectsSwept`/`projectsAnalyzed`, not by which `scope` string was requested) and the recipe to
-change it. `scopeNote` rides exactly those sweep-outcome responses; every pre-sweep return —
-argument validation, `kind=position`'s own resolution failures, and a missing project context — is
-note-less, because none of them reach the code that builds the note.
+change it. Argument validation, ordinary `kind=position` resolution failures, and a missing
+project context remain note-less. A typed pre-sweep deadline response instead carries a note
+describing the expired phase and explicitly says that later semantic work was not started.
 
 - **One project swept** — however the sweep target arrived (an explicit `.fsproj` `projectPath`, a
   `path`-derived fallback, or a solution/directory that itself has only one member project): the
@@ -150,6 +290,113 @@ incomplete even when it is the final page and `truncated=false`, because that pa
 sites. For an exhaustive refactor count, follow `nextCursor`, reconcile against
 `totalEstimate.sites`, and treat only an unpaged offset-zero response as complete in isolation.
 
+### Stateless v2 cursor consistency (#259)
+
+`find` cursors contain only `v=2`, `tool="find"`, the next offset, and fixed-size SHA-256
+identities for the canonical query and complete canonical stream. The query identity includes
+materialized defaults, normalized target/path and position inputs, and every result-shaping flag.
+It deliberately excludes `cursor`, `maxResults`, and `timeoutMs`, so callers may alternate page
+sizes or increase the remaining-time budget without changing the logical query.
+
+The stream identity covers the ordered declared project/coverage ledger, resolved query/kind/
+scope and position-symbol identity, response-affecting diagnostic identities, and every sorted
+site after deterministic bounded source/context and site-type-alternative shaping but before page
+slicing. Page size, page offset, and the final 60,000-character envelope cannot reshape a row.
+This recomputation retains no per-cursor result state and puts no plaintext query, local path,
+diagnostic, or source text in the token. The hash is a consistency identity, not an authorization
+mechanism and not a claim that FCS observed an atomic filesystem snapshot.
+
+For position requests, the identity binds the actual resolved symbol's assembly, declaration/
+signature locations, and untruncated semantic type/signature, not just its name. Retyping a call
+to select another overload therefore invalidates the cursor even if every site row is identical.
+A removed identifier or line is stale; unavailable type checking returns incomplete validation.
+The same-cursor retry route also applies to deadline expiry during final page planning and
+serialization, after the snapshot hash has already matched.
+
+Continuation failures are typed and never return sites:
+
+| `errorKind` | Caller action |
+|---|---|
+| `cursor_query_mismatch` | The request changed; repeat it without a cursor. |
+| `cursor_stale` | Source, solution, coverage, diagnostics, or result rows changed; restart at page zero. |
+| `cursor_out_of_range` | Discard the cursor and restart at page zero. |
+| `cursor_version_unsupported` | Discard a legacy/unknown-version cursor and restart under v2. |
+| `cursor_malformed` | Discard the invalid token and restart. |
+| `cursor_tool_mismatch` | Use the cursor only with the tool that issued it. |
+| `cursor_validation_incomplete` | Retry the same cursor, normally with a larger `timeoutMs`; no page was delivered. |
+
+After a process restart, an explicit `projectPath` can be validated directly. A request that
+relied on active context must repeat `set_project` first. With neither, `find` returns its normal
+missing-context error and does not claim that the cursor was validated. Other paginated tools
+continue to mint and accept their legacy offset-only cursors, but their strict legacy decoder
+rejects a tagged v2 `find` token instead of extracting its offset.
+
+### Serialized response budget (#258)
+
+`maxResults` is an upper bound on sites delivered on the requested page, not a promise that every
+requested row fits. `find` first constructs and hashes every canonical pre-pagination row, then
+assembles the requested page and measures it with the same indented
+`System.Text.Json` options used by `Tools.renderToken`. The hard ceiling is **60,000 UTF-16 code
+units** (`System.String.Length` after production serialization), so Unicode is measured in the
+same unit the transport string uses rather than estimated bytes or tokens. The measurement covers
+every variable section: `sites`, `projectDiagnostics`, `perProject`, coverage/resolution metadata,
+notes, and pagination.
+
+Source context is bounded before assembly. `lineText` and every `before`/`after` entry contain at
+most 512 UTF-16 code units; a positive `contextLines` request is capped at 8 lines per side.
+`range` never changes. `lineTextSourceStartColumn`, `lineTextSourceEndColumn` (exclusive),
+`lineTextSourceLength`, and `lineTextTruncated` map the visible matched-line snippet back to the
+full source. Context entries carry the analogous `sourceStartColumn`, `sourceEndColumn`,
+`sourceLength`, and `truncated` fields. `contextLinesRequested`, `contextLinesApplied`, and
+`contextLinesTruncated` expose the vertical cap.
+
+The response planner keeps an in-order site prefix. It first accounts for diagnostics and
+per-project rows, then reduces delivered sites until the complete serialized root fits. If even
+the first site competes with oversized optional metadata, diagnostics and per-project detail are
+reduced with explicit returned/total/truncation fields so pagination can still progress. The
+cursor offset is always `pageOffset + returnedSiteCount`; `cursorAdvancedBy` exposes the same
+increment. Count-capped and budget-capped pages therefore compose without skips.
+
+Metadata and site prefix counts are selected with logarithmic binary searches, not by removing one
+row and reserializing repeatedly. Every probe still builds the complete candidate response and
+measures it with the production serializer; no byte, token, or per-row size estimate decides what
+fits. Per-project detail retains priority over diagnostics exactly as before: the planner first
+keeps all project rows and finds the largest diagnostics prefix that fits. Only when even zero
+diagnostics cannot coexist with all project rows does it keep diagnostics empty and search the
+largest fitting project prefix.
+
+Raw diagnostics are counted before projection, but only the first 200 eligible records are
+converted to JSON. `projectDiagnosticsTotalCount` reports the eligible total;
+`projectDiagnosticsCountComplete=false` marks a deadline-interrupted count rather than presenting
+a partial count as exhaustive. The serialized budget can reduce the delivered prefix further:
+compare `projectDiagnosticsReturnedCount` and `projectDiagnosticsTruncated` with the total.
+
+After planning, every public `Find` result passes once through the same exact-serializer final
+guard, including validation, position-resolution, and project-discovery errors that return before
+the planner. An oversized early result is replaced by a fixed typed recovery envelope containing no
+caller-controlled strings, no continuation cursor, and `cursorAdvancedBy=0`. The guard is reusable
+by an outer deadline path for timeout envelopes it originates; applying it does not change timeout
+or admission behavior. Its generic recovery requires restarting without a cursor
+(`reuseOriginalCursor=false`), because shortening a query/path can change cursor identity; the
+site-aware late planner recovery remains separate and retains its more precise cursor semantics.
+
+Every site in the complete sorted stream is projected to a canonical JSON row before page slicing
+or planning. Its `project`, source snippet metadata, and deterministic per-site
+`siteTypeAlternatives` projection do not depend on
+cursor offset, `maxResults`, neighbouring rows, or remaining response budget. The planner may
+select only an in-order prefix of those already-formed rows; it never removes or reshapes fields
+inside a delivered site.
+
+If one bounded site still cannot fit, the tool returns `status="aborted"`,
+`deliveryStatus="blocked"`, and `errorCode="find_site_exceeds_response_budget"`, with scalar
+coverage/match ledgers preserved and a `recovery` recipe. `nextCursor` is deliberately `null` and
+`cursorAdvancedBy=0`. The planner has already tested one site with diagnostics and per-project rows
+reduced as far as possible, so lowering `maxResults` cannot affect the failing payload;
+`recovery.sameCursorRetry.allowed=false` even for a continuation. Restart without a cursor before
+reducing context/metadata shaping or changing query/kind/member/field, scope/projectPath/path,
+position, or any other identity input. Fixed metadata overflow uses
+`find_metadata_exceeds_response_budget` under the same non-looping contract.
+
 ### kind and scope
 
 | `kind` | What it resolves |
@@ -157,7 +404,7 @@ sites. For an exhaustive refactor count, follow `nextCursor`, reconcile against
 | `auto` (default) | Union of `symbol` + `members` + `field` definitions/references/sites |
 | `symbol` | Grouped definitions + references |
 | `members` | Member-usage sites on a type; pair with `member` |
-| `field` | Record field sites — construction, copy-update, mutation, pattern, read; pair with `field` |
+| `field` | Record field use sites — `query="Card", field="Name"`, or exact `query="Card.Name"` without a selector |
 | `definition` | Definition sites only |
 | `position` | Exact-position resolution; needs `path` + `line` + `word`/`character` |
 
@@ -176,7 +423,8 @@ sites. For an exhaustive refactor count, follow `nextCursor`, reconcile against
    member-usage sites.
 3. De-duplicates the union by `(file, range)` and groups by symbol identity.
 4. When FCS finds no sites, probes the project-bound FSAC `workspace/symbol` index without
-   treating a warming, disconnected, or mismatched FSAC session as a valid zero.
+   treating a warming, disconnected, or mismatched FSAC session as a valid zero. `kind=field`
+   skips this name-only fallback: an indexed declaration is not evidence of field use sites.
 5. Returns flat `sites` entries with `file`, `range`, `lineText`, plus scoped
    `projectDiagnostics` and explicit project-coverage counts.
 
@@ -184,8 +432,27 @@ sites. For an exhaustive refactor count, follow `nextCursor`, reconcile against
 
 Changing a record field's type is a fan-out edit: every construction site, every copy-and-update,
 every mutation, every destructuring pattern, and every read may need a *different* change, and on a
-solution they are spread across projects. `find(kind='field', field='Name', includeSiteTypes=true)`
+solution they are spread across projects. `find(query='Card', kind='field', field='Name', includeSiteTypes=true)`
 is built for exactly that loop.
+
+**Query contract.** Use the declaring record type as `query`, with optional `field` to select
+one field. With `kind='field'`, `exact=true` (the default), and no `field` selector, `Card.Name`
+is shorthand for `query='Card', field='Name'`; module-qualified forms work too. Resolution
+uses actual record/field identities, not a blind last-dot split. If the entire query names a
+record type, that interpretation takes precedence, even if that type has no use sites.
+Short declaring-type names and dotted type suffixes retain legacy matching: all matching
+declaring types are included, not an arbitrary first record. Qualify the namespace/module
+when different records share the same type name.
+An explicit `field` selector always keeps `query` as the declaring type; `exact=false` retains
+declaring-type substring matching. Bare `query='Name'` is **not** a search across records sharing
+that field name. `auto` and other kinds retain their existing behavior.
+
+Field-only `matched=true` requires actual FCS use sites, never just a declaration or an FSAC
+index hit. A completed zero says no use sites were found in the selected scope, not that the
+declaration is absent. Zero-site hints explain the contract even without `includeSiteTypes`.
+Incomplete sweeps cannot exclude a later whole-type match, so provisional shorthand sites
+are withheld; read `coverage` and retry before inferring absence. Cursor continuations must
+repeat the original spelling and selector, even when another spelling would mean the same field.
 
 **Site kinds.** Field sites are classified from the parse tree into five kinds, each of which needs
 a different edit:
@@ -220,7 +487,7 @@ has **today** — the "before" half. `find` deliberately does **not** typecheck 
 record shape: knowing the "after" type requires compiling the modified code, which is what `check`
 does. The intended loop is therefore:
 
-1. `find(kind='field', field='Name', includeSiteTypes=true)` — enumerate every site with its kind,
+1. `find(query='Card', kind='field', field='Name', includeSiteTypes=true)` — enumerate every site with its kind,
    line text, and today's type;
 2. edit all of them;
 3. `check(scope='project')` — one verdict on the result.
@@ -259,25 +526,27 @@ projects that resolved it**, so the site can be planned per project:
 bucket, so the `typed + degraded = fieldSites` identity is unchanged. Both the field and the counter
 are absent/zero on a normal single-project sweep.
 
-**Why it is bounded.** Unlike `siteType`, whose 200-character cap bounds it per row, the
-alternatives column grows with the number of projects a linked file is compiled by. Three limits
-keep a full page inside the response ceiling, and each one is *reported*, never silent: at most 3
-distinct types per row and 3 projects per type (the remainder becomes `siteTypeAlternativesOmitted`
-on the row and `projectsOmitted` on the entry), and a page-wide 6000-character allowance spent in
-row order — rows past it carry only `siteTypeAlternativesOmitted`, the count of other types, with no
-strings. `siteTypes.alternativesTruncatedRows` counts the rows on this page that hit any of the
-three, and the `siteTypesNote` says so. Narrow with `scope`/`projectPath` to see the full picture
-for a contested file.
+**Why it is bounded and page-invariant.** Unlike `siteType`, the alternatives column grows with the
+number of projects a linked file is compiled by. Deterministic per-site limits keep it bounded in
+cardinality: at most 3 distinct types per row and 3 projects per type. The remainder becomes
+`siteTypeAlternativesOmitted` on the row and `projectsOmitted` on the entry. A capped row also
+records `siteTypeAlternativesOffset`, the zero-based index of the first omitted alternative
+(not a separate cursor or an input parameter). These limits depend
+only on the site's sorted alternatives, so the same site serializes identically at different
+`maxResults` and page boundaries. `siteTypes.alternativesTruncatedRows` counts delivered rows that
+hit either cap, and the `siteTypesNote` says so. The final 60,000-unit response guard handles total
+page size by delivering fewer whole rows, never by dropping `project` or alternative details from
+a row. Narrow with `scope`/`projectPath` to see the full picture for a contested file.
 
 **Scope and cost.** `includeSiteTypes` annotates **field sites only** — non-field rows under
 `kind='auto'` stay lean, and a `kind` that produces no field sites at all (`definition`, `symbol`,
 `members`) gets a `siteTypesNote` saying so instead of silently doing nothing. Type resolution runs
 inside `find`'s single `timeoutMs` budget.
 
-**Page budget.** `siteType` is capped at 200 characters (plus a `...` marker) so a pathological
-generic signature cannot blow the page. Measured growth on a real sweep is ≈19 chars per site; the
-worst case is 80 × (527 + 203 + 15) ≈ 59.6k chars, still under the ~72k-char MCP ceiling, so the
-default `maxResults` of 80 does **not** need lowering when the flag is on.
+**Page budget.** `siteType` is capped at 200 characters (plus a `...` marker), alternatives are
+capped as described above, and source snippets are bounded. These row-local controls reduce the
+chance of a first-item overflow; the authoritative bound remains the measured 60,000 UTF-16-unit
+production JSON ceiling, which may lower the delivered count below the default `maxResults=80`.
 
 **Known limit — generic records.** FCS reports no per-use generic arguments for record fields, so a
 field on `Box<'T>` renders as the type **parameter** `'T` at every site, not as the instantiation
@@ -318,11 +587,13 @@ the bare call already swept all of them.
 suffices: returns `verdict` (`clean`|`errors`|`unknown`) after a FRESH in-process type-check, so it
 never reports a stale-`{}` false-clean within the current FCS/check profile. Optional `scope`
 (`auto`|`file`|`project`|`workspace`|`snippet`), `path`, `snippet` (inline source), `speed` (trusted
-default | `fast` = cached FSAC snapshot), and `severity` shape the request.
+default | `fast` = cached FSAC snapshot), `snippetPosition` (`start`|`end`, default `end`), and
+`severity` shape the request.
 
 **Signature:** every argument is optional. `scope` (default `auto`) picks `snippet` when `snippet`
 is set, `file` when `path` is set, else the active project (or the whole solution when it spans
->1 `.fsproj`). `path` / `snippet` / `fileGlob` / `mode` (`fs`|`fsi`) target the unit to check.
+>1 `.fsproj`). `path` / `snippet` / `fileGlob` / `mode` (`fs`|`fsi`) target the unit to check;
+`snippetPosition` controls where a snippet sits in project compile order.
 `speed` (`trusted` default | `fast`), `severity` (`error` default | `warning` | `information` |
 `hint` | `all`), `projectPath` (falls back to active `set_project`), and `timeoutMs` (default 60000)
 round out the surface.
@@ -355,6 +626,25 @@ untyped unavailable FSAC snapshot remain separately classified as `timeout`, `ca
 | `trusted` (default) | Runs a FRESH FCS check; the verdict reflects the current source on disk |
 | `fast` | Reads a project-bound FSAC snapshot; `clean` requires a current publication for every evaluated in-scope source file |
 
+### Snippet placement
+
+`scope=snippet` type-checks source text as one synthetic project file. `snippetPosition` makes its
+compile-order location explicit and the response echoes the normalized effective value:
+
+| `snippetPosition` | Compile-order semantics |
+|-------------------|-------------------------|
+| `end` (default) | Appends the snippet after every evaluated project source file, preserving v0.17.1 behavior and allowing it to consume symbols from the final `<Compile>` item |
+| `start` | Prepends the snippet before every evaluated project source file, so project-source symbols are intentionally not yet in scope |
+
+Both placements keep diagnostics scoped to the snippet itself: project-file diagnostics and
+synthetic wrapper artifacts remain filtered, and temporary files are deleted after checking.
+Ordinary F# shadowing rules apply at the selected point; for example, an `end` snippet can open a
+project module and then shadow one of its values with a local binding.
+
+This is source-order validation, not built-assembly execution. Symbols that exist only after a
+build step (for example generated or emitted members absent from evaluated source files) are not
+made available by `snippetPosition=end`.
+
 ### How it works internally
 
 1. Resolves `scope`: `snippet` when `snippet` is set, `file` when `path` is set, else `project`
@@ -363,7 +653,8 @@ untyped unavailable FSAC snapshot remain separately classified as `timeout`, `ca
    `ParseAndCheckProject` for a project/workspace) so the result reflects the current source — never
    a stale cached payload. At `speed=fast`, derives the expected files from evaluated FCS project
    options, then accepts only diagnostics from the matching live FSAC generation.
-3. For `scope=snippet`, first scopes diagnostics to the snippet's content: wrapper artifacts
+3. For `scope=snippet`, inserts the synthetic source file at `snippetPosition=start` or `end`, then
+   scopes diagnostics to the snippet's content: wrapper artifacts
    (FS0222 missing-module, FS0225 source-file bookkeeping), diagnostics attached to other
    project files, and duplicates are removed, and `file` reads `"snippet"` — so bare
    expression code without a `module` header is valid.

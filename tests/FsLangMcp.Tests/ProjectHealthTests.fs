@@ -152,6 +152,58 @@ let private testEvaluatedSnapshot referencesExisting referencesTotal projectPath
 let private testEvaluatedProvider path =
     async { return testEvaluatedSnapshot 0 0 path }
 
+let private copyExternalCompileFixture destinationRoot =
+    let fixtureRoot = Path.Combine(__SOURCE_DIRECTORY__, "Fixtures", "ExternalCompile")
+
+    for relativePath in
+        [ Path.Combine("App", "App.fsproj")
+          Path.Combine("App", "Program.fs")
+          Path.Combine("Shared", "Domain.fs")
+          Path.Combine("Shared", "Unrelated.fs") ] do
+        let destinationPath = Path.Combine(destinationRoot, relativePath)
+        Directory.CreateDirectory(Path.GetDirectoryName destinationPath) |> ignore
+        File.Copy(Path.Combine(fixtureRoot, relativePath), destinationPath)
+
+let private restoreFixtureProject projectPath =
+    task {
+        let dotnetHost =
+            Environment.GetEnvironmentVariable("DOTNET_HOST_PATH")
+            |> Option.ofObj
+            |> Option.filter (String.IsNullOrWhiteSpace >> not)
+            |> Option.defaultValue "dotnet"
+
+        let psi = ProcessStartInfo(dotnetHost)
+
+        for argument in
+            [ "restore"
+              projectPath
+              "--ignore-failed-sources"
+              "--nologo"
+              "--disable-build-servers"
+              "-p:UseSharedCompilation=false"
+              "-p:NuGetAudit=false" ] do
+            psi.ArgumentList.Add argument
+
+        psi.RedirectStandardOutput <- true
+        psi.RedirectStandardError <- true
+        psi.UseShellExecute <- false
+        psi.Environment["MSBUILDDISABLENODEREUSE"] <- "1"
+        psi.Environment["DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER"] <- "1"
+        psi.Environment["DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE"] <- "true"
+
+        use restore =
+            Process.Start psi
+            |> Option.ofObj
+            |> Option.defaultWith (fun () -> failwith $"Failed to start fixture restore with %s{dotnetHost}")
+
+        let stdoutTask = restore.StandardOutput.ReadToEndAsync()
+        let stderrTask = restore.StandardError.ReadToEndAsync()
+        do! restore.WaitForExitAsync()
+        let! stdout = stdoutTask
+        and! stderr = stderrTask
+        return restore.ExitCode, $"%s{stdout}\n%s{stderr}"
+    }
+
 let private report args snapshot =
     createReport args snapshot testEvaluatedProvider |> Async.RunSynchronously
 
@@ -167,6 +219,23 @@ let private reportWithProbe (probe: ProjectOptionsProbe) args snapshot =
         }
 
     createReport args snapshot provider |> Async.RunSynchronously
+
+let private solutionContents (extension: string) (members: string list) =
+    if extension = ".slnx" then
+        [ "<Solution>"
+          yield! members |> List.map (fun path -> $"  <Project Path=\"{path}\" />")
+          "</Solution>" ]
+        |> String.concat "\n"
+    else
+        [ "Microsoft Visual Studio Solution File, Format Version 12.00"
+          yield!
+              members
+              |> List.mapi (fun index path ->
+                  let windowsPath = path.Replace('/', '\\')
+                  $"Project(\"{{F2A71F9B-5D33-465A-A702-920D77279786}}\") = \"Project{index}\", \"{windowsPath}\", \"{{00000000-0000-0000-0000-{index:D12}}}\"\nEndProject")
+          "Global"
+          "EndGlobal" ]
+        |> String.concat "\n"
 
 [<Fact>]
 let ``project_health reports source files and analyzer setup`` () =
@@ -251,6 +320,70 @@ let ``project_health summarizes a directory with multiple fsproj files (#100)`` 
         Assert.Equal("solution", (result["reportKind"]).GetValue<string>())
         Assert.Equal("solution", ((result["toolingReadiness"])["overall"]).GetValue<string>())
         Assert.Equal(2, ((result["solution"])["projectCount"]).GetValue<int>())
+    finally
+        if Directory.Exists root then
+            Directory.Delete(root, true)
+
+[<Theory>]
+[<InlineData(".sln")>]
+[<InlineData(".slnx")>]
+let ``project_health reports every declared solution member with its real existence``
+    (extension: string)
+    =
+    let runId = Guid.NewGuid().ToString("N")
+    let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_health_solution_%s{runId}")
+
+    let write (relativePath: string) (content: string) =
+        let path = Path.Combine(root, relativePath)
+        Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
+        File.WriteAllText(path, content)
+        path
+
+    try
+        write "PresentA/PresentA.fsproj" "<Project Sdk=\"Microsoft.NET.Sdk\" />" |> ignore
+        write "PresentB/PresentB.fsproj" "<Project Sdk=\"Microsoft.NET.Sdk\" />" |> ignore
+
+        let cases =
+            [ "all-present", [ "PresentA/PresentA.fsproj"; "PresentB/PresentB.fsproj" ], [| true; true |]
+              "one-missing", [ "PresentA/PresentA.fsproj"; "Missing/Missing.fsproj" ], [| true; false |]
+              "all-missing", [ "MissingOne/MissingOne.fsproj"; "MissingTwo/MissingTwo.fsproj" ], [| false; false |] ]
+
+        for name, members, expectedExists in cases do
+            let solutionPath =
+                write $"{name}{extension}" (solutionContents extension members)
+
+            let result =
+                report (healthArgs solutionPath (Some root)) (readySnapshot solutionPath root)
+
+            Assert.Equal("solution", result["reportKind"].GetValue<string>())
+            Assert.Equal(members.Length, (result["solution"]["projectCount"]).GetValue<int>())
+
+            Assert.Equal(
+                expectedExists |> Array.filter id |> Array.length,
+                (result["solution"]["loadableProjectCount"]).GetValue<int>()
+            )
+
+            Assert.Equal(
+                expectedExists |> Array.filter not |> Array.length,
+                (result["solution"]["missingProjectCount"]).GetValue<int>()
+            )
+
+            let projects = (result["solution"]["projects"]).AsArray()
+            let actualExists = projects |> Seq.map (fun project -> project["exists"].GetValue<bool>()) |> Seq.toArray
+
+            Assert.Equal<bool array>(expectedExists, actualExists)
+
+            let actualPaths =
+                projects |> Seq.map (fun project -> project["fsproj"].GetValue<string>()) |> Seq.toArray
+
+            let expectedPaths =
+                members
+                |> List.map (fun memberPath ->
+                    memberPath.Replace('/', Path.DirectorySeparatorChar)
+                    |> fun normalized -> Path.GetFullPath(Path.Combine(root, normalized)))
+                |> List.toArray
+
+            Assert.Equal<string array>(expectedPaths, actualPaths)
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
@@ -380,6 +513,81 @@ let ``fsharp_project_inspect reports compile order and package references`` () =
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
+
+[<Fact>]
+let ``fsharp_project_inspect preserves evaluated external linked Compile order (#256)`` () : Task =
+    task {
+        let runId = Guid.NewGuid().ToString("N")
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_external_compile_%s{runId}")
+        let appDir = Path.Combine(root, "App")
+        let sharedDir = Path.Combine(root, "Shared")
+        let appProject = Path.Combine(appDir, "App.fsproj")
+        let domainPath = Path.Combine(sharedDir, "Domain.fs")
+        let programPath = Path.Combine(appDir, "Program.fs")
+        let unrelatedPath = Path.Combine(sharedDir, "Unrelated.fs")
+
+        try
+            copyExternalCompileFixture root
+
+            let! restoreExitCode, restoreOutput = restoreFixtureProject appProject
+            Assert.True((restoreExitCode = 0), $"fixture restore failed:\n%s{restoreOutput}")
+
+            let bridge = FcsBridge()
+
+            let provider path =
+                bridge.GetEvaluatedProjectSnapshot(path) |> Async.AwaitTask
+
+            let args workspacePath =
+                { projectPath = Some appProject
+                  workspacePath = workspacePath
+                  scope = None
+                  includeGeneratedFiles = Some false
+                  includePackageDetails = Some false
+                  includeResolvedOptions = Some false }
+
+            // No workspacePath override: App is the root, while Domain is a real
+            // evaluated Compile item physically under the sibling Shared directory.
+            let! inspected = inspectProject (args None) provider |> Async.StartAsTask
+
+            Assert.Equal("ok", inspected["status"].GetValue<string>())
+            Assert.Equal("ionide-proj-info", (inspected["evaluation"]["source"]).GetValue<string>())
+
+            let compileItems = inspected["compileOrder"].AsArray() |> Seq.toArray
+
+            let compilePaths =
+                compileItems |> Array.map (fun item -> item["path"].GetValue<string>())
+
+            Assert.Equal<string>([| domainPath; programPath |], compilePaths)
+            Assert.Equal("Domain.fs", (compileItems[0]["link"]).GetValue<string>())
+            Assert.True(File.Exists unrelatedPath)
+            Assert.DoesNotContain(unrelatedPath, compilePaths)
+            Assert.Equal(2, (inspected["filterSummary"]["includedFiles"]).GetValue<int>())
+
+            let defaultExclusionReasons = inspected["filterSummary"]["exclusionsByReason"]
+            Assert.Null(defaultExclusionReasons["outside_workspace"])
+
+            // An explicit root is still authoritative for ordinary inputs. With
+            // Shared selected, linked Domain remains eligible but unlinked Program
+            // is outside the workspace and the response explains that exclusion.
+            let! narrowed = inspectProject (args (Some sharedDir)) provider |> Async.StartAsTask
+
+            let narrowedPaths =
+                narrowed["compileOrder"].AsArray()
+                |> Seq.map (fun item -> item["path"].GetValue<string>())
+                |> Seq.toArray
+
+            Assert.Equal<string>([| domainPath |], narrowedPaths)
+
+            let exclusionReasons = narrowed["filterSummary"]["exclusionsByReason"]
+
+            let outsideWorkspaceCount =
+                exclusionReasons["outside_workspace"].GetValue<int>()
+
+            Assert.Equal(1, outsideWorkspaceCount)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
 
 [<Fact>]
 let ``inspection and health share evaluated SDK defaults conditions imports and references (P1-08)`` () : Task =

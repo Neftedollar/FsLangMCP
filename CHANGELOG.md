@@ -8,6 +8,156 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-08
+
+0.19.0 expands `find` without adding tools: the 35-tool surface remains unchanged.
+Count-only inventory can evaluate 1–50 names in one shared project-use sweep, and fixed phase
+timings plus cache ledgers make the work observed by each request explicit. Exact `Type.Field`
+shorthand now resolves through semantic record-field identity while incomplete coverage and
+zero-site evidence remain conservative. This is still a pre-1.0 release, not a contract freeze.
+
+### Added
+
+- `find` accepts either the existing single `query` site search or a count-only inventory through
+  `queries` (1–50 distinct, trimmed names). Inventory evaluates every name during one shared
+  project-use sweep and returns independent per-query definition/reference/unique-site totals,
+  matched-symbol ambiguity evidence, and project-indexed recognized-test/unmarked-project counts
+  without snippets or pagination. `testProjectDetection="project_health_heuristic"` makes that
+  XML/package grouping explicit; it is not execution evidence. A single `query` with
+  `countsOnly=true` uses the same inventory response; all
+  existing single-query calls retain their site-search and cursor behavior (#227).
+- Handler-produced `find` responses now include ten fixed, non-overlapping `phaseTimingsMs` buckets whose sum
+  is `elapsedMs`, plus request-observed project-options and project-use cache hit/miss/incomplete
+  ledgers. These fields distinguish discovery, FCS work, classification, fallback, and response
+  construction without presenting one machine's timing as a latency guarantee (#227).
+
+### Changed
+
+- Inventory accepts `kind=symbol` (also omitted/`auto`) or `kind=definition` and exact matching by
+  default; `exact=false` is case-insensitive substring matching, not wildcard syntax. Incomplete
+  totals are explicit lower bounds, complete zero is `not_found`, and incomplete zero is
+  indeterminate. Oversized inventory output returns typed `find_inventory_response_budget`
+  guidance to split queries or narrow scope rather than emitting a partial unpageable response.
+
+### Fixed
+
+- `find(kind="field")` accepts exact `Type.Field` shorthand when no `field` selector is
+  supplied, using semantic record-field identity and preserving whole declaring-type
+  precedence, including module-qualified types. Field-only matches now require actual
+  FCS use sites; a declaration or FSAC symbol-index hit cannot produce a confident zero.
+  Zero-site hints explain the declaring-type contract without recommending ambiguous bare
+  field names. Incomplete sweeps withhold provisional shorthand sites (#227).
+
+## [0.18.0] - 2026-09-07
+
+0.18.0 makes `find` continuations query/snapshot-bound and isolates project-options
+reloads from the long-lived host. The 35-tool surface remains, but the `find` cursor
+wire contract changes: restart searches without a cursor after upgrading from 0.17.x.
+This is still a pre-1.0 release, not a contract freeze.
+
+### Changed
+
+- `find` now issues strict stateless v2 cursors bound to both the canonical request and the
+  complete pre-pagination result, coverage, diagnostic, and bounded-source stream (#259).
+  Request changes return `cursor_query_mismatch`; source, position-symbol, solution-membership,
+  coverage, or result changes return `cursor_stale`. Deadline-incomplete initial results are
+  useful but cursorless, while an incomplete continuation returns no sites and permits retrying
+  the same cursor. Legacy offset-only cursors are rejected by `find`; all other tools retain their
+  legacy minting while rejecting tagged `find` cursors. Tokens contain only version/tool/offset
+  plus SHA-256 identities, retain no per-cursor server state, and make no atomic-filesystem-
+  snapshot claim. Old `find` cursors return `cursor_version_unsupported`; discard them and
+  repeat the original request without `cursor`. Other tools keep their existing cursor formats.
+- Unchanged `find` continuations restart as stale when the last or selected declared solution
+  member is removed, while initial missing targets and malformed/mismatched cursors keep their
+  distinct errors. The final error-response size guard checks the existing deadline before and
+  after serialization; expiry of a well-formed continuation returns a bounded, empty,
+  same-cursor-retry response, including when constructing stale/out-of-range/query errors.
+- Cursor validation rejects nonnumeric JSON versions and invalid Unicode without throwing, preserves same-cursor
+  retries through final response serialization, and binds position cursors to the selected
+  overload's semantic identity. Removed position targets restart as stale; unavailable resolution
+  retries without delivering a page. Saturated linked-type alternatives expose their omitted
+  offset. Regression coverage includes full alternating-budget linked-row traversal, stable
+  failure recovery with identical sites, and refreshed diagnostics beyond the response prefix.
+
+### Added
+
+- `check` accepts `snippetPosition="start"|"end"` and reports its effective placement.
+  Omitted/null placement stays `end`, preserving access to the final project source file.
+  The explicit source-order contract keeps project references/compiler options and returns
+  snippet-only diagnostics; it does not claim a reproduced regression in the old default (#196).
+
+### Fixed
+
+- Genuine project-options reloads evaluate ProjInfo/MSBuild in short-lived
+  helper processes, so retained MSBuild node threads do not accumulate in the
+  long-lived MCP host. The versioned bounded data protocol preserves F#/CLR
+  references and evaluated settings; shared callers keep independent budgets,
+  and cancellation drains the helper tree before releasing admission. Runtime
+  status identifies `evaluationMode="isolated_helper"`; cache hits launch no
+  helper (#150, #224).
+- Definition lookup now resolves compiled backtick-bound names by their source spelling,
+  including unquoted queries, while preserving semantic identity, qualifier boundaries,
+  exact/case-insensitive matching, and ambiguity (#267).
+- Test fixtures retain and drain nested outline workers before deleting their files; hostile
+  regex correctness checks no longer depend on a one-second wall-clock assertion. Flushed
+  lifecycle traces improve evidence for future stalls. This is bounded test hardening, not
+  proof that the historical intermittent testhost hang has been eliminated (#199, PR #278).
+
+### Documentation
+
+- README separates project NuGet audits from libraries bundled inside external runtime tools,
+  explains exact bootstrap pins/downgrades and updates, and records the known dependency risk.
+  Closing #170 documents that risk; this release does not change those external-tool pins or
+  claim that their advisory-listed assemblies have been patched.
+
+## [0.17.1] - 2026-09-05
+
+0.17.1 is a correctness-hardening patch for project discovery and the `find` request lifecycle.
+It keeps the 35-tool surface compatible while making incomplete solution membership, deadlines,
+response delivery, linked compile items, cancellation, and test cleanup explicit and bounded.
+
+### Fixed
+
+- `find` and `project_health` preserve every declared F# solution member, including missing
+  `.fsproj` paths. Missing members count as requested evidence but never as swept projects;
+  absence remains indeterminate until the declared solution is loadable (#165).
+- `find` uses one end-to-end request deadline across admission, position resolution, target and
+  project discovery, project-options evaluation, FCS sweep, FSAC fallback, classification, and
+  response construction. Discovery is streamed, source windows are read once per file/page,
+  and retained workers keep bounded admission until their exact task completes. Each shared
+  worker's callers retain independent deadlines; response expiry explicitly requires a new
+  page without a cursor (#255).
+- `find` caps the complete production-serialized response at 60,000 UTF-16 code units, bounds
+  source context, preserves an in-order site prefix, and exposes exact truncation/cursor ledgers.
+  A blocked row never advances a cursor, and identity-changing recovery restarts without one
+  (#258).
+- Project inspection now preserves evaluated external `Compile` items only when external linked
+  files are explicitly enabled and the item carries `Link` metadata; directory and review scans
+  remain workspace-bounded (#256).
+- Pre-cancelled process execution is rejected at the final controlled boundary before launch,
+  avoiding an observable child-process side effect while retaining the documented post-check race
+  boundary (#257).
+- `check` discovery now observes all live callers of a shared worker, not only the first caller's
+  deadline. It does not start a fallback scan after all callers expire, retains admission until
+  actual completion, and removes only the exact completed worker. Deterministic trusted/fast
+  tests cover both deadline orders, fallback boundaries, busy/retry, and stale cleanup (#249).
+
+### Changed
+
+- Repository SDK selection declares .NET SDK `10.0.100` as the supported floor and uses
+  `latestFeature`, so contributors may use any compatible stable .NET 10 feature band. CI still
+  verifies the floor independently and pins release/runtime validation to `10.0.400` (#246).
+- CI records bounded VSTest hang diagnostics and uploads `TestResults` after a stalled coverage
+  run, so intermittent testhost lifecycle failures tracked in #199 produce actionable evidence.
+- The macOS live-runtime job is temporarily pinned to `macos-15` after the `macos-latest`
+  image migration broke the pinned Fantomas daemon. The original smoke checks remain intact;
+  restoring the rolling image is tracked separately in #271 (#269).
+
+### Deferred
+
+- Versioned query/snapshot-bound cursors are designed in ADR-0002 but remain a v0.18.0 runtime
+  change (#259); this patch preserves the existing cursor compatibility contract.
+
 ## [0.17.0] - 2026-08-31
 
 0.17.0 keeps the 35-tool surface intact and hardens the evidence agents use to plan changes:
@@ -1074,7 +1224,10 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
   above), so it has no link definition either — 0.15.0 compares from the
   last version that actually was tagged, 0.13.2.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.18.0...v0.19.0
+[0.18.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.1...v0.18.0
+[0.17.1]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.13.2...v0.15.0

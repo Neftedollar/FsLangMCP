@@ -30,6 +30,11 @@ live-fsac: restore runtime-tools
     dotnet build FsLangMcp.fsproj --configuration Release --no-restore --warnaserror
     python3 scripts/runtime-toolchain.py smoke --tool-path {{runtime_tool_path}} --server bin/Release/net10.0/FsLangMcp.dll --project FsLangMcp.fsproj
 
+# Genuine reloads, warm-cache controls, thread reclamation and latency evidence.
+project-evaluation-soak: restore runtime-tools
+    dotnet build FsLangMcp.fsproj --configuration Release --no-restore --warnaserror
+    python3 scripts/project-evaluation-soak.py --tool-path {{runtime_tool_path}} --server bin/Release/net10.0/FsLangMcp.dll
+
 build:
     dotnet build {{solution}} --no-restore
 

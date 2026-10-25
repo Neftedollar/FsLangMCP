@@ -27,6 +27,8 @@ type FindRequest =
     /// FCS union sweep; after an empty FCS result the project-bound FSAC symbol index
     /// can still prove presence. It is injected here so the substrate stays LSP-agnostic.
     | Find of FindArgs
+    /// Count-only multi-query inventory over one shared project sweep.
+    | FindInventory of FindArgs * string array
 
 /// Internal request representation for the "check" tool cluster.
 /// check-cluster spans both FCS (fcsBridge) and FSAC (lspBridge); the dispatcher
@@ -139,29 +141,51 @@ module FindDispatch =
         | Some status -> FindFsacProbeResult.Failed(message $"Unexpected FSAC status '{status}'.")
         | None -> FindFsacProbeResult.Failed "FSAC workspace-symbol response omitted status."
 
-    /// Route a find-cluster request to the same backend call its handler made
-    /// before the dispatcher seam was introduced.
+    // FSAC symbol-index probe: consulted only when the FCS sweep has no hits.
+    // Keep every non-success state typed; failure or project mismatch is not
+    // equivalent to a valid zero-hit result.
+    let private fsacProbeFor (args: FindArgs) (lspBridge: FsAutoCompleteBridge) =
+        fun (query: string) ->
+            task {
+                match fsacWorkspaceProbeEligibility args lspBridge.CurrentProjectPath with
+                | Error reason -> return FindFsacProbeResult.Unavailable reason
+                | Ok() ->
+                    try
+                        let! response =
+                            lspBridge.WorkspaceSymbolForContext(args.projectPath, { query = query })
+
+                        return classifyFsacProbeResponse response
+                    with ex ->
+                        return FindFsacProbeResult.Failed ex.Message
+            }
+
+    /// Route a direct/internal find call with its own deadline.
     let internal run (fcsBridge: FcsBridge) (lspBridge: FsAutoCompleteBridge) (request: FindRequest) : Task<JsonNode> =
         match request with
+        | Find args -> fcsBridge.Find(args, fsacProbe = fsacProbeFor args lspBridge)
+        | FindInventory(args, queries) -> fcsBridge.Find(args, inventoryQueries = queries)
+
+    /// Route the public MCP handler while preserving the one deadline created before
+    /// FCS-gate admission and the retained lifetime callback owned by Program.fs.
+    let internal runWithinDeadline
+        (fcsBridge: FcsBridge)
+        (lspBridge: FsAutoCompleteBridge)
+        (deadline: FindRequestDeadline)
+        (cancellationToken: System.Threading.CancellationToken)
+        (retainUntil: Task -> unit)
+        (request: FindRequest)
+        : Task<JsonNode> =
+        match request with
         | Find args ->
-            // FSAC symbol-index probe: consulted only when the FCS sweep has no
-            // hits. Keep every non-success state typed; failure or project mismatch
-            // is not equivalent to a valid zero-hit result.
-            let fsacProbe (q: string) : Task<FindFsacProbeResult> =
-                task {
-                    match fsacWorkspaceProbeEligibility args lspBridge.CurrentProjectPath with
-                    | Error reason -> return FindFsacProbeResult.Unavailable reason
-                    | Ok() ->
-                        try
-                            let! response =
-                                lspBridge.WorkspaceSymbolForContext(args.projectPath, { query = q })
-
-                            return classifyFsacProbeResponse response
-                        with ex ->
-                            return FindFsacProbeResult.Failed ex.Message
-                }
-
-            fcsBridge.Find(args, fsacProbe = fsacProbe)
+            fcsBridge.FindWithinDeadline(
+                args,
+                deadline,
+                cancellationToken,
+                retainUntil,
+                Some(fsacProbeFor args lspBridge)
+            )
+        | FindInventory(args, queries) ->
+            fcsBridge.FindWithinDeadline(args, deadline, cancellationToken, retainUntil, None, inventoryQueries = queries)
 
 [<RequireQualifiedAccess>]
 module CheckDispatch =

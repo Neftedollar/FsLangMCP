@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
+import json
+import re
 import tempfile
 import unittest
 import zipfile
+from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -303,6 +305,122 @@ class PackageVersionContractTests(unittest.TestCase):
 
 
 class WorkflowGateContractTests(unittest.TestCase):
+    def test_passing_test_evidence_is_retained_as_distinct_trx_only_artifacts(self) -> None:
+        def step_block(workflow: str, name: str) -> str:
+            match = re.search(
+                rf"(?ms)^      - name: {re.escape(name)}\n.*?(?=^      - name:|^  [a-zA-Z0-9_-]+:|\Z)",
+                workflow,
+            )
+            self.assertIsNotNone(match, name)
+            return match.group(0)
+
+        ci = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        publish = (REPOSITORY_ROOT / ".github/workflows/publish.yml").read_text(encoding="utf-8")
+        cases = (
+            (ci, "Test (with coverage)", "coverage_tests", "Upload coverage test results",
+             "ci-coverage-test-results", "TestResults", "test-results.trx"),
+            (ci, "Test with minimum SDK", "minimum_sdk_tests", "Upload minimum SDK test results",
+             "minimum-sdk-test-results", "TestResults/minimum-sdk", "minimum-sdk-test-results.trx"),
+            (publish, "Test release bits with tag version", "release_bit_tests", "Upload release-bit test results",
+             "release-bit-test-results", "TestResults/release-bits", "release-bit-test-results.trx"),
+        )
+        names = set()
+        for workflow, test_name, step_id, upload_name, artifact_name, directory, filename in cases:
+            with self.subTest(job=step_id):
+                test = step_block(workflow, test_name)
+                upload = step_block(workflow, upload_name)
+                self.assertIn(f"id: {step_id}", test)
+                self.assertIn(f'--logger "trx;LogFileName={filename}"', test)
+                self.assertIn(f'--results-directory "$GITHUB_WORKSPACE/{directory}"', test)
+                self.assertIn(f"if: always() && steps.{step_id}.outcome != 'skipped'", upload)
+                self.assertIn("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", upload)
+                self.assertIn(f"name: {artifact_name}", upload)
+                self.assertIn(f"path: '${{{{ github.workspace }}}}/{directory}/{filename}'", upload)
+                self.assertIn("if-no-files-found: error", upload)
+                self.assertIn("retention-days: 30", upload)
+                self.assertNotIn("continue-on-error", test + upload)
+                self.assertNotIn("--filter", test)
+                self.assertNotIn("*", upload)
+                self.assertLess(workflow.index(test), workflow.index(upload))
+                self.assertNotIn(artifact_name, names)
+                names.add(artifact_name)
+
+        self.assertIn("if: failure()", step_block(ci, "Upload test hang diagnostics"))
+        self.assertNotIn("nuget-release-package", names)
+        release_test = step_block(publish, "Test release bits with tag version")
+        for flag in ('-p:Version="${VERSION}"', '-p:PackageVersion="${VERSION}"',
+                     '-p:ContinuousIntegrationBuild=true', '--no-build', '--no-restore'):
+            self.assertIn(flag, release_test)
+
+    def test_repository_sdk_floor_is_flexible_but_release_jobs_stay_pinned(self) -> None:
+        def job_block(workflow: str, job_name: str) -> str:
+            marker = f"  {job_name}:\n"
+            start = workflow.index(marker)
+            remainder = workflow[start + len(marker) :]
+            next_job = re.search(r"(?m)^  [A-Za-z0-9_-]+:\s*$", remainder)
+            end = start + len(marker) + (next_job.start() if next_job else len(remainder))
+            return workflow[start:end]
+
+        global_json = json.loads(
+            (REPOSITORY_ROOT / "global.json").read_text(encoding="utf-8")
+        )
+        sdk = global_json["sdk"]
+
+        self.assertEqual("10.0.100", sdk["version"])
+        self.assertEqual("latestFeature", sdk["rollForward"])
+        self.assertIs(sdk["allowPrerelease"], False)
+
+        ci_workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        minimum_job = job_block(ci_workflow, "minimum-sdk")
+        self.assertIn(
+            "DOTNET_INSTALL_DIR: ${{ github.workspace }}/.dotnet-minimum", minimum_job
+        )
+        self.assertIn("DOTNET_MULTILEVEL_LOOKUP: '0'", minimum_job)
+        self.assertIn("dotnet-version: '10.0.100'", minimum_job)
+        self.assertIn('test "$(dotnet --version)" = "10.0.100"', minimum_job)
+        self.assertIn("dotnet restore FsLangMcp.slnx --locked-mode", minimum_job)
+        self.assertIn("dotnet build FsLangMcp.slnx", minimum_job)
+        self.assertIn("dotnet test FsLangMcp.slnx", minimum_job)
+
+        live_workflow = (
+            REPOSITORY_ROOT / ".github/workflows/live-fsac.yml"
+        ).read_text(encoding="utf-8")
+        publish_workflow = (
+            REPOSITORY_ROOT / ".github/workflows/publish.yml"
+        ).read_text(encoding="utf-8")
+        exact_jobs = {
+            "primary": (
+                job_block(ci_workflow, "build-and-test"),
+                ('test "$(dotnet --version)" = "10.0.400"',),
+            ),
+            "live-fsac": (
+                job_block(live_workflow, "live-fsac"),
+                (
+                    '$actual -ne "10.0.400"',
+                    'throw "Expected .NET SDK 10.0.400, got $actual"',
+                ),
+            ),
+            "publish": (
+                job_block(publish_workflow, "build-and-verify"),
+                ('test "$(dotnet --version)" = "10.0.400"',),
+            ),
+        }
+
+        for name, (exact_job, guards) in exact_jobs.items():
+            with self.subTest(job=name):
+                self.assertIn(
+                    "DOTNET_INSTALL_DIR: ${{ github.workspace }}/.dotnet-exact",
+                    exact_job,
+                )
+                self.assertIn("DOTNET_MULTILEVEL_LOOKUP: '0'", exact_job)
+                self.assertRegex(
+                    exact_job, r"dotnet-version:\s+['\"]10\.0\.400['\"]"
+                )
+                for guard in guards:
+                    self.assertIn(guard, exact_job)
+
     def test_publish_waits_for_same_commit_reusable_live_matrix(self) -> None:
         live_workflow = (REPOSITORY_ROOT / ".github/workflows/live-fsac.yml").read_text(
             encoding="utf-8"

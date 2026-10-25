@@ -13,6 +13,9 @@ concurrency:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    env:
+      DOTNET_INSTALL_DIR: ${{ github.workspace }}/.dotnet-exact
+      DOTNET_MULTILEVEL_LOOKUP: '0'
 
     steps:
       - name: Checkout
@@ -47,13 +50,42 @@ jobs:
         run: python -m unittest -v scripts.tests.test_sdk_pin_preflight_e2e
 
       - name: Test (with coverage)
+        id: coverage_tests
         # coverlet.msbuild instruments FsLangMcp.dll via the ProjectReference graph (ADR-0001).
         # IncludeTestAssembly is no longer needed — prod and test code are in separate assemblies.
+        env:
+          FSLANGMCP_TEST_TIME_MULTIPLIER: 4
+          FSLANGMCP_TEST_TRACE: ${{ github.workspace }}/TestResults/testhost-events.ndjson
         run: |
+          mkdir -p "$GITHUB_WORKSPACE/TestResults"
           dotnet test FsLangMcp.slnx --no-build --no-restore --configuration Release \
+            --blame-hang \
+            --blame-hang-timeout 3m \
+            --blame-hang-dump-type none \
+            --logger "console;verbosity=normal" \
+            --logger "trx;LogFileName=test-results.trx" \
+            --results-directory "$GITHUB_WORKSPACE/TestResults" \
+            --diag "$GITHUB_WORKSPACE/TestResults/vstest-diagnostics.log" \
             /p:CollectCoverage=true \
             /p:CoverletOutputFormat=cobertura \
             /p:CoverletOutput=./coverage/
+
+      - name: Upload coverage test results
+        if: always() && steps.coverage_tests.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-coverage-test-results
+          path: '${{ github.workspace }}/TestResults/test-results.trx'
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload test hang diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-hang-diagnostics
+          path: '**/TestResults/**'
+          if-no-files-found: warn
 
       - name: Coverage gate (≥ 54% line)
         run: |
@@ -83,3 +115,47 @@ jobs:
           name: coverage-cobertura
           path: '**/coverage.cobertura.xml'
           if-no-files-found: warn
+
+  minimum-sdk:
+    name: Minimum SDK (10.0.100)
+    runs-on: ubuntu-latest
+    env:
+      DOTNET_INSTALL_DIR: ${{ github.workspace }}/.dotnet-minimum
+      DOTNET_MULTILEVEL_LOOKUP: '0'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup minimum .NET SDK
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.100'
+
+      - name: Verify minimum SDK selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(dotnet --version)" = "10.0.100"
+
+      - name: Restore locked dependencies
+        run: dotnet restore FsLangMcp.slnx --locked-mode
+
+      - name: Build with minimum SDK
+        run: dotnet build FsLangMcp.slnx --no-restore --configuration Release --warnaserror
+
+      - name: Test with minimum SDK
+        id: minimum_sdk_tests
+        run: |
+          dotnet test FsLangMcp.slnx --no-build --no-restore --configuration Release \
+            --logger "trx;LogFileName=minimum-sdk-test-results.trx" \
+            --results-directory "$GITHUB_WORKSPACE/TestResults/minimum-sdk"
+
+      - name: Upload minimum SDK test results
+        if: always() && steps.minimum_sdk_tests.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: minimum-sdk-test-results
+          path: '${{ github.workspace }}/TestResults/minimum-sdk/minimum-sdk-test-results.trx'
+          if-no-files-found: error
+          retention-days: 30

@@ -36,6 +36,45 @@ let private findNearestFsproj (filePath: string) : string option =
 
     walk (Path.GetDirectoryName(Path.GetFullPath(filePath)))
 
+/// Find-only nearest-project walk. The general helper above keeps its existing
+/// behavior for other tools; find can stop its retained discovery worker between
+/// individual directory entries when the shared deadline or caller ends.
+let private findNearestFsprojWithContinuation
+    (filePath: string)
+    (beforeStep: string -> int -> unit)
+    (shouldContinue: unit -> bool)
+    : string option =
+    let ensure phase index =
+        beforeStep phase index
+
+        if not (shouldContinue ()) then
+            raise (TimeoutException($"Find nearest-project discovery expired during {phase}."))
+
+    let rec walk directoryIndex fileIndex (dir: string) =
+        if isNull dir then
+            None
+        else
+            ensure "nearest-project-directory" directoryIndex
+            use fsprojs = Directory.EnumerateFiles(dir, "*.fsproj").GetEnumerator()
+            let mutable currentFileIndex = fileIndex
+            let mutable found = None
+            let mutable reading = true
+
+            while reading && Option.isNone found do
+                ensure "nearest-project-file" currentFileIndex
+
+                if fsprojs.MoveNext() then
+                    found <- Some fsprojs.Current
+                    currentFileIndex <- currentFileIndex + 1
+                else
+                    reading <- false
+
+            match found with
+            | Some project -> Some project
+            | None -> walk (directoryIndex + 1) currentFileIndex (Path.GetDirectoryName(dir))
+
+    walk 0 0 (Path.GetDirectoryName(Path.GetFullPath(filePath)))
+
 let private explicitFsproj (projectPath: string option) : string option =
     projectPath
     |> Option.map normalizePath
@@ -288,26 +327,18 @@ module internal FieldSiteTypes =
                 | typeOrder -> typeOrder)
 
     /// Per-row caps: distinct alternative types, and projects listed under one type. They
-    /// stop a single pathological row from eating the whole page allowance below.
+    /// make one site's serialized alternatives deterministic and bounded in cardinality.
+    /// These caps are deliberately independent of cursor position, maxResults, and the
+    /// response budget: a physical site has one canonical row on every page that contains it.
     [<Literal>]
     let AlternativeTypesPerSite = 3
 
     [<Literal>]
     let AlternativeProjectsPerType = 3
 
-    /// Page-wide allowance for the alternatives column, in rendered characters.
-    ///
-    /// #207 review: the number of alternatives is NOT bounded by the per-type 200-char cap —
-    /// it grows with the number of projects a linked file is compiled by, once per site. The
-    /// documented worst case for a full page is 80 × (527 + 203 + 15) ≈ 59.6k against a ~72k
-    /// ceiling, so the column gets the headroom and no more. Rows past the allowance keep the
-    /// COUNT and drop the strings, which is bounded by construction.
-    [<Literal>]
-    let AlternativesPageBudgetChars = 6000
-
     /// Group (type, project) pairs into per-type entries under the per-row caps. Returns the
     /// entries — each as (siteType, projects shown, projects omitted) — plus how many distinct
-    /// types the cap left out. Pure: the page-budget decision belongs to the caller.
+    /// types the cap left out. Pure and page-invariant by construction.
     let alternativeEntries (alternatives: (string * string) list) : (string * string list * int) list * int =
         let byType =
             alternatives
@@ -330,15 +361,13 @@ module internal FieldSiteTypes =
 
         entries, max 0 (byType.Length - AlternativeTypesPerSite)
 
-    /// True when this row's alternatives were capped in ANY way — distinct types dropped,
-    /// projects under a type dropped, or the whole list replaced by a count past the page
-    /// allowance. Drives the `alternativesTruncatedRows` ledger entry, which would otherwise
-    /// have to be inferred by sniffing the rendered JSON and would miss the projects-only case.
-    let alternativesTruncated (withinPageBudget: bool) (alternatives: (string * string) list) : bool =
+    /// True when this row's alternatives were capped in ANY way — distinct types dropped or
+    /// projects under a type dropped. Drives the `alternativesTruncatedRows` ledger entry,
+    /// which would otherwise have to be inferred by sniffing the rendered JSON and would miss
+    /// the projects-only case.
+    let alternativesTruncated (alternatives: (string * string) list) : bool =
         if List.isEmpty alternatives then
             false
-        elif not withinPageBudget then
-            true
         else
             let entries, typesOmitted = alternativeEntries alternatives
 
@@ -347,13 +376,11 @@ module internal FieldSiteTypes =
 
     /// The `siteTypeAlternatives` row fields — emitted ONLY when another swept project
     /// resolved the same physical site to a different type, so the common row shape is
-    /// byte-identical to a single-project sweep. `withinPageBudget=false` keeps the count and
-    /// drops the strings: an agent still learns the site is contested, and the page stays
-    /// inside the response ceiling. Nothing is ever dropped silently — every omission is a
-    /// number in the row.
+    /// byte-identical to a single-project sweep. Nothing is ever dropped silently — every
+    /// per-site omission is a number in the row. The response-size planner never reshapes
+    /// this projection; it can only omit the whole site by choosing a shorter page prefix.
     let alternativesFields
         (includeSiteTypes: bool)
-        (withinPageBudget: bool)
         (alternatives: (string * string) list)
         : (string * JsonNode) list =
         if not includeSiteTypes || List.isEmpty alternatives then
@@ -361,31 +388,29 @@ module internal FieldSiteTypes =
         else
             let entries, typesOmitted = alternativeEntries alternatives
 
-            if not withinPageBudget then
-                [ ("siteTypeAlternativesOmitted", jint (entries.Length + typesOmitted)) ]
-            else
-                let entryNodes =
-                    entries
-                    |> List.map (fun (siteType, projects, projectsOmitted) ->
-                        jobj (
-                            [ "siteType", jstr siteType
-                              "projects", JsonArray(projects |> List.map jstr |> List.toArray) :> JsonNode ]
-                            // Parenthesised on purpose: a one-element list of an
-                            // UNparenthesised tuple raises FS3536 ("did you mean ';'?"), and
-                            // FcsBridgeTests type-checks this very file expecting zero
-                            // diagnostics at every severity — informational included.
-                            @ (if projectsOmitted > 0 then
-                                   [ ("projectsOmitted", jint projectsOmitted) ]
-                               else
-                                   [])
-                        )
-                        :> JsonNode)
+            let entryNodes =
+                entries
+                |> List.map (fun (siteType, projects, projectsOmitted) ->
+                    jobj (
+                        [ "siteType", jstr siteType
+                          "projects", JsonArray(projects |> List.map jstr |> List.toArray) :> JsonNode ]
+                        // Parenthesised on purpose: a one-element list of an
+                        // UNparenthesised tuple raises FS3536 ("did you mean ';'?"), and
+                        // FcsBridgeTests type-checks this very file expecting zero
+                        // diagnostics at every severity — informational included.
+                        @ (if projectsOmitted > 0 then
+                               [ ("projectsOmitted", jint projectsOmitted) ]
+                           else
+                               [])
+                    )
+                    :> JsonNode)
 
-                [ ("siteTypeAlternatives", JsonArray(entryNodes |> List.toArray) :> JsonNode) ]
-                @ (if typesOmitted > 0 then
-                       [ ("siteTypeAlternativesOmitted", jint typesOmitted) ]
-                   else
-                       [])
+            [ ("siteTypeAlternatives", JsonArray(entryNodes |> List.toArray) :> JsonNode) ]
+            @ (if typesOmitted > 0 then
+                   [ "siteTypeAlternativesOmitted", jint typesOmitted
+                     "siteTypeAlternativesOffset", jint entries.Length ]
+               else
+                   [])
 
     /// Project a site's stored (siteType, typeStatus) into the JSON fields its row carries.
     /// Present on EVERY field site under includeSiteTypes — an explicit JSON null for a
@@ -418,11 +443,471 @@ type internal FindFsacProbeResult =
     | Failed of reason: string
     | Unavailable of reason: string
 
+/// Request-local, exclusive wall-clock attribution. A phase switch closes the previous
+/// interval: nested worker time is never added a second time, and retained workers stop
+/// contributing when their caller stops waiting. Cache decisions travel with results,
+/// never through process-global counter differences.
+type internal FindCostTelemetry(nowMilliseconds: unit -> int) =
+    let phaseNames =
+        [| "admission"; "positionResolution"; "targetDiscovery"; "projectOptions"
+           "snapshot"; "fcsSweep"; "classification"; "fsacFallback"
+           "responseConstruction"; "unattributed" |]
+    let phaseTotals = Array.zeroCreate<int> phaseNames.Length
+    let cacheNames = [| "projectOptions"; "projectUses" |]
+    let cacheAttempts = Array.zeroCreate<int> cacheNames.Length
+    let cacheHits = Array.zeroCreate<int> cacheNames.Length
+    let cacheMisses = Array.zeroCreate<int> cacheNames.Length
+    let mutable activePhase = 0
+    let mutable lastSample = 0
+
+    let sample () =
+        let elapsed = max lastSample (nowMilliseconds ())
+        phaseTotals[activePhase] <- phaseTotals[activePhase] + elapsed - lastSample
+        lastSample <- elapsed
+
+    member _.SetPhase(name: string) =
+        sample ()
+        activePhase <- phaseNames |> Array.findIndex ((=) name)
+
+    member _.BeginCacheObservation(name: string) =
+        let index = cacheNames |> Array.findIndex ((=) name)
+        cacheAttempts[index] <- cacheAttempts[index] + 1
+
+    member _.RecordCacheObservation(name: string, hit: bool) =
+        let index = cacheNames |> Array.findIndex ((=) name)
+        if hit then cacheHits[index] <- cacheHits[index] + 1
+        else cacheMisses[index] <- cacheMisses[index] + 1
+
+    /// Sample immediately before the final measured serialization. The final serializer
+    /// and transport are outside this sample; repeated planner serialization IS included.
+    /// Do not attach after a size check: the added fixed metadata must itself be measured.
+    member _.Attach(response: JsonNode) =
+        sample ()
+        response["elapsedMs"] <- jint lastSample
+        response["phaseTimingsMs"] <-
+            Array.zip phaseNames phaseTotals
+            |> Array.map (fun (name, elapsed) -> name, jint elapsed)
+            |> Array.toList
+            |> jobj
+        response["cacheState"] <-
+            cacheNames
+            |> Array.mapi (fun index name ->
+                let incomplete = cacheAttempts[index] - cacheHits[index] - cacheMisses[index]
+                let state =
+                    if cacheAttempts[index] = 0 then "not_observed"
+                    elif incomplete > 0 then "incomplete"
+                    else "observed"
+                name,
+                (jobj [ "hits", jint cacheHits[index]
+                        "misses", jint cacheMisses[index]
+                        "incomplete", jint incomplete
+                        "state", jstr state ] :> JsonNode))
+            |> Array.toList
+            |> jobj
+        response
+
+/// One monotonic request deadline shared by Program.fs admission and every find phase.
+/// Semantic work stops early enough to leave a small, explicit allowance for constructing
+/// the typed response. The optional signal is a deterministic test seam: production expiry
+/// is always derived from Stopwatch's monotonic clock.
+type internal FindRequestDeadline
+    (timeoutMs: int, ?semanticExpirySignal: Task, ?responseExpirySignal: Task) =
+    let elapsed = System.Diagnostics.Stopwatch.StartNew()
+    let telemetry = FindCostTelemetry(fun () -> int elapsed.ElapsedMilliseconds)
+
+    let responseAllowanceMs =
+        if timeoutMs <= 0 then
+            0
+        else
+            min 250 (max 1 (timeoutMs / 20))
+
+    let semanticBudgetMs = max 0 (timeoutMs - responseAllowanceMs)
+    let mutable semanticExpired = if semanticBudgetMs = 0 then 1 else 0
+    let mutable responseStartedAt: TimeSpan option = None
+
+    let remainingFrom budgetMs =
+        let remaining = TimeSpan.FromMilliseconds(float budgetMs) - elapsed.Elapsed
+        if remaining <= TimeSpan.Zero then TimeSpan.Zero else remaining
+
+    member _.TimeoutMs = timeoutMs
+    member _.ResponseAllowanceMs = responseAllowanceMs
+    member _.ElapsedMilliseconds = int elapsed.ElapsedMilliseconds
+    member _.Telemetry = telemetry
+
+    /// Early/timeout envelopes have no planner. If the guard replaces an oversized
+    /// envelope, attach to that small replacement and measure it as well.
+    member _.GuardResponse(response: JsonNode) =
+        let attached = telemetry.Attach response
+        let guarded = FindResponseBudget.guardFinalResponse attached
+        if Object.ReferenceEquals(attached, guarded) then guarded
+        else telemetry.Attach guarded |> FindResponseBudget.guardFinalResponse
+    member _.SemanticExpirySignal = semanticExpirySignal
+    member _.ResponseExpirySignal = responseExpirySignal
+
+    member _.MarkSemanticExpired() =
+        Interlocked.Exchange(&semanticExpired, 1) |> ignore
+
+    member _.RemainingSemanticBudget() =
+        let signalled =
+            semanticExpirySignal
+            |> Option.exists _.IsCompleted
+
+        if Volatile.Read(&semanticExpired) <> 0 || signalled then
+            TimeSpan.Zero
+        else
+            remainingFrom semanticBudgetMs
+
+    member _.BeginResponseConstruction() =
+        if responseStartedAt.IsNone then
+            telemetry.SetPhase("responseConstruction")
+            responseStartedAt <- Some elapsed.Elapsed
+
+    member _.RemainingResponseBudget() =
+        let signalled =
+            responseExpirySignal
+            |> Option.exists _.IsCompleted
+
+        if signalled then
+            TimeSpan.Zero
+        else
+            let overallRemaining = remainingFrom timeoutMs
+
+            match responseStartedAt with
+            | None -> TimeSpan.Zero
+            | Some startedAt ->
+                let allowanceRemaining =
+                    TimeSpan.FromMilliseconds(float responseAllowanceMs) - (elapsed.Elapsed - startedAt)
+
+                let boundedAllowance =
+                    if allowanceRemaining <= TimeSpan.Zero then
+                        TimeSpan.Zero
+                    else
+                        allowanceRemaining
+
+                if overallRemaining <= boundedAllowance then overallRemaining else boundedAllowance
+
+    member this.SemanticExpired = this.RemainingSemanticBudget() <= TimeSpan.Zero
+    member this.ResponseExpired = this.RemainingResponseBudget() <= TimeSpan.Zero
+
+exception private FindProjectNotStartedException
+
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type private FindTargetDiscoveryResult =
+    | Paths of string array
+    | Projects of SolutionParsing.FindProjectDiscovery
+
+[<NoEquality; NoComparison>]
+type private FindResolvedPosition =
+    { Query: string
+      SymbolIdentity: string }
+
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type private FindPositionFailure =
+    | InvalidRequest of JsonNode
+    | Changed of JsonNode
+    | Incomplete of JsonNode
+
+[<RequireQualifiedAccess>]
+module internal FindCursorContract =
+
+    let private normalizedStablePath value =
+        value
+        |> Option.filter (String.IsNullOrWhiteSpace >> not)
+        |> Option.map normalizePath
+
+    let queryModel
+        (args: FindArgs)
+        (query: string)
+        (kind: string)
+        (scope: string)
+        (exact: bool)
+        (contextLines: int)
+        (includeDeclaration: bool)
+        (includeInfo: bool)
+        (includePerProject: bool)
+        (includeSiteTypes: bool)
+        : Cursor.FindQueryV2 =
+        let path = normalizedStablePath args.path
+
+        // Public MCP dispatch materializes active-project fallback before this point.
+        // Direct bridge callers without projectPath use their normalized source path as
+        // the stable target identity; target discovery still resolves the owning project.
+        let target =
+            normalizedStablePath args.projectPath
+            |> Option.orElse path
+            |> Option.defaultValue ""
+
+        let position =
+            if kind = "position" then
+                Some
+                    { Cursor.FindPositionRequestV2.Path = path |> Option.defaultValue ""
+                      Line = args.line
+                      Character = args.character
+                      Word = args.word
+                      Occurrence = Some(args.occurrence |> Option.defaultValue -1) }
+            else
+                None
+
+        { Cursor.FindQueryV2.Schema = 2
+          Query = query
+          RequestedKind = kind
+          RequestedScope = scope
+          Target = target
+          Path = path
+          Position = position
+          Exact = exact
+          Member = args.``member``
+          Field = args.field
+          ContextLines = contextLines
+          IncludeDeclaration = includeDeclaration
+          IncludeInfo = includeInfo
+          IncludePerProject = includePerProject
+          IncludeSiteTypes = includeSiteTypes }
+
+    let rejected errorKind message =
+        jobj
+            [ "status", jstr "invalid_cursor"
+              "errorKind", jstr errorKind
+              "paginationRestartRequired", jbool true
+              "retrySameCursor", jbool false
+              "nextCursor", null
+              "sites", JsonArray() :> JsonNode
+              "message", jstr message ]
+        :> JsonNode
+
+    let decodeRejected (error: Cursor.FindCursorDecodeError) =
+        let errorKind = Cursor.findCursorErrorKind error
+
+        let message =
+            match errorKind with
+            | "cursor_version_unsupported" ->
+                "This find cursor uses an unsupported version; repeat the same request without cursor and use the current protocol."
+            | "cursor_tool_mismatch" ->
+                "This cursor belongs to another tool; use only a cursor issued by find."
+            | _ ->
+                "The find cursor is malformed; discard it and repeat the request without cursor."
+
+        rejected errorKind message
+
+    let queryMismatch () =
+        rejected
+            "cursor_query_mismatch"
+            "The find request differs from the cursor query; repeat this query without cursor."
+
+    let stale () =
+        rejected
+            "cursor_stale"
+            "The find result changed; repeat the request without cursor."
+
+    let outOfRange () =
+        rejected
+            "cursor_out_of_range"
+            "The find cursor offset is beyond the matching result stream; repeat the request without cursor."
+
+    let validationIncomplete (deadline: FindRequestDeadline) message =
+        jobj
+            [ "status", jstr "invalid_cursor"
+              "errorKind", jstr "cursor_validation_incomplete"
+              "paginationRestartRequired", jbool false
+              "retrySameCursor", jbool true
+              "retryable", jbool true
+              "timeoutMs", jint deadline.TimeoutMs
+              "elapsedMs", jint deadline.ElapsedMilliseconds
+              "nextCursor", null
+              "sites", JsonArray() :> JsonNode
+              "message", jstr message ]
+        :> JsonNode
+
+[<RequireQualifiedAccess>]
+module internal FindDeadlineResponse =
+
+    let private phaseNode phase status =
+        jobj [ "phase", jstr phase; "status", jstr status ] :> JsonNode
+
+    let private knownProjectsBeforeDiscovery (args: FindArgs) =
+        args.projectPath
+        |> Option.filter (String.IsNullOrWhiteSpace >> not)
+        |> Option.filter (fun path -> path.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase))
+        |> Option.map (fun path ->
+            try
+                normalizePath path
+            with _ ->
+                path)
+        |> Option.toArray
+
+    /// Typed response used when the shared request deadline expires before find has a
+    /// discovered project set. An explicit .fsproj is already known without filesystem
+    /// discovery and is therefore reported as not_started; a solution/directory remains
+    /// unknown rather than being scanned after expiry merely to improve accounting.
+    let beforeDiscovery
+        (args: FindArgs)
+        (deadline: FindRequestDeadline)
+        (phase: string)
+        (phaseStatus: string)
+        (errorKind: string)
+        (message: string)
+        : JsonNode =
+        let kind = (args.kind |> Option.defaultValue "auto").Trim().ToLowerInvariant()
+        let scope = (args.scope |> Option.defaultValue "auto").Trim().ToLowerInvariant()
+        let exact = args.exact |> Option.defaultValue true
+        let projects = knownProjectsBeforeDiscovery args
+        let projectsRequested = projects.Length
+        let projectsNotStarted = projectsRequested
+
+        let perProject =
+            projects
+            |> Array.map (fun project ->
+                let projectName =
+                    try
+                        Path.GetFileNameWithoutExtension project
+                    with _ ->
+                        project
+
+                jobj
+                    [ "project", jstr projectName
+                      "fsproj", jstr project
+                      "status", jstr "not_started"
+                      "errorKind", jstr "deadline_not_started"
+                      "retryable", jbool true
+                      "error", jstr message
+                      "elapsedMs", jint 0 ]
+                :> JsonNode)
+
+        let admissionStatus =
+            if phase = "admission" then phaseStatus else "complete"
+
+        let positionStatus =
+            if phase = "position_resolution" then
+                phaseStatus
+            elif phase = "admission" then
+                "not_started"
+            elif kind = "position" then
+                "complete"
+            else
+                "not_needed"
+
+        let targetDiscoveryStatus =
+            if phase = "target_discovery" then
+                phaseStatus
+            else
+                "not_started"
+
+        let phases =
+            JsonArray(
+                [| phaseNode "admission" admissionStatus
+                   phaseNode "position_resolution" positionStatus
+                   phaseNode "target_discovery" targetDiscoveryStatus
+                   phaseNode "project_sweep" "not_started"
+                   phaseNode "fsac_fallback" "not_started"
+                   phaseNode "response_construction" "complete" |]
+            )
+            :> JsonNode
+
+        let coverage =
+            jobj
+                [ "complete", jbool false
+                  "projectsRequested", jint projectsRequested
+                  "projectsAnalyzed", jint 0
+                  "projectsFailed", jint 0
+                  "projectsMissing", jint 0
+                  "projectsTimedOut", jint 0
+                  "projectsBusy", jint 0
+                  "projectsNotStarted", jint projectsNotStarted
+                  "phases", phases ]
+            :> JsonNode
+
+        let kindResolved = if kind = "position" then "position" else kind
+
+        let scopeResolved =
+            if projectsRequested = 1 then
+                if scope = "file" then "file" else "project"
+            elif scope = "workspace" then
+                "workspace"
+            else
+                scope
+
+        let resolution =
+            jobj
+                [ "matched", null
+                  "outcome", jstr "indeterminate"
+                  "complete", jbool false
+                  "kindResolved", jstr kindResolved
+                  "scopeResolved", jstr scopeResolved
+                  "projectsSwept", jint 0
+                  "projectsRequested", jint projectsRequested
+                  "projectsAnalyzed", jint 0
+                  "projectsFailed", jint 0
+                  "projectsMissing", jint 0
+                  "projectsTimedOut", jint 0
+                  "projectsBusy", jint 0
+                  "projectsNotStarted", jint projectsNotStarted
+                  "via", jstr "deadline"
+                  "fcsSiteCount", jint 0
+                  "fsacFallbackHits", jint 0
+                  "fsacFallbackState", jstr "not_started"
+                  "fsacFallbackReason", jstr message ]
+            :> JsonNode
+
+        jobj
+            [ "status", jstr "unknown"
+              "deliveryStatus", jstr "partial"
+              "errorKind", jstr errorKind
+              "message", jstr message
+              "timeoutMs", jint deadline.TimeoutMs
+              "responseConstructionAllowanceMs", jint deadline.ResponseAllowanceMs
+              "outcome", jstr "indeterminate"
+              "query", jstr args.query
+              "kind", jstr kind
+              "kindResolved", jstr kindResolved
+              "scope", jstr scope
+              "exact", jbool exact
+              "resolution", resolution
+              "coverage", coverage
+              "projectsSwept", jint 0
+              "projectsRequested", jint projectsRequested
+              "projectsAnalyzed", jint 0
+              "projectsFailed", jint 0
+              "projectsMissing", jint 0
+              "projectsTimedOut", jint 0
+              "projectsBusy", jint 0
+              "projectsNotStarted", jint projectsNotStarted
+              "totalSites", jint 0
+              "matchedUseCount", jint 0
+              "breakdownComplete", jbool false
+              "breakdown",
+              jobj
+                  [ "definitions", jint 0
+                    "references", jint 0
+                    "fieldSetLiteral", jint 0
+                    "fieldSetUpdate", jint 0
+                    "fieldSetMutation", jint 0
+                    "fieldPattern", jint 0
+                    "fieldRead", jint 0
+                    "memberUsages", jint 0 ]
+              :> JsonNode
+              "sites", JsonArray() :> JsonNode
+              "perProject", JsonArray(perProject) :> JsonNode
+              "sweepElapsedMs", jint deadline.ElapsedMilliseconds
+              "projectDiagnostics", JsonArray() :> JsonNode
+              "resultSetComplete", jbool false
+              "truncated", jbool true
+              "nextCursor", null
+              "totalEstimate", jobj [ ("sites", jint 0) ] :> JsonNode
+              "totalEstimateIsLowerBound", jbool true
+              "paginationRestartRequired", jbool true
+              "retrySameCursor", jbool false
+              "paginationIncompleteReason", jstr "deadline_incomplete"
+              "scopeNote",
+              jstr
+                  $"find timed out during {phase}; no later semantic phase was started. Retry with a larger timeoutMs after any retained worker completes." ]
+        :> JsonNode
+
 let rec private findFailureIsTimeout (ex: exn) =
     match ex with
     | :? TimeoutException -> true
-    // Find has no caller cancellation token today, so cancellation observed
-    // inside its budgeted sweep is a timeout-equivalent incomplete result.
+    // A worker can report cancellation without the caller token being cancelled;
+    // that remains timeout-equivalent. FindWithinDeadline propagates an actual
+    // caller cancellation before invoking this classifier.
     | :? OperationCanceledException -> true
     | :? AggregateException as aggregate ->
         aggregate.Flatten().InnerExceptions |> Seq.exists findFailureIsTimeout
@@ -1631,6 +2116,19 @@ module internal AnalysisSnapshotKey =
         appendProject "root" "" projectOptions
         aggregate.GetHashAndReset() |> Convert.ToHexString
 
+/// Single construction path for user-supplied project-outline filters. Tests
+/// assert these engine guarantees directly instead of treating host speed as a
+/// correctness property.
+module internal ProjectOutlineFilter =
+    let private matchTimeout = TimeSpan.FromMilliseconds(250.0)
+
+    let compile (pattern: string) =
+        let options =
+            System.Text.RegularExpressions.RegexOptions.NonBacktracking
+            ||| System.Text.RegularExpressions.RegexOptions.IgnoreCase
+
+        new System.Text.RegularExpressions.Regex(pattern, options, matchTimeout)
+
 /// Adapts Ionide.ProjInfo's evaluated MSBuild result to the small, stable model
 /// shared by project_health and fsharp_project_inspect.
 module private EvaluatedProjectModel =
@@ -1967,6 +2465,7 @@ type internal CheckBlockingFailure =
 
 let rec private boundedCheckWorkFailureIsBusy (ex: exn) =
     match ex with
+    | :? ProjectEvaluationBusyException -> true
     | :? BoundedCheckWorkBusyException -> true
     | :? AggregateException as aggregate ->
         aggregate.Flatten().InnerExceptions |> Seq.exists boundedCheckWorkFailureIsBusy
@@ -2019,6 +2518,88 @@ type internal BoundedCheckWorkAdmission(operation: string, capacity: int) =
     member _.StartedCount = Volatile.Read(&startedCount)
     member _.RejectedCount = Volatile.Read(&rejectedCount)
     member _.MaxObservedConcurrency = Volatile.Read(&maxObservedConcurrency)
+
+/// One exact-key actual worker with caller-owned waiters. The worker never captures
+/// the first caller's deadline: it only learns whether at least one caller still owns
+/// an interest in continuing. Once a worker observes zero waiters, the entry closes to
+/// late joiners and is removed only after that exact worker has settled.
+[<Sealed>]
+type private WaiterAwareSingleFlight<'T>
+    (
+        start: (unit -> bool) -> Task<'T>,
+        onCompleted: WaiterAwareSingleFlight<'T> -> unit
+    ) as this =
+    let gate = obj ()
+    let waiters = System.Collections.Generic.Dictionary<int, unit -> bool>()
+    let mutable nextWaiterId = 0
+    let mutable acceptingWaiters = true
+
+    let close () =
+        lock gate (fun () -> acceptingWaiters <- false)
+
+    let operation =
+        lazy
+            (task {
+                try
+                    return! start this.HasActiveWaiters
+                finally
+                    close ()
+                    onCompleted this
+            })
+
+    // Liveness predicates run under gate: they must be fast, non-blocking, and must
+    // not call back into this flight. Only cancellation is interpreted as inactivity;
+    // other exceptions indicate a broken caller contract and are not hidden.
+    member _.TryAddWaiter(isActive: unit -> bool) =
+        lock gate (fun () ->
+            if acceptingWaiters then
+                nextWaiterId <- nextWaiterId + 1
+                waiters.Add(nextWaiterId, isActive)
+                Some nextWaiterId
+            else
+                None)
+
+    member _.ReleaseWaiter(waiterId: int) =
+        lock gate (fun () -> waiters.Remove(waiterId) |> ignore)
+
+    member _.HasActiveWaiters() =
+        lock gate (fun () ->
+            let expired = ResizeArray<int>()
+
+            for waiter in waiters do
+                let active =
+                    try
+                        waiter.Value()
+                    with :? OperationCanceledException ->
+                        false
+
+                if not active then
+                    expired.Add(waiter.Key)
+
+            for waiterId in expired do
+                waiters.Remove(waiterId) |> ignore
+
+            if waiters.Count > 0 then
+                true
+            else
+                acceptingWaiters <- false
+                false)
+
+    member _.Operation = operation.Value
+    member _.WaiterCount = lock gate (fun () -> waiters.Count)
+
+[<Sealed>]
+type private WaiterAwareSingleFlightWaiter<'T>(flight: WaiterAwareSingleFlight<'T>, waiterId: int) =
+    let mutable released = 0
+
+    member _.Operation = flight.Operation
+
+    member _.Release() =
+        if Interlocked.Exchange(&released, 1) = 0 then
+            flight.ReleaseWaiter(waiterId)
+
+    interface IDisposable with
+        member this.Dispose() = this.Release()
 
 [<RequireQualifiedAccess>]
 type private CheckTargetDiscoveryResult =
@@ -2379,6 +2960,7 @@ type internal FcsBridge
         ?analysisSnapshotKeyBeforeComputeOverride: (unit -> unit),
         ?checkTargetDiscoveryBeforeComputeOverride: (unit -> unit),
         ?checkProjectDiscoveryBeforeFallbackOverride: (unit -> unit),
+        ?checkTargetDiscoveryDeadlineTokenOverride: (unit -> CancellationToken),
         ?freshProjectCheckWorkerOverride: (FSharpProjectOptions -> Task<FSharpDiagnostic array>),
         ?freshProjectCheckConcurrencyOverride: int,
         ?freshProjectCheckBeforeAdmissionOverride: (unit -> Task),
@@ -2389,17 +2971,48 @@ type internal FcsBridge
         ?testsForSymbolProjectSweepWaitMsOverride: (int -> int),
         ?projectOutlineFileOutlineOverride: (FcsFileOutlineArgs -> Task<JsonNode>),
         ?checkFastSnapshotDeadlineExpiredOverride: (unit -> bool),
+        ?findPositionResolutionBeforeComputeOverride: (unit -> Task),
+        ?findTargetDiscoveryBeforeComputeOverride: (string -> Task),
+        ?findTargetDiscoveryBeforeStepOverride: (string -> int -> unit),
+        ?findDeadlineSignalOverride: (unit -> Task),
+        ?findResponseDeadlineSignalOverride: (unit -> Task),
+        ?findResponseConstructionBeforeStartOverride: (unit -> Task),
+        ?findResponseConstructionBeforeStepOverride: (string -> int -> unit),
+        ?findFinalResponseBeforeMeasureOverride: (unit -> unit),
+        ?findFinalResponseAfterMeasureOverride: (unit -> unit),
         // #207: test-only seam for find's PER-SITE siteType deadline. The production check
-        // is `sweepSw.ElapsedMilliseconds >= sweepBudgetMs`, which cannot be driven from a
-        // test without a clock: timeoutMs=0 is exhausted BEFORE the sweep, so it fails the
-        // whole project and yields no sites at all. This override makes the reachable
+        // reads the shared FindRequestDeadline, which cannot target one site deterministically
+        // without a seam: timeoutMs=0 is exhausted BEFORE the sweep and yields no sites.
+        // This override makes the reachable
         // degraded arm (a large solution whose budget expires between a project's sweep
         // returning and its site loop finishing) deterministically testable.
         ?findSiteTypeDeadlineExpiredOverride: (unit -> bool),
         ?referenceResolutionProbeOverride: (string array -> int * int),
         ?projectOptionsCacheValidationBeforeComputeOverride: (string -> unit),
-        ?trustedFileCheckAnswerOverride: (FSharpCheckFileAnswer -> FSharpCheckFileAnswer)
+        ?trustedFileCheckAnswerOverride: (FSharpCheckFileAnswer -> FSharpCheckFileAnswer),
+        // Deterministic test seam for the otherwise fixed production find ceiling.
+        ?findResponseBudgetCharsOverride: int,
+        // Test-only ownership boundary for synthetic snippet files. Production
+        // continues to use the OS temp directory.
+        ?snippetTempDirectoryOverride: string
     ) =
+    let findResponseBudgetChars =
+        match findResponseBudgetCharsOverride with
+        | Some value when value > 0 -> value
+        | Some value -> invalidArg (nameof findResponseBudgetCharsOverride) $"find response budget must be positive; got {value}."
+        | None -> FindResponseBudget.MaxSerializedChars
+
+    let snippetTempDirectory =
+        match snippetTempDirectoryOverride with
+        | Some path when String.IsNullOrWhiteSpace(path) ->
+            invalidArg (nameof snippetTempDirectoryOverride) "snippet temp directory must not be blank."
+        | Some path -> Path.GetFullPath(path)
+        | None -> Path.GetTempPath()
+
+    let createSnippetFile prefix extension =
+        Directory.CreateDirectory(snippetTempDirectory) |> ignore
+        Path.Combine(snippetTempDirectory, $"{prefix}_{Guid.NewGuid():N}{extension}")
+
     // FCS default projectCacheSize is 3. The `find` multi-project union sweep
     // (issue #128) re-checks EVERY member project of the active solution on each
     // call; with a cache of 3 a >3-project solution thrashes FCS's project cache
@@ -2441,7 +3054,7 @@ type internal FcsBridge
         System.Collections.Generic.Dictionary<string, string>(StringComparer.Ordinal)
 
     let optionsInFlight =
-        ConcurrentDictionary<string, Lazy<Task<ProjectOptionsCacheEntry>>>()
+        ConcurrentDictionary<string, WaiterAwareSingleFlight<ProjectOptionsCacheEntry * bool>>()
 
     // Project-cache validation performs recursive hashing and Ionide/MSBuild loads
     // race on process-global SDK state. Keep the entire exact-fsproj resolve behind
@@ -2476,13 +3089,31 @@ type internal FcsBridge
     let snapshotComputationAdmission =
         BoundedCheckWorkAdmission("project snapshot computation", 1)
 
-    let snapshotComputationsInFlight = ConcurrentDictionary<string, Lazy<Task<string>>>()
+    let snapshotComputationsInFlight =
+        ConcurrentDictionary<string, WaiterAwareSingleFlight<string>>()
 
     let checkTargetDiscoveryAdmission =
         BoundedCheckWorkAdmission("check target discovery", 1)
 
     let checkTargetDiscoveriesInFlight =
-        ConcurrentDictionary<string, Lazy<Task<CheckTargetDiscoveryResult>>>()
+        ConcurrentDictionary<string, WaiterAwareSingleFlight<CheckTargetDiscoveryResult>>()
+
+    // Find has the same uncancellable boundaries as Check, plus position resolution.
+    // Exact-key callers share the active worker; distinct keys are rejected immediately.
+    // Caller/deadline expiry never releases these slots before the real worker settles.
+    let findPositionResolutionAdmission =
+        BoundedCheckWorkAdmission("find position resolution", freshProjectCheckCapacity)
+
+    let findPositionResolutionsInFlight =
+        ConcurrentDictionary<string, WaiterAwareSingleFlight<Result<FindResolvedPosition, FindPositionFailure>>>()
+
+    let findTargetDiscoveryAdmission = BoundedCheckWorkAdmission("find target discovery", 1)
+
+    let findTargetDiscoveriesInFlight =
+        ConcurrentDictionary<string, WaiterAwareSingleFlight<FindTargetDiscoveryResult>>()
+
+    let mutable findPositionResolutionComputeCount = 0L
+    let mutable findTargetDiscoveryComputeCount = 0L
 
     let referenceResolutionProbeAdmission =
         BoundedCheckWorkAdmission("reference resolution probe", 1)
@@ -2536,6 +3167,73 @@ type internal FcsBridge
         )
         |> ignore
 
+    let removeExactSingleFlight
+        (registry: ConcurrentDictionary<string, WaiterAwareSingleFlight<'T>>)
+        (key: string)
+        (flight: WaiterAwareSingleFlight<'T>)
+        =
+        let entries =
+            registry
+            :> System.Collections.Generic.ICollection<
+                System.Collections.Generic.KeyValuePair<string, WaiterAwareSingleFlight<'T>>
+             >
+
+        entries.Remove(System.Collections.Generic.KeyValuePair(key, flight)) |> ignore
+
+    let acquireSingleFlightWhileNeeded
+        (registry: ConcurrentDictionary<string, WaiterAwareSingleFlight<'T>>)
+        (key: string)
+        (remainingBudget: (unit -> TimeSpan) option)
+        (callerIsNeeded: unit -> bool)
+        (start: (unit -> bool) -> Task<'T>)
+        =
+        let ensureCallerCanWait () =
+            if not (callerIsNeeded ()) then
+                raise (TimeoutException("The parent worker has no active callers."))
+
+            match remainingBudget with
+            | Some getRemaining when getRemaining () <= TimeSpan.Zero -> raise (TimeoutException())
+            | Some _
+            | None -> ()
+
+        let callerIsActive () =
+            callerIsNeeded ()
+            && (match remainingBudget with
+                | Some getRemaining ->
+                    try
+                        getRemaining () > TimeSpan.Zero
+                    with :? OperationCanceledException ->
+                        false
+                | None -> true)
+
+        let rec acquire () =
+            ensureCallerCanWait ()
+
+            let flight =
+                registry.GetOrAdd(
+                    key,
+                    fun _ ->
+                        WaiterAwareSingleFlight<'T>(
+                            start,
+                            removeExactSingleFlight registry key
+                        )
+                )
+
+            match flight.TryAddWaiter(callerIsActive) with
+            | Some waiterId ->
+                new WaiterAwareSingleFlightWaiter<'T>(flight, waiterId)
+            | None ->
+                // A zero-waiter worker has already committed to stopping. Its exact
+                // completion callback removes the retained entry; a late caller must
+                // retry instead of inheriting that worker's terminal timeout.
+                Thread.Yield() |> ignore
+                acquire ()
+
+        acquire ()
+
+    let acquireSingleFlight registry key remainingBudget start =
+        acquireSingleFlightWhileNeeded registry key remainingBudget (fun () -> true) start
+
     let normalizedCheckWorkPath (path: string) =
         let normalized =
             try
@@ -2566,98 +3264,196 @@ type internal FcsBridge
     let runCheckTargetDiscovery
         (key: string)
         (remainingBudget: (unit -> TimeSpan) option)
-        (work: unit -> CheckTargetDiscoveryResult)
+        (work: (unit -> bool) -> CheckTargetDiscoveryResult)
         : Task<CheckTargetDiscoveryResult> =
-        let ensureBudget () =
-            match remainingBudget with
-            | Some getRemaining when getRemaining () <= TimeSpan.Zero -> raise (TimeoutException())
-            | _ -> ()
+        task {
+            // Test-only deadline signal: production uses the caller's remaining budget.
+            // Both paths are synchronously visible to the worker, even before the
+            // caller's wait continuation has run and disposed its waiter.
+            let deadlineToken =
+                checkTargetDiscoveryDeadlineTokenOverride
+                |> Option.map (fun getToken -> getToken ())
+                |> Option.defaultValue CancellationToken.None
 
-        let pending =
-            checkTargetDiscoveriesInFlight.GetOrAdd(
-                key,
-                fun _ ->
-                    Lazy<Task<CheckTargetDiscoveryResult>>(
-                        (fun () ->
-                            task {
-                                try
-                                    try
-                                        return!
-                                            checkTargetDiscoveryAdmission.TryRun(
-                                                key,
-                                                fun () ->
-                                                    Task.Run(fun () ->
-                                                        // Admission can happen after the
-                                                        // caller's WaitAsync has already
-                                                        // expired. Do not begin a late scan.
-                                                        ensureBudget ()
-
-                                                        checkTargetDiscoveryBeforeComputeOverride
-                                                        |> Option.iter (fun hook -> hook ())
-
-                                                        // Test hooks model a scan blocked
-                                                        // before its first filesystem read.
-                                                        ensureBudget ()
-                                                        work ())
-                                            )
-                                    with :? BoundedCheckWorkBusyException as ex ->
-                                        return CheckTargetDiscoveryResult.Busy ex.Message
-                                finally
-                                    checkTargetDiscoveriesInFlight.TryRemove(key) |> ignore
-                            }),
-                        LazyThreadSafetyMode.ExecutionAndPublication
-                    )
-            )
-
-        let operation = pending.Value
-        observeFault operation
-
-        match remainingBudget with
-        | None -> operation
-        | Some getRemaining ->
-            task {
-                let remaining = getRemaining ()
-
-                if remaining <= TimeSpan.Zero then
-                    return raise (TimeoutException("Analysis-snapshot budget was exhausted."))
+            let callerBudget () =
+                if deadlineToken.IsCancellationRequested then
+                    TimeSpan.Zero
                 else
-                    try
-                        return! operation.WaitAsync(remaining)
-                    with :? TimeoutException ->
-                        return
-                            raise (
-                                TimeoutException(
-                                    $"Analysis-snapshot computation exceeded the remaining %d{int remaining.TotalMilliseconds}ms budget."
-                                )
-                            )
-            }
+                    match remainingBudget with
+                    | Some getRemaining -> getRemaining ()
+                    | None -> TimeSpan.MaxValue
+
+            use waiter =
+                acquireSingleFlight
+                    checkTargetDiscoveriesInFlight
+                    key
+                    (Some callerBudget)
+                    (fun hasActiveWaiters ->
+                        task {
+                            try
+                                return!
+                                    checkTargetDiscoveryAdmission.TryRun(
+                                        key,
+                                        fun () ->
+                                            Task.Run(fun () ->
+                                                let ensureWorkerNeeded () =
+                                                    if not (hasActiveWaiters ()) then
+                                                        raise (TimeoutException("The check discovery worker has no active callers."))
+
+                                                ensureWorkerNeeded ()
+                                                checkTargetDiscoveryBeforeComputeOverride
+                                                |> Option.iter (fun hook -> hook ())
+                                                ensureWorkerNeeded ()
+                                                work hasActiveWaiters)
+                                    )
+                            with :? BoundedCheckWorkBusyException as ex ->
+                                return CheckTargetDiscoveryResult.Busy ex.Message
+                        })
+
+            let operation = waiter.Operation
+            observeFault operation
+
+            try
+                match remainingBudget with
+                | None -> return! operation.WaitAsync(deadlineToken)
+                | Some _ ->
+                    let remaining = callerBudget ()
+
+                    if remaining <= TimeSpan.Zero then
+                        return raise (TimeoutException("Check discovery budget was exhausted."))
+                    else
+                        return! operation.WaitAsync(remaining, deadlineToken)
+            with :? OperationCanceledException when deadlineToken.IsCancellationRequested ->
+                return raise (TimeoutException("Check discovery budget was exhausted."))
+        }
+
+    let findPositionResolutionKey (args: FindArgs) =
+        let frame (value: string) = $"{value.Length}:{value}"
+
+        let valueOrEmpty value =
+            value
+            |> Option.defaultValue ""
+
+        let intOrEmpty value =
+            value
+            |> Option.map string
+            |> Option.defaultValue ""
+
+        String.Concat(
+            frame (valueOrEmpty args.projectPath),
+            frame (valueOrEmpty args.path),
+            frame (intOrEmpty args.line),
+            frame (valueOrEmpty args.word),
+            frame (intOrEmpty args.occurrence),
+            frame (intOrEmpty args.character)
+        )
+
+    let runFindPositionResolution
+        (args: FindArgs)
+        (remainingBudget: unit -> TimeSpan)
+        (work: (unit -> bool) -> Task<Result<FindResolvedPosition, FindPositionFailure>>)
+        =
+        let key = findPositionResolutionKey args
+
+        acquireSingleFlight
+            findPositionResolutionsInFlight
+            key
+            (Some remainingBudget)
+            (fun hasActiveWaiters ->
+                findPositionResolutionAdmission.TryRun(
+                    key,
+                    fun () ->
+                        task {
+                            let ensureWorkerNeeded () =
+                                if not (hasActiveWaiters ()) then
+                                    raise (
+                                        TimeoutException(
+                                            "The find position-resolution worker has no active callers."
+                                        )
+                                    )
+
+                            do! Task.Yield()
+                            ensureWorkerNeeded ()
+
+                            match findPositionResolutionBeforeComputeOverride with
+                            | Some beforeCompute -> do! beforeCompute ()
+                            | None -> ()
+
+                            ensureWorkerNeeded ()
+                            Interlocked.Increment(&findPositionResolutionComputeCount)
+                            |> ignore
+                            return! work hasActiveWaiters
+                        }
+                ))
+
+    let runFindTargetDiscovery
+        (phase: string)
+        (target: string)
+        (remainingBudget: unit -> TimeSpan)
+        (work: (unit -> bool) -> FindTargetDiscoveryResult)
+        =
+        let key = checkDiscoveryKey $"find-{phase}" target None
+
+        acquireSingleFlight
+            findTargetDiscoveriesInFlight
+            key
+            (Some remainingBudget)
+            (fun hasActiveWaiters ->
+                findTargetDiscoveryAdmission.TryRun(
+                    key,
+                    fun () ->
+                        task {
+                            let ensureWorkerNeeded () =
+                                if not (hasActiveWaiters ()) then
+                                    raise (
+                                        TimeoutException(
+                                            $"The find {phase} worker has no active callers."
+                                        )
+                                    )
+
+                            do! Task.Yield()
+                            ensureWorkerNeeded ()
+
+                            match findTargetDiscoveryBeforeComputeOverride with
+                            | Some beforeCompute -> do! beforeCompute phase
+                            | None -> ()
+
+                            ensureWorkerNeeded ()
+                            Interlocked.Increment(&findTargetDiscoveryComputeCount)
+                            |> ignore
+                            return work hasActiveWaiters
+                        }
+                ))
 
     let resolveSingleCheckProject
         (target: string)
         (sourcePath: string option)
-        (remainingBudget: (unit -> TimeSpan) option)
+        (hasActiveWaiters: unit -> bool)
         =
+        let ensureWorkerNeeded () =
+            if not (hasActiveWaiters ()) then
+                raise (TimeoutException("The check discovery worker has no active callers."))
+
+        ensureWorkerNeeded ()
+
         if target.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
             Some target
         else
             let nearest =
                 sourcePath
-                |> Option.bind findNearestFsproj
+                |> Option.bind (fun path ->
+                    ensureWorkerNeeded ()
+                    findNearestFsproj path)
                 |> Option.map normalizePath
 
             match nearest with
             | Some fsproj -> Some fsproj
             | None ->
-                let ensureBudget () =
-                    match remainingBudget with
-                    | Some getRemaining when getRemaining () <= TimeSpan.Zero -> raise (TimeoutException())
-                    | _ -> ()
-
-                // findNearestFsproj can consume the caller's remaining budget. Never
-                // begin the fallback recursive project scan without checking again.
-                ensureBudget ()
+                // Nearest lookup may outlive every caller. Only current live waiters
+                // authorize the next scan; the leader's deadline does not own it.
+                ensureWorkerNeeded ()
                 checkProjectDiscoveryBeforeFallbackOverride |> Option.iter (fun hook -> hook ())
-                ensureBudget ()
+                ensureWorkerNeeded ()
                 Interlocked.Increment(&checkProjectDiscoveryFallbackCount) |> ignore
                 SolutionParsing.listProjects target |> Array.tryHead
 
@@ -3373,6 +4169,118 @@ type internal FcsBridge
                   "before", JsonArray(before) :> JsonNode
                   "after", JsonArray(after) :> JsonNode ]
 
+    /// `find`-specific source context. Every source line is a bounded, contiguous
+    /// UTF-16 slice; the semantic range remains full-source coordinates and these
+    /// offsets tell consumers how to map the visible snippet back to that source.
+    /// Surrounding line count is capped independently from the response budget so
+    /// `contextLines=Int32.MaxValue` cannot allocate an unbounded intermediate array.
+    let findLineContextToJson
+        (linesByNumber: System.Collections.Generic.IReadOnlyDictionary<int, string>)
+        requestedContextLines
+        startLine
+        startColumn
+        endLine
+        endColumn
+        =
+        let requestedContextLines = max 0 requestedContextLines
+
+        let appliedContextLines =
+            min requestedContextLines FindResponseBudget.MaxContextLines
+
+        let snippetNode lineNumber focusStart focusEnd text =
+            let snippet = FindResponseBudget.boundedSnippet focusStart focusEnd text
+
+            jobj
+                [ "line", jint lineNumber
+                  "text", jstr snippet.Text
+                  "sourceStartColumn", jint snippet.SourceStartColumn
+                  "sourceEndColumn", jint snippet.SourceEndColumn
+                  "sourceLength", jint snippet.SourceLength
+                  "truncated", jbool snippet.Truncated ]
+            :> JsonNode
+
+        let targetLine = max 1 startLine
+
+        let matchedLine =
+            match linesByNumber.TryGetValue(targetLine) with
+            | true, text -> text
+            | _ -> ""
+
+        let matchedFocusEnd =
+            if startLine = endLine then endColumn else startColumn
+
+        let matchedSnippet =
+            FindResponseBudget.boundedSnippet startColumn matchedFocusEnd matchedLine
+
+        let contextRange first last =
+            [| first..last |]
+            |> Array.choose (fun line ->
+                match linesByNumber.TryGetValue(line) with
+                | true, text -> Some(snippetNode line startColumn startColumn text)
+                | _ -> None)
+
+        let before = contextRange (max 1 (targetLine - appliedContextLines)) (targetLine - 1)
+        let after = contextRange (targetLine + 1) (targetLine + appliedContextLines)
+
+        jobj
+            [ "lineText", jstr matchedSnippet.Text
+              "lineTextSourceStartColumn", jint matchedSnippet.SourceStartColumn
+              "lineTextSourceEndColumn", jint matchedSnippet.SourceEndColumn
+              "lineTextSourceLength", jint matchedSnippet.SourceLength
+              "lineTextTruncated", jbool matchedSnippet.Truncated
+              "contextLinesRequested", jint requestedContextLines
+              "contextLinesApplied", jint appliedContextLines
+              "contextLinesTruncated", jbool (requestedContextLines > appliedContextLines)
+              "before", JsonArray(before) :> JsonNode
+              "after", JsonArray(after) :> JsonNode ]
+
+    let isDoubleBacktickIdentifier (value: string) =
+        not (isNull value)
+        && value.Length > 4
+        && value.StartsWith("``", StringComparison.Ordinal)
+        && value.EndsWith("``", StringComparison.Ordinal)
+
+    /// Return the length of the query suffix that spells this FCS source name.
+    /// FCS preserves double backticks in DisplayName, while callers naturally ask
+    /// for both the plain name and its double-backtick-delimited spelling. Compare
+    /// only the semantic identifier suffix; never scan source text or strip interior quotes.
+    let trySourceIdentifierSuffixLength comparison (sourceName: string) (query: string) =
+        if isNull sourceName || isNull query then
+            None
+        elif query.EndsWith(sourceName, comparison) then
+            Some sourceName.Length
+        elif isDoubleBacktickIdentifier sourceName then
+            let contentLength = sourceName.Length - 4
+
+            if
+                query.Length >= contentLength
+                && String.Compare(
+                    query,
+                    query.Length - contentLength,
+                    sourceName,
+                    2,
+                    contentLength,
+                    comparison
+                ) = 0
+            then
+                Some contentLength
+            else
+                None
+        else
+            let quotedLength = sourceName.Length + 4
+            let quotedStart = query.Length - quotedLength
+
+            if
+                quotedStart >= 0
+                && query[quotedStart] = '`'
+                && query[quotedStart + 1] = '`'
+                && query.EndsWith("``", StringComparison.Ordinal)
+                && String.Compare(query, quotedStart + 2, sourceName, 0, sourceName.Length, comparison) = 0
+            then
+                Some quotedLength
+            else
+                None
+
     let symbolMatches query exact (symbol: FSharpSymbol) =
         let displayName = symbol.DisplayName
         let fullName = symbol.FullName
@@ -3389,16 +4297,57 @@ type internal FcsBridge
             && fullName.Length > query.Length
             && fullName[fullName.Length - query.Length - 1] = '.'
 
+        // #267: GetAllUsesOfAllSymbols returns backtick-bound values and test methods
+        // with the delimiters in DisplayName/FullName. Match quoted and unquoted query
+        // spellings against that FCS identity, including a module-qualified final name.
+        // Qualifiers remain exact dot-delimited suffixes, so a punctuation near-miss
+        // cannot become a hit and duplicate source names continue to return every site.
+        let sourceNameMatch comparison =
+            match trySourceIdentifierSuffixLength comparison displayName query with
+            | None -> false
+            | Some suffixLength when suffixLength = query.Length -> true
+            | Some suffixLength when isNull fullName -> false
+            | Some suffixLength ->
+                let querySeparator = query.Length - suffixLength - 1
+                let fullDisplayStart = fullName.Length - displayName.Length
+
+                if
+                    querySeparator < 0
+                    || query[querySeparator] <> '.'
+                    || fullDisplayStart <= 0
+                    || not (fullName.EndsWith(displayName, StringComparison.Ordinal))
+                    || fullName[fullDisplayStart - 1] <> '.'
+                then
+                    false
+                else
+                    let queryQualifierLength = querySeparator
+                    let fullQualifierLength = fullDisplayStart - 1
+
+                    (fullQualifierLength = queryQualifierLength
+                     && String.Compare(fullName, 0, query, 0, queryQualifierLength, comparison) = 0)
+                    || (fullQualifierLength > queryQualifierLength
+                        && fullName[fullQualifierLength - queryQualifierLength - 1] = '.'
+                        && String.Compare(
+                            fullName,
+                            fullQualifierLength - queryQualifierLength,
+                            query,
+                            0,
+                            queryQualifierLength,
+                            comparison
+                        ) = 0)
+
         if exact then
             String.Equals(displayName, query, StringComparison.Ordinal)
             || String.Equals(fullName, query, StringComparison.Ordinal)
             || dottedSuffixMatch ()
+            || sourceNameMatch StringComparison.Ordinal
         else
             displayName.Contains(query, StringComparison.OrdinalIgnoreCase)
             || (if isNull fullName then
                     false
                 else
                     fullName.Contains(query, StringComparison.OrdinalIgnoreCase))
+            || sourceNameMatch StringComparison.OrdinalIgnoreCase
 
     let isIdentifierChar (ch: char) =
         Char.IsLetterOrDigit(ch) || ch = '_' || ch = '\'' || ch = '`'
@@ -3601,57 +4550,63 @@ type internal FcsBridge
         observeFault operation
         operation
 
+    let acquireAnalysisSnapshotKey
+        (projectOptions: FSharpProjectOptions)
+        (remainingBudget: (unit -> TimeSpan) option)
+        =
+        let workKey = snapshotComputationKey projectOptions
+
+        acquireSingleFlight
+            snapshotComputationsInFlight
+            workKey
+            remainingBudget
+            (fun hasActiveWaiters ->
+                snapshotComputationAdmission.TryRun(
+                    workKey,
+                    fun () ->
+                        Task.Run(fun () ->
+                            let ensureWorkerNeeded () =
+                                if not (hasActiveWaiters ()) then
+                                    raise (
+                                        TimeoutException(
+                                            "The analysis-snapshot worker has no active callers."
+                                        )
+                                    )
+
+                            ensureWorkerNeeded ()
+
+                            analysisSnapshotKeyBeforeComputeOverride
+                            |> Option.iter (fun hook -> hook ())
+
+                            ensureWorkerNeeded ()
+                            computeAnalysisSnapshotKey projectOptions)
+                ))
+
     let resolveAnalysisSnapshotKey
         (projectOptions: FSharpProjectOptions)
         (remainingBudget: (unit -> TimeSpan) option)
-        : Task<string> =
-        let workKey = snapshotComputationKey projectOptions
+        =
+        task {
+            use waiter = acquireAnalysisSnapshotKey projectOptions remainingBudget
+            let operation = waiter.Operation
+            observeFault operation
 
-        let ensureBudget () =
             match remainingBudget with
-            | Some getRemaining when getRemaining () <= TimeSpan.Zero -> raise (TimeoutException())
-            | _ -> ()
+            | Some getRemaining ->
+                let remaining = getRemaining ()
 
-        let pending =
-            snapshotComputationsInFlight.GetOrAdd(
-                workKey,
-                fun _ ->
-                    Lazy<Task<string>>(
-                        (fun () ->
-                            task {
-                                try
-                                    return!
-                                        snapshotComputationAdmission.TryRun(
-                                            workKey,
-                                            fun () ->
-                                                Task.Run(fun () ->
-                                                    ensureBudget ()
+                if remaining <= TimeSpan.Zero then
+                    return raise (TimeoutException("Analysis snapshot budget was exhausted."))
+                else
+                    return! operation.WaitAsync(remaining)
+            | None -> return! operation
+        }
 
-                                                    analysisSnapshotKeyBeforeComputeOverride
-                                                    |> Option.iter (fun hook -> hook ())
-
-                                                    ensureBudget ()
-                                                    computeAnalysisSnapshotKey projectOptions)
-                                        )
-                                finally
-                                    snapshotComputationsInFlight.TryRemove(workKey) |> ignore
-                            }),
-                        LazyThreadSafetyMode.ExecutionAndPublication
-                    )
-            )
-
-        let operation = pending.Value
-        observeFault operation
-
-        match remainingBudget with
-        | Some getRemaining ->
-            let remaining = getRemaining ()
-
-            if remaining <= TimeSpan.Zero then
-                Task.FromException<string>(TimeoutException("Analysis snapshot budget was exhausted."))
-            else
-                operation.WaitAsync(remaining)
-        | None -> operation
+    let acquireAnalysisSnapshotKeyActual
+        (projectOptions: FSharpProjectOptions)
+        (remainingBudget: unit -> TimeSpan)
+        =
+        acquireAnalysisSnapshotKey projectOptions (Some remainingBudget)
 
     let commitAnalysisSnapshotKey (projectOptions: FSharpProjectOptions) (key: string) =
         let projectIdentity = analysisProjectIdentity projectOptions
@@ -4056,149 +5011,158 @@ type internal FcsBridge
             | None -> ()
 
             // A caller deadline may expire while a test/probe/cache phase is awaiting.
-            // Recheck immediately before the non-cancellable MSBuild worker starts.
+            // Recheck immediately before the isolated MSBuild worker starts.
             ensureCanContinue ()
 
-            // Offload to thread pool — MSBuild/SDK probing is CPU+IO bound. The
-            // caller owns the outer admission slot across this actual completion.
+            // Keep SDK probing and fingerprint work off the caller thread. MSBuild
+            // itself now runs in a short-lived process: genuine cache misses must
+            // not retain in-process MSBuild node threads in this long-lived host.
+            // The caller owns admission until the actual child has been drained.
             return!
-                Task.Run(fun () ->
-                    ensureCanContinue ()
-                    let projectDir = Path.GetDirectoryName(fsprojPath)
+                Task.Run<(FSharpProjectOptions * ProjectOptionsFingerprint * EvaluatedProjectSnapshot) option>(fun () ->
+                    task {
+                        ensureCanContinue ()
+                        let projectDir = Path.GetDirectoryName(fsprojPath)
 
-                    // #192: outside the try on purpose. Init.init inherits this
-                    // directory's global.json, and an unsatisfiable `rollForward:
-                    // "disable"` pin is not a load failure to degrade into None —
-                    // it is a machine-configuration problem the agent must be told
-                    // about by name. Raising here also keeps MSBuild untouched.
-                    SdkPreflight.ensure [ projectDir ]
-                    InstallationHealth.ensureCurrent ()
+                        // #192: outside the try on purpose. Init.init inherits this
+                        // directory's global.json, and an unsatisfiable `rollForward:
+                        // "disable"` pin is not a load failure to degrade into None —
+                        // it is a machine-configuration problem the agent must be told
+                        // about by name. Raising here also keeps MSBuild untouched.
+                        SdkPreflight.ensure [ projectDir ]
+                        InstallationHealth.ensureCurrent ()
+                        ensureCanContinue ()
 
-                    try
-                        let toolsPath = Init.init (DirectoryInfo(projectDir)) None
-                        let loader = WorkspaceLoader.Create(toolsPath, [])
-                        Interlocked.Increment(&projectOptionsLoadCount) |> ignore
-                        let projects = loader.LoadProjects([ fsprojPath ]) |> Seq.toList
+                        try
+                            ensureCanContinue ()
+                            Interlocked.Increment(&projectOptionsLoadCount) |> ignore
+                            let! projects = ProjectEvaluation.loadProjectsAsync fsprojPath ensureCanContinue
+                            ensureCanContinue ()
 
-                        match projects with
-                        | proj :: _ ->
-                            let fcsOpts = FCS.mapToFSharpProjectOptions proj (projects |> Seq.map id)
-                            let fingerprint = captureProjectOptionsFingerprint projects
-                            let snapshot = EvaluatedProjectModel.create "ionide-proj-info" proj fcsOpts
-                            Some(fcsOpts, fingerprint, snapshot)
-                        | [] -> None
-                    with ex ->
-                        Console.Error.WriteLine($"[proj-info] Failed to load %s{fsprojPath}: %s{ex.Message}")
-                        None)
+                            match projects with
+                            | proj :: _ ->
+                                let fcsOpts = FCS.mapToFSharpProjectOptions proj (projects |> Seq.map id)
+                                let fingerprint = captureProjectOptionsFingerprint projects
+                                let snapshot = EvaluatedProjectModel.create "ionide-proj-info" proj fcsOpts
+                                ensureCanContinue ()
+                                return Some(fcsOpts, fingerprint, snapshot)
+                            | [] -> return None
+                        with
+                        | :? TimeoutException as ex -> return raise ex
+                        | :? OperationCanceledException as ex -> return raise ex
+                        | ex ->
+                            Console.Error.WriteLine($"[proj-info] Failed to load %s{fsprojPath}: %s{ex.Message}")
+                            return None
+                    })
         }
 
-    member private this.ResolveFsprojEntryWithinBudget
-        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option, waitWithinBudget: bool)
-        : Task<ProjectOptionsCacheEntry> =
+    member private this.AcquireFsprojEntryWithinBudget
+        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option, ?callerIsNeeded: unit -> bool)
+        =
         let fullPath = normalizePath fsprojPath
         let fsprojKey = makeFsprojOptionsCacheKey fullPath
 
-        let ensureBudget () =
-            match remainingBudget with
-            | Some getRemaining when getRemaining () <= TimeSpan.Zero -> raise (TimeoutException())
-            | _ -> ()
-
-        let pending =
-            optionsInFlight.GetOrAdd(
-                fsprojKey,
-                fun _ ->
-                    Lazy<Task<ProjectOptionsCacheEntry>>(
-                        (fun () ->
-                            task {
-                                try
-                                    return!
-                                        projectEvaluationAdmission.TryRun(
-                                            fullPath,
-                                            fun () ->
-                                                task {
-                                                    ensureBudget ()
-
-                                                    // Cache-hit validation hashes imported
-                                                    // files and recursively inventories
-                                                    // source directories. It belongs inside
-                                                    // the same admitted actual worker as a
-                                                    // cache miss, not before single-flight.
-                                                    let! cached =
-                                                        Task.Run(fun () ->
-                                                            ensureBudget ()
-
-                                                            match optionsCache.TryGet(fsprojKey) with
-                                                            | Some entry ->
-                                                                projectOptionsCacheValidationBeforeComputeOverride
-                                                                |> Option.iter (fun hook -> hook fullPath)
-
-                                                                ensureBudget ()
-
-                                                                Interlocked.Increment(
-                                                                    &projectOptionsCacheValidationCount
-                                                                )
-                                                                |> ignore
-
-                                                                if projectOptionsCacheEntryIsCurrent entry then
-                                                                    Some entry
-                                                                else
-                                                                    // A precise reload signal: this key had a
-                                                                    // cached ProjInfo result, its full input
-                                                                    // fingerprint changed, and the single-flight
-                                                                    // owner will evaluate it again below. Cold
-                                                                    // first loads and bounded-cache evictions are
-                                                                    // deliberately not mislabeled as reloads.
-                                                                    Interlocked.Increment(
-                                                                        &projectOptionsStaleReloadCount
-                                                                    )
-                                                                    |> ignore
-
-                                                                    None
-                                                            | None -> None)
-
-                                                    match cached with
-                                                    | Some entry -> return entry
-                                                    | None ->
-                                                        ensureBudget ()
-                                                        let! projInfoResult =
-                                                            this.LoadProjectOptionsFromFsproj(fullPath, ensureBudget)
-
-                                                        match projInfoResult with
-                                                        | Some(projOpts, fingerprint, evaluatedSnapshot) ->
-                                                            let entry =
-                                                                makeOptionsCacheEntry
-                                                                    projOpts
-                                                                    "ionide-proj-info"
-                                                                    (Some fingerprint)
-                                                                    None
-                                                                    (Some evaluatedSnapshot)
-
-                                                            optionsCache.Set(fsprojKey, entry)
-                                                            return entry
-                                                        | None ->
-                                                            return
-                                                                raise (
-                                                                    InvalidOperationException(
-                                                                        $"Unable to load F# project options from explicit projectPath: %s{fullPath}"
-                                                                    )
-                                                                )
-                                                }
+        acquireSingleFlightWhileNeeded
+            optionsInFlight
+            fsprojKey
+            remainingBudget
+            (defaultArg callerIsNeeded (fun () -> true))
+            (fun hasActiveWaiters ->
+                projectEvaluationAdmission.TryRun(
+                    fullPath,
+                    fun () ->
+                        task {
+                            let ensureWorkerNeeded () =
+                                if not (hasActiveWaiters ()) then
+                                    raise (
+                                        TimeoutException(
+                                            "The project-options worker has no active callers."
                                         )
-                                finally
-                                    optionsInFlight.TryRemove(fsprojKey) |> ignore
-                            }),
-                        LazyThreadSafetyMode.ExecutionAndPublication
-                    )
-            )
+                                    )
 
-        let work = pending.Value
-        observeFault work
+                            ensureWorkerNeeded ()
 
-        match remainingBudget, waitWithinBudget with
-        | _, false -> work
-        | None, true -> work
-        | Some getRemaining, true ->
-            task {
+                            // Cache-hit validation hashes imported files and recursively
+                            // inventories source directories. It belongs inside the same
+                            // admitted actual worker as a cache miss, not before single-flight.
+                            let! cached =
+                                Task.Run(fun () ->
+                                    ensureWorkerNeeded ()
+
+                                    match optionsCache.TryGet(fsprojKey) with
+                                    | Some entry ->
+                                        projectOptionsCacheValidationBeforeComputeOverride
+                                        |> Option.iter (fun hook -> hook fullPath)
+
+                                        ensureWorkerNeeded ()
+
+                                        Interlocked.Increment(
+                                            &projectOptionsCacheValidationCount
+                                        )
+                                        |> ignore
+
+                                        if projectOptionsCacheEntryIsCurrent entry then
+                                            Some entry
+                                        else
+                                            // A precise reload signal: this key had a
+                                            // cached ProjInfo result, its full input
+                                            // fingerprint changed, and the single-flight
+                                            // owner will evaluate it again below. Cold
+                                            // first loads and bounded-cache evictions are
+                                            // deliberately not mislabeled as reloads.
+                                            Interlocked.Increment(
+                                                &projectOptionsStaleReloadCount
+                                            )
+                                            |> ignore
+
+                                            None
+                                    | None -> None)
+
+                            match cached with
+                            | Some entry -> return entry, true
+                            | None ->
+                                ensureWorkerNeeded ()
+                                let! projInfoResult =
+                                    this.LoadProjectOptionsFromFsproj(fullPath, ensureWorkerNeeded)
+
+                                match projInfoResult with
+                                | Some(projOpts, fingerprint, evaluatedSnapshot) ->
+                                    let entry =
+                                        makeOptionsCacheEntry
+                                            projOpts
+                                            "ionide-proj-info"
+                                            (Some fingerprint)
+                                            None
+                                            (Some evaluatedSnapshot)
+
+                                    optionsCache.Set(fsprojKey, entry)
+                                    return entry, false
+                                | None ->
+                                    return
+                                        raise (
+                                            InvalidOperationException(
+                                                $"Unable to load F# project options from explicit projectPath: {fullPath}"
+                                            )
+                                        )
+                        }
+                ))
+
+    member private this.ResolveFsprojEntryWithinBudget
+        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option, ?callerIsNeeded: unit -> bool)
+        : Task<ProjectOptionsCacheEntry> =
+        task {
+            let fullPath = normalizePath fsprojPath
+            use waiter =
+                this.AcquireFsprojEntryWithinBudget(fullPath, remainingBudget, ?callerIsNeeded = callerIsNeeded)
+            let work = task {
+                let! entry, _cacheHit = waiter.Operation
+                return entry
+            }
+            observeFault work
+
+            match remainingBudget with
+            | None -> return! work
+            | Some getRemaining ->
                 let remaining = getRemaining ()
 
                 if remaining <= TimeSpan.Zero then
@@ -4210,30 +5174,20 @@ type internal FcsBridge
                         return
                             raise (
                                 TimeoutException(
-                                    $"Project-options evaluation for '%s{Path.GetFileName fullPath}' exceeded the remaining %d{int remaining.TotalMilliseconds}ms budget."
+                                    $"Project-options evaluation for '{Path.GetFileName fullPath}' exceeded the remaining {int remaining.TotalMilliseconds}ms budget."
                                 )
                             )
-            }
-
-    member private this.ResolveFsprojEntry(fsprojPath: string) : Task<ProjectOptionsCacheEntry> =
-        this.ResolveFsprojEntryWithinBudget(fsprojPath, None, true)
-
-    member private this.ResolveFsprojOptionsWithinBudget
-        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option)
-        : Task<FSharpProjectOptions * string> =
-        task {
-            let! entry = this.ResolveFsprojEntryWithinBudget(fsprojPath, remainingBudget, true)
-            return entry.Options, entry.Source
         }
 
-    /// Returns the actual project-evaluation task rather than a timeout proxy around it.
-    /// ProjectOutline races this task itself so its outer FCS gate can retain the real lifetime.
-    member private this.ResolveFsprojOptionsActualWithinBudget
-        (fsprojPath: string, remainingBudget: unit -> TimeSpan)
+    member private this.ResolveFsprojEntry(fsprojPath: string) : Task<ProjectOptionsCacheEntry> =
+        this.ResolveFsprojEntryWithinBudget(fsprojPath, None)
+
+    member private this.ResolveFsprojOptionsWithinBudget
+        (fsprojPath: string, remainingBudget: (unit -> TimeSpan) option, ?callerIsNeeded: unit -> bool)
         : Task<FSharpProjectOptions * string> =
         task {
-            let! entry = this.ResolveFsprojEntryWithinBudget(fsprojPath, Some remainingBudget, false)
-
+            let! entry =
+                this.ResolveFsprojEntryWithinBudget(fsprojPath, remainingBudget, ?callerIsNeeded = callerIsNeeded)
             return entry.Options, entry.Source
         }
 
@@ -4241,9 +5195,30 @@ type internal FcsBridge
         this.ResolveFsprojOptionsWithinBudget(fsprojPath, None)
 
     member private this.ResolveProjectOptions
-        (path: string, text: string, projectPath: string option, projectOptions: string list option)
+        (
+            path: string,
+            text: string,
+            projectPath: string option,
+            projectOptions: string list option,
+            ?ensureCanContinue: unit -> unit
+        )
         : Task<FSharpProjectOptions * string> =
         task {
+            let continuation = ensureCanContinue
+            let ensureCanContinue = defaultArg continuation ignore
+
+            // This nested waiter represents the entire parent position worker, not
+            // its first caller. Do not invent a new deadline or permanently-live
+            // waiter: a surviving follower may still need the shared evaluation.
+            let callerIsNeeded () =
+                try
+                    ensureCanContinue ()
+                    true
+                with
+                | :? TimeoutException
+                | :? OperationCanceledException -> false
+
+            ensureCanContinue ()
             let fullPath = normalizePath path
             let cacheKey = makeCacheKey projectPath projectOptions
 
@@ -4257,6 +5232,7 @@ type internal FcsBridge
                 match optionsCache.TryGet(cacheKey) with
                 | Some cached -> return cached.Options, cached.Source
                 | None ->
+                    ensureCanContinue ()
                     let resolvedOptions =
                         checker.GetProjectOptionsFromCommandLineArgs(projectFileName, options |> List.toArray)
 
@@ -4266,20 +5242,33 @@ type internal FcsBridge
                 let requestedFsproj = explicitFsproj projectPath
 
                 let resolvedFsproj =
-                    requestedFsproj |> Option.orElseWith (fun () -> findNearestFsproj fullPath)
+                    requestedFsproj
+                    |> Option.orElseWith (fun () ->
+                        match continuation with
+                        | Some _ -> findNearestFsprojWithContinuation fullPath (fun _ _ -> ()) callerIsNeeded
+                        | None -> findNearestFsproj fullPath)
+
+                ensureCanContinue ()
 
                 match resolvedFsproj with
                 | Some fsprojPath ->
                     try
-                        return! this.ResolveFsprojOptions(fsprojPath)
-                    with ex ->
+                        return!
+                            this.ResolveFsprojOptionsWithinBudget(fsprojPath, None, callerIsNeeded = callerIsNeeded)
+                    with
+                    | :? TimeoutException as ex -> return raise ex
+                    | :? OperationCanceledException as ex -> return raise ex
+                    | ex ->
                         match requestedFsproj with
                         | Some _ -> return raise ex
                         | None ->
                             // Fall back to script inference with honest labelling.
+                            ensureCanContinue ()
                             let sourceText = SourceText.ofString text
 
+                            ensureCanContinue ()
                             let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
+                            ensureCanContinue ()
 
                             let discovered =
                                 { scriptOptions with
@@ -4287,6 +5276,7 @@ type internal FcsBridge
 
                             return discovered, "auto-discovered-script-fallback"
                 | None ->
+                    ensureCanContinue ()
                     let scriptKey = $"script::%s{fullPath}"
                     let contentHash = scriptSourceHash text
 
@@ -4295,7 +5285,9 @@ type internal FcsBridge
                         return cached.Options, cached.Source
                     | _ ->
                         let sourceText = SourceText.ofString text
+                        ensureCanContinue ()
                         let! scriptOptions, _ = checker.GetProjectOptionsFromScript(fullPath, sourceText) |> asTask
+                        ensureCanContinue ()
                         optionsCache.Set(
                             scriptKey,
                             makeOptionsCacheEntry scriptOptions "scriptInference" None (Some contentHash) None
@@ -4320,11 +5312,15 @@ type internal FcsBridge
             let fullPath = normalizePath path
             let source = text |> Option.defaultWith (fun () -> File.ReadAllText(fullPath))
             let sourceText = SourceText.ofString source
+            ensureCanContinue ()
 
             let! options, optionsSource =
                 match resolvedOptions with
                 | Some context -> Task.FromResult context
-                | None -> this.ResolveProjectOptions(fullPath, source, projectPath, projectOptions)
+                | None ->
+                    this.ResolveProjectOptions(
+                        fullPath, source, projectPath, projectOptions, ensureCanContinue = ensureCanContinue
+                    )
 
             ensureCanContinue ()
             let parsingOptions, _ = checker.GetParsingOptionsFromProjectOptions(options)
@@ -4480,8 +5476,7 @@ type internal FcsBridge
 
                 let ext = if mode = "fsi" then ".fsi" else ".fs"
 
-                let snippetFile =
-                    Path.Combine(Path.GetTempPath(), $"fslangmcp_snippet_{Guid.NewGuid():N}{ext}")
+                let snippetFile = createSnippetFile "fslangmcp_snippet" ext
 
                 try
                     File.WriteAllText(snippetFile, args.content)
@@ -5824,8 +6819,8 @@ type internal FcsBridge
         }
 
     // ── find: resolve the symbol name under a cursor (kind=position) ─────────────
-    // Returns Ok displayName (fed to the union sweep as an exact query) or Error
-    // envelope. Mirrors fcs_symbol_at_word's tolerant resolution: line + optional
+    // Returns the sweep key AND the actual resolved symbol identity, or a typed
+    // failure. Mirrors fcs_symbol_at_word's tolerant resolution: line + optional
     // word/occurrence/character.
     //
     // Extracted from ResolveQueryAtPosition to keep the outer task {} state machine
@@ -5837,7 +6832,7 @@ type internal FcsBridge
          source: string,
          checkedResults: FSharpCheckFileResults option,
          args: FindArgs)
-        : Result<string, JsonNode> =
+        : Result<FindResolvedPosition, FindPositionFailure> =
         match checkedResults with
         | None ->
             Error(
@@ -5845,6 +6840,7 @@ type internal FcsBridge
                     [ "status", jstr "aborted"
                       "message", jstr "Type checking was aborted at the requested position." ]
                 :> JsonNode
+                |> FindPositionFailure.Incomplete
             )
         | Some checkResults ->
             let lines = sourceLines source
@@ -5856,6 +6852,7 @@ type internal FcsBridge
                           "message",
                           jstr $"line {line} is out of range (file has {lines.Length} lines)." ]
                     :> JsonNode
+                    |> FindPositionFailure.Changed
                 )
             else
                 let lineText = lines[line]
@@ -5867,6 +6864,7 @@ type internal FcsBridge
                             [ "status", jstr "no_candidate"
                               "message", jstr "No identifier found at the requested position." ]
                         :> JsonNode
+                        |> FindPositionFailure.Changed
                     )
                 else
                     let occurrence = args.occurrence |> Option.defaultValue -1
@@ -5891,9 +6889,10 @@ type internal FcsBridge
                     match symbolUse with
                     | Some u ->
                         // kind=position resolved THE specific symbol under the cursor.
-                        // Key the subsequent sweep on its FullName so the match stays
-                        // precise: DisplayName alone would also sweep an unrelated
-                        // `Config` in another namespace (or every same-named overload).
+                        // Keep the existing FullName sweep key: DisplayName alone
+                        // would also sweep an unrelated `Config` in another namespace.
+                        // Overloads can still share this key; the fingerprint below
+                        // binds the selected symbol without changing sweep matching.
                         // Locals / synthetic symbols may carry no useful FullName, so
                         // fall back to DisplayName there.
                         let key =
@@ -5905,7 +6904,40 @@ type internal FcsBridge
                             with _ ->
                                 u.Symbol.DisplayName
 
-                        Ok key
+                        // FullName is a search key, not a semantic identity: overloads
+                        // share it. Keep declaration/signature locations and full types
+                        // (never display-truncated) in the snapshot, not the query hash.
+                        // Property/formatting failures must not mint a weak identity.
+                        let symbol = u.Symbol
+                        let signature =
+                            match symbol with
+                            | :? FSharpMemberOrFunctionOrValue as value ->
+                                jobj
+                                    [ "type", jstr (value.FullType.Format(FSharpDisplayContext.Empty))
+                                      "xmlDocSig", jstr value.XmlDocSig ] :> JsonNode
+                            | :? FSharpField as field ->
+                                jstr (field.FieldType.Format(FSharpDisplayContext.Empty))
+                            | :? FSharpParameter as parameter ->
+                                jstr (parameter.Type.Format(FSharpDisplayContext.Empty))
+                            | :? FSharpUnionCase as unionCase ->
+                                jobj
+                                    [ "returnType", jstr (unionCase.ReturnType.Format(FSharpDisplayContext.Empty))
+                                      "fields", JsonArray(unionCase.Fields |> Seq.map (fun field ->
+                                          jstr (field.FieldType.Format(FSharpDisplayContext.Empty))) |> Seq.toArray) :> JsonNode ] :> JsonNode
+                            | :? FSharpEntity as entity -> jstr entity.XmlDocSig
+                            | _ -> null
+
+                        let identity =
+                            jobj
+                                [ "symbol", symbolToJson symbol
+                                  "kind", jstr (symbolKind symbol)
+                                  "assembly", jstr symbol.Assembly.QualifiedName
+                                  "signature", signature
+                                  "signatureLocation", symbol.SignatureLocation |> Option.map rangeToJson |> Option.defaultValue null
+                                  "implementationLocation", symbol.ImplementationLocation |> Option.map rangeToJson |> Option.defaultValue null ]
+                            |> Cursor.findSnapshotIdentityV2
+
+                        Ok { Query = key; SymbolIdentity = identity }
                     | None ->
                         Error(
                             jobj
@@ -5914,13 +6946,23 @@ type internal FcsBridge
                                   jstr
                                       $"Could not resolve a symbol at {Path.GetFileName path}:{line}." ]
                             :> JsonNode
+                            // A completed check can report FS0039 for a target
+                            // that has become unresolved. Errors do not make that
+                            // semantic evidence unavailable; only an incomplete
+                            // check warrants retrying the same continuation.
+                            |> (if checkResults.HasFullTypeCheckInfo then
+                                    FindPositionFailure.Changed
+                                else
+                                    FindPositionFailure.Incomplete)
                         )
 
     // Outer shell: validates args and awaits type-check, then delegates the purely
     // synchronous symbol resolution to ResolvePositionInFile. Keeping this task {}
     // free of nested match-over-task-result branches makes it statically compilable
     // (FS3511 fix — same technique as ProjectSweepUses).
-    member private this.ResolveQueryAtPosition(args: FindArgs) : Task<Result<string, JsonNode>> =
+    member private this.ResolveQueryAtPosition
+        (args: FindArgs, ensureCanContinue: unit -> unit)
+        : Task<Result<FindResolvedPosition, FindPositionFailure>> =
         task {
             match args.path with
             | None ->
@@ -5930,6 +6972,7 @@ type internal FcsBridge
                             [ "status", jstr "invalid_args"
                               "message", jstr "kind='position' requires 'path' (and 'line')." ]
                         :> JsonNode
+                        |> FindPositionFailure.InvalidRequest
                     )
             | Some path when String.IsNullOrWhiteSpace path ->
                 return
@@ -5938,6 +6981,7 @@ type internal FcsBridge
                             [ "status", jstr "invalid_args"
                               "message", jstr "kind='position' requires 'path' (and 'line')." ]
                         :> JsonNode
+                        |> FindPositionFailure.InvalidRequest
                     )
             | Some path ->
                 match args.line with
@@ -5948,14 +6992,26 @@ type internal FcsBridge
                                 [ "status", jstr "invalid_args"
                                   "message", jstr "kind='position' requires 'line' (0-based)." ]
                             :> JsonNode
+                            |> FindPositionFailure.InvalidRequest
                         )
                 | Some line ->
                     // FindArgs carries no unsaved-buffer field; resolve position against on-disk content.
                     match validateSourcePath "find" None path with
-                    | Some err -> return Error err
+                    // An unreadable/missing file does not establish a new semantic
+                    // identity. A continuation can retry once the context is available.
+                    | Some err -> return Error(FindPositionFailure.Incomplete err)
                     | None ->
+                        ensureCanContinue ()
+
                         let! _, source, _, _, _, checkedResults =
-                            this.PrepareCheckContext(path, None, args.projectPath, None)
+                            this.PrepareCheckContextCore(
+                                path,
+                                None,
+                                args.projectPath,
+                                None,
+                                None,
+                                ensureCanContinue
+                            )
 
                         return this.ResolvePositionInFile(path, line, source, checkedResults, args)
         }
@@ -5982,16 +7038,20 @@ type internal FcsBridge
     // enumeration + diagnostics, keyed by the shared analysis content snapshot. Kept in its own method
     // so Find's per-project loop awaits a plain Task instead of nesting a task CE
     // (which is not statically compilable under Release optimization → FS3511).
-    // The caller waits through a hard Task.WaitAsync boundary. FCS does not expose
-    // cancellation for GetAllUsesOfAllSymbols once the synchronous walk starts, so
-    // the underlying task may finish later; projectUsesInFlight deduplicates retries.
-    member private _.ProjectSweepUses
-        (usesKey: string, options: FSharpProjectOptions, timeoutMs: int)
+    // FCS does not expose cancellation for GetAllUsesOfAllSymbols once the synchronous
+    // walk starts. Find races the actual task so its outer admission lifetime can retain
+    // the real worker; legacy callers use the timeout wrapper below. In both cases
+    // projectUsesInFlight deduplicates retries.
+    member private _.ProjectSweepUsesActual
+        (usesKey: string, options: FSharpProjectOptions, ?observeCache: bool -> unit)
         : Task<FSharpSymbolUse array * FSharpDiagnostic array> =
         task {
             match projectUsesCache.TryGet(usesKey) with
-            | Some cached -> return cached
+            | Some cached ->
+                observeCache |> Option.iter (fun observe -> observe true)
+                return cached
             | None ->
+                observeCache |> Option.iter (fun observe -> observe false)
                 let generation = Volatile.Read(&projectUsesCacheGeneration)
 
                 let pending =
@@ -6039,20 +7099,125 @@ type internal FcsBridge
 
                 let work = pending.Value
                 observeFault work
-
-                try
-                    return! work.WaitAsync(TimeSpan.FromMilliseconds(float (max 1 timeoutMs)))
-                with :? TimeoutException ->
-                    return
-                        raise (
-                            TimeoutException(
-                                $"FCS sweep of '{Path.GetFileNameWithoutExtension options.ProjectFileName}' timed out after %d{timeoutMs}ms (cold cache or very large project). Run `dotnet build` to warm it, retry, or raise timeoutMs."
-                            )
-                        )
+                return! work
         }
 
-    member this.Find(args: FindArgs, ?fsacProbe: string -> Task<FindFsacProbeResult>) : Task<JsonNode> =
+    member private this.ProjectSweepUses
+        (usesKey: string, options: FSharpProjectOptions, timeoutMs: int)
+        : Task<FSharpSymbolUse array * FSharpDiagnostic array> =
         task {
+            let work = this.ProjectSweepUsesActual(usesKey, options)
+
+            try
+                return! work.WaitAsync(TimeSpan.FromMilliseconds(float (max 1 timeoutMs)))
+            with :? TimeoutException ->
+                return
+                    raise (
+                        TimeoutException(
+                            $"FCS sweep of '{Path.GetFileNameWithoutExtension options.ProjectFileName}' timed out after %d{timeoutMs}ms (cold cache or very large project). Run `dotnet build` to warm it, retry, or raise timeoutMs."
+                        )
+                    )
+        }
+
+    member private this.FindCoreWithinDeadline
+        (
+            args: FindArgs,
+            deadline: FindRequestDeadline,
+            cancellationToken: CancellationToken,
+            retainUntil: Task -> unit,
+            fsacProbe: (string -> Task<FindFsacProbeResult>) option,
+            recordValidatedContinuationEnvelope: unit -> unit,
+            recordMeasuredResponse: JsonNode -> unit,
+            inventoryQueries: string array option
+        )
+        : Task<JsonNode> =
+        task {
+            let ensureCanStart phase =
+                cancellationToken.ThrowIfCancellationRequested()
+
+                if deadline.SemanticExpired then
+                    deadline.MarkSemanticExpired()
+                    raise (TimeoutException($"The find deadline was exhausted before {phase} started."))
+
+            let remainingWorkerBudget () =
+                if cancellationToken.IsCancellationRequested then
+                    TimeSpan.Zero
+                else
+                    deadline.RemainingSemanticBudget()
+
+            let awaitWithinDeadline
+                (phase: string)
+                (retainIncompleteOperation: bool)
+                (operation: Task<'T>)
+                : Task<'T> =
+                task {
+                    let remaining = deadline.RemainingSemanticBudget()
+
+                    if remaining <= TimeSpan.Zero then
+                        deadline.MarkSemanticExpired()
+                        observeFault operation
+
+                        if not operation.IsCompleted then
+                            if retainIncompleteOperation then
+                                retainUntil (operation :> Task)
+
+                        return raise (TimeoutException($"The find deadline was exhausted during {phase}."))
+                    else
+                        use deadlineWaitCancellation =
+                            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+
+                        let timeout = Task.Delay(remaining, deadlineWaitCancellation.Token)
+
+                        let contenders =
+                            match deadline.SemanticExpirySignal with
+                            | Some signal -> [| operation :> Task; timeout; signal |]
+                            | None -> [| operation :> Task; timeout |]
+
+                        let! winner = Task.WhenAny contenders
+                        deadlineWaitCancellation.Cancel()
+
+                        let operationWon =
+                            Object.ReferenceEquals(winner, operation :> Task)
+                            && not deadline.SemanticExpired
+                            && not cancellationToken.IsCancellationRequested
+
+                        if operationWon then
+                            return! operation
+                        else
+                            observeFault operation
+
+                            if not operation.IsCompleted then
+                                if retainIncompleteOperation then
+                                    retainUntil (operation :> Task)
+
+                            // Cancellation may be observed while an admitted MSBuild/FCS
+                            // operation is already uncancellable. Register its real task
+                            // with the outer lifetime before propagating cancellation, or
+                            // Program.fs would release the shared slot too early.
+                            deadline.MarkSemanticExpired()
+                            cancellationToken.ThrowIfCancellationRequested()
+
+                            return raise (TimeoutException($"The find deadline was exhausted during {phase}."))
+                }
+
+            let awaitRetainedSingleFlight
+                (phase: string)
+                (waiter: WaiterAwareSingleFlightWaiter<'T>)
+                : Task<'T> =
+                task {
+                    use waiter = waiter
+                    let operation = waiter.Operation
+                    return! awaitWithinDeadline phase true operation
+                }
+
+            let incompleteBeforeDiscovery phase phaseStatus errorKind message =
+                if args.cursor.IsSome then
+                    FindCursorContract.validationIncomplete
+                        deadline
+                        "The find deadline expired before the continuation could be fully validated. Retry the same cursor with a larger timeoutMs."
+                else
+                    FindDeadlineResponse.beforeDiscovery args deadline phase phaseStatus errorKind message
+
             match ArgsValidation.requireNonBlank "query" args.query with
             | Error _ ->
                 return
@@ -6078,19 +7243,18 @@ type internal FcsBridge
             // #207: opt-in per-site field types. Off by default — resolving and formatting
             // a type for every site is FCS work the common `find` call has no use for.
             let includeSiteTypes = args.includeSiteTypes |> Option.defaultValue false
-            // #100 hang fix: `find` must ALWAYS return. timeoutMs is the overall
-            // wall-clock budget for the whole multi-project sweep (default 120s);
-            // each project's FCS sweep is cancelled at the remaining budget, and
-            // projects past the deadline are skipped with a perProject error entry.
-            let sweepBudgetMs = args.timeoutMs |> Option.defaultValue 120000
+            // #255: timeoutMs is one end-to-end monotonic budget (default 120s), shared
+            // with outer admission and every resolution/discovery/FCS/fallback phase.
+            // Semantic work reserves a bounded allowance for constructing typed evidence;
+            // projects not begun before the cutoff are reported separately.
+            let requestTimeoutMs = args.timeoutMs |> Option.defaultValue 120000
             // Default page size keeps the compact payload well under the MCP token
             // ceiling on a cap-case hit. Each site is now serialized ONCE — the flat
             // `sites` list — after the grouped definitions/references/fieldSites/
             // memberSites buckets (which duplicated every site) were dropped, so the
             // per-site cost dropped from ~1030 to ~527 chars (measured on
             // find("FindArgs")). With one representation the default is raised from 40
-            // to 80: a full 80-site page is ~43k chars (~14k tokens, under the
-            // ~25k-token ceiling ≈ ~72k chars), and a 69-site hot symbol now fits one
+            // to 80: a typical 80-site page is ~43k chars, and a 69-site hot symbol fits one
             // page at ~37k chars instead of truncating at 40. breakdown + totalSites
             // still report the FULL set, and cursor/nextCursor pages the rest, so a
             // complete refactor list stays reachable past the default.
@@ -6099,22 +7263,19 @@ type internal FcsBridge
             // adds one `siteType` string per FIELD row, so the envelope above is no longer
             // the whole story. The increment is bounded by construction at
             // `siteTypeMaxChars` (200) + a "..." marker, giving a capped worst case of
-            // 80 × (527 + 203 + ~15 chars of JSON key overhead) ≈ 59.6k chars, still under
-            // the ~72k ceiling — so the default 80 stands with the flag on. Measured real
+            // 80 × (527 + 203 + ~15 chars of JSON key overhead) ≈ 59.6k chars. Measured real
             // growth is far smaller: +18.5 chars/site on the field fixture, and a 58-char
             // longest siteType across a 3434-site sweep of this repo. That arithmetic is
             // ASSERTED in FindTests ("the type column stays inside find's documented page
             // budget"), so raising siteTypeMaxChars without redoing this math fails there.
-            // Caveat inherited from this envelope, not introduced by #207: 527 is a measured
-            // AVERAGE, not a bound — `lineText` is emitted uncapped, so a page of
-            // pathologically long source lines can exceed the arithmetic with or without
-            // the column.
+            // This arithmetic now guides only the default; bounded snippets plus the exact
+            // final production-serializer guard below provide the actual hard ceiling.
             let pageSize = args.maxResults |> Option.defaultValue 80
 
             let invalidArgs message =
                 jobj [ "status", jstr "invalid_args"; "message", jstr message ] :> JsonNode
 
-            let mutable validationError =
+            let validationError =
                 if
                     not (
                         Set.ofList [ "auto"; "symbol"; "members"; "field"; "definition"; "position" ]
@@ -6129,8 +7290,8 @@ type internal FcsBridge
                     Some $"maxResults must be between 1 and 1000; got %d{pageSize}."
                 elif contextLines < 0 then
                     Some $"contextLines must be non-negative; got %d{contextLines}."
-                elif sweepBudgetMs < 0 then
-                    Some $"timeoutMs must be non-negative; got %d{sweepBudgetMs}."
+                elif requestTimeoutMs < 0 then
+                    Some $"timeoutMs must be non-negative; got %d{requestTimeoutMs}."
                 elif args.line |> Option.exists (fun value -> value < 0) then
                     Some "line must be non-negative (0-based)."
                 elif args.character |> Option.exists (fun value -> value < 0) then
@@ -6142,46 +7303,266 @@ type internal FcsBridge
                     && (args.path |> Option.forall String.IsNullOrWhiteSpace)
                 then
                     Some "scope='file' requires a non-empty path."
+                elif kind = "position" && (args.path |> Option.forall String.IsNullOrWhiteSpace) then
+                    Some "kind='position' requires 'path' (and 'line')."
+                elif kind = "position" && args.line.IsNone then
+                    Some "kind='position' requires 'line' (0-based)."
+                elif
+                    (args.projectPath |> Option.forall String.IsNullOrWhiteSpace)
+                    && (args.path |> Option.forall String.IsNullOrWhiteSpace)
+                then
+                    Some "find needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first."
                 else
                     None
 
-            let mutable pageOffset = 0
+            let cursorResult =
+                match args.cursor with
+                | None -> Ok None
+                | Some _ when deadline.SemanticExpired ->
+                    Error(
+                        FindCursorContract.validationIncomplete
+                            deadline
+                            "The find deadline expired before the continuation cursor could be decoded. Retry the same cursor with a larger timeoutMs."
+                    )
+                | Some cursorStr ->
+                    match Cursor.tryDecodeFind cursorStr with
+                    | Ok payload -> Ok(Some payload)
+                    | Error error -> Error(FindCursorContract.decodeRejected error)
 
-            match args.cursor with
-            | None -> ()
-            | Some cursorStr ->
-                match Cursor.tryDecode cursorStr with
-                | Ok payload -> pageOffset <- payload.offset
-                | Error reason -> validationError <- Some $"Invalid cursor: %s{reason}"
+            // Basic errors and an already exhausted initial request must be answered
+            // before canonical path normalization can inspect malformed user input.
+            match validationError, cursorResult with
+            | Some message, _ -> return invalidArgs message
+            | None, Error envelope -> return envelope
+            | None, Ok _ when args.cursor.IsNone && deadline.SemanticExpired ->
+                return
+                    incompleteBeforeDiscovery
+                        (if kind = "position" then "position_resolution" else "admission")
+                        "timed_out"
+                        "find_timeout"
+                        "The find end-to-end deadline was already exhausted."
+            | None, Ok _ ->
+
+            let queryModelResult =
+                try
+                    FindCursorContract.queryModel
+                        args
+                        query0
+                        kind
+                        scope
+                        exact
+                        contextLines
+                        includeDeclaration
+                        includeInfo
+                        includePerProject
+                        includeSiteTypes
+                    |> Ok
+                with
+                | :? ArgumentException as ex -> Error ex.Message
+                | :? NotSupportedException as ex -> Error ex.Message
+                | :? PathTooLongException as ex -> Error ex.Message
+
+            match queryModelResult with
+            | Error message -> return invalidArgs $"find received an invalid path: {message}"
+            | Ok queryModel ->
+
+            let queryIdentity = Cursor.findQueryIdentityV2 queryModel
+
+            let cursorPayload =
+                match cursorResult with
+                | Ok payload -> payload
+                | Error _ -> None
+
+            let pageOffset = cursorPayload |> Option.map _.Offset |> Option.defaultValue 0
+
+            // Record only a decoded v2 envelope with valid inputs and context. This
+            // is per-call evidence for the final deadline guard, not proof that its
+            // query/snapshot match, nor state retained for a cursor. Malformed tokens
+            // and invalid initial requests keep their typed errors even on late expiry.
+            if validationError.IsNone && not (String.IsNullOrEmpty(queryModel.Target)) then
+                cursorPayload |> Option.iter (fun _ -> recordValidatedContinuationEnvelope ())
 
             // kind=position resolves the symbol under the cursor, then sweeps it as a symbol.
             let! queryResult =
                 task {
-                    match validationError with
-                    | Some message -> return Error(invalidArgs message)
-                    | None ->
+                    match validationError, cursorResult with
+                    | Some message, _ -> return Error(invalidArgs message)
+                    | None, Error envelope -> return Error envelope
+                    | None, Ok _ when String.IsNullOrEmpty(queryModel.Target) ->
+                        return
+                            Error(
+                                jobj
+                                    [ "status", jstr "invalid_args"
+                                      "message",
+                                      jstr
+                                          "find needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first." ]
+                                :> JsonNode
+                            )
+                    | None, Ok(Some _) when deadline.SemanticExpired ->
+                        return
+                            Error(
+                                FindCursorContract.validationIncomplete
+                                    deadline
+                                    "The find deadline expired before the cursor query identity could be validated. Retry the same cursor with a larger timeoutMs."
+                            )
+                    | None, Ok(Some payload) when
+                        not (String.Equals(payload.Query, queryIdentity, StringComparison.Ordinal))
+                        ->
+                        return Error(FindCursorContract.queryMismatch ())
+                    | None, Ok _ ->
                         if kind = "position" then
-                            return! this.ResolveQueryAtPosition(args)
+                            try
+                                deadline.Telemetry.SetPhase("positionResolution")
+                                ensureCanStart "position resolution"
+
+                                let waiter =
+                                    runFindPositionResolution
+                                        args
+                                        remainingWorkerBudget
+                                        (fun hasActiveWaiters ->
+                                            this.ResolveQueryAtPosition(
+                                                args,
+                                                fun () ->
+                                                    if not (hasActiveWaiters ()) then
+                                                        raise (
+                                                            TimeoutException(
+                                                                "The find position-resolution worker has no active callers."
+                                                            )
+                                                        )
+                                            ))
+
+                                let! result = awaitRetainedSingleFlight "position resolution" waiter
+                                match result with
+                                | Ok resolved -> return Ok(resolved.Query, Some resolved.SymbolIdentity)
+                                | Error failure ->
+                                    let envelope =
+                                        match failure, cursorPayload with
+                                        | FindPositionFailure.Changed _, Some _ -> FindCursorContract.stale ()
+                                        | FindPositionFailure.Incomplete _, Some _ ->
+                                            FindCursorContract.validationIncomplete
+                                                deadline
+                                                "The symbol at the requested position could not be validated. Retry the same cursor when type checking is available, with a larger timeoutMs if needed."
+                                        | FindPositionFailure.InvalidRequest envelope, _
+                                        | FindPositionFailure.Changed envelope, _
+                                        | FindPositionFailure.Incomplete envelope, _ -> envelope
+                                    return Error envelope
+                            with
+                            | :? TimeoutException as ex ->
+                                return
+                                    Error(
+                                        incompleteBeforeDiscovery
+                                            "position_resolution"
+                                            "timed_out"
+                                            "find_timeout"
+                                            ex.Message
+                                    )
+                            | :? BoundedCheckWorkBusyException as ex ->
+                                return
+                                    Error(
+                                        incompleteBeforeDiscovery
+                                            "position_resolution"
+                                            "busy"
+                                            "fcs_worker_busy"
+                                            ex.Message
+                                    )
+                            | ex when cursorPayload.IsSome && not (ex :? OperationCanceledException) ->
+                                return
+                                    Error(
+                                        FindCursorContract.validationIncomplete
+                                            deadline
+                                            "The symbol at the requested position could not be reconstructed. Retry the same cursor when the project is available."
+                                    )
                         else
-                            return Ok query0
+                            if deadline.SemanticExpired then
+                                return
+                                    Error(
+                                        incompleteBeforeDiscovery
+                                            "admission"
+                                            "timed_out"
+                                            "find_timeout"
+                                            "The find end-to-end deadline was already exhausted."
+                                    )
+                            else
+                                return Ok(query0, None)
                 }
 
             match queryResult with
             | Error envelope -> return envelope
-            | Ok query ->
+            | Ok(query, positionSymbolIdentity) ->
 
+            deadline.Telemetry.SetPhase("targetDiscovery")
             let kindResolved = if kind = "position" then "symbol" else kind
 
-            // Resolve the sweep target: explicit projectPath (already falls back to the
-            // active set_project in Program.fs), else the nearest .fsproj to args.path.
-            let sweepTargetOpt =
+            let findNearestProjectForRequest path shouldContinue =
+                let beforeStep =
+                    findTargetDiscoveryBeforeStepOverride
+                    |> Option.defaultValue (fun _ _ -> ())
+
+                findNearestFsprojWithContinuation
+                    path
+                    beforeStep
+                    shouldContinue
+
+            // Resolve the sweep target inside the same deadline. The nearest-project
+            // filesystem walk is admitted single-flight work, never a synchronous prelude.
+            let explicitSweepTarget =
                 args.projectPath
                 |> Option.filter (String.IsNullOrWhiteSpace >> not)
                 |> Option.map normalizePath
-                |> Option.orElseWith (fun () -> args.path |> Option.bind findNearestFsproj |> Option.map normalizePath)
 
-            match sweepTargetOpt with
-            | None ->
+            let! sweepTargetResult =
+                task {
+                    match explicitSweepTarget with
+                    | Some target -> return Ok(Some target)
+                    | None ->
+                        match args.path |> Option.filter (String.IsNullOrWhiteSpace >> not) with
+                        | None -> return Ok None
+                        | Some path ->
+                            try
+                                ensureCanStart "nearest-project discovery"
+
+                                let waiter =
+                                    runFindTargetDiscovery
+                                        "nearest-project"
+                                        path
+                                        remainingWorkerBudget
+                                        (fun shouldContinue ->
+                                            findNearestProjectForRequest path shouldContinue
+                                            |> Option.map normalizePath
+                                            |> Option.toArray
+                                            |> FindTargetDiscoveryResult.Paths)
+
+                                let! discovered =
+                                    awaitRetainedSingleFlight "nearest-project discovery" waiter
+
+                                match discovered with
+                                | FindTargetDiscoveryResult.Paths paths -> return Ok(Array.tryHead paths)
+                                | FindTargetDiscoveryResult.Projects _ ->
+                                    return raise (InvalidOperationException("Unexpected find discovery result."))
+                            with
+                            | :? TimeoutException as ex ->
+                                return
+                                    Error(
+                                        incompleteBeforeDiscovery
+                                            "target_discovery"
+                                            "timed_out"
+                                            "find_timeout"
+                                            ex.Message
+                                    )
+                            | :? BoundedCheckWorkBusyException as ex ->
+                                return
+                                    Error(
+                                        incompleteBeforeDiscovery
+                                            "target_discovery"
+                                            "busy"
+                                            "fcs_worker_busy"
+                                            ex.Message
+                                    )
+                }
+
+            match sweepTargetResult with
+            | Error envelope -> return envelope
+            | Ok None ->
                 return
                     jobj
                         [ "status", jstr "invalid_args"
@@ -6189,9 +7570,61 @@ type internal FcsBridge
                           jstr
                               "find needs a project context: pass projectPath (.fsproj/.sln/.slnx) or path, or call set_project first." ]
                     :> JsonNode
-            | Some sweepTarget ->
+            | Ok(Some sweepTarget) ->
 
-            let memberProjects = SolutionParsing.listProjects sweepTarget
+            let! projectDiscoveryResult =
+                task {
+                    try
+                        ensureCanStart "project discovery"
+
+                        let waiter =
+                            runFindTargetDiscovery
+                                "projects"
+                                sweepTarget
+                                remainingWorkerBudget
+                                (fun shouldContinue ->
+                                    let beforeStep =
+                                        findTargetDiscoveryBeforeStepOverride
+                                        |> Option.defaultValue (fun _ _ -> ())
+
+                                    SolutionParsing.discoverProjectsForFind
+                                        sweepTarget
+                                        beforeStep
+                                        shouldContinue
+                                    |> FindTargetDiscoveryResult.Projects)
+
+                        let! discovery = awaitRetainedSingleFlight "project discovery" waiter
+
+                        match discovery with
+                        | FindTargetDiscoveryResult.Projects projects -> return Ok projects
+                        | FindTargetDiscoveryResult.Paths _ ->
+                            return raise (InvalidOperationException("Unexpected find discovery result."))
+                    with
+                    | :? TimeoutException as ex ->
+                        return
+                            Error(
+                                incompleteBeforeDiscovery
+                                    "target_discovery"
+                                    "timed_out"
+                                    "find_timeout"
+                                    ex.Message
+                            )
+                    | :? BoundedCheckWorkBusyException as ex ->
+                        return
+                            Error(
+                                incompleteBeforeDiscovery
+                                    "target_discovery"
+                                    "busy"
+                                    "fcs_worker_busy"
+                                    ex.Message
+                            )
+                }
+
+            match projectDiscoveryResult with
+            | Error envelope -> return envelope
+            | Ok projectDiscovery ->
+
+            let loadableMemberProjects = projectDiscovery.LoadableProjects
 
             let sourcePathComparison =
                 if OperatingSystem.IsWindows() then
@@ -6199,16 +7632,82 @@ type internal FcsBridge
                 else
                     StringComparison.Ordinal
 
+            let fileScopePath =
+                if scope = "file" then
+                    args.path
+                    |> Option.filter (String.IsNullOrWhiteSpace >> not)
+                    |> Option.map normalizePath
+                else
+                    None
+
             let isMemberProject (candidate: string) =
                 let fullCandidate = normalizePath candidate
-
-                memberProjects
-                |> Array.exists (fun project ->
-                    String.Equals(normalizePath project, fullCandidate, sourcePathComparison))
+                projectDiscovery.MemberProjectPaths.Contains(fullCandidate)
 
             // scope=file/project narrows to the single owning project; workspace/auto
             // sweeps every member project of the solution.
             let mutable projectResolutionError = None
+
+            let mutable scopedProjectEarlyResponse: JsonNode option = None
+
+            let! scopedProject =
+                task {
+                    if
+                        (scope = "file" || scope = "project")
+                        && not (sweepTarget.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase))
+                    then
+                        match args.path |> Option.filter (String.IsNullOrWhiteSpace >> not) with
+                        | None -> return None
+                        | Some path ->
+                            try
+                                ensureCanStart "scoped-project discovery"
+
+                                let waiter =
+                                    runFindTargetDiscovery
+                                        "scoped-project"
+                                        path
+                                        remainingWorkerBudget
+                                        (fun shouldContinue ->
+                                            findNearestProjectForRequest path shouldContinue
+                                            |> Option.map normalizePath
+                                            |> Option.toArray
+                                            |> FindTargetDiscoveryResult.Paths)
+
+                                let! projects =
+                                    awaitRetainedSingleFlight "scoped-project discovery" waiter
+
+                                match projects with
+                                | FindTargetDiscoveryResult.Paths paths -> return Array.tryHead paths
+                                | FindTargetDiscoveryResult.Projects _ ->
+                                    return raise (InvalidOperationException("Unexpected find discovery result."))
+                            with
+                            | :? TimeoutException as ex ->
+                                scopedProjectEarlyResponse <-
+                                    Some(
+                                        incompleteBeforeDiscovery
+                                            "target_discovery"
+                                            "timed_out"
+                                            "find_timeout"
+                                            ex.Message
+                                    )
+
+                                return None
+                            | :? BoundedCheckWorkBusyException as ex ->
+                                scopedProjectEarlyResponse <-
+                                    Some(
+                                        incompleteBeforeDiscovery
+                                            "target_discovery"
+                                            "busy"
+                                            "fcs_worker_busy"
+                                            ex.Message
+                                    )
+
+                                return None
+                    elif sweepTarget.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
+                        return Some sweepTarget
+                    else
+                        return None
+                }
 
             let projectsToSweep =
                 match scope with
@@ -6220,31 +7719,98 @@ type internal FcsBridge
                         if sweepTarget.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase) then
                             Some sweepTarget
                         else
-                            args.path |> Option.bind findNearestFsproj
+                            scopedProject
 
                     match single with
-                    | Some project when isMemberProject project -> [| normalizePath project |]
+                    | Some project when isMemberProject project -> ResizeArray([ normalizePath project ])
                     | Some project ->
                         projectResolutionError <-
                             Some
                                 $"scope='%s{scope}' resolved '%s{normalizePath project}', which is not a member of the requested workspace '%s{sweepTarget}'."
 
-                        [||]
+                        ResizeArray<string>()
                     | None ->
                         projectResolutionError <-
                             Some
                                 $"scope='%s{scope}' requires projectPath to be a single .fsproj or path to resolve to one member project; a whole solution cannot be used as a single-project scope."
 
-                        [||]
-                | _ -> memberProjects
+                        ResizeArray<string>()
+                | _ -> loadableMemberProjects
 
-            if projectsToSweep.Length = 0 then
-                let message =
-                    projectResolutionError
-                    |> Option.defaultValue $"find could not resolve any .fsproj to sweep from: %s{sweepTarget}"
+            // Narrow file/project searches intentionally cover one selected project.
+            // Workspace/auto searches retain every missing declared solution member as
+            // a typed discovery failure while only real files enter the FCS loop.
+            let missingProjects =
+                match scope with
+                | "file"
+                | "project" -> ResizeArray<string>()
+                | _ -> projectDiscovery.MissingProjects
 
-                return invalidArgs message
+            if projectsToSweep.Count = 0 && missingProjects.Count = 0 then
+                match scopedProjectEarlyResponse with
+                | Some envelope -> return envelope
+                | None when cursorPayload.IsSome && deadline.SemanticExpired ->
+                    return
+                        FindCursorContract.validationIncomplete
+                            deadline
+                            "The find deadline expired while validating the requested project membership. Retry the same cursor with a larger timeoutMs."
+                | None when cursorPayload.IsSome ->
+                    // The envelope and canonical request already matched above. Losing
+                    // the last/selected declared member changes this stream, not the
+                    // request, even when discovery now has no project left to sweep.
+                    return FindCursorContract.stale ()
+                | None ->
+                    let message =
+                        projectResolutionError
+                        |> Option.defaultValue $"find could not resolve any .fsproj to sweep from: %s{sweepTarget}"
+
+                    return invalidArgs message
             else
+
+            // Inventory test labels are discovery work, never response-phase file
+            // reads. Keep a slow filesystem/XML worker within the same admission
+            // lifetime even after its waiter times out or is cancelled.
+            let! inventoryTestProjectsResult =
+                task {
+                    if inventoryQueries.IsNone then
+                        return Ok Set.empty
+                    else
+                        try
+                            deadline.Telemetry.SetPhase("targetDiscovery")
+                            ensureCanStart "inventory project classification"
+                            let selectedProjectsIdentity =
+                                String.Join("\u0000", projectsToSweep) |> Cursor.textIdentityV2
+                            let waiter =
+                                runFindTargetDiscovery
+                                    $"inventory-test-projects-{selectedProjectsIdentity}"
+                                    sweepTarget
+                                    remainingWorkerBudget
+                                    (fun shouldContinue ->
+                                        let tests = ResizeArray<string>()
+                                        for index in 0 .. projectsToSweep.Count - 1 do
+                                            if not (shouldContinue ()) then
+                                                raise (TimeoutException "The inventory project-classification deadline expired.")
+                                            findTargetDiscoveryBeforeStepOverride
+                                            |> Option.iter (fun beforeStep -> beforeStep "inventory-project-classification" index)
+                                            let project = projectsToSweep[index]
+                                            if FsLangMcp.ProjectHealth.isTestProjectFile project then
+                                                tests.Add(normalizePath project)
+                                        FindTargetDiscoveryResult.Paths(tests.ToArray()))
+                            let! result = awaitRetainedSingleFlight "inventory project classification" waiter
+                            match result with
+                            | FindTargetDiscoveryResult.Paths paths -> return Ok(Set.ofArray paths)
+                            | FindTargetDiscoveryResult.Projects _ ->
+                                return raise (InvalidOperationException "Unexpected inventory project-classification result.")
+                        with
+                        | :? TimeoutException as ex ->
+                            return Error(incompleteBeforeDiscovery "target_discovery" "timed_out" "find_timeout" ex.Message)
+                        | :? BoundedCheckWorkBusyException as ex ->
+                            return Error(incompleteBeforeDiscovery "target_discovery" "busy" "fcs_worker_busy" ex.Message)
+                }
+
+            match inventoryTestProjectsResult with
+            | Error envelope -> return envelope
+            | Ok inventoryTestProjects ->
 
             // ── Matching predicates (stable-string, cross-compilation-safe) ───────
             let fullNameBoundaryMatch (fullName: string) =
@@ -6272,6 +7838,37 @@ type internal FcsBridge
 
             let fieldRestrict = args.field
             let memberRestrict = args.``member``
+
+            // Field shorthand is opt-in by kind and never reinterprets an explicit
+            // selector or the established non-exact declaring-type search. Match
+            // against actual field names (which may themselves contain dots), not
+            // an unconditional last-dot split of a module-qualified type name.
+            let allowDottedField =
+                kindResolved = "field" && exact && fieldRestrict.IsNone && query.Contains('.')
+
+            let mutable wholeFieldTypeMatched = false
+
+            let isDottedField (symbolUse: FSharpSymbolUse) =
+                match symbolUse.Symbol with
+                | :? FSharpField as field when allowDottedField ->
+                    try
+                        match field.DeclaringEntity with
+                        | Some entity when entity.IsFSharpRecord ->
+                            [ field.Name; $"``{field.Name}``" ]
+                            |> List.exists (fun fieldName ->
+                                let suffix = $".{fieldName}"
+                                if query.EndsWith(suffix, StringComparison.Ordinal) then
+                                    let prefix = query.Substring(0, query.Length - suffix.Length)
+                                    prefix.Length > 0
+                                    && (String.Equals(entity.DisplayName, prefix, StringComparison.Ordinal)
+                                        || String.Equals(entity.FullName, prefix, StringComparison.Ordinal)
+                                        || entity.FullName.EndsWith($".{prefix}", StringComparison.Ordinal))
+                                else
+                                    false)
+                        | Some _ | None -> false // Shorthand is for named record fields only.
+                    with _ ->
+                        false // FCS may expose an unresolved declaring entity in erroneous code.
+                | _ -> false // Other symbols cannot establish record-field identity.
 
             let isQueriedField (symbolUse: FSharpSymbolUse) =
                 match symbolUse.Symbol with
@@ -6327,18 +7924,23 @@ type internal FcsBridge
                 | _ -> false
 
             let wantName =
-                kindResolved = "auto" || kindResolved = "symbol" || kindResolved = "definition"
+                inventoryQueries.IsNone
+                && (kindResolved = "auto" || kindResolved = "symbol" || kindResolved = "definition")
 
             let wantDefsOnly = kindResolved = "definition"
-            let wantField = kindResolved = "auto" || kindResolved = "field"
-            let wantMember = kindResolved = "auto" || kindResolved = "members"
+            let wantField = inventoryQueries.IsNone && (kindResolved = "auto" || kindResolved = "field")
+            let wantMember = inventoryQueries.IsNone && (kindResolved = "auto" || kindResolved = "members")
+            let inventoryCollector =
+                inventoryQueries
+                |> Option.map (fun queries ->
+                    FindInventory.Collector(queries, exact, wantDefsOnly, includeDeclaration, fileScopePath))
 
             // De-dup accumulator keyed by stable source location.
             // NOTE: we store only primitive coordinates, NOT the FCS `range` struct —
             // `range` carries [<NoComparison>], and anonymous records auto-derive
             // comparison, which would fail under warnings-as-errors. The range JSON is
             // rebuilt from these fields in siteToJson.
-            let siteByKey =
+            let mutable siteByKey =
                 System.Collections.Generic.Dictionary<
                     string,
                     {| File: string
@@ -6361,17 +7963,73 @@ type internal FcsBridge
                        TypeAlternatives: (string * string) list |}
                  >()
 
-            let perProject = ResizeArray<JsonNode>()
+            // A later project may declare a record whose full name is the entire
+            // query. Keep shorthand candidates separate until coverage proves that
+            // the existing declaring-type interpretation does not take precedence.
+            let dottedFieldSites = System.Collections.Generic.Dictionary<_, _>()
+            let dottedFieldProjectCounts = ResizeArray<int * int>()
+
+            let perProject = JsonArray()
             // Lockstep with perProject: false for a project that matched nothing and didn't
             // error, so the output can drop pure-noise entries (one per swept project on a
             // large solution) without losing the matched/errored ones (#100 token-tax).
             let perProjectKeep = ResizeArray<bool>()
-            let aggregatedDiagnostics = ResizeArray<FSharpDiagnostic>()
+            let aggregatedDiagnostics = ResizeArray<string * FSharpDiagnostic>()
             let sweepSw = System.Diagnostics.Stopwatch.StartNew()
             let mutable projectsAnalyzed = 0
             let mutable projectsFailed = 0
             let mutable projectsTimedOut = 0
             let mutable projectsBusy = 0
+            let mutable projectsNotStarted = 0
+            let mutable stopStartingProjects = false
+            let projectsMissing = missingProjects.Count
+            let projectsSwept = projectsToSweep.Count
+            let projectsRequested = projectsSwept + projectsMissing
+            let mutable targetDiscoveryMaterializationTimedOut = false
+
+            let coverageFailureSummary () =
+                let notStarted =
+                    if projectsNotStarted = 0 then
+                        ""
+                    else
+                        $", %d{projectsNotStarted} not started"
+
+                if projectsMissing = 0 then
+                    $"%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy%s{notStarted}"
+                else
+                    $"%d{projectsFailed} failed, %d{projectsMissing} missing, %d{projectsTimedOut} timed out, %d{projectsBusy} busy%s{notStarted}"
+
+            let mutable missingProjectIndex = 0
+            let mutable missingProjectRowsExpired = false
+
+            while missingProjectIndex < missingProjects.Count && not missingProjectRowsExpired do
+                findTargetDiscoveryBeforeStepOverride
+                |> Option.iter (fun beforeStep -> beforeStep "missing-project-row" missingProjectIndex)
+
+                if deadline.SemanticExpired then
+                    deadline.MarkSemanticExpired()
+                    missingProjectRowsExpired <- true
+                else
+                    let normalizedProject = normalizePath missingProjects[missingProjectIndex]
+
+                    perProject.Add(
+                        jobj
+                            [ "project", jstr (Path.GetFileNameWithoutExtension normalizedProject)
+                              "fsproj", jstr normalizedProject
+                              "status", jstr "missing"
+                              "errorKind", jstr "project_not_found"
+                              "retryable", jbool false
+                              "error", jstr $"Declared solution member does not exist: %s{normalizedProject}"
+                              "elapsedMs", jint 0 ]
+                        :> JsonNode
+                    )
+
+                    perProjectKeep.Add(true)
+                    missingProjectIndex <- missingProjectIndex + 1
+
+            if missingProjectRowsExpired then
+                targetDiscoveryMaterializationTimedOut <- true
+                stopStartingProjects <- true
 
             let locationKey (r: range) =
                 $"%s{normalizePath r.FileName}:%d{r.StartLine}:%d{r.StartColumn}:%d{r.EndLine}:%d{r.EndColumn}"
@@ -6379,21 +8037,39 @@ type internal FcsBridge
             // Per-project sweep. Sequential by design: parallel Ionide.ProjInfo option
             // resolution races on MSBuild's *.nuget.g.props for sibling projects that
             // share a P2P reference; FCS also serializes ParseAndCheckProject internally.
-            for fsproj in projectsToSweep do
+            let mutable sweepProjectIndex = 0
+
+            while
+                sweepProjectIndex < projectsToSweep.Count
+                && not stopStartingProjects
+                && not deadline.SemanticExpired
+                do
+                let fsproj = projectsToSweep[sweepProjectIndex]
                 let projSw = System.Diagnostics.Stopwatch.StartNew()
                 let projDisplay = Path.GetFileNameWithoutExtension fsproj
 
                 try
-                    let remainingBeforeLoad = sweepBudgetMs - int sweepSw.ElapsedMilliseconds
+                    if stopStartingProjects || deadline.SemanticExpired then
+                        stopStartingProjects <- true
+                        raise FindProjectNotStartedException
 
-                    if remainingBeforeLoad <= 0 then
-                        raise (TimeoutException($"Overall find budget of %d{sweepBudgetMs}ms was exhausted."))
+                    deadline.Telemetry.SetPhase("projectOptions")
+                    ensureCanStart $"project-options resolution for '{projDisplay}'"
+                    deadline.Telemetry.BeginCacheObservation("projectOptions")
 
-                    let optionsTask = this.ResolveFsprojOptions(fsproj)
-                    observeFault optionsTask
+                    let optionsWaiter =
+                        this.AcquireFsprojEntryWithinBudget(
+                            fsproj,
+                            Some remainingWorkerBudget
+                        )
 
-                    let! options, _ =
-                        optionsTask.WaitAsync(TimeSpan.FromMilliseconds(float remainingBeforeLoad))
+                    let! optionsEntry, optionsCacheHit =
+                        awaitRetainedSingleFlight
+                            $"project-options resolution for '{projDisplay}'"
+                            optionsWaiter
+
+                    deadline.Telemetry.RecordCacheObservation("projectOptions", optionsCacheHit)
+                    let options = optionsEntry.Options
 
                     // issue #131/#168 P1-07: memoize the whole-symbol-use enumeration by
                     // the shared content-addressed analysis snapshot. A cache HIT skips BOTH
@@ -6405,15 +8081,33 @@ type internal FcsBridge
                     // own method (ProjectSweepUses) so this outer state machine stays
                     // statically compilable under Release optimization (a nested task CE
                     // inside the loop trips FS3511).
-                    let usesKey = analysisSnapshotKey options
-                    // #100: overall wall-clock budget across the whole sweep. Each project
-                    // gets whatever remains; once exhausted, `max 1` makes the next project's
-                    // type-check cancel almost immediately and land in the catch branch as a
-                    // timeout error entry — so a huge/cold solution returns partial instead of
-                    // blocking the caller forever.
-                    let remainingMs = max 1 (sweepBudgetMs - int sweepSw.ElapsedMilliseconds)
-                    let! allUses, projDiagnostics = this.ProjectSweepUses(usesKey, options, remainingMs)
-                    aggregatedDiagnostics.AddRange(projDiagnostics)
+                    deadline.Telemetry.SetPhase("snapshot")
+                    ensureCanStart $"snapshot computation for '{projDisplay}'"
+
+                    let snapshotWaiter =
+                        acquireAnalysisSnapshotKeyActual options remainingWorkerBudget
+
+                    let! usesKey =
+                        awaitRetainedSingleFlight
+                            $"snapshot computation for '{projDisplay}'"
+                            snapshotWaiter
+
+                    commitAnalysisSnapshotKey options usesKey
+                    deadline.Telemetry.SetPhase("fcsSweep")
+                    ensureCanStart $"FCS sweep for '{projDisplay}'"
+
+                    deadline.Telemetry.BeginCacheObservation("projectUses")
+                    let sweepOperation =
+                        this.ProjectSweepUsesActual(
+                            usesKey, options,
+                            observeCache = fun hit -> deadline.Telemetry.RecordCacheObservation("projectUses", hit))
+
+                    let! allUses, projDiagnostics =
+                        awaitWithinDeadline $"FCS sweep for '{projDisplay}'" true sweepOperation
+
+                    deadline.Telemetry.SetPhase("classification")
+                    for diagnostic in projDiagnostics do
+                        aggregatedDiagnostics.Add(normalizePath fsproj, diagnostic)
 
                     // Per-file record-field form classifier (literal vs with-update).
                     let parsingOptions, _ = checker.GetParsingOptionsFromProjectOptions(options)
@@ -6465,6 +8159,7 @@ type internal FcsBridge
 
                     let mutable nameCount = 0
                     let mutable fieldCount = 0
+                    let mutable dottedFieldCount = 0
                     let mutable memberCount = 0
 
                     // #207: type resolution shares `find`'s ONE wall-clock budget. Past the
@@ -6474,7 +8169,7 @@ type internal FcsBridge
                     let siteTypeDeadlineExpired () =
                         match findSiteTypeDeadlineExpiredOverride with
                         | Some hook -> hook ()
-                        | None -> int sweepSw.ElapsedMilliseconds >= sweepBudgetMs
+                        | None -> deadline.SemanticExpired
 
                     let resolveSiteType (symbolUse: FSharpSymbolUse) =
                         if not includeSiteTypes then
@@ -6483,71 +8178,130 @@ type internal FcsBridge
                             FieldSiteTypes.outcome (siteTypeDeadlineExpired ()) (fun () ->
                                 tryFormatFieldSiteType symbolUse)
 
-                    let add (symbolUse: FSharpSymbolUse) (siteKind: string) (overwrite: bool) (siteType: string) (typeStatus: string) =
+                    let add (dottedField: bool) (symbolUse: FSharpSymbolUse) (siteKind: string) (overwrite: bool) (siteType: string) (typeStatus: string) =
+                        let siteByKey = if dottedField then dottedFieldSites else siteByKey
                         let r = symbolUse.Range
-                        let key = locationKey r
+                        let normalizedFile = normalizePath r.FileName
 
-                        if overwrite || not (siteByKey.ContainsKey key) then
-                            // #207 review: kind precedence still lets a later pass overwrite the
-                            // row, but a TYPE another project already resolved for this same
-                            // physical site is never silently replaced — a linked .fs swept by
-                            // several projects can resolve the field differently in each. The
-                            // first resolved type keeps the `siteType` column AND the project
-                            // label that produced it (otherwise the row would report one
-                            // project's name beside another project's type); the rest are kept
-                            // as alternatives. Without includeSiteTypes every SiteType is null,
-                            // so this reduces exactly to the previous last-writer-wins behaviour.
-                            // `typeStatus` is non-null ONLY on a field-pass row under
-                            // includeSiteTypes, so the merge is confined to field-vs-field
-                            // across projects. A member pass overwriting the same range still
-                            // nulls the type exactly as before — otherwise a member-usage row
-                            // could carry a type and break `typed + degraded = fieldSites`.
-                            let keptType, keptStatus, keptProject, alternatives =
-                                match siteByKey.TryGetValue key with
-                                | true, prior when not (isNull prior.SiteType) && not (isNull typeStatus) ->
-                                    prior.SiteType,
-                                    prior.TypeStatus,
-                                    prior.Project,
-                                    FieldSiteTypes.mergeAlternatives
-                                        prior.SiteType
-                                        siteType
-                                        projDisplay
-                                        prior.TypeAlternatives
-                                | _ -> siteType, typeStatus, projDisplay, []
+                        let withinRequestedFile =
+                            match fileScopePath with
+                            | Some requestedFile ->
+                                String.Equals(normalizedFile, requestedFile, sourcePathComparison)
+                            | None -> true
 
-                            siteByKey[key] <-
-                                {| File = normalizePath r.FileName
-                                   StartLine = r.StartLine
-                                   StartCol = r.StartColumn
-                                   EndLine = r.EndLine
-                                   EndCol = r.EndColumn
-                                   Kind = siteKind
-                                   Project = keptProject
-                                   FullName =
-                                    (match symbolUse.Symbol.FullName with
-                                     | null -> null
-                                     | s -> s)
-                                   SiteType = keptType
-                                   TypeStatus = keptStatus
-                                   TypeAlternatives = alternatives |}
+                        if withinRequestedFile then
+                            let key = locationKey r
+
+                            if overwrite || not (siteByKey.ContainsKey key) then
+                                // #207 review: kind precedence still lets a later pass overwrite the
+                                // row, but a TYPE another project already resolved for this same
+                                // physical site is never silently replaced — a linked .fs swept by
+                                // several projects can resolve the field differently in each. The
+                                // first resolved type keeps the `siteType` column AND the project
+                                // label that produced it (otherwise the row would report one
+                                // project's name beside another project's type); the rest are kept
+                                // as alternatives. Without includeSiteTypes every SiteType is null,
+                                // so this reduces exactly to the previous last-writer-wins behaviour.
+                                // `typeStatus` is non-null ONLY on a field-pass row under
+                                // includeSiteTypes, so the merge is confined to field-vs-field
+                                // across projects. A member pass overwriting the same range still
+                                // nulls the type exactly as before — otherwise a member-usage row
+                                // could carry a type and break `typed + degraded = fieldSites`.
+                                let keptType, keptStatus, keptProject, alternatives =
+                                    match siteByKey.TryGetValue key with
+                                    | true, prior when not (isNull prior.SiteType) && not (isNull typeStatus) ->
+                                        prior.SiteType,
+                                        prior.TypeStatus,
+                                        prior.Project,
+                                        FieldSiteTypes.mergeAlternatives
+                                            prior.SiteType
+                                            siteType
+                                            projDisplay
+                                            prior.TypeAlternatives
+                                    | _ -> siteType, typeStatus, projDisplay, []
+
+                                siteByKey[key] <-
+                                    {| File = normalizedFile
+                                       StartLine = r.StartLine
+                                       StartCol = r.StartColumn
+                                       EndLine = r.EndLine
+                                       EndCol = r.EndColumn
+                                       Kind = siteKind
+                                       Project = keptProject
+                                       FullName =
+                                        (match symbolUse.Symbol.FullName with
+                                         | null -> null
+                                         | s -> s)
+                                       SiteType = keptType
+                                       TypeStatus = keptStatus
+                                       TypeAlternatives = alternatives |}
 
                     // Field/member sites first so their richer kind wins over a generic
                     // "reference" tag when a non-exact name-match overlaps the same range.
+                    let mutable classificationExpired = false
+
+                    let canClassifyNext () =
+                        cancellationToken.ThrowIfCancellationRequested()
+                        if classificationExpired || deadline.SemanticExpired then
+                            classificationExpired <- true
+                            false
+                        else
+                            true
+
+                    match inventoryCollector with
+                    | Some collector ->
+                        if not (collector.ObserveProject(sweepProjectIndex, allUses, symbolMatches, canClassifyNext)) then
+                            classificationExpired <- true
+                    | None -> ()
+
                     if wantField then
-                        for u in allUses do
+                        let mutable fieldIndex = 0
+
+                        while fieldIndex < allUses.Length && canClassifyNext () do
+                            let u = allUses[fieldIndex]
+
+                            if allowDottedField && not wholeFieldTypeMatched then
+                                wholeFieldTypeMatched <-
+                                    try
+                                        match u.Symbol with
+                                        | :? FSharpEntity as entity ->
+                                            not entity.IsNamespace && not entity.IsFSharpModule && entityMatchesQuery entity
+                                        | :? FSharpField as field ->
+                                            field.DeclaringEntity
+                                            |> Option.exists entityMatchesQuery
+                                        | _ -> false // Values/members do not establish a declaring record type.
+                                    with _ ->
+                                        false // Unresolved FCS metadata must not fail the entire project sweep.
+
                             if not u.IsFromDefinition && isQueriedField u then
                                 fieldCount <- fieldCount + 1
                                 let siteType, typeStatus = resolveSiteType u
-                                add u (fieldKind u) true siteType typeStatus
+                                add false u (fieldKind u) true siteType typeStatus
+                            elif not u.IsFromDefinition && isDottedField u then
+                                dottedFieldCount <- dottedFieldCount + 1
+                                let siteType, typeStatus = resolveSiteType u
+                                add true u (fieldKind u) true siteType typeStatus
+
+                            fieldIndex <- fieldIndex + 1
 
                     if wantMember then
-                        for u in allUses do
+                        let mutable memberIndex = 0
+
+                        while memberIndex < allUses.Length && canClassifyNext () do
+                            let u = allUses[memberIndex]
+
                             if not u.IsFromDefinition && isQueriedMember u then
                                 memberCount <- memberCount + 1
-                                add u "member-usage" true null null
+                                add false u "member-usage" true null null
+
+                            memberIndex <- memberIndex + 1
 
                     if wantName then
-                        for u in allUses do
+                        let mutable nameIndex = 0
+
+                        while nameIndex < allUses.Length && canClassifyNext () do
+                            let u = allUses[nameIndex]
+
                             if symbolMatches query exact u.Symbol then
                                 let passDefsOnly = (not wantDefsOnly) || u.IsFromDefinition
                                 let passDecl = wantDefsOnly || includeDeclaration || not u.IsFromDefinition
@@ -6555,7 +8309,18 @@ type internal FcsBridge
                                 if passDefsOnly && passDecl then
                                     nameCount <- nameCount + 1
                                     let k = if u.IsFromDefinition then "definition" else "reference"
-                                    add u k false null null
+                                    add false u k false null null
+
+                            nameIndex <- nameIndex + 1
+
+                    if classificationExpired then
+                        deadline.MarkSemanticExpired()
+
+                        raise (
+                            TimeoutException(
+                                $"The find deadline was exhausted while classifying FCS sites for '{projDisplay}'."
+                            )
+                        )
 
                     projSw.Stop()
                     projectsAnalyzed <- projectsAnalyzed + 1
@@ -6574,8 +8339,32 @@ type internal FcsBridge
                     )
 
                     perProjectKeep.Add(nameCount > 0 || fieldCount > 0 || memberCount > 0)
-                with ex ->
+                    if dottedFieldCount > 0 then
+                        dottedFieldProjectCounts.Add(perProject.Count - 1, dottedFieldCount)
+                with
+                | FindProjectNotStartedException ->
                     projSw.Stop()
+                    projectsNotStarted <- projectsNotStarted + 1
+                    stopStartingProjects <- true
+
+                    perProject.Add(
+                        jobj
+                            [ "project", jstr projDisplay
+                              "fsproj", jstr (normalizePath fsproj)
+                              "status", jstr "not_started"
+                              "errorKind", jstr "deadline_not_started"
+                              "retryable", jbool true
+                              "error",
+                              jstr
+                                  "The end-to-end find deadline expired before this project started."
+                              "elapsedMs", jint 0 ]
+                        :> JsonNode
+                    )
+
+                    perProjectKeep.Add(true)
+                | ex ->
+                    projSw.Stop()
+                    cancellationToken.ThrowIfCancellationRequested()
 
                     let timedOut = findFailureIsTimeout ex
                     let busy = not timedOut && boundedCheckWorkFailureIsBusy ex
@@ -6589,6 +8378,7 @@ type internal FcsBridge
 
                     if timedOut then
                         projectsTimedOut <- projectsTimedOut + 1
+                        stopStartingProjects <- deadline.SemanticExpired
                     elif busy then
                         projectsBusy <- projectsBusy + 1
                     else
@@ -6618,7 +8408,7 @@ type internal FcsBridge
                                       | SdkPreflight.SdkPinUnsatisfiable _ -> "sdk_not_found"
                                       | _ -> "project_failure"
                               )
-                              "retryable", jbool busy
+                              "retryable", jbool (timedOut || busy)
                               "error", jstr ex.Message
                               "elapsedMs", jint (int projSw.ElapsedMilliseconds) ]
                             @ typedFailureFields
@@ -6628,87 +8418,280 @@ type internal FcsBridge
 
                     perProjectKeep.Add(true)
 
+                deadline.Telemetry.SetPhase("unattributed")
+                sweepProjectIndex <- sweepProjectIndex + 1
+
+            if sweepProjectIndex < projectsToSweep.Count then
+                // Scalar coverage remains exact without materializing an unbounded
+                // tail after expiry. This partial ledger cannot produce a cursor.
+                projectsNotStarted <- projectsNotStarted + projectsToSweep.Count - sweepProjectIndex
+
             sweepSw.Stop()
 
-            // scope=file post-filters to args.path's file (still type-checked in-project).
-            let allSites0 = siteByKey.Values |> Seq.toArray
-
-            let allSites =
-                if scope = "file" then
-                    match args.path with
-                    | Some p when not (String.IsNullOrWhiteSpace p) ->
-                        let pf = normalizePath p
-                        allSites0 |> Array.filter (fun s -> String.Equals(s.File, pf, sourcePathComparison))
-                    | _ -> allSites0
-                else
-                    allSites0
-
-            let sortedSites =
-                allSites
-                |> Array.sortBy (fun s -> s.File, s.StartLine, s.StartCol, s.EndLine, s.EndCol, s.Kind)
-
-            let countKind (k: string) =
-                sortedSites |> Array.filter (fun s -> s.Kind = k) |> Array.length
-
-            let defCount = countKind "definition"
-            let refCount = countKind "reference"
-            let fLit = countKind "field-set-literal"
-            let fUpd = countKind "field-set-update"
-            let fMut = countKind "field-set-mutation"
-            let fPat = countKind "field-pattern"
-            let fRead = countKind "field-read"
-            let memCount = countKind "member-usage"
-            let totalSites = sortedSites.Length
-
-            // #207: counted over the FULL matched set (post scope=file filter), not just the
-            // returned page, so "3 of 40 sites could not be typed" stays true across paging.
-            let fieldSiteCount = fLit + fUpd + fMut + fPat + fRead
-
-            let countTypeStatus (status: string) =
-                sortedSites
-                |> Array.filter (fun s -> String.Equals(s.TypeStatus, status, StringComparison.Ordinal))
-                |> Array.length
-
-            let typedSites = countTypeStatus FieldSiteTypes.Typed
-            let unresolvedSites = countTypeStatus FieldSiteTypes.Unresolved
-            let timedOutTypeSites = countTypeStatus FieldSiteTypes.TimedOut
-            let degradedSites = unresolvedSites + timedOutTypeSites
-
-            // #207 review: a SUBSET of `typed`, not a third bucket — the identity
-            // `typed + degraded = fieldSites` still holds. These rows carry a type; what
-            // they also carry is another project's different answer for the same physical
-            // site, in `siteTypeAlternatives`.
-            let multiTypedSites =
-                sortedSites
-                |> Array.filter (fun s -> not (List.isEmpty s.TypeAlternatives))
-                |> Array.length
-
-            let projectsRequested = projectsToSweep.Length
+            // Declared coverage and actual semantic sweep breadth are intentionally
+            // separate. Missing solution members count as requested evidence, but they
+            // never enter the FCS loop and therefore must not inflate projectsSwept.
             let coverageComplete =
                 projectsAnalyzed = projectsRequested
                 && projectsFailed = 0
+                && projectsMissing = 0
                 && projectsTimedOut = 0
                 && projectsBusy = 0
+                && projectsNotStarted = 0
+
+            let scopeResolved =
+                if projectsSwept <= 1 then
+                    if scope = "file" then "file" else "project"
+                else
+                    "workspace"
+
+            if inventoryCollector.IsSome then
+                // Inventory shares discovery/options/snapshot/FCS once per project,
+                // but bypasses source snippets, site projection, FSAC and v2 cursors.
+                deadline.BeginResponseConstruction()
+                let collector = inventoryCollector.Value
+                let queries = inventoryQueries.Value
+
+                let coverage complete =
+                    jobj
+                        [ "complete", jbool complete
+                          "discoveryComplete", jbool (not targetDiscoveryMaterializationTimedOut)
+                          "projectsRequested", jint projectsRequested
+                          "projectsAnalyzed", jint projectsAnalyzed
+                          "projectsFailed", jint projectsFailed
+                          "projectsMissing", jint projectsMissing
+                          "projectsTimedOut", jint projectsTimedOut
+                          "projectsBusy", jint projectsBusy
+                          "projectsNotStarted", jint projectsNotStarted ]
+
+                let blocked errorKind status message =
+                    jobj
+                        [ "status", jstr status
+                          "errorKind", jstr errorKind
+                          "message", jstr message
+                          "countsOnly", jbool true
+                          "aggregation", jstr "per_query"
+                          "countsReturned", jbool false
+                          "countsComplete", jbool false
+                          "countsAreLowerBounds", jbool true
+                          "resultSetComplete", jbool false
+                          "queriesRequested", jint queries.Length
+                          "queriesReturned", jint 0
+                          "queries", JsonArray() :> JsonNode
+                          "coverage", coverage false :> JsonNode
+                          "timeoutMs", jint deadline.TimeoutMs
+                          "responseBudgetChars", jint findResponseBudgetChars
+                          "responseSizeUnit", jstr FindResponseBudget.SizeUnit
+                          "retryable", jbool true
+                          "nextCursor", null
+                          "recovery",
+                          jobj
+                              [ "action", jstr "split_queries_or_narrow_scope"
+                                "instruction",
+                                jstr "Split queries into smaller batches or use scope='project' with one .fsproj; maxResults does not page inventory counts." ]
+                          :> JsonNode ]
+                    :> JsonNode
+
+                let ensureInventoryResponse () =
+                    cancellationToken.ThrowIfCancellationRequested()
+                    if deadline.ResponseExpired then
+                        raise (TimeoutException "Inventory response construction exhausted the find deadline.")
+
+                try
+                    ensureInventoryResponse ()
+                    let pathComparer = if OperatingSystem.IsWindows() then StringComparer.OrdinalIgnoreCase else StringComparer.Ordinal
+                    let ledgerByPath = System.Collections.Generic.Dictionary<string, JsonNode>(pathComparer)
+
+                    for row in perProject do
+                        ensureInventoryResponse ()
+                        ledgerByPath[row["fsproj"].GetValue<string>()] <- row
+
+                    let projectLedger = JsonArray()
+
+                    let addProject index path missing =
+                        ensureInventoryResponse ()
+                        let normalized = normalizePath path
+                        let prior =
+                            match ledgerByPath.TryGetValue normalized with
+                            | true, row -> Some row
+                            | false, _ -> None
+                        let status =
+                            prior
+                            |> Option.map (fun row -> row["status"].GetValue<string>())
+                            |> Option.defaultValue (if missing then "missing" else "not_started")
+                        let node =
+                            jobj
+                                [ "projectIndex", jint index
+                                  "project", jstr (Path.GetFileNameWithoutExtension normalized)
+                                  "fsproj", jstr normalized
+                                  "isTestProject", (if missing then null else jbool (inventoryTestProjects.Contains normalized))
+                                  "status", jstr status
+                                  "countsComplete", jbool (status = "analyzed")
+                                  "elapsedMs",
+                                  prior |> Option.map (fun row -> row["elapsedMs"].DeepClone()) |> Option.defaultValue (jint 0) ]
+                        prior
+                        |> Option.iter (fun row ->
+                            for key in [ "errorKind"; "totalProjectSymbolUses" ] do
+                                if not (isNull row[key]) then node[key] <- row[key].DeepClone())
+                        projectLedger.Add(node :> JsonNode)
+
+                    for index in 0 .. projectsToSweep.Count - 1 do
+                        addProject index projectsToSweep[index] false
+
+                    for index in 0 .. missingProjects.Count - 1 do
+                        addProject (projectsToSweep.Count + index) missingProjects[index] true
+
+                    let response = collector.ToJson(coverageComplete, canContinue = (fun () ->
+                        cancellationToken.ThrowIfCancellationRequested()
+                        not deadline.ResponseExpired))
+                    let countsComplete = response["countsComplete"].GetValue<bool>()
+                    let matched = if collector.HasMatches then Some true elif countsComplete then Some false else None
+                    response["status"] <- jstr (if countsComplete then (if collector.HasMatches then "ok" else "not_found") elif collector.HasMatches then "partial" else "unknown")
+                    response["matched"] <- matched |> Option.map jbool |> Option.defaultValue null
+                    response["outcome"] <- jstr (if collector.HasMatches then "found" elif countsComplete then "not_found" else "indeterminate")
+                    response["resultSetComplete"] <- jbool countsComplete
+                    response["countsReturned"] <- jbool true
+                    response["queriesRequested"] <- jint queries.Length
+                    response["queriesReturned"] <- jint queries.Length
+                    response["projectLedger"] <- projectLedger
+                    response["testProjectDetection"] <- jstr "project_health_heuristic"
+                    response["coverage"] <- coverage countsComplete
+                    response["kindResolved"] <- jstr kindResolved
+                    response["scopeResolved"] <- jstr scopeResolved
+                    response["timeoutMs"] <- jint deadline.TimeoutMs
+                    response["responseConstructionAllowanceMs"] <- jint deadline.ResponseAllowanceMs
+                    response["responseBudgetChars"] <- jint findResponseBudgetChars
+                    response["responseSizeUnit"] <- jstr FindResponseBudget.SizeUnit
+                    response["nextCursor"] <- null
+                    response["fsacFallbackState"] <- jstr "not_applicable_inventory"
+                    ensureInventoryResponse ()
+                    deadline.Telemetry.Attach(response :> JsonNode) |> ignore
+                    let responseLength = response.ToJsonString(mcpRenderOptions).Length
+                    ensureInventoryResponse ()
+
+                    if responseLength > findResponseBudgetChars then
+                        return blocked "find_inventory_response_budget" "aborted" "The complete inventory exceeds the serialized response ceiling; no count rows were delivered."
+                    else
+                        recordMeasuredResponse (response :> JsonNode)
+                        return response :> JsonNode
+                with :? TimeoutException ->
+                    return blocked "find_response_timeout" "unknown" "Inventory counts could not be delivered before the response deadline. No absence claim was made."
+            else
+            let useDottedFields = allowDottedField && not wholeFieldTypeMatched && coverageComplete
+            if useDottedFields then
+                // O(1) selection; per-project response rows are adjusted below under
+                // the response deadline. Incomplete discovery cannot exclude a later
+                // whole-type match, so its provisional shorthand sites are withheld.
+                siteByKey <- dottedFieldSites
 
             // HEADLINE: a positive site is always useful, but absence is conclusive
             // only when every requested FCS project completed. FSAC outcomes remain
             // typed so not-ready/mismatch/failure cannot masquerade as zero hits.
+            // scope=file sites are filtered while they enter siteByKey, so determining
+            // whether the semantic sweep hit anything is O(1) and happens before the
+            // response-construction allowance begins. No post-sweep materialization is
+            // allowed to hide before that boundary.
+            let totalSites = siteByKey.Count
             let fcsMatched = totalSites > 0
+
+            let mutable fsacFallbackTimedOut = false
+            let mutable fsacFallbackNotStarted = false
 
             let! fsacProbeResult =
                 task {
-                    if fcsMatched then
+                    if fcsMatched || kindResolved = "field" then
+                        // A workspace-symbol count is not evidence of a field USE.
+                        // Even a real unused declaration must not turn zero sites into
+                        // matched=true. Field-only results rely exclusively on FCS sites.
                         return FindFsacProbeResult.Unavailable "not_needed"
+                    elif targetDiscoveryMaterializationTimedOut then
+                        fsacFallbackNotStarted <- true
+
+                        return
+                            FindFsacProbeResult.Unavailable
+                                "The find deadline expired while materializing discovered projects; the zero-hit FSAC fallback was not started."
+                    elif deadline.SemanticExpired then
+                        fsacFallbackTimedOut <- true
+
+                        return
+                            FindFsacProbeResult.Unavailable
+                                "The end-to-end find deadline expired before the zero-hit FSAC fallback started."
                     else
                         match fsacProbe with
                         | Some probe ->
                             try
-                                return! probe query
-                            with ex ->
+                                deadline.Telemetry.SetPhase("fsacFallback")
+                                ensureCanStart "the zero-hit FSAC fallback"
+                                let operation = probe query
+                                return! awaitWithinDeadline "the zero-hit FSAC fallback" false operation
+                            with
+                            | :? TimeoutException as ex ->
+                                fsacFallbackTimedOut <- true
+                                return FindFsacProbeResult.Unavailable ex.Message
+                            | ex ->
+                                cancellationToken.ThrowIfCancellationRequested()
                                 return FindFsacProbeResult.Failed ex.Message
                         | None ->
                             return FindFsacProbeResult.Unavailable "No FSAC probe was supplied."
                 }
+
+            // Semantic work ends with the zero-hit fallback. Everything below is response
+            // shaping and shares one fixed allowance, beginning before even the fallback
+            // result is normalized. A test-only asynchronous seam can deterministically
+            // occupy that allowance; production construction remains synchronous and
+            // checks the monotonic response deadline between bounded rows/steps.
+            deadline.BeginResponseConstruction()
+            let mutable responseConstructionTimedOut = deadline.ResponseExpired
+
+            match findResponseConstructionBeforeStartOverride with
+            | Some beforeStart when not responseConstructionTimedOut ->
+                let operation = beforeStart ()
+                observeFault operation
+                let remaining = deadline.RemainingResponseBudget()
+
+                if remaining <= TimeSpan.Zero then
+                    responseConstructionTimedOut <- true
+                else
+                    use responseWaitCancellation =
+                        CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+
+                    let contenders =
+                        match deadline.ResponseExpirySignal with
+                        | Some signal -> [| operation; Task.Delay(remaining, responseWaitCancellation.Token); signal |]
+                        | None -> [| operation; Task.Delay(remaining, responseWaitCancellation.Token) |]
+
+                    let! winner =
+                        Task.WhenAny(contenders)
+
+                    responseWaitCancellation.Cancel()
+
+                    if Object.ReferenceEquals(winner, operation) then
+                        do! operation
+                        responseConstructionTimedOut <- deadline.ResponseExpired
+                    else
+                        cancellationToken.ThrowIfCancellationRequested()
+                        responseConstructionTimedOut <- true
+            | _ -> ()
+
+            let responseStep phase index =
+                cancellationToken.ThrowIfCancellationRequested()
+
+                findResponseConstructionBeforeStepOverride
+                |> Option.iter (fun beforeStep -> beforeStep phase index)
+
+                if deadline.ResponseExpired then
+                    responseConstructionTimedOut <- true
+                    false
+                else
+                    true
+
+            if useDottedFields then
+                let mutable projectIndex = 0
+                while projectIndex < dottedFieldProjectCounts.Count && responseStep "field-selection" projectIndex do
+                    let rowIndex, count = dottedFieldProjectCounts[projectIndex]
+                    perProject[rowIndex]["fieldMatchUses"] <- jint count
+                    perProjectKeep[rowIndex] <- true
+                    projectIndex <- projectIndex + 1
 
             let fsacHits, fsacFallbackState, fsacFallbackReason =
                 match fsacProbeResult with
@@ -6718,13 +8701,21 @@ type internal FcsBridge
                 | FindFsacProbeResult.NotReady reason -> 0, "not_ready", Some reason
                 | FindFsacProbeResult.ContextMismatch reason -> 0, "context_mismatch", Some reason
                 | FindFsacProbeResult.Failed reason -> 0, "failed", Some reason
+                | _ when fsacFallbackTimedOut ->
+                    0,
+                    "timed_out",
+                    Some "The zero-hit FSAC fallback did not complete inside find's shared deadline."
+                | _ when fsacFallbackNotStarted ->
+                    0,
+                    "not_started",
+                    Some "The zero-hit FSAC fallback was not started after target discovery expired."
                 | FindFsacProbeResult.Unavailable "not_needed" -> 0, "not_needed", None
                 | FindFsacProbeResult.Unavailable reason -> 0, "unavailable", Some reason
 
             let matched: bool option =
                 if fcsMatched || fsacHits > 0 then
                     Some true
-                elif coverageComplete then
+                elif coverageComplete && not fsacFallbackTimedOut then
                     Some false
                 else
                     None
@@ -6736,7 +8727,7 @@ type internal FcsBridge
                 | None -> "indeterminate"
 
             let responseStatus =
-                if coverageComplete then
+                if coverageComplete && not fsacFallbackTimedOut then
                     "succeeded"
                 elif matched = Some true then
                     "partial"
@@ -6746,40 +8737,251 @@ type internal FcsBridge
             let via =
                 if fcsMatched then "fcs-multiproject-sweep"
                 elif fsacHits > 0 then "fsac-symbol-index"
+                elif targetDiscoveryMaterializationTimedOut then "incomplete-target-discovery"
+                elif fsacFallbackTimedOut then "incomplete-fsac-fallback"
                 elif coverageComplete then "none"
                 else "incomplete-fcs-sweep"
 
             let completenessMessage =
+                let failureSummary = coverageFailureSummary ()
+
                 match responseStatus with
                 | "partial" ->
                     Some
                         $"Matches were found, but only %d{projectsAnalyzed}/%d{projectsRequested} requested project(s) were analyzed; the result set may be incomplete."
                 | "unknown" ->
-                    Some
-                        $"Cannot confirm absence: only %d{projectsAnalyzed}/%d{projectsRequested} requested project(s) were analyzed (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy)."
+                    if targetDiscoveryMaterializationTimedOut then
+                        Some
+                            "Cannot confirm absence: the find deadline expired while materializing discovered projects, before the FCS sweep started."
+                    elif fsacFallbackTimedOut then
+                        Some
+                            "Cannot confirm absence: the FCS sweep returned zero sites, but the zero-hit FSAC fallback did not complete inside the shared deadline."
+                    else
+                        Some
+                            $"Cannot confirm absence: only %d{projectsAnalyzed}/%d{projectsRequested} requested project(s) were analyzed (%s{failureSummary})."
                 | _ -> None
 
-            let pageSites =
-                sortedSites |> Array.skip (min pageOffset totalSites) |> Array.truncate pageSize
+            // Response shaping begins at the boundary above. Build the ordered index and
+            // all counters in ONE pass, checking the response deadline before every bounded
+            // dictionary/ordered-set step. This replaces materialize + sort + eleven full
+            // array scans that previously ran before BeginResponseConstruction.
+            let siteKeyComparer =
+                System.Collections.Generic.Comparer<
+                    struct (string * int * int * int * int * string)
+                 >.Create(fun
+                              (struct (leftFile, leftStartLine, leftStartCol, leftEndLine, leftEndCol, leftKind))
+                              (struct (rightFile, rightStartLine, rightStartCol, rightEndLine, rightEndCol, rightKind)) ->
+                    let byFile = StringComparer.Ordinal.Compare(leftFile, rightFile)
 
-            // Project coverage and response delivery are separate dimensions. A complete
-            // sweep can still return only one cursor page; in that case the caller has not
-            // received the complete site set yet. Cursor pages after the first also omit
-            // earlier sites even when `truncated=false` on the final page.
-            let resolutionComplete =
-                coverageComplete && pageOffset = 0 && pageSites.Length = totalSites
+                    if byFile <> 0 then
+                        byFile
+                    else
+                        let byStartLine = compare leftStartLine rightStartLine
 
-            let lineContextCache = System.Collections.Generic.Dictionary<string, string array>()
+                        if byStartLine <> 0 then
+                            byStartLine
+                        else
+                            let byStartCol = compare leftStartCol rightStartCol
 
-            // #207 review: the alternatives column is the one part of a row whose size is not
-            // bounded by a per-value cap — it grows with the number of projects a linked file
-            // is compiled by. Spend a fixed page allowance in row order (siteToJson runs
-            // sequentially over pageSites, so this is deterministic); once it is gone, rows
-            // keep the count and drop the strings. Charged against what was actually rendered,
-            // not an estimate.
-            let mutable alternativesBudget = FieldSiteTypes.AlternativesPageBudgetChars
-            let mutable alternativesTruncatedRows = 0
+                            if byStartCol <> 0 then
+                                byStartCol
+                            else
+                                let byEndLine = compare leftEndLine rightEndLine
 
+                                if byEndLine <> 0 then
+                                    byEndLine
+                                else
+                                    let byEndCol = compare leftEndCol rightEndCol
+
+                                    if byEndCol <> 0 then
+                                        byEndCol
+                                    else
+                                        StringComparer.Ordinal.Compare(leftKind, rightKind))
+
+            let sortedSiteIndex =
+                System.Collections.Generic.SortedDictionary<
+                    struct (string * int * int * int * int * string),
+                    _
+                 >(siteKeyComparer)
+
+            let mutable defCount = 0
+            let mutable refCount = 0
+            let mutable fLit = 0
+            let mutable fUpd = 0
+            let mutable fMut = 0
+            let mutable fPat = 0
+            let mutable fRead = 0
+            let mutable memCount = 0
+            let mutable typedSites = 0
+            let mutable unresolvedSites = 0
+            let mutable timedOutTypeSites = 0
+            let mutable multiTypedSites = 0
+
+            if not responseConstructionTimedOut then
+                use sites = (siteByKey.Values :> seq<_>).GetEnumerator()
+                let mutable shapingIndex = 0
+                let mutable keepShaping = true
+
+                while keepShaping && not responseConstructionTimedOut do
+                    if not (responseStep "post-sweep-shaping" shapingIndex) then
+                        keepShaping <- false
+                    elif sites.MoveNext() then
+                        let site = sites.Current
+
+                        sortedSiteIndex.Add(
+                            struct (
+                                site.File,
+                                site.StartLine,
+                                site.StartCol,
+                                site.EndLine,
+                                site.EndCol,
+                                site.Kind
+                            ),
+                            site
+                        )
+
+                        match site.Kind with
+                        | "definition" -> defCount <- defCount + 1
+                        | "reference" -> refCount <- refCount + 1
+                        | "field-set-literal" -> fLit <- fLit + 1
+                        | "field-set-update" -> fUpd <- fUpd + 1
+                        | "field-set-mutation" -> fMut <- fMut + 1
+                        | "field-pattern" -> fPat <- fPat + 1
+                        | "field-read" -> fRead <- fRead + 1
+                        | "member-usage" -> memCount <- memCount + 1
+                        | _ -> ()
+
+                        match site.TypeStatus with
+                        | status when String.Equals(status, FieldSiteTypes.Typed, StringComparison.Ordinal) ->
+                            typedSites <- typedSites + 1
+                        | status when String.Equals(status, FieldSiteTypes.Unresolved, StringComparison.Ordinal) ->
+                            unresolvedSites <- unresolvedSites + 1
+                        | status when String.Equals(status, FieldSiteTypes.TimedOut, StringComparison.Ordinal) ->
+                            timedOutTypeSites <- timedOutTypeSites + 1
+                        | _ -> ()
+
+                        if not (List.isEmpty site.TypeAlternatives) then
+                            multiTypedSites <- multiTypedSites + 1
+
+                        shapingIndex <- shapingIndex + 1
+                    else
+                        keepShaping <- false
+
+            // Counts already accumulated remain useful lower bounds. Capture their
+            // completeness here: later context/planner expiry cannot undo a full count.
+            let breakdownComplete = not responseConstructionTimedOut
+
+            if responseConstructionTimedOut then
+                sortedSiteIndex.Clear()
+
+            // #207: these counts cover the full scoped result, not just this cursor page.
+            let fieldSiteCount = fLit + fUpd + fMut + fPat + fRead
+            let degradedSites = unresolvedSites + timedOutTypeSites
+
+            let canonicalSites = ResizeArray<_>()
+
+            if not responseConstructionTimedOut then
+                use orderedSites = (sortedSiteIndex.Values :> seq<_>).GetEnumerator()
+                let mutable sortedIndex = 0
+                let mutable keepSelecting = true
+
+                while
+                    keepSelecting
+                    && not responseConstructionTimedOut
+                    do
+                    if not (responseStep "page-selection" sortedIndex) then
+                        keepSelecting <- false
+                    elif orderedSites.MoveNext() then
+                        canonicalSites.Add(orderedSites.Current)
+                        sortedIndex <- sortedIndex + 1
+                    else
+                        keepSelecting <- false
+
+            if responseConstructionTimedOut then
+                canonicalSites.Clear()
+
+            // Union the complete canonical stream's source windows before reading.
+            // Reopening a file for each site would rescan every earlier line
+            // O(sites * file length) and consume the bounded response allowance on
+            // large files. Each file is streamed once; only requested lines survive,
+            // and each site's own columns shape its snippet.
+            let appliedContextLines = min (max 0 contextLines) FindResponseBudget.MaxContextLines
+            let requestedSourceLines =
+                System.Collections.Generic.Dictionary<string, System.Collections.Generic.SortedSet<int>>(StringComparer.Ordinal)
+
+            let mutable sourceWindowIndex = 0
+
+            while sourceWindowIndex < canonicalSites.Count && not responseConstructionTimedOut do
+                if responseStep "line-context-selection" sourceWindowIndex then
+                    let site = canonicalSites[sourceWindowIndex]
+                    let filePath = normalizePath site.File
+                    let selected =
+                        match requestedSourceLines.TryGetValue(filePath) with
+                        | true, lines -> lines
+                        | false, _ ->
+                            let lines = System.Collections.Generic.SortedSet<int>()
+                            requestedSourceLines.Add(filePath, lines)
+                            lines
+
+                    let targetLine = max 1 site.StartLine
+
+                    for lineNumber in max 1 (targetLine - appliedContextLines) .. targetLine + appliedContextLines do
+                        selected.Add(lineNumber) |> ignore
+
+                    sourceWindowIndex <- sourceWindowIndex + 1
+
+            let lineContextCache =
+                System.Collections.Generic.Dictionary<
+                    string,
+                    System.Collections.Generic.IReadOnlyDictionary<int, string>
+                 >(StringComparer.Ordinal)
+
+            use sourceFiles = (requestedSourceLines :> seq<_>).GetEnumerator()
+            let mutable sourceFileIndex = 0
+
+            while not responseConstructionTimedOut && sourceFiles.MoveNext() do
+                if responseStep "line-context-file" sourceFileIndex then
+                    let filePath = sourceFiles.Current.Key
+                    let requested = sourceFiles.Current.Value
+                    let lastLine = requested.Max
+                    let selected = System.Collections.Generic.Dictionary<int, string>()
+
+                    if File.Exists filePath then
+                        use lines = File.ReadLines(filePath).GetEnumerator()
+                        let mutable lineNumber = 1
+                        let mutable reachedEnd = false
+
+                        while lineNumber <= lastLine && not reachedEnd && not responseConstructionTimedOut do
+                            if responseStep "line-context" lineNumber then
+                                if lines.MoveNext() then
+                                    if requested.Contains(lineNumber) then
+                                        selected.Add(lineNumber, lines.Current)
+
+                                    lineNumber <- lineNumber + 1
+                                else
+                                    reachedEnd <- true
+
+                    lineContextCache.Add(filePath, selected)
+                    sourceFileIndex <- sourceFileIndex + 1
+
+            let tryLineContextToJson filePath startLine startColumn endLine endColumn =
+                if not (responseStep "line-context-json" startLine) then
+                    None
+                else
+                    match lineContextCache.TryGetValue(normalizePath filePath) with
+                    | true, lines ->
+                        let context = findLineContextToJson lines contextLines startLine startColumn endLine endColumn
+
+                        if responseStep "line-context-json-complete" startLine then
+                            Some context
+                        else
+                            None
+                    | false, _ -> None
+
+            // Canonical row projection: every field of one site is derived only from that site
+            // and the request's content options. In particular, alternatives use deterministic
+            // per-site caps rather than a shared page allowance, so maxResults, cursor position,
+            // and the final response-budget boundary cannot reshape a row.
             let siteToJson (s: {| File: string
                                   StartLine: int
                                   StartCol: int
@@ -6790,9 +8992,9 @@ type internal FcsBridge
                                   FullName: string
                                   SiteType: string
                                   TypeStatus: string
-                                  TypeAlternatives: (string * string) list |}) =
-                let ctx = lineContextToJson lineContextCache contextLines s.File s.StartLine
-
+                                  TypeAlternatives: (string * string) list |})
+                (ctx: JsonNode)
+                =
                 let rangeNode =
                     jobj
                         [ "startLine", jint s.StartLine
@@ -6807,44 +9009,46 @@ type internal FcsBridge
                 // restores the richer surrounding-code output.
                 let contextFields =
                     if contextLines > 0 then
-                        [ "before", ctx["before"].DeepClone(); "after", ctx["after"].DeepClone() ]
+                        [ "contextLinesRequested", ctx["contextLinesRequested"].DeepClone()
+                          "contextLinesApplied", ctx["contextLinesApplied"].DeepClone()
+                          "contextLinesTruncated", ctx["contextLinesTruncated"].DeepClone()
+                          "before", ctx["before"].DeepClone()
+                          "after", ctx["after"].DeepClone() ]
                     else
                         []
 
                 // #207: see FieldSiteTypes.rowFields — extracted so its degraded (JSON null)
                 // arm is unit-testable, which inline here it was not.
-                let withinAlternativesBudget = alternativesBudget > 0
+                let alternativeFields = FieldSiteTypes.alternativesFields includeSiteTypes s.TypeAlternatives
 
-                let alternativeFields =
-                    FieldSiteTypes.alternativesFields includeSiteTypes withinAlternativesBudget s.TypeAlternatives
-
-                for _, node in alternativeFields do
-                    if not (isNull node) then
-                        alternativesBudget <- alternativesBudget - node.ToJsonString().Length
-
-                if
+                let alternativesWereTruncated =
                     includeSiteTypes
-                    && FieldSiteTypes.alternativesTruncated withinAlternativesBudget s.TypeAlternatives
-                then
-                    alternativesTruncatedRows <- alternativesTruncatedRows + 1
+                    && FieldSiteTypes.alternativesTruncated s.TypeAlternatives
 
                 let siteTypeFields =
                     FieldSiteTypes.rowFields includeSiteTypes s.SiteType s.TypeStatus
                     @ alternativeFields
 
-                jobj
-                    ([ "file", jstr s.File
-                       "range", rangeNode
-                       "kind", jstr s.Kind
-                       "project", jstr s.Project
-                       "symbolFullName",
-                       (match s.FullName with
-                        | null -> null
-                        | v -> jstr v)
-                       "lineText", ctx["lineText"].DeepClone() ]
-                     @ siteTypeFields
-                     @ contextFields)
-                :> JsonNode
+                let node =
+                    jobj
+                        ([ "file", jstr s.File
+                           "range", rangeNode
+                           "kind", jstr s.Kind
+                           "project", jstr s.Project
+                           "symbolFullName",
+                           (match s.FullName with
+                            | null -> null
+                            | v -> jstr v)
+                           "lineText", ctx["lineText"].DeepClone()
+                           "lineTextSourceStartColumn", ctx["lineTextSourceStartColumn"].DeepClone()
+                           "lineTextSourceEndColumn", ctx["lineTextSourceEndColumn"].DeepClone()
+                           "lineTextSourceLength", ctx["lineTextSourceLength"].DeepClone()
+                           "lineTextTruncated", ctx["lineTextTruncated"].DeepClone() ]
+                         @ siteTypeFields
+                         @ contextFields)
+                    :> JsonNode
+
+                node, alternativesWereTruncated
 
             // One self-describing representation per site: each node carries
             // file / range / kind / project / symbolFullName / lineText, so an agent
@@ -6852,26 +9056,129 @@ type internal FcsBridge
             // counts. The grouped definitions/references/fieldSites/memberSites buckets
             // were dropped — they re-emitted every site a second time and doubled the
             // payload (the reason the default page cap had been forced down to 40).
-            let siteNodes = pageSites |> Array.map siteToJson
+            let siteNodeBuffer = ResizeArray<JsonNode>()
+            let alternativesTruncatedBuffer = ResizeArray<bool>()
+            let mutable responseSiteIndex = 0
 
-            // Aggregated diagnostics across swept projects: Error always (so callers can
-            // detect broken projects even on zero hits), Warning/Info gated by includeInfo.
-            let diagNodes =
-                aggregatedDiagnostics.ToArray()
-                |> Array.filter (fun d ->
-                    d.Severity = FSharpDiagnosticSeverity.Error
-                    || (includeInfo
-                        && (d.Severity = FSharpDiagnosticSeverity.Warning
-                            || d.Severity = FSharpDiagnosticSeverity.Hidden
-                            || d.Severity = FSharpDiagnosticSeverity.Info)))
-                |> Array.truncate 200
-                |> Array.map diagnosticToJson
-
-            let scopeResolved =
-                if projectsToSweep.Length <= 1 then
-                    if scope = "file" then "file" else "project"
+            while responseSiteIndex < canonicalSites.Count && not responseConstructionTimedOut do
+                if not (responseStep "site-json" responseSiteIndex) then
+                    responseConstructionTimedOut <- true
                 else
-                    "workspace"
+                    let site = canonicalSites[responseSiteIndex]
+
+                    match tryLineContextToJson site.File site.StartLine site.StartCol site.EndLine site.EndCol with
+                    | None -> responseConstructionTimedOut <- true
+                    | Some context ->
+                        let node, alternativesTruncated = siteToJson site context
+
+                        if responseStep "site-json-complete" responseSiteIndex then
+                            siteNodeBuffer.Add(node)
+                            alternativesTruncatedBuffer.Add(alternativesTruncated)
+                            responseSiteIndex <- responseSiteIndex + 1
+
+            if deadline.ResponseExpired then
+                responseConstructionTimedOut <- true
+
+            let allCanonicalSites = canonicalSites.ToArray()
+            let allCanonicalSiteNodes = siteNodeBuffer.ToArray()
+            let allAlternativesTruncatedBySite = alternativesTruncatedBuffer.ToArray()
+
+            let mutable resolutionComplete =
+                coverageComplete
+                && not fsacFallbackTimedOut
+                && not responseConstructionTimedOut
+                && pageOffset = 0
+                && allCanonicalSiteNodes.Length = totalSites
+
+            // Count every eligible raw diagnostic within the deadline, retaining at most
+            // 200 rows before JSON projection. A timed-out count is explicitly incomplete.
+            let diagnosticPrefix = ResizeArray<FSharpDiagnostic>(200)
+            let canonicalDiagnosticRows = ResizeArray<JsonNode>()
+            let mutable projectDiagnosticsTotalCount = 0
+            let mutable diagnosticIndex = 0
+
+            while diagnosticIndex < aggregatedDiagnostics.Count && not responseConstructionTimedOut do
+                if not (responseStep "diagnostic-collection" diagnosticIndex) then
+                    responseConstructionTimedOut <- true
+                else
+                    let diagnosticProject, diagnostic = aggregatedDiagnostics[diagnosticIndex]
+
+                    if
+                        diagnostic.Severity = FSharpDiagnosticSeverity.Error
+                        || (includeInfo
+                            && (diagnostic.Severity = FSharpDiagnosticSeverity.Warning
+                                || diagnostic.Severity = FSharpDiagnosticSeverity.Hidden
+                                || diagnostic.Severity = FSharpDiagnosticSeverity.Info))
+                    then
+                        projectDiagnosticsTotalCount <- projectDiagnosticsTotalCount + 1
+
+                        canonicalDiagnosticRows.Add(
+                            jobj
+                                [ "project", jstr diagnosticProject
+                                  "file", jstr (normalizePath diagnostic.FileName)
+                                  "code", jstr diagnostic.ErrorNumberText
+                                  "severity", jstr (diagnostic.Severity.ToString())
+                                  "range", rangeToJsonNoFile diagnostic.Range
+                                  "messageIdentity", jstr (Cursor.textIdentityV2 diagnostic.Message) ]
+                            :> JsonNode
+                        )
+
+                        if diagnosticPrefix.Count < 200 then
+                            diagnosticPrefix.Add(diagnostic)
+
+                    diagnosticIndex <- diagnosticIndex + 1
+
+            let ensureResponseStep phase index =
+                if not (responseStep phase index) then
+                    raise (TimeoutException("The find response-construction deadline expired."))
+
+            let initialDiagNodes =
+                if responseConstructionTimedOut then
+                    [||]
+                else
+                    try
+                        let mutable jsonIndex = 0
+                        let mapDiagnostic diagnostic =
+                            ensureResponseStep "diagnostic-json" jsonIndex
+                            jsonIndex <- jsonIndex + 1
+                            diagnosticToJson diagnostic
+
+                        let _, nodes =
+                            FindResponseBudget.materializeCappedPrefix
+                                200
+                                mapDiagnostic
+                                (diagnosticPrefix.ToArray())
+
+                        nodes
+                    with :? TimeoutException ->
+                        responseConstructionTimedOut <- true
+                        [||]
+
+            // Apply metadata filtering before freezing the phase ledger. Cloning happens
+            // only for the bounded prefixes selected by the response planner below.
+            let isErrorEntry (node: JsonNode) =
+                match node with
+                | :? JsonObject as o -> o.ContainsKey("error")
+                | _ -> false
+
+            let retainedPerProject = ResizeArray<JsonNode>()
+            let mutable perProjectIndex = 0
+
+            while perProjectIndex < perProject.Count && not responseConstructionTimedOut do
+                if not (responseStep "per-project" perProjectIndex) then
+                    responseConstructionTimedOut <- true
+                else
+                    let node = perProject[perProjectIndex]
+                    let keep = if includePerProject then perProjectKeep[perProjectIndex] else isErrorEntry node
+
+                    if keep then
+                        retainedPerProject.Add(node)
+
+                    perProjectIndex <- perProjectIndex + 1
+
+            if deadline.ResponseExpired then
+                responseConstructionTimedOut <- true
+                resolutionComplete <- false
 
             let matchedNode =
                 match matched with
@@ -6879,28 +9186,85 @@ type internal FcsBridge
                 | None -> null
 
             let coverage =
+                let projectSweepStatus =
+                    if targetDiscoveryMaterializationTimedOut then
+                        "not_started"
+                    elif coverageComplete then
+                        "complete"
+                    elif projectsTimedOut > 0 && deadline.SemanticExpired then
+                        "timed_out"
+                    else
+                        "partial"
+
+                let fsacFallbackPhaseStatus =
+                    if fcsMatched || kindResolved = "field" then
+                        "not_needed"
+                    elif fsacFallbackNotStarted then
+                        "not_started"
+                    elif fsacFallbackTimedOut then
+                        "timed_out"
+                    else
+                        "complete"
+
+                let phases =
+                    JsonArray(
+                        [| jobj [ "phase", jstr "admission"; "status", jstr "complete" ] :> JsonNode
+                           jobj
+                               [ "phase", jstr "position_resolution"
+                                 "status", jstr (if kind = "position" then "complete" else "not_needed") ]
+                           :> JsonNode
+                           jobj
+                               [ "phase", jstr "target_discovery"
+                                 "status",
+                                 jstr (
+                                     if targetDiscoveryMaterializationTimedOut then
+                                         "timed_out"
+                                     else
+                                         "complete"
+                                 ) ]
+                           :> JsonNode
+                           jobj [ "phase", jstr "project_sweep"; "status", jstr projectSweepStatus ] :> JsonNode
+                           jobj
+                               [ "phase", jstr "fsac_fallback"
+                                 "status", jstr fsacFallbackPhaseStatus ]
+                           :> JsonNode
+                           jobj
+                               [ "phase", jstr "response_construction"
+                                 "status",
+                                 jstr (if responseConstructionTimedOut then "timed_out" else "complete") ]
+                           :> JsonNode |]
+                    )
+                    :> JsonNode
+
                 jobj
                     [ "complete", jbool coverageComplete
                       "projectsRequested", jint projectsRequested
                       "projectsAnalyzed", jint projectsAnalyzed
                       "projectsFailed", jint projectsFailed
+                      "projectsMissing", jint projectsMissing
                       "projectsTimedOut", jint projectsTimedOut
-                      "projectsBusy", jint projectsBusy ]
+                      "projectsBusy", jint projectsBusy
+                      "projectsNotStarted", jint projectsNotStarted
+                      "phases", phases ]
                 :> JsonNode
 
             let resolution =
                 jobj
                     [ "matched", matchedNode
                       "outcome", jstr outcome
-                      "complete", jbool resolutionComplete
+                      // Finalized after the serialized-size planner chooses the delivered
+                      // site prefix. Coverage and delivery completeness are independent.
+                      "complete", jbool false
                       "kindResolved", jstr kindResolved
                       "scopeResolved", jstr scopeResolved
-                      "projectsSwept", jint projectsRequested
+                      "projectsSwept", jint projectsSwept
                       "projectsRequested", jint projectsRequested
                       "projectsAnalyzed", jint projectsAnalyzed
                       "projectsFailed", jint projectsFailed
+                      "projectsMissing", jint projectsMissing
                       "projectsTimedOut", jint projectsTimedOut
                       "projectsBusy", jint projectsBusy
+                      "projectsNotStarted", jint projectsNotStarted
                       "via", jstr via
                       "fcsSiteCount", jint totalSites
                       "fsacFallbackHits", jint fsacHits
@@ -6928,8 +9292,54 @@ type internal FcsBridge
             // #207: the honesty ledger for includeSiteTypes. `typed + degraded` must always
             // equal `fieldSites`, so a caller can tell "every site carries its type" from
             // "some rows are blank" without diffing the sites array.
-            let siteTypesFields =
-                if not includeSiteTypes then
+            let siteTypesNote alternativesTruncatedRows =
+                if fieldSiteCount = 0 && not coverageComplete then
+                    let failureSummary = coverageFailureSummary ()
+
+                    // Do not blame the caller's `kind` for an empty result the sweep
+                    // never got far enough to produce — coverage is the real story.
+                    $"No field site was typed because the sweep is incomplete: %d{projectsAnalyzed} of %d{projectsRequested} project(s) were analyzed (%s{failureSummary}). See coverage/message; restore missing projects, retry busy work, or re-run with a larger timeoutMs before reading anything into the empty result."
+                elif fieldSiteCount = 0 then
+                    // Advice must name a NEXT step the caller has not already taken.
+                    // Telling a kind='auto'/'field' caller to "use kind='field' or
+                    // kind='auto'" is circular, and a kind='position' caller sees
+                    // kindResolved='symbol' (position folds into the symbol sweep),
+                    // so each entry point gets the step that actually differs.
+                    let recipe =
+                        match kind, kindResolved with
+                        | "position", _ ->
+                            "kind='position' resolves the symbol under the cursor and then sweeps it as kind='symbol', which never unions field sites. Re-run with kind='field' and the resolved name as query (echoed above as `query`)."
+                        | _, "field" ->
+                            "Use the declaring record type as query and an optional field selector, for example query='Card', field='Name'; exact Type.Field shorthand is also accepted when no field selector is supplied. Bare field names are not resolved across records. Zero use sites do not prove that a field declaration is absent."
+                        | _, "auto" ->
+                            $"The query already unioned field sites — '%s{query}' simply matches no record field here. Check the declaring type name (find matches fields by their DECLARING type, not the field name), drop field='…' if it is over-restricting, or pass exact=false for a substring match on the type."
+                        | _ ->
+                            "Re-run with kind='field' (optionally with field='Name') or kind='auto', which union record-field sites; this kind does not."
+
+                    $"includeSiteTypes annotates record-field sites only, and this sweep produced none (kindResolved='%s{kindResolved}'). %s{recipe}"
+                else
+                    let degradedClause =
+                        if degradedSites = 0 then
+                            "Every field site is typed."
+                        else
+                            $"%d{degradedSites} of %d{fieldSiteCount} field sites could not be typed (%d{unresolvedSites} unresolved, %d{timedOutTypeSites} past the timeoutMs budget) and carry siteType: null."
+
+                    let multiClause =
+                        if multiTypedSites = 0 then
+                            ""
+                        else
+                            let truncationClause =
+                                if alternativesTruncatedRows = 0 then
+                                    ""
+                                else
+                                    $" On {alternativesTruncatedRows} delivered row(s) the column hit its deterministic per-site cap and carries siteTypeAlternativesOmitted and/or projectsOmitted counts instead of the full list — narrow with scope/projectPath to reduce the competing project interpretations."
+
+                            $" {multiTypedSites} site(s) are compiled by more than one swept project and resolved to DIFFERENT types: siteType/project report the first project's answer and siteTypeAlternatives names each other type with the project(s) that resolved it — plan those sites per project, not from one type.{truncationClause}"
+
+                    $"siteType is the field's type as the CURRENT typecheck resolves it at that site, rendered with that site's own opens — the BEFORE half of a field-type change. {degradedClause}{multiClause} find deliberately does NOT typecheck a hypothetical new record shape: edit every site listed here, then run check(scope='project') for the AFTER verdict. On a generic record the type shows as the type PARAMETER (e.g. 'T), not its instantiation at the site."
+
+            let siteTypesFields alternativesTruncatedRows =
+                if responseConstructionTimedOut || not includeSiteTypes then
                     []
                 else
                     let summary =
@@ -6942,92 +9352,179 @@ type internal FcsBridge
                               "degradedTimedOut", jint timedOutTypeSites
                               // Subset of `typed`; see multiTypedSites.
                               "typedDifferentlyByAnotherProject", jint multiTypedSites
-                              // Rows on THIS page where the alternatives column hit a cap or
-                              // the page allowance and rendered a count instead of the
-                              // strings — a truncation the caller can see, not infer.
+                              // Rows on THIS page where the alternatives column hit its
+                              // deterministic per-site cap — a truncation the caller can see,
+                              // not infer. Page boundaries never reshape a site's alternatives.
                               "alternativesTruncatedRows", jint alternativesTruncatedRows ]
                         :> JsonNode
 
-                    let note =
-                        if fieldSiteCount = 0 && not coverageComplete then
-                            // Do not blame the caller's `kind` for an empty result the sweep
-                            // never got far enough to produce — coverage is the real story.
-                            $"No field site was typed because the sweep is incomplete: %d{projectsAnalyzed} of %d{projectsRequested} project(s) were analyzed (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy). See coverage/message; retry busy work or re-run with a larger timeoutMs before reading anything into the empty result."
-                        elif fieldSiteCount = 0 then
-                            // Advice must name a NEXT step the caller has not already taken.
-                            // Telling a kind='auto'/'field' caller to "use kind='field' or
-                            // kind='auto'" is circular, and a kind='position' caller sees
-                            // kindResolved='symbol' (position folds into the symbol sweep),
-                            // so each entry point gets the step that actually differs.
-                            let recipe =
-                                match kind, kindResolved with
-                                | "position", _ ->
-                                    "kind='position' resolves the symbol under the cursor and then sweeps it as kind='symbol', which never unions field sites. Re-run with kind='field' and the resolved name as query (echoed above as `query`)."
-                                | _, ("field" | "auto") ->
-                                    $"The query already unioned field sites — '%s{query}' simply matches no record field here. Check the declaring type name (find matches fields by their DECLARING type, not the field name), drop field='…' if it is over-restricting, or pass exact=false for a substring match on the type."
-                                | _ ->
-                                    "Re-run with kind='field' (optionally with field='Name') or kind='auto', which union record-field sites; this kind does not."
+                    [ ("siteTypes", summary)
+                      ("siteTypesNote", jstr (siteTypesNote alternativesTruncatedRows)) ]
 
-                            $"includeSiteTypes annotates record-field sites only, and this sweep produced none (kindResolved='%s{kindResolved}'). %s{recipe}"
-                        else
-                            let degradedClause =
-                                if degradedSites = 0 then
-                                    "Every field site is typed."
-                                else
-                                    $"%d{degradedSites} of %d{fieldSiteCount} field sites could not be typed (%d{unresolvedSites} unresolved, %d{timedOutTypeSites} past the timeoutMs budget) and carry siteType: null."
+            let perProjectNodes = retainedPerProject.ToArray()
+            let emitPerProject = includePerProject || perProjectNodes.Length > 0
 
-                            let multiClause =
-                                if multiTypedSites = 0 then
-                                    ""
-                                else
-                                    let truncationClause =
-                                        if alternativesTruncatedRows = 0 then
-                                            ""
-                                        else
-                                            $" On {alternativesTruncatedRows} row(s) the column hit its per-row cap or this page's size allowance and carries siteTypeAlternativesOmitted (a count) instead of the full list — narrow with scope/projectPath, or page through, to see them."
+            let deadlineIncomplete =
+                targetDiscoveryMaterializationTimedOut
+                || projectsTimedOut > 0
+                || projectsBusy > 0
+                || projectsNotStarted > 0
+                || fsacFallbackTimedOut
+                || fsacFallbackNotStarted
+                || responseConstructionTimedOut
 
-                                    $" {multiTypedSites} site(s) are compiled by more than one swept project and resolved to DIFFERENT types: siteType/project report the first project's answer and siteTypeAlternatives names each other type with the project(s) that resolved it — plan those sites per project, not from one type.{truncationClause}"
-
-                            $"siteType is the field's type as the CURRENT typecheck resolves it at that site, rendered with that site's own opens — the BEFORE half of a field-type change. {degradedClause}{multiClause} find deliberately does NOT typecheck a hypothetical new record shape: edit every site listed here, then run check(scope='project') for the AFTER verdict. On a generic record the type shows as the type PARAMETER (e.g. 'T), not its instantiation at the site."
-
-                    [ ("siteTypes", summary); ("siteTypesNote", jstr note) ]
-
-            let paginationFields =
-                Cursor.paginationFields "sites" totalSites pageOffset pageSize pageSites.Length
-
-            // F5 (#100): drop per-project entries that matched nothing and didn't error —
-            // on a large solution they are one-noise-line-per-project that dwarfs a small
-            // result. `projectsSwept` still conveys the full sweep breadth either way.
-            let isErrorEntry (node: JsonNode) =
-                match node with
-                | :? JsonObject as o -> o.ContainsKey("error")
-                | _ -> false
-
-            let perProjectField =
-                if includePerProject then
-                    let kept =
-                        Seq.zip perProject perProjectKeep
-                        |> Seq.choose (fun (node, keep) -> if keep then Some node else None)
-                        |> Seq.toArray
-
-                    [ ("perProject", JsonArray(kept) :> JsonNode) ]
-                else
-                    // includePerProject=false still SURFACES failed-sweep entries — the only
-                    // place a per-project load/timeout error is visible. Omitting them would
-                    // let a caller read a failed project as "zero uses" and delete a live
-                    // symbol (#100). Pure zero-match noise entries stay omitted.
-                    let errored = perProject |> Seq.filter isErrorEntry |> Seq.toArray
-
-                    if errored.Length > 0 then
-                        [ ("perProject", JsonArray(errored) :> JsonNode) ]
+            let buildSnapshotIdentity () =
+                ensureResponseStep "snapshot-start" 0
+                let projectPathComparer =
+                    if OperatingSystem.IsWindows() then
+                        StringComparer.OrdinalIgnoreCase
                     else
-                        []
+                        StringComparer.Ordinal
+
+                let canonicalProjectRowsByPath =
+                    System.Collections.Generic.Dictionary<string, JsonNode>(projectPathComparer)
+
+                perProject
+                |> Seq.iteri (fun index node ->
+                    ensureResponseStep "snapshot-project-ledger" index
+                    let project = node :?> JsonObject
+
+                    let canonical =
+                        project
+                        |> Seq.choose (fun property ->
+                            // Attempt telemetry and free-form recovery text are not part of
+                            // the reusable stream identity. Stable coverage/category fields are.
+                            if property.Key = "elapsedMs" || property.Key = "error" then
+                                None
+                            else
+                                Some(property.Key, property.Value.DeepClone()))
+                        |> Seq.toList
+                        |> jobj
+                        :> JsonNode
+
+                    canonicalProjectRowsByPath.Add(project["fsproj"].GetValue<string>(), canonical))
+
+                let requestedProjectsInOrder =
+                    match scope with
+                    | "file"
+                    | "project" -> projectsToSweep :> seq<string>
+                    | _ -> projectDiscovery.MemberProjectsInOrder :> seq<string>
+
+                let canonicalProjectRows =
+                    requestedProjectsInOrder
+                    |> Seq.mapi (fun index projectPath ->
+                        ensureResponseStep "snapshot-project-order" index
+                        match canonicalProjectRowsByPath.TryGetValue(normalizePath projectPath) with
+                        | true, row -> Some row
+                        | false, _ -> None)
+                    |> Seq.choose id
+                    |> Seq.toArray
+
+                let snapshotResolution =
+                    jobj
+                        [ "resolvedQuery", jstr query
+                          "resolvedKind", jstr kindResolved
+                          "resolvedScope", jstr scopeResolved
+                          "positionSymbolIdentity",
+                          (positionSymbolIdentity |> Option.map jstr |> Option.defaultValue null)
+                          "matched",
+                          (match matchedNode with
+                           | null -> null
+                           | node -> node.DeepClone())
+                          "outcome", jstr outcome
+                          "via", jstr via
+                          "fcsSiteCount", jint totalSites
+                          "fsacFallbackHits", jint fsacHits
+                          "fsacFallbackState", jstr fsacFallbackState
+                          "fieldSites", jint fieldSiteCount
+                          "typedSites", jint typedSites
+                          "degradedSites", jint degradedSites
+                          "multiTypedSites", jint multiTypedSites ]
+                    :> JsonNode
+
+                let snapshotSites =
+                    allCanonicalSiteNodes
+                    |> Array.mapi (fun index node ->
+                        ensureResponseStep "snapshot-sites" index
+                        node.DeepClone())
+
+                let snapshotModel =
+                    jobj
+                        [ "schema", jint 2
+                          "projects", JsonArray(canonicalProjectRows) :> JsonNode
+                          "coverage", coverage.DeepClone()
+                          "resolution", snapshotResolution
+                          "diagnostics", JsonArray(canonicalDiagnosticRows.ToArray()) :> JsonNode
+                          "sites", JsonArray(snapshotSites) :> JsonNode
+                          "totalSites", jint totalSites
+                          "breakdown", breakdown.DeepClone() ]
+                    :> JsonNode
+
+                let mutable jsonIndex = 0
+                let ensureSnapshotJson () =
+                    ensureResponseStep "snapshot-json" jsonIndex
+                    jsonIndex <- jsonIndex + 1
+
+                let identity = Cursor.findSnapshotIdentityV2WithinBudget ensureSnapshotJson snapshotModel
+                ensureResponseStep "snapshot-complete" 0
+                identity
+
+            // Incomplete evidence has no reusable snapshot identity. Avoid rebuilding
+            // the full declared ledger merely to construct a cursorless timeout.
+            let snapshotIdentity =
+                if deadlineIncomplete then
+                    None
+                else
+                    try
+                        Some(buildSnapshotIdentity ())
+                    with :? TimeoutException ->
+                        responseConstructionTimedOut <- true
+                        None
+
+            let continuationError =
+                match cursorPayload, snapshotIdentity with
+                | Some _, None ->
+                    Some(
+                        FindCursorContract.validationIncomplete
+                            deadline
+                            "The find deadline expired before the complete result stream could be reconstructed. Retry the same cursor with a larger timeoutMs."
+                    )
+                | Some payload, Some identity when
+                    not (String.Equals(payload.Snapshot, identity, StringComparison.Ordinal))
+                    ->
+                    Some(FindCursorContract.stale ())
+                | Some _, Some _ when pageOffset > totalSites -> Some(FindCursorContract.outOfRange ())
+                | _ -> None
+
+            let pageStart = min pageOffset allCanonicalSiteNodes.Length
+
+            let siteNodes =
+                allCanonicalSiteNodes
+                |> Array.skip pageStart
+                |> Array.truncate pageSize
+
+            let candidatePageSites =
+                allCanonicalSites
+                |> Array.skip (min pageOffset allCanonicalSites.Length)
+                |> Array.truncate pageSize
+
+            let alternativesTruncatedBySite =
+                allAlternativesTruncatedBySite
+                |> Array.skip (min pageOffset allAlternativesTruncatedBySite.Length)
+                |> Array.truncate pageSize
 
             // F1 (#100): a dotted query that resolved to nothing reads like "symbol absent".
             // symbolMatches now accepts a dotted suffix, so this only fires for a genuine miss
             // — point the caller at the bare identifier rather than leaving a silent empty.
             let hintField =
-                if matched = Some false && not (String.IsNullOrEmpty query) && query.Contains('.') then
+                if kindResolved = "field" && totalSites = 0 then
+                    let coverageHint =
+                        if coverageComplete then
+                            "No field use sites were found in the selected scope; this does not prove that the field declaration is absent."
+                        else
+                            "The field sweep is incomplete; do not infer absence from zero sites. Dotted-field candidates are withheld until the sweep can exclude a whole declaring-type match. Retry after resolving the coverage limitations."
+                    [ ("hint", jstr $"{coverageHint} For kind='field', query is the declaring record type, with an optional field selector: find(query='Card', kind='field', field='Name'). With exact=true and no field selector, query='Card.Name' is also accepted. Bare field names are not resolved across records; an explicit field selector does not reinterpret query as a field name.") ]
+                elif matched = Some false && not (String.IsNullOrEmpty query) && query.Contains('.') then
                     let bare = query.Substring(query.LastIndexOf('.') + 1)
 
                     [ ("hint",
@@ -7037,9 +9534,27 @@ type internal FcsBridge
                     []
 
             let completenessFields =
-                completenessMessage
-                |> Option.map (fun message -> [ ("message", jstr message) ])
-                |> Option.defaultValue []
+                if responseConstructionTimedOut then
+                    [ ("errorKind", jstr "find_response_timeout")
+                      ("message",
+                       jstr
+                           "Semantic analysis completed, but find's reserved response-construction allowance expired; retry after narrowing maxResults/contextLines.") ]
+                elif
+                    targetDiscoveryMaterializationTimedOut
+                    || projectsTimedOut > 0
+                    || projectsNotStarted > 0
+                    || fsacFallbackTimedOut
+                then
+                    [ ("errorKind", jstr "find_timeout")
+                      ("message",
+                       completenessMessage
+                       |> Option.defaultValue
+                           "The end-to-end find deadline expired before all semantic work completed."
+                       |> jstr) ]
+                else
+                    completenessMessage
+                    |> Option.map (fun message -> [ ("message", jstr message) ])
+                    |> Option.defaultValue []
 
             // #193: a top-level (never buried in perProject) recall-vs-speed guardrail on
             // every response, naming the ACTUAL sweep outcome rather than the requested
@@ -7050,9 +9565,9 @@ type internal FcsBridge
             // scope='workspace' + the SAME .fsproj projectPath would re-sweep the identical
             // one project and mistakenly believe it now had cross-project coverage. The only
             // thing that actually changes what gets swept is what sweepTarget resolves to
-            // (a .fsproj vs. a .sln/.slnx/directory) — so this note reports on projectsRequested
-            // (the real outcome), independent of which `scope` argument led there, and the
-            // widening/narrowing recipe below names the argument that actually works.
+            // (a .fsproj vs. a .sln/.slnx/directory). Missing declared solution members are
+            // coverage failures, not semantic sweeps, so this note uses projectsSwept for
+            // breadth and projectsRequested/projectsMissing for completeness.
             //
             // Round 2 (post-re-review): the note must never overstate coverage. This same
             // code path is reached by `partial`/`unknown` responses too (e.g. the
@@ -7063,14 +9578,19 @@ type internal FcsBridge
             // wording. Separately, scope='file' has a SECOND blind spot beyond siblings:
             // the one project that IS swept has its sites additionally post-filtered to a
             // single file (see `allSites` above), so the single-project note names that too.
-            let scopeNoteField =
+            let buildScopeNoteField () =
+                let failureSummary = coverageFailureSummary ()
                 let widenRecipe =
                     "To sweep the whole solution, pass its .sln/.slnx as projectPath (or set_project it) with scope='workspace'."
 
                 let narrowRecipe =
                     "To narrow to just one project (faster, but misses cross-project usages), pass its .fsproj as projectPath."
 
-                if projectsRequested <= 1 then
+                if projectsSwept = 0 then
+                    [ ("scopeNote",
+                       jstr
+                           $"find swept no projects: %d{projectsMissing} declared solution member(s) are missing. This response is incomplete; restore those projects or pass a loadable .fsproj before trusting an absence of matches.") ]
+                elif projectsSwept = 1 then
                     let filterPath =
                         if scope = "file" then
                             match args.path with
@@ -7085,23 +9605,54 @@ type internal FcsBridge
                             $"find swept only this one project — cross-project usages in sibling projects are not visible. {widenRecipe}"
                         | true, Some path ->
                             $"find swept only this one project, and kept only sites in '{path}' — other files in this project, and all sibling projects, are not visible. {widenRecipe}"
+                        | false, None when projectsAnalyzed = projectsSwept && projectsMissing > 0 ->
+                            $"find swept only this one loadable project, but %d{projectsMissing} declared solution member(s) are missing and were not swept. This response is incomplete; restore them before trusting an absence of matches. Cross-project usages in other siblings are not visible. %s{widenRecipe}"
                         | false, None ->
-                            $"find could not fully analyze this project (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy) — this response is incomplete; see coverage/message before trusting an absence of matches. Cross-project usages in sibling projects are also not visible. %s{widenRecipe}"
+                            $"find could not fully analyze this project (%s{failureSummary}) — this response is incomplete; see coverage/message before trusting an absence of matches. Cross-project usages in sibling projects are also not visible. %s{widenRecipe}"
                         | false, Some path ->
-                            $"find could not fully analyze this project (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy) — this response is incomplete; see coverage/message before trusting an absence of matches. Sites, where present, are also filtered to '%s{path}'; other files in this project, and all sibling projects, are not visible. %s{widenRecipe}"
+                            $"find could not fully analyze this project (%s{failureSummary}) — this response is incomplete; see coverage/message before trusting an absence of matches. Sites, where present, are also filtered to '%s{path}'; other files in this project, and all sibling projects, are not visible. %s{widenRecipe}"
 
                     [ ("scopeNote", jstr text) ]
                 else
                     let text =
                         if coverageComplete then
-                            $"find swept %d{projectsRequested} member projects of '%s{sweepTarget}'. %s{narrowRecipe}"
+                            $"find swept %d{projectsSwept} member projects of '%s{sweepTarget}'. %s{narrowRecipe}"
                         else
-                            $"find analyzed %d{projectsAnalyzed} of %d{projectsRequested} member projects of '%s{sweepTarget}' (%d{projectsFailed} failed, %d{projectsTimedOut} timed out, %d{projectsBusy} busy) — this response is incomplete; see coverage/message before trusting an absence of matches. %s{narrowRecipe}"
+                            $"find analyzed %d{projectsAnalyzed} of %d{projectsRequested} member projects of '%s{sweepTarget}' (%s{failureSummary}) — this response is incomplete; see coverage/message before trusting an absence of matches. %s{narrowRecipe}"
 
                     [ ("scopeNote", jstr text) ]
 
+            let scopeNoteField =
+                if responseConstructionTimedOut then [] else buildScopeNoteField ()
+
+            let finalResponseStatus =
+                if responseConstructionTimedOut then
+                    if matched = Some true then "partial" else "unknown"
+                else
+                    responseStatus
+
+            let perProjectField =
+                if emitPerProject then
+                    [ ("perProject", JsonArray() :> JsonNode) ]
+                else
+                    []
+
+            let paginationFields =
+                match snapshotIdentity with
+                | Some identity ->
+                    Cursor.findPaginationFieldsV2 "sites" totalSites pageOffset pageSize 0 queryIdentity identity
+                | None ->
+                    [ "truncated", jbool true
+                      "nextCursor", null
+                      "totalEstimate", jobj [ ("sites", jint totalSites) ]
+                      "pageOffset", jint pageOffset
+                      "pageSize", jint pageSize ]
+
             let baseFields =
-                [ "status", jstr responseStatus
+                [ "status", jstr finalResponseStatus
+                  "timeoutMs", jint deadline.TimeoutMs
+                  "responseConstructionAllowanceMs", jint deadline.ResponseAllowanceMs
+                  "elapsedMs", jint deadline.ElapsedMilliseconds
                   "outcome", jstr outcome
                   "query", jstr query
                   "kind", jstr kind
@@ -7110,26 +9661,443 @@ type internal FcsBridge
                   "exact", jbool exact
                   "resolution", resolution
                   "coverage", coverage
-                  "projectsSwept", jint projectsRequested
+                  "projectsSwept", jint projectsSwept
                   "projectsRequested", jint projectsRequested
                   "projectsAnalyzed", jint projectsAnalyzed
                   "projectsFailed", jint projectsFailed
+                  "projectsMissing", jint projectsMissing
                   "projectsTimedOut", jint projectsTimedOut
                   "projectsBusy", jint projectsBusy
+                  "projectsNotStarted", jint projectsNotStarted
                   "totalSites", jint totalSites
                   "matchedUseCount", jint totalSites
+                  "breakdownComplete", jbool breakdownComplete
                   "breakdown", breakdown
-                  "sites", JsonArray(siteNodes) :> JsonNode ]
+                  "returnedSiteCount", jint 0
+                  "sitesTruncatedByBudget", jbool false
+                  "sites", JsonArray() :> JsonNode
+                  "resultSetComplete", jbool resolutionComplete ]
                 @ completenessFields
                 @ perProjectField
-                @ [ "sweepElapsedMs", jint (int sweepSw.ElapsedMilliseconds)
-                    "projectDiagnostics", JsonArray(diagNodes) :> JsonNode ]
+                @ [ "perProjectTotalCount", jint perProjectNodes.Length
+                    "perProjectReturnedCount", jint 0
+                    "perProjectTruncatedByBudget", jbool false
+                    "sweepElapsedMs", jint (int sweepSw.ElapsedMilliseconds)
+                    "projectDiagnosticsTotalCount", jint projectDiagnosticsTotalCount
+                    "projectDiagnosticsCountComplete", jbool (diagnosticIndex = aggregatedDiagnostics.Count)
+                    "projectDiagnosticsReturnedCount", jint 0
+                    "projectDiagnosticsTruncated", jbool false
+                    "projectDiagnosticsTruncatedByBudget", jbool false
+                    "projectDiagnostics", JsonArray() :> JsonNode ]
                 @ hintField
-                @ siteTypesFields
+                @ siteTypesFields 0
                 @ scopeNoteField
+                @ [ "responseTruncatedByBudget", jbool false
+                    "responseBudgetChars", jint findResponseBudgetChars
+                    "responseSizeUnit", jstr FindResponseBudget.SizeUnit
+                    "responseSizeHint", null
+                    "cursorAdvancedBy", jint 0 ]
 
-            return jobj (baseFields @ paginationFields) :> JsonNode
+            let responseTemplate = jobj (baseFields @ paginationFields)
+
+            let jsonArrayPrefix (nodes: JsonNode array) count =
+                Array.init count (fun index ->
+                    ensureResponseStep "response-json-copy" index
+                    nodes[index].DeepClone())
+                |> JsonArray
+                :> JsonNode
+
+            let mutable plannerProbe = 0
+
+            let buildResponse deliveredSites deliveredDiagnostics deliveredProjects =
+                ensureResponseStep "response-planning" plannerProbe
+                plannerProbe <- plannerProbe + 1
+                let response = responseTemplate.DeepClone() :?> JsonObject
+                response["sites"] <- jsonArrayPrefix siteNodes deliveredSites
+                response["projectDiagnostics"] <- jsonArrayPrefix initialDiagNodes deliveredDiagnostics
+
+                if emitPerProject then
+                    response["perProject"] <- jsonArrayPrefix perProjectNodes deliveredProjects
+
+                let alternativesTruncatedRows =
+                    alternativesTruncatedBySite
+                    |> Array.take deliveredSites
+                    |> Array.filter id
+                    |> Array.length
+
+                if includeSiteTypes then
+                    let siteTypes = response["siteTypes"] :?> JsonObject
+                    siteTypes["alternativesTruncatedRows"] <- jint alternativesTruncatedRows
+                    response["siteTypesNote"] <- jstr (siteTypesNote alternativesTruncatedRows)
+
+                // Project coverage and response delivery are separate dimensions. A
+                // complete sweep can still deliver only a serialized-budget prefix.
+                let resolutionComplete =
+                    coverageComplete
+                    && not fsacFallbackTimedOut
+                    && pageOffset = 0
+                    && deliveredSites = totalSites
+
+                let responseResolution = response["resolution"] :?> JsonObject
+                responseResolution["complete"] <- jbool resolutionComplete
+                response["resultSetComplete"] <- jbool resolutionComplete
+
+                let sitesTruncatedByBudget = deliveredSites < siteNodes.Length
+                let diagnosticsTruncatedByBudget = deliveredDiagnostics < initialDiagNodes.Length
+                let diagnosticsTruncated = deliveredDiagnostics < projectDiagnosticsTotalCount
+                let perProjectTruncatedByBudget = deliveredProjects < perProjectNodes.Length
+
+                let responseTruncatedByBudget =
+                    sitesTruncatedByBudget
+                    || diagnosticsTruncatedByBudget
+                    || perProjectTruncatedByBudget
+
+                response["returnedSiteCount"] <- jint deliveredSites
+                response["sitesTruncatedByBudget"] <- jbool sitesTruncatedByBudget
+                response["perProjectReturnedCount"] <- jint deliveredProjects
+                response["perProjectTruncatedByBudget"] <- jbool perProjectTruncatedByBudget
+                response["projectDiagnosticsReturnedCount"] <- jint deliveredDiagnostics
+                response["projectDiagnosticsTruncated"] <- jbool diagnosticsTruncated
+                response["projectDiagnosticsTruncatedByBudget"] <- jbool diagnosticsTruncatedByBudget
+                response["responseTruncatedByBudget"] <- jbool responseTruncatedByBudget
+                response["cursorAdvancedBy"] <- jint deliveredSites
+
+                response["responseSizeHint"] <-
+                    if responseTruncatedByBudget then
+                        jstr
+                            $"The complete production-serialized find response is capped at %d{findResponseBudgetChars} UTF-16 code units. This page delivered %d{deliveredSites} site(s), %d{deliveredDiagnostics} diagnostic(s), and %d{deliveredProjects} per-project row(s); full scalar coverage and match counts remain available. Follow nextCursor when present."
+                    else
+                        null
+
+                let nextOffset = pageOffset + deliveredSites
+                let truncated = deadlineIncomplete || nextOffset < totalSites
+                response["truncated"] <- jbool truncated
+
+                response["nextCursor"] <-
+                    match snapshotIdentity with
+                    | Some identity when not deadlineIncomplete && truncated && deliveredSites > 0 ->
+                        jstr (Cursor.encodeFindV2 nextOffset queryIdentity identity)
+                    | _ -> null
+
+                if deadlineIncomplete then
+                    response["deliveryStatus"] <- jstr "partial"
+                    response["paginationRestartRequired"] <- jbool true
+                    response["retrySameCursor"] <- jbool false
+                    response["totalEstimateIsLowerBound"] <- jbool true
+                    response["paginationIncompleteReason"] <- jstr "deadline_incomplete"
+
+                ensureResponseStep "response-planning-complete" plannerProbe
+                deadline.Telemetry.Attach(response :> JsonNode)
+
+            let initialResponseTimeout () =
+                let response = responseTemplate.DeepClone() :?> JsonObject
+                response["status"] <- jstr (if matched = Some true then "partial" else "unknown")
+                response["errorKind"] <- jstr "find_response_timeout"
+                response["message"] <-
+                    jstr "The find response-construction deadline expired. Restart without a cursor after narrowing the request."
+                response["retryable"] <- jbool true
+                response["deliveryStatus"] <- jstr "partial"
+                response["elapsedMs"] <- jint deadline.ElapsedMilliseconds
+                response["resultSetComplete"] <- jbool false
+                response["paginationRestartRequired"] <- jbool true
+                response["retrySameCursor"] <- jbool false
+                response["totalEstimateIsLowerBound"] <- jbool true
+                response["paginationIncompleteReason"] <- jstr "deadline_incomplete"
+                response["truncated"] <- jbool true
+                response["nextCursor"] <- null
+                response["projectDiagnosticsTruncated"] <- jbool (projectDiagnosticsTotalCount > 0)
+                let responseResolution = response["resolution"] :?> JsonObject
+                responseResolution["complete"] <- jbool false
+                let responseCoverage = response["coverage"]
+                let phases = responseCoverage["phases"] :?> JsonArray
+
+                for phase in phases do
+                    if phase["phase"].GetValue<string>() = "response_construction" then
+                        phase["status"] <- jstr "timed_out"
+
+                response :> JsonNode
+
+            // The same end-to-end deadline applies after snapshot validation too:
+            // planner/serializer expiry contributes no page and never discards an
+            // otherwise valid continuation. Only initial requests use partial restart.
+            let responseTimeout () =
+                match cursorPayload with
+                | Some _ ->
+                    FindCursorContract.validationIncomplete
+                        deadline
+                        "The find deadline expired while constructing the continuation response. Retry the same cursor with a larger timeoutMs."
+                | None -> initialResponseTimeout ()
+
+            let budgetFailure errorCode message =
+                let failureMatchedNode =
+                    match matched with
+                    | Some value -> jbool value
+                    | None -> null
+
+                let failureResolution =
+                    jobj
+                        [ "matched", failureMatchedNode
+                          "outcome", jstr outcome
+                          "complete", jbool false
+                          "kindResolved", jstr kindResolved
+                          "scopeResolved", jstr scopeResolved
+                          "projectsSwept", jint projectsSwept
+                          "projectsRequested", jint projectsRequested
+                          "projectsAnalyzed", jint projectsAnalyzed
+                          "projectsFailed", jint projectsFailed
+                          "projectsMissing", jint projectsMissing
+                          "projectsTimedOut", jint projectsTimedOut
+                          "projectsBusy", jint projectsBusy
+                          "projectsNotStarted", jint projectsNotStarted
+                          "via", jstr via
+                          "fcsSiteCount", jint totalSites
+                          "fsacFallbackHits", jint fsacHits
+                          "fsacFallbackState", jstr fsacFallbackState
+                          // A potentially unbounded infrastructure message is omitted from
+                          // this last-resort envelope; its typed state remains available.
+                          "fsacFallbackReason", null ]
+                    :> JsonNode
+
+                // The planner reaches this envelope only after a one-site response (or
+                // fixed metadata alone) has already failed to fit. Reducing maxResults
+                // therefore cannot change the serialized payload, so retaining a cursor
+                // would only send the caller into a non-progressing retry loop.
+                let canRetrySameCursor = false
+
+                let sameCursorRetry =
+                    jobj
+                        [ "allowed", jbool canRetrySameCursor
+                          "action", jstr "retry_same_cursor"
+                          "requiresUnchangedResultIdentity", jbool true
+                          "allowedChangedInputs", JsonArray([| jstr "maxResults" |]) :> JsonNode
+                          "recommendedMaxResults", jint 1
+                          "reuseOriginalCursor", jbool canRetrySameCursor ]
+                    :> JsonNode
+
+                let changedIdentityRetry =
+                    jobj
+                        [ "action", jstr "restart_without_cursor"
+                          "requiredBeforeChangingResultIdentity", jbool true
+                          "recommendedContextLines", jint 0
+                          "recommendedIncludeInfo", jbool false
+                          "recommendedIncludePerProject", jbool false
+                          "recommendedMaxResults", jint 1
+                          "reuseOriginalCursor", jbool false ]
+                    :> JsonNode
+
+                let recovery =
+                    jobj
+                        [ "action", jstr "restart_without_cursor"
+                          "instruction",
+                          jstr
+                              "Reducing maxResults cannot make this blocked response fit because the planner already tested one site or fixed metadata alone. Restart without a cursor before reducing contextLines or metadata, or before changing query, kind, exact, member, field, scope, projectPath, path, line, character, word, occurrence, includeDeclaration, or includeSiteTypes."
+                          "reuseOriginalCursor", jbool false
+                          "reuseOriginalCursorCondition", jstr "never_for_budget_failure"
+                          "sameCursorRetry", sameCursorRetry
+                          "changedIdentityRetry", changedIdentityRetry ]
+                    :> JsonNode
+
+                jobj
+                    [ "status", jstr "aborted"
+                      "timeoutMs", jint deadline.TimeoutMs
+                      "responseConstructionAllowanceMs", jint deadline.ResponseAllowanceMs
+                      "elapsedMs", jint deadline.ElapsedMilliseconds
+                      "outcome", jstr outcome
+                      "deliveryStatus", jstr "blocked"
+                      "errorCode", jstr errorCode
+                      "errorKind", jstr errorCode
+                      "message", jstr message
+                      "retryable", jbool true
+                      "paginationRestartRequired", jbool true
+                      "retrySameCursor", jbool false
+                      "resolution", failureResolution
+                      "coverage", coverage.DeepClone()
+                      "projectsSwept", jint projectsSwept
+                      "projectsRequested", jint projectsRequested
+                      "projectsAnalyzed", jint projectsAnalyzed
+                      "projectsFailed", jint projectsFailed
+                      "projectsMissing", jint projectsMissing
+                      "projectsTimedOut", jint projectsTimedOut
+                      "projectsBusy", jint projectsBusy
+                      "projectsNotStarted", jint projectsNotStarted
+                      "resultSetComplete", jbool false
+                      "totalSites", jint totalSites
+                      "matchedUseCount", jint totalSites
+                      "breakdownComplete", jbool breakdownComplete
+                      "breakdown", breakdown.DeepClone()
+                      "sites", JsonArray() :> JsonNode
+                      "returnedSiteCount", jint 0
+                      "sitesTruncatedByBudget", jbool (candidatePageSites.Length > 0)
+                      "projectDiagnosticsTotalCount", jint projectDiagnosticsTotalCount
+                      "projectDiagnosticsCountComplete", jbool (diagnosticIndex = aggregatedDiagnostics.Count)
+                      "projectDiagnosticsReturnedCount", jint 0
+                      "projectDiagnosticsTruncated", jbool (projectDiagnosticsTotalCount > 0)
+                      "projectDiagnosticsTruncatedByBudget", jbool (initialDiagNodes.Length > 0)
+                      "perProjectTotalCount", jint perProjectNodes.Length
+                      "perProjectReturnedCount", jint 0
+                      "perProjectTruncatedByBudget", jbool (perProjectNodes.Length > 0)
+                      "responseTruncatedByBudget", jbool true
+                      "responseBudgetChars", jint findResponseBudgetChars
+                      "responseSizeUnit", jstr FindResponseBudget.SizeUnit
+                      "pageOffset", jint pageOffset
+                      "pageSize", jint pageSize
+                      "cursorAdvancedBy", jint 0
+                      "truncated", jbool (pageOffset < totalSites)
+                      // Never emit a non-advancing cursor; blocked pages require restart.
+                      "nextCursor", null
+                      "totalEstimate", (jobj [ ("sites", jint totalSites) ] :> JsonNode)
+                      "blockedSiteIndex",
+                      (if candidatePageSites.Length > 0 then jint pageOffset else null)
+                      "recovery", recovery ]
+                :> JsonNode
+
+            let continuationErrorResponse = continuationError |> Option.defaultValue null
+
+            if not (isNull continuationErrorResponse) then
+                return continuationErrorResponse
+            elif responseConstructionTimedOut || deadline.ResponseExpired then
+                return responseTimeout ()
+            else
+                try
+                    let plan =
+                        FindResponseBudget.planResponse
+                            findResponseBudgetChars
+                            siteNodes.Length
+                            initialDiagNodes.Length
+                            perProjectNodes.Length
+                            buildResponse
+
+                    ensureResponseStep "response-serialization" plannerProbe
+
+                    match plan with
+                    | FindResponseBudget.FitPlan.Fits(deliveredSites, deliveredDiagnostics, deliveredProjects) ->
+                        let response = buildResponse deliveredSites deliveredDiagnostics deliveredProjects
+                        let responseLength = renderedLength response
+                        ensureResponseStep "response-serialization-complete" plannerProbe
+
+                        if responseLength <= findResponseBudgetChars then
+                            // Record only this exact, final, unmodified node, after
+                            // both size and deadline checks. The public wrapper must
+                            // not serialize it a second time outside this deadline.
+                            recordMeasuredResponse response
+                            return response
+                        else
+                            return
+                                budgetFailure
+                                    "find_response_budget_invariant_failed"
+                                    "The final find response exceeded its production-serialized ceiling after planning. Retry with narrower response-shaping arguments."
+                    | FindResponseBudget.FitPlan.FirstSiteOverflow ->
+                        return
+                            budgetFailure
+                                "find_site_exceeds_response_budget"
+                                "The next find site cannot fit within the serialized response ceiling even after optional diagnostic and per-project rows were removed. No cursor was advanced."
+                    | FindResponseBudget.FitPlan.FixedMetadataOverflow ->
+                        return
+                            budgetFailure
+                                "find_metadata_exceeds_response_budget"
+                                "The fixed find response metadata cannot fit within the serialized response ceiling. No cursor was advanced."
+                with :? TimeoutException ->
+                    responseConstructionTimedOut <- true
+                    return responseTimeout ()
         }
+
+    /// Keep every result path behind one final exact-serializer ceiling, including
+    /// early validation/position/discovery exits that never reach planResponse.
+    member internal this.FindWithinDeadline
+        (
+            args: FindArgs,
+            deadline: FindRequestDeadline,
+            cancellationToken: CancellationToken,
+            retainUntil: Task -> unit,
+            fsacProbe: (string -> Task<FindFsacProbeResult>) option,
+            ?inventoryQueries: string array
+        ) : Task<JsonNode> =
+        task {
+            deadline.Telemetry.SetPhase("unattributed")
+            let mutable measuredResponse: JsonNode = null
+            let mutable validatedContinuationEnvelope = false
+
+            let! response =
+                this.FindCoreWithinDeadline(
+                    args, deadline, cancellationToken, retainUntil, fsacProbe,
+                    (fun () -> validatedContinuationEnvelope <- true),
+                    (fun measured -> measuredResponse <- measured), inventoryQueries
+                )
+
+            if inventoryQueries.IsSome && isNull response["countsOnly"] then
+                response["countsOnly"] <- jbool true
+                response["aggregation"] <- jstr "per_query"
+                response["countsReturned"] <- jbool false
+                response["countsComplete"] <- jbool false
+                response["queriesRequested"] <- jint inventoryQueries.Value.Length
+                response["queriesReturned"] <- jint 0
+
+            if Object.ReferenceEquals(response, measuredResponse) then
+                // Per-call reference identity is evidence from the core, never a
+                // JSON field supplied by a caller. Nothing mutates this node after
+                // its final measured serialization and deadline check.
+                return response
+            else
+                // Early errors and timeout/budget envelopes were not measured by
+                // the planner. Begin its bounded response allowance if needed, without
+                // restarting the end-to-end deadline or an already-started allowance.
+                deadline.BeginResponseConstruction()
+                let validationIncomplete () =
+                    FindCursorContract.validationIncomplete
+                        deadline
+                        "The find deadline expired during continuation response construction. Retry the same cursor with a larger timeoutMs."
+                    |> deadline.GuardResponse
+
+                findFinalResponseBeforeMeasureOverride |> Option.iter (fun hook -> hook ())
+                if validatedContinuationEnvelope && deadline.ResponseExpired then
+                    return validationIncomplete ()
+                else
+                    let guardedResponse = deadline.GuardResponse response
+                    findFinalResponseAfterMeasureOverride |> Option.iter (fun hook -> hook ())
+                    if validatedContinuationEnvelope && deadline.ResponseExpired then
+                        return validationIncomplete ()
+                    else
+                        return guardedResponse
+        }
+
+    member this.Find(args: FindArgs, ?fsacProbe: string -> Task<FindFsacProbeResult>, ?inventoryQueries: string array) : Task<JsonNode> =
+        let timeoutMs = args.timeoutMs |> Option.defaultValue 120_000
+
+        if timeoutMs < 0 then
+            // Keep argument validation in the shared core; the deadline itself accepts
+            // only a non-negative duration.
+            let deadline = FindRequestDeadline(0)
+
+            this.FindWithinDeadline(
+                args,
+                deadline,
+                CancellationToken.None,
+                ignore,
+                fsacProbe,
+                ?inventoryQueries = inventoryQueries
+            )
+        else
+            let expirySignal = findDeadlineSignalOverride |> Option.map (fun signal -> signal ())
+
+            let responseExpirySignal =
+                findResponseDeadlineSignalOverride
+                |> Option.map (fun signal -> signal ())
+
+            let deadline =
+                FindRequestDeadline(
+                    timeoutMs,
+                    ?semanticExpirySignal = expirySignal,
+                    ?responseExpirySignal = responseExpirySignal
+                )
+
+            this.FindWithinDeadline(
+                args,
+                deadline,
+                CancellationToken.None,
+                ignore,
+                fsacProbe,
+                ?inventoryQueries = inventoryQueries
+            )
 
     // ── fcs_tests_for_symbol (#60): the test-coverage slice of `find` ───────────
     // Reuses the multi-project sweep machinery, but keeps ONLY the test projects of the
@@ -7893,6 +10861,14 @@ type internal FcsBridge
             let contextFingerprints = ResizeArray<string>()
             let mutable deadlineExpired = false
 
+            // This inner fast-path wait may time out before the outer Check timer.
+            // Publish its terminal state to discovery waiters synchronously too.
+            let discoveryBudget =
+                remainingBudget
+                |> Option.map (fun getRemaining ->
+                    fun () ->
+                        if Volatile.Read(&deadlineExpired) then TimeSpan.Zero else getRemaining ())
+
             let addBlockingReason (reason: JsonNode) =
                 let rendered = reason.ToJsonString()
 
@@ -7930,7 +10906,7 @@ type internal FcsBridge
                     failures.Add message
                     addGenericBlockingReason "timeout" message true
 
-                deadlineExpired <- true
+                Volatile.Write(&deadlineExpired, true)
 
             let awaitWithinDeadline description (start: unit -> Task<'T>) : Task<'T option> =
                 task {
@@ -8050,10 +11026,10 @@ type internal FcsBridge
                                 (fun () ->
                                     runCheckTargetDiscovery
                                         (checkDiscoveryKey "project" target args.path)
-                                        remainingBudget
-                                        (fun () ->
+                                        discoveryBudget
+                                        (fun hasActiveWaiters ->
                                             CheckTargetDiscoveryResult.Project(
-                                                resolveSingleCheckProject target args.path remainingBudget
+                                                resolveSingleCheckProject target args.path hasActiveWaiters
                                             )))
 
                         match discovered with
@@ -8088,8 +11064,9 @@ type internal FcsBridge
                                 (fun () ->
                                     runCheckTargetDiscovery
                                         (checkDiscoveryKey "workspace" target None)
-                                        remainingBudget
-                                        (fun () ->
+                                        discoveryBudget
+                                        (fun hasActiveWaiters ->
+                                            if not (hasActiveWaiters ()) then raise (TimeoutException())
                                             let projects = SolutionParsing.listProjects target
 
                                             CheckTargetDiscoveryResult.Projects(
@@ -8199,6 +11176,12 @@ type internal FcsBridge
         task {
             let speed = (args.speed |> Option.defaultValue "trusted").Trim().ToLowerInvariant()
             let mode = (args.mode |> Option.defaultValue "fs").Trim().ToLowerInvariant()
+            // v0.17.1 already appended snippets after SourceFiles. Keep that useful
+            // behavior as the explicit default while allowing callers to request the
+            // pre-project position when they need to model an early compile file.
+            let snippetPosition =
+                (args.snippetPosition |> Option.defaultValue "end").Trim().ToLowerInvariant()
+
             let severityFloor = (args.severity |> Option.defaultValue "error").Trim().ToLowerInvariant()
             let scopeRaw = (args.scope |> Option.defaultValue "auto").Trim().ToLowerInvariant()
             let timeoutMs = args.timeoutMs |> Option.defaultValue 60000
@@ -8235,6 +11218,8 @@ type internal FcsBridge
                 return invalid $"speed must be 'trusted' or 'fast' (got '{speed}')"
             elif mode <> "fs" && mode <> "fsi" then
                 return invalid $"mode must be 'fs' or 'fsi' (got '{mode}')"
+            elif snippetPosition <> "start" && snippetPosition <> "end" then
+                return invalid $"snippetPosition must be 'start' or 'end' (got '{snippetPosition}')"
             elif not (List.contains severityFloor severityNames) then
                 return invalid $"severity must be one of error|warning|information|hint|all (got '{severityFloor}')"
             elif not (List.contains scopeRaw [ "auto"; "file"; "project"; "workspace"; "snippet" ]) then
@@ -8293,7 +11278,8 @@ type internal FcsBridge
                                     runCheckTargetDiscovery
                                         (checkDiscoveryKey "nearest-project" path None)
                                         (Some remainingCheckBudget)
-                                        (fun () ->
+                                        (fun hasActiveWaiters ->
+                                            if not (hasActiveWaiters ()) then raise (TimeoutException())
                                             CheckTargetDiscoveryResult.Project(
                                                 findNearestFsproj path |> Option.map normalizePath
                                             ))
@@ -8355,7 +11341,8 @@ type internal FcsBridge
                                         runCheckTargetDiscovery
                                             (checkDiscoveryKey "auto-scope" target None)
                                             (Some remainingCheckBudget)
-                                            (fun () ->
+                                            (fun hasActiveWaiters ->
+                                                if not (hasActiveWaiters ()) then raise (TimeoutException())
                                                 CheckTargetDiscoveryResult.Scope(
                                                     if (SolutionParsing.listProjects target).Length > 1 then
                                                         "workspace"
@@ -8597,7 +11584,7 @@ type internal FcsBridge
                         [||]
                         (Some discoveryReason)
                         ([ ("projectsSwept", jint 0) ] @ blockingFields discoveryFailure)
-            // ── snippet: always FRESH (ignores speed); old ValidateSnippet logic ──
+            // ── snippet: always FRESH (ignores speed); placement-aware validation ──
             | "snippet" ->
                 match args.snippet with
                 | Some snippetText when not (String.IsNullOrWhiteSpace snippetText) ->
@@ -8621,15 +11608,19 @@ type internal FcsBridge
                         let! options, optionsSource = this.ResolveFsprojOptions(fsproj)
                         let ext = if mode = "fsi" then ".fsi" else ".fs"
 
-                        let snippetFile =
-                            Path.Combine(Path.GetTempPath(), $"fslangmcp_check_{Guid.NewGuid():N}{ext}")
+                        let snippetFile = createSnippetFile "fslangmcp_check" ext
 
                         try
                             File.WriteAllText(snippetFile, snippetText)
 
+                            let snippetSourceFiles =
+                                match snippetPosition with
+                                | "start" -> Array.append [| snippetFile |] options.SourceFiles
+                                | _ -> Array.append options.SourceFiles [| snippetFile |]
+
                             let modifiedOptions =
                                 { options with
-                                    SourceFiles = Array.append options.SourceFiles [| snippetFile |] }
+                                    SourceFiles = snippetSourceFiles }
 
                             let sourceText = SourceText.ofString snippetText
 
@@ -8693,6 +11684,7 @@ type internal FcsBridge
                                     [||] // synthetic temp file — no meaningful source path to surface
                                     reason
                                     [ "mode", jstr mode
+                                      "snippetPosition", jstr snippetPosition
                                       "projectFileName", jstr options.ProjectFileName
                                       "optionsSource", jstr optionsSource ]
                         finally
@@ -9202,12 +12194,12 @@ type internal FcsBridge
                             runCheckTargetDiscovery
                                 (checkDiscoveryKey "project" target args.path)
                                 (Some remainingCheckBudget)
-                                (fun () ->
+                                (fun hasActiveWaiters ->
                                     CheckTargetDiscoveryResult.Project(
                                         resolveSingleCheckProject
                                             target
                                             args.path
-                                            (Some remainingCheckBudget)
+                                            hasActiveWaiters
                                     )))
 
                     match boundedFsproj with
@@ -9393,7 +12385,8 @@ type internal FcsBridge
                             runCheckTargetDiscovery
                                 (checkDiscoveryKey "workspace" target None)
                                 (Some remainingCheckBudget)
-                                (fun () ->
+                                (fun hasActiveWaiters ->
+                                    if not (hasActiveWaiters ()) then raise (TimeoutException())
                                     let projects = SolutionParsing.listProjects target
 
                                     CheckTargetDiscoveryResult.Projects(
@@ -10337,11 +13330,7 @@ type internal FcsBridge
                             // NonBacktracking eliminates catastrophic-backtracking risk for
                             // user-supplied patterns like (a+)+$. A 250ms timeout is a belt-
                             // and-suspenders guard; NonBacktracking should never time out.
-                            let opts =
-                                System.Text.RegularExpressions.RegexOptions.NonBacktracking
-                                ||| System.Text.RegularExpressions.RegexOptions.IgnoreCase
-
-                            Some(System.Text.RegularExpressions.Regex(pattern, opts, TimeSpan.FromMilliseconds 250.0))
+                            Some(ProjectOutlineFilter.compile pattern)
                         with ex ->
                             invalidArg (nameof args.filter) $"Invalid filter regex: %s{ex.Message}"
 
@@ -10438,12 +13427,12 @@ type internal FcsBridge
                         cancellationToken.ThrowIfCancellationRequested()
                         TimeSpan.FromMilliseconds(float (remainingMilliseconds ()))
 
-                    let optionsOperation =
-                        this.ResolveFsprojOptionsActualWithinBudget(projectPath, optionsRemainingBudget)
+                    use optionsWaiter =
+                        this.AcquireFsprojEntryWithinBudget(projectPath, Some optionsRemainingBudget)
 
                     try
-                        let! options = awaitWithinDeadline "project_options" optionsOperation
-                        resolvedProjectOptions <- Some options
+                        let! entry, _cacheHit = awaitWithinDeadline "project_options" optionsWaiter.Operation
+                        resolvedProjectOptions <- Some(entry.Options, entry.Source)
                         optionsPhaseStatus <- "complete"
                     with
                     | :? TimeoutException as ex ->
@@ -12319,6 +15308,9 @@ type internal FcsBridge
     member _.ProjectEvaluationRejectedCount = projectEvaluationAdmission.RejectedCount
     member _.ProjectEvaluationMaxObservedConcurrency = projectEvaluationAdmission.MaxObservedConcurrency
     member _.ProjectOptionsInFlightCount = optionsInFlight.Count
+    member _.ProjectOptionsWaiterCount =
+        optionsInFlight.Values |> Seq.sumBy (fun flight -> flight.WaiterCount)
+
     member _.ProjectTypeCheckStartCount = Volatile.Read(&projectTypeCheckStartCount)
     member _.FreshProjectCheckActiveCount = freshProjectCheckAdmission.ActiveCount
     member _.FreshProjectCheckStartedCount = freshProjectCheckAdmission.StartedCount
@@ -12335,11 +15327,52 @@ type internal FcsBridge
     member _.SnapshotComputationStartedCount = snapshotComputationAdmission.StartedCount
     member _.SnapshotComputationRejectedCount = snapshotComputationAdmission.RejectedCount
     member _.SnapshotComputationInFlightCount = snapshotComputationsInFlight.Count
+    member _.SnapshotComputationWaiterCount =
+        snapshotComputationsInFlight.Values |> Seq.sumBy (fun flight -> flight.WaiterCount)
+
     member _.CheckTargetDiscoveryActiveCount = checkTargetDiscoveryAdmission.ActiveCount
     member _.CheckTargetDiscoveryStartedCount = checkTargetDiscoveryAdmission.StartedCount
     member _.CheckTargetDiscoveryRejectedCount = checkTargetDiscoveryAdmission.RejectedCount
     member _.CheckTargetDiscoveryInFlightCount = checkTargetDiscoveriesInFlight.Count
+    member _.CheckTargetDiscoveryWaiterCount =
+        checkTargetDiscoveriesInFlight.Values |> Seq.sumBy (fun flight -> flight.WaiterCount)
+
+    /// Observe after a discovery hook signals that the exact-key worker has started.
+    member _.TryGetCheckTargetDiscoveryCompletionForTest
+        (scope: string, target: string, path: string option)
+        : Task option =
+        let key = checkDiscoveryKey scope target path
+
+        match checkTargetDiscoveriesInFlight.TryGetValue(key) with
+        | true, flight -> Some(flight.Operation :> Task)
+        | false, _ -> None // No retained worker for this key.
+
+    /// Capture the production exact-worker cleanup to replay a stale callback after
+    /// a replacement has started. This must never remove the replacement (ABA).
+    member _.TryGetCheckTargetDiscoveryCleanupForTest(scope: string, target: string, path: string option) =
+        let key = checkDiscoveryKey scope target path
+
+        match checkTargetDiscoveriesInFlight.TryGetValue(key) with
+        | true, flight -> Some(fun () -> removeExactSingleFlight checkTargetDiscoveriesInFlight key flight)
+        | false, _ -> None // No retained worker for this key.
+
     member _.CheckProjectDiscoveryFallbackCount = Volatile.Read(&checkProjectDiscoveryFallbackCount)
+    member _.FindPositionResolutionActiveCount = findPositionResolutionAdmission.ActiveCount
+    member _.FindPositionResolutionStartedCount = findPositionResolutionAdmission.StartedCount
+    member _.FindPositionResolutionRejectedCount = findPositionResolutionAdmission.RejectedCount
+    member _.FindPositionResolutionInFlightCount = findPositionResolutionsInFlight.Count
+    member _.FindPositionResolutionWaiterCount =
+        findPositionResolutionsInFlight.Values |> Seq.sumBy (fun flight -> flight.WaiterCount)
+
+    member _.FindPositionResolutionComputeCount = Volatile.Read(&findPositionResolutionComputeCount)
+    member _.FindTargetDiscoveryActiveCount = findTargetDiscoveryAdmission.ActiveCount
+    member _.FindTargetDiscoveryStartedCount = findTargetDiscoveryAdmission.StartedCount
+    member _.FindTargetDiscoveryRejectedCount = findTargetDiscoveryAdmission.RejectedCount
+    member _.FindTargetDiscoveryInFlightCount = findTargetDiscoveriesInFlight.Count
+    member _.FindTargetDiscoveryWaiterCount =
+        findTargetDiscoveriesInFlight.Values |> Seq.sumBy (fun flight -> flight.WaiterCount)
+
+    member _.FindTargetDiscoveryComputeCount = Volatile.Read(&findTargetDiscoveryComputeCount)
 
     /// Pure deterministic seam for verifying collision-free discovery key framing.
     member _.CheckDiscoveryKeyForTest(scope: string, target: string, path: string option) =

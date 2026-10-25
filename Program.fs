@@ -271,12 +271,144 @@ let internal runLimitedWithTimeoutRetained
     : Task<JsonNode> =
     runLimitedWithTimeoutRetainedCore gate cancellationToken timeoutMs ignore work
 
+/// Find-specific admission wrapper. Unlike the legacy relative-timeout helper, this
+/// receives the same monotonic deadline object that the admitted find operation uses,
+/// so queue wait and every later phase consume one clock. The semantic cutoff reserves
+/// FindRequestDeadline.ResponseAllowanceMs for constructing a typed response.
+let internal runLimitedWithFindDeadlineRetainedCore
+    (gate: SemaphoreSlim)
+    (cancellationToken: CancellationToken)
+    (deadline: FindRequestDeadline)
+    (onAdmitted: unit -> unit)
+    (work: FindRequestDeadline -> (Task -> unit) -> Task<JsonNode>)
+    : Task<JsonNode> =
+    task {
+        let mutable lifetime: ProtectedWorkLifetime option = None
+
+        let admissionTimeout () =
+            jobj
+                [ "status", jstr "timeout"
+                  "errorKind", jstr "fcs_admission_timeout"
+                  "message",
+                  jstr
+                      $"FCS admission exhausted find's end-to-end timeoutMs=%d{deadline.TimeoutMs} before protected work started."
+                  "timeoutMs", jint deadline.TimeoutMs
+                  "retryable", jbool true ]
+            :> JsonNode
+
+        try
+            let remaining = deadline.RemainingSemanticBudget()
+
+            if remaining <= TimeSpan.Zero then
+                deadline.MarkSemanticExpired()
+                return admissionTimeout ()
+            else
+                use admissionCancellation =
+                    CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+
+                let admission = gate.WaitAsync(admissionCancellation.Token)
+                let timeout = Task.Delay(remaining, admissionCancellation.Token)
+
+                let contenders =
+                    match deadline.SemanticExpirySignal with
+                    | Some signal -> [| admission; timeout; signal |]
+                    | None -> [| admission; timeout |]
+
+                let! winner = Task.WhenAny(contenders)
+                admissionCancellation.Cancel()
+
+                let admitted =
+                    Object.ReferenceEquals(winner, admission)
+                    && admission.IsCompletedSuccessfully
+                    && not deadline.SemanticExpired
+
+                if not admitted then
+                    try
+                        do! admission
+                    with :? OperationCanceledException ->
+                        ()
+
+                    // The semaphore can complete concurrently with expiry after WhenAny
+                    // chose the other contender. Return that raced permit explicitly.
+                    if admission.IsCompletedSuccessfully then
+                        gate.Release() |> ignore
+
+                    cancellationToken.ThrowIfCancellationRequested()
+                    deadline.MarkSemanticExpired()
+                    return admissionTimeout ()
+                else
+                    let admittedLifetime = ProtectedWorkLifetime(gate)
+                    lifetime <- Some admittedLifetime
+                    onAdmitted ()
+                    cancellationToken.ThrowIfCancellationRequested()
+
+                    if deadline.SemanticExpired then
+                        deadline.MarkSemanticExpired()
+                        return admissionTimeout ()
+                    else
+                        return! work deadline admittedLifetime.Retain
+        finally
+            lifetime |> Option.iter _.CompleteResponseOwner()
+    }
+
+let internal runLimitedWithFindDeadlineRetained
+    (gate: SemaphoreSlim)
+    (cancellationToken: CancellationToken)
+    (deadline: FindRequestDeadline)
+    (work: FindRequestDeadline -> (Task -> unit) -> Task<JsonNode>)
+    : Task<JsonNode> =
+    runLimitedWithFindDeadlineRetainedCore gate cancellationToken deadline ignore work
+
 let internal runLimited
     (gate: SemaphoreSlim)
     (cancellationToken: CancellationToken)
     (work: unit -> Task<JsonNode>)
     : Task<JsonNode> =
     runLimitedWithTimeout gate cancellationToken None (fun _ -> work ())
+
+let internal normalizeProjectOutlineAdmissionResult (timeoutMs: int) (result: JsonNode) : JsonNode =
+    let isAdmissionTimeout =
+        match result["errorKind"] with
+        | null -> false
+        | kind -> kind.GetValue<string>() = "fcs_admission_timeout"
+
+    if not isAdmissionTimeout then
+        result
+    else
+        let issue =
+            jobj
+                [ "phase", jstr "admission"
+                  "status", jstr "timed_out"
+                  "errorKind", jstr "fcs_admission_timeout"
+                  "message", result["message"].DeepClone() ]
+            :> JsonNode
+
+        jobj
+            [ "status", jstr "unknown"
+              "errorKind", jstr "fcs_admission_timeout"
+              "message", result["message"].DeepClone()
+              "timeoutMs", jint timeoutMs
+              "retryable", jbool true
+              "resultSetComplete", jbool false
+              "coverage",
+              jobj
+                  [ "complete", jbool false
+                    "filesRequested", jint 0
+                    "filesScanned", jint 0
+                    "filesTimedOut", jint 0
+                    "filesFailed", jint 0
+                    "filesNotStarted", jint 0
+                    "phases",
+                    JsonArray([| jobj [ "phase", jstr "admission"; "status", jstr "timed_out" ] :> JsonNode |])
+                    :> JsonNode
+                    "issues", JsonArray([| issue |]) :> JsonNode
+                    "issuesReturned", jint 1
+                    "issuesTruncated", jbool false ]
+              :> JsonNode
+              "truncated", jbool false
+              "nextCursor", null
+              "files", JsonArray() :> JsonNode ]
+        :> JsonNode
 
 type internal RuntimeToolPin =
     { PackageId: string
@@ -669,7 +801,7 @@ let private mainCore argv =
                 tool (
                     TypedTool.define<CheckArgs>
                         "check"
-                        "Fresh F# verdict for the active context. Bare check() returns clean|errors|unknown from an in-process type-check. Optional: scope, path, snippet, speed, severity. trusted (default) is fresh; fast uses cached FSAC. Counts reconcile: totalDiagnostics=errors+warnings+info. Project scope marks downstream consumers unchecked; workspace requires a solution or directory. Prefer for yes/no validation."
+                        "Fresh F# verdict for the active context. Bare check() returns clean|errors|unknown from an in-process type-check. For scope=snippet, snippetPosition=start|end (default end) controls compile-order placement and is echoed; end sees all project sources. trusted is fresh; fast uses cached FSAC. Project scope marks downstream consumers unchecked; workspace requires a solution or directory."
                         (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
@@ -805,19 +937,83 @@ let private mainCore argv =
                 )
 
                 tool (
-                    TypedTool.define<FindArgs>
+                    TypedTool.define<FindToolArgs>
                         "find"
-        "F# semantic search across solution projects: definitions/references, field sites, and member calls. Bare find(query) returns compact sites; contextLines adds code. Narrow with kind (symbol|members|field|definition|position), scope, path, or projectPath. Member calls: kind=members + member=Name; query may be the member or declaring type. Field impact: kind=field + includeSiteTypes. FCS-resolved; scopeNote reports breadth."
+                        "F# definitions/references, field sites and member calls. query returns snippets with v2 cursors; queries (1..50) or query+countsOnly=true inventories counts in one sweep, kind=symbol/definition, no cursor. kind=field: query=Card + field=Name, or exact Card.Name without field; bare field names unsupported. Narrow scope=project + projectPath; inspect coverage, phaseTimingsMs and cache before trusting zero. 60,000 UTF-16 ceiling. For covering tests prefer fcs_tests_for_symbol."
                         (fun args (ct: CancellationToken) ->
+                            // Start the one monotonic deadline at public-handler entry,
+                            // before active-project fallback or gate admission.
+                            let timeoutMs = args.timeoutMs |> Option.defaultValue 120_000
+                            let deadline = FindRequestDeadline(max 0 timeoutMs)
+
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
 
-                            let timeoutMs = args.timeoutMs |> Option.defaultValue 120_000 |> Some
-
                             toolResult (fun () ->
-                                runLimitedWithTimeout fcsGate ct timeoutMs (fun remainingTimeoutMs ->
-                                    let args = { args with timeoutMs = remainingTimeoutMs }
-                                    Dispatcher.FindDispatch.run fcsBridge bridge (Dispatcher.Find args))))
+                                match FindInput.prepare args with
+                                | Error invalid ->
+                                    deadline.BeginResponseConstruction()
+                                    Task.FromResult(deadline.GuardResponse invalid)
+                                | Ok prepared ->
+                                    let seedArgs, request, inventoryQueries =
+                                        match prepared with
+                                        | FindInput.Sites args -> args, Dispatcher.Find args, None
+                                        | FindInput.Inventory(args, queries) -> args, Dispatcher.FindInventory(args, queries), Some queries
+
+                                    task {
+                                        let! result =
+                                            if timeoutMs < 0 then
+                                                runLimitedWithTimeout fcsGate ct (Some timeoutMs) (fun _ ->
+                                                    Dispatcher.FindDispatch.run fcsBridge bridge request)
+                                            else
+                                                runLimitedWithFindDeadlineRetained
+                                                    fcsGate
+                                                    ct
+                                                    deadline
+                                                    (fun sharedDeadline retainUntil ->
+                                                        Dispatcher.FindDispatch.runWithinDeadline
+                                                            fcsBridge
+                                                            bridge
+                                                            sharedDeadline
+                                                            ct
+                                                            retainUntil
+                                                            request)
+
+                                        let isAdmissionTimeout =
+                                            match result["errorKind"] with
+                                            | null -> false
+                                            | errorKind ->
+                                                errorKind.GetValue<string>() = "fcs_admission_timeout"
+
+                                        if isAdmissionTimeout then
+                                            let timeoutResponse =
+                                                if seedArgs.cursor.IsSome then
+                                                    FindCursorContract.validationIncomplete
+                                                        deadline
+                                                        "The find deadline expired during gate admission before the continuation could be validated. Retry the same cursor with a larger timeoutMs."
+                                                else
+                                                    FindDeadlineResponse.beforeDiscovery
+                                                        seedArgs
+                                                        deadline
+                                                        "admission"
+                                                        "timed_out"
+                                                        "fcs_admission_timeout"
+                                                        (result["message"].GetValue<string>())
+
+                                            inventoryQueries |> Option.iter (fun queries ->
+                                                timeoutResponse["countsOnly"] <- jbool true
+                                                timeoutResponse["countsReturned"] <- jbool false
+                                                timeoutResponse["countsComplete"] <- jbool false
+                                                timeoutResponse["queriesRequested"] <- jint queries.Length
+                                                timeoutResponse["queriesReturned"] <- jint 0)
+                                            deadline.BeginResponseConstruction()
+                                            return deadline.GuardResponse timeoutResponse
+                                        elif timeoutMs < 0 then
+                                            deadline.BeginResponseConstruction()
+                                            return deadline.GuardResponse result
+                                        else
+                                            return result
+                                    }))
                     |> unwrapResult
                 )
 
@@ -854,54 +1050,10 @@ let private mainCore argv =
 
                                                 fcsBridge.ProjectOutlineWithinDeadline(args, ct, retainUntil))
 
-                                    let isAdmissionTimeout =
-                                        match result["errorKind"] with
-                                        | null -> false
-                                        | kind -> kind.GetValue<string>() = "fcs_admission_timeout"
-
-                                    if isAdmissionTimeout then
-                                        let issue =
-                                            jobj
-                                                [ "phase", jstr "admission"
-                                                  "status", jstr "timed_out"
-                                                  "errorKind", jstr "fcs_admission_timeout"
-                                                  "message", result["message"].DeepClone() ]
-                                            :> JsonNode
-
-                                        return
-                                            jobj
-                                                [ "status", jstr "unknown"
-                                                  "errorKind", jstr "fcs_admission_timeout"
-                                                  "message", result["message"].DeepClone()
-                                                  "timeoutMs", jint (timeoutMs |> Option.defaultValue 60_000)
-                                                  "retryable", jbool true
-                                                  "resultSetComplete", jbool false
-                                                  "coverage",
-                                                  jobj
-                                                      [ "complete", jbool false
-                                                        "filesRequested", jint 0
-                                                        "filesScanned", jint 0
-                                                        "filesTimedOut", jint 0
-                                                        "filesFailed", jint 0
-                                                        "filesNotStarted", jint 0
-                                                        "phases",
-                                                        JsonArray(
-                                                            [| jobj
-                                                                   [ "phase", jstr "admission"
-                                                                     "status", jstr "timed_out" ]
-                                                               :> JsonNode |]
-                                                        )
-                                                        :> JsonNode
-                                                        "issues", JsonArray([| issue |]) :> JsonNode
-                                                        "issuesReturned", jint 1
-                                                        "issuesTruncated", jbool false ]
-                                                  :> JsonNode
-                                                  "truncated", jbool false
-                                                  "nextCursor", null
-                                                  "files", JsonArray() :> JsonNode ]
-                                            :> JsonNode
-                                    else
-                                        return result
+                                    return
+                                        normalizeProjectOutlineAdmissionResult
+                                            (timeoutMs |> Option.defaultValue 60_000)
+                                            result
                                 }))
                     |> unwrapResult
                 )
@@ -1189,12 +1341,24 @@ let private mainCore argv =
 
 [<EntryPoint>]
 let main argv =
-    if argv.Length > 0 && argv[0] = InternalProcessSessionWrapperArgument then
+    if argv.Length > 0 && argv[0] = InternalProcessGroupWrapperArgument then
+        if argv.Length < 2 then
+            Console.Error.WriteLine("The internal process-group wrapper requires a command.")
+            64
+        else
+            runUnixProcessGroupWrapper argv[1] argv[2..]
+    elif argv.Length > 0 && argv[0] = InternalProcessSessionWrapperArgument then
         if argv.Length < 2 then
             Console.Error.WriteLine("The internal process-session wrapper requires a command.")
             64
         else
             runUnixSessionWrapper argv[1] argv[2..]
+    elif argv.Length > 0 && argv[0] = ProjectEvaluation.InternalArgument then
+        if argv.Length <> 2 then
+            Console.Error.WriteLine("The internal project-evaluation helper requires exactly one project path.")
+            64
+        else
+            ProjectEvaluation.runHelper argv[1]
     else
         try
             mainCore argv

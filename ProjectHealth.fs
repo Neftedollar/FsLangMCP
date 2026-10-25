@@ -601,28 +601,39 @@ let private resolveHealthProjectPath (input: string option) =
         else
             Error "project_health expects a .fsproj, .sln, .slnx path, or a directory containing exactly one .fsproj."
 
-/// A solution (.slnx/.sln) or directory with MORE THAN ONE .fsproj can't be reduced to a
-/// single project to report on. Rather than block (#100 — `overall:"blocked"` read like an
-/// error), project_health emits a lightweight solution summary from this list. Returns None
-/// for single-project / non-solution inputs, which the normal single-project path handles.
-let private listSolutionProjects (input: string option) : (string * string array) option =
+/// A solution (.slnx/.sln) reports its declared membership even when some or all members
+/// are missing. Directories retain the existing multi-project summary behavior. The typed
+/// discovery result is shared with semantic consumers, so health does not reparse or infer
+/// membership independently.
+let private listSolutionProjects
+    (input: string option)
+    : (string * SolutionParsing.ProjectDiscovery array) option =
     match input with
     | Some inputPath when not (System.String.IsNullOrWhiteSpace inputPath) ->
         let fullPath = Path.GetFullPath inputPath
         let ext = Path.GetExtension fullPath
 
-        let projects =
-            if File.Exists fullPath && ext.Equals(".slnx", StringComparison.OrdinalIgnoreCase) then
-                FsLangMcp.ProjectFiles.SolutionParsing.fsprojsFromSlnx fullPath
-            elif File.Exists fullPath && ext.Equals(".sln", StringComparison.OrdinalIgnoreCase) then
-                FsLangMcp.ProjectFiles.SolutionParsing.fsprojsFromSln fullPath
-            elif Directory.Exists fullPath then
-                Directory.GetFiles(fullPath, "*.fsproj", SearchOption.TopDirectoryOnly)
-                |> Array.map Path.GetFullPath
-            else
-                [||]
+        if
+            File.Exists fullPath
+            && (ext.Equals(".slnx", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".sln", StringComparison.OrdinalIgnoreCase))
+        then
+            let projects = SolutionParsing.discoverProjects fullPath
 
-        if projects.Length > 1 then Some(fullPath, projects) else None
+            if projects.Length > 1 || Array.exists SolutionParsing.isMissing projects then
+                Some(fullPath, projects)
+            else
+                None
+        elif Directory.Exists fullPath then
+            let projects: SolutionParsing.ProjectDiscovery array =
+                Directory.GetFiles(fullPath, "*.fsproj", SearchOption.TopDirectoryOnly)
+                |> Array.map (fun projectPath ->
+                    { ProjectPath = Path.GetFullPath projectPath
+                      Status = SolutionParsing.ProjectDiscoveryStatus.Loadable })
+
+            if projects.Length > 1 then Some(fullPath, projects) else None
+        else
+            None
     | _ -> None
 
 let internal createReport
@@ -639,12 +650,19 @@ let internal createReport
             // caller to pass one .fsproj for full FCS/LSP readiness. (#100)
             let projectNodes =
                 projects
-                |> Array.map (fun p ->
+                |> Array.map (fun project ->
+                    let projectPath = SolutionParsing.projectPath project
+
                     jobj
-                        [ "name", jstr (Path.GetFileNameWithoutExtension p)
-                          "fsproj", jstr p
-                          "exists", jbool (File.Exists p) ]
+                        [ "name", jstr (Path.GetFileNameWithoutExtension projectPath)
+                          "fsproj", jstr projectPath
+                          "exists", jbool (SolutionParsing.isLoadable project) ]
                     :> JsonNode)
+
+            let loadableProjectCount =
+                projects |> Array.filter SolutionParsing.isLoadable |> Array.length
+
+            let missingProjectCount = projects.Length - loadableProjectCount
 
             // Solution mode cannot run a compile check — there's no single project to compile.
             // Be HONEST about a requested (non-"Skip") compileCheck rather than silently
@@ -675,6 +693,8 @@ let internal createReport
                       jobj
                           [ "source", jstr source
                             "projectCount", jint projects.Length
+                            "loadableProjectCount", jint loadableProjectCount
+                            "missingProjectCount", jint missingProjectCount
                             "projects", JsonArray projectNodes :> JsonNode ]
                       "hint",
                       jstr

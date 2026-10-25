@@ -570,6 +570,7 @@ let ``set_project find and check preserve the same typed SDK blocking evidence``
                 { scope = Some "project"
                   path = None
                   snippet = None
+                  snippetPosition = None
                   fileGlob = None
                   mode = None
                   speed = Some "trusted"
