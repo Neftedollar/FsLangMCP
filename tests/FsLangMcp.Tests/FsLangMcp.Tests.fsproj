@@ -81,20 +81,20 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="Ionide.ProjInfo.FCS" Version="[0.74.2]" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="[18.9.0]" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="[18.11.0]" />
     <PackageReference Include="StreamJsonRpc" Version="[2.26.150]" />
     <!-- Pin StringTools to 18.4.0; see FsLangMcp.fsproj for rationale
          (MessagePack's transitive 17.6.3 breaks Ionide.ProjInfo project loading). -->
     <PackageReference Include="Microsoft.NET.StringTools" Version="[18.9.6]" />
     <PackageReference Include="xunit" Version="[2.9.3]" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="[4.0.0]">
+    <PackageReference Include="xunit.runner.visualstudio" Version="[4.0.1]">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <!-- coverlet.msbuild instruments FsLangMcp.dll (referenced via <ProjectReference>).
          The default behaviour — exclude the test assembly from coverage — is correct now that
          prod and test code live in separate assemblies (per ADR-0001). -->
-    <PackageReference Include="coverlet.msbuild" Version="[10.0.1]">
+    <PackageReference Include="coverlet.msbuild" Version="[10.1.0]">
       <IncludeAssets>build; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
