@@ -8,6 +8,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-08
+
+0.19.0 expands `find` without adding tools: the 35-tool surface remains unchanged.
+Count-only inventory can evaluate 1–50 names in one shared project-use sweep, and fixed phase
+timings plus cache ledgers make the work observed by each request explicit. Exact `Type.Field`
+shorthand now resolves through semantic record-field identity while incomplete coverage and
+zero-site evidence remain conservative. This is still a pre-1.0 release, not a contract freeze.
+
+### Added
+
+- `find` accepts either the existing single `query` site search or a count-only inventory through
+  `queries` (1–50 distinct, trimmed names). Inventory evaluates every name during one shared
+  project-use sweep and returns independent per-query definition/reference/unique-site totals,
+  matched-symbol ambiguity evidence, and project-indexed recognized-test/unmarked-project counts
+  without snippets or pagination. `testProjectDetection="project_health_heuristic"` makes that
+  XML/package grouping explicit; it is not execution evidence. A single `query` with
+  `countsOnly=true` uses the same inventory response; all
+  existing single-query calls retain their site-search and cursor behavior (#227).
+- Handler-produced `find` responses now include ten fixed, non-overlapping `phaseTimingsMs` buckets whose sum
+  is `elapsedMs`, plus request-observed project-options and project-use cache hit/miss/incomplete
+  ledgers. These fields distinguish discovery, FCS work, classification, fallback, and response
+  construction without presenting one machine's timing as a latency guarantee (#227).
+
+### Changed
+
+- Inventory accepts `kind=symbol` (also omitted/`auto`) or `kind=definition` and exact matching by
+  default; `exact=false` is case-insensitive substring matching, not wildcard syntax. Incomplete
+  totals are explicit lower bounds, complete zero is `not_found`, and incomplete zero is
+  indeterminate. Oversized inventory output returns typed `find_inventory_response_budget`
+  guidance to split queries or narrow scope rather than emitting a partial unpageable response.
+
+### Fixed
+
+- `find(kind="field")` accepts exact `Type.Field` shorthand when no `field` selector is
+  supplied, using semantic record-field identity and preserving whole declaring-type
+  precedence, including module-qualified types. Field-only matches now require actual
+  FCS use sites; a declaration or FSAC symbol-index hit cannot produce a confident zero.
+  Zero-site hints explain the declaring-type contract without recommending ambiguous bare
+  field names. Incomplete sweeps withhold provisional shorthand sites (#227).
+
 ## [0.18.0] - 2026-09-07
 
 0.18.0 makes `find` continuations query/snapshot-bound and isolates project-options
@@ -1184,7 +1224,8 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
   above), so it has no link definition either — 0.15.0 compares from the
   last version that actually was tagged, 0.13.2.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.16.0...v0.17.0

@@ -8,7 +8,7 @@ toc:
 
 The MCP description tells you *whether* to call a tool; this file tells you *how it works internally*.
 
-**Start here.** `find` and `check` are the primary entry points in the 35-tool v0.18.0 surface.
+**Start here.** `find` and `check` are the primary entry points in the 35-tool v0.19.0 surface.
 The consolidation aliases below were removed in v0.11.0 and are no longer registered:
 
 | Removed names | Current route |
@@ -89,13 +89,17 @@ elapsed time means.
 **Routing description:** Multi-project symbol search. Sweeps every member `.fsproj` of the
 solution and unions definitions, references, record-field set sites, and member-usage sites.
 Bare `find(query)` suffices; optional `kind`
-(`auto`|`symbol`|`members`|`field`|`definition`|`position`) and `scope` narrow it. `scopeNote`
-names how many projects were actually swept and how to widen/narrow (#193 — see below); a
+(`auto`|`symbol`|`members`|`field`|`definition`|`position`) and `scope` narrow it. For legacy site
+search, `scopeNote` names how many projects were actually swept and how to widen/narrow (#193 — see below); a
 deadline before discovery instead explains which phase could not finish. Prefer over text search
 for cross-project refactors.
 
-**Signature:** `query` is the only required argument. `kind` (default `auto`) and `scope` (default
-`auto`) shape the sweep. `exact` (default `true`) toggles exact-vs-substring matching. `member` /
+**Signature:** Supply either `query` for the existing site search or `queries` for count-only
+inventory, never both. `queries` accepts 1–50 distinct non-blank strings after trimming and
+defaults `countsOnly` to `true`; `query` plus `countsOnly=true` requests the same inventory shape.
+Without `countsOnly=true`, the legacy single-`query` behavior is unchanged. `kind` (default `auto`)
+and `scope` (default `auto`) shape the sweep. `exact` (default `true`) toggles exact-vs-substring
+matching; it never enables wildcard syntax. `member` /
 `field` restrict the member-usage / record-field unions. `path` + `line` + `word` + `occurrence` +
 `character` anchor `kind=position`. `contextLines` (default 0), `includeDeclaration` (default true),
 `includeInfo` (default false), `includeSiteTypes` (default false — see *Field-impact mode*),
@@ -107,13 +111,15 @@ a `path` that resolves to one member project of the requested solution.
 ### One request deadline
 
 `timeoutMs` is one monotonic end-to-end budget, including queue admission, position resolution,
-project discovery, project-options loading, the semantic sweep, and FSAC fallback. No phase
-restarts that clock. Up to 250 ms (5% of the requested budget, with a 1 ms minimum for positive
-budgets) is reserved **inside** it for response construction; `responseConstructionAllowanceMs`
-reports the reservation. The response planner, diagnostic projection, source-line streaming,
-JSON copying, and final serialization checks observe that same bounded allowance.
+project discovery, project-options loading, the FCS sweep, classification, FSAC fallback, and
+response construction. No phase restarts that clock. Up to 250 ms (5% of the requested budget,
+with a 1 ms minimum for positive budgets) is reserved **inside** it for response construction;
+`responseConstructionAllowanceMs` reports the reservation. The response planner, diagnostic
+projection, source-line streaming, JSON copying, and final serialization checks observe that same
+bounded allowance.
 
-An immediate or pre-discovery expiry returns `errorKind="find_timeout"` and never performs a new
+An expiry before outer admission returns `errorKind="fcs_admission_timeout"`; a pre-discovery
+expiry after admission returns `errorKind="find_timeout"`. Neither performs a new
 scan just to count missing projects. A known explicit `.fsproj` is `not_started`; an undiscovered
 solution has no invented member count. `coverage.phases` names the affected phase, while
 `projectsNotStarted`, `projectsTimedOut`, `projectsBusy`, `projectsMissing`, and `projectsFailed`
@@ -146,17 +152,109 @@ Uncancellable work already running retains its admission slot until it actually 
 early timeout cannot create an unbounded worker backlog. A synchronous filesystem or compiler
 call already in progress is not forcibly interrupted.
 
+Projects are processed sequentially against the same remaining budget. A later project therefore
+receives only the time left after admission, discovery, project options, and earlier project work;
+it does not get a fresh `timeoutMs`.
+
+### Cost and cache evidence
+
+Every handler-produced success and typed search error carries `elapsedMs`, `phaseTimingsMs`, and
+`cacheState`. SDK argument-binding, transport, and installation-health failures can occur outside
+that handler and do not carry this search telemetry.
+`phaseTimingsMs` always contains these ten non-overlapping integer buckets:
+`admission`, `positionResolution`, `targetDiscovery`, `projectOptions`, `snapshot`, `fcsSweep`,
+`classification`, `fsacFallback`, `responseConstruction`, and `unattributed`. Their sum equals
+`elapsedMs`. The sample is taken before the last production size-check serialization and transport,
+so it is not total client-observed latency and should not be treated as a latency guarantee.
+
+`cacheState.projectOptions` and `cacheState.projectUses` each report `hits`, `misses`, `incomplete`,
+and `state` (`not_observed`, `observed`, or `incomplete`). They count only cache lookups this request
+actually reached: they do not expose FCS's internal caches or project-options work nested inside
+position resolution. A `projectUses` miss remains a known miss even if its worker later fails. On a
+warm request these caches can avoid project evaluation and FCS parse/check/use enumeration. On a
+cold request, narrowing `kind` can reduce classification and snippet work, but it does not remove
+the base FCS project check. Compare like-for-like requests and coverage rather than inferring a
+general speed claim from one run. Legacy site search continues to omit successful zero-match
+projects from `perProject`; their work remains visible through these phase and cache ledgers.
+Inventory instead keeps every requested project in `projectLedger`.
+
+Expect the first sweep after `set_project` to be substantially more expensive than repeated
+searches over unchanged projects. One [0.18.0 dogfood report](https://github.com/Neftedollar/FsLangMCP/issues/227#issuecomment-6023560318)
+on an eight-project solution measured 101.3 seconds for the first workspace search, then
+0.3–5.6 seconds for subsequent searches in the same session. This is an observed cold/warm gap,
+not a promised speedup or baseline: project size, builds running concurrently, filesystem work,
+and cache invalidation can change it. `set_project` readiness and `symbolIndexState="warming"`
+describe FSAC startup/index observations; they do not prove that the FCS project-use caches are
+warm. Use `cacheState`, phase timings, and equal coverage to distinguish a cold sweep from a
+persistently expensive search before abandoning semantic inventory.
+
 ### Bare-call default
 
 `find(query)` runs `kind=auto` over `scope=auto` — i.e. it sweeps **every** member project of the
 active solution and unions all four site kinds. No position, no project path, no flags needed; the
 common case is a single argument.
 
-### scopeNote (#193)
+To constrain that legacy search to one project:
+
+```text
+find { "query": "OrderId", "kind": "symbol", "scope": "project", "projectPath": "src/Core/Core.fsproj" }
+```
+
+`src/Core/Core.fsproj` is an illustrative path. This avoids sibling-project classification and
+snippet work, but a cold request still has to load and check that project's FCS context.
+
+### Count-only inventory
+
+Inventory answers “how many semantic sites do these names have?” without returning `sites`, source
+snippets, or one cursor stream per name:
+
+```text
+find { "queries": ["OrderId", "OrderService"], "projectPath": "src/Core/Core.fsproj", "scope": "project" }
+```
+
+The tool enumerates each requested project's symbol uses once and evaluates every query against
+that enumeration. Omitted/`auto` `kind` is normalized to `symbol`; `definition` counts definitions
+only. Matching is the same as legacy search: exact by default, or case-insensitive substring with
+`exact=false`. Asterisks and other wildcard syntax have no special meaning.
+
+Each query row reports `definitions`, `references`, `uniqueSites`, `matchedSymbolCount`,
+`ambiguous`, and a bounded illustrative `symbols` list. `ambiguous=true` is conclusive as soon as
+two symbol identities are observed; it is `false` only when complete counts contain at most one,
+and `null` when incomplete counts have not yet proved ambiguity. Its `perProject` counts refer by
+`projectIndex` to the shared `projectLedger`, which uses normalized `.fsproj` identities.
+Projects with no match may be absent from that per-query array, but every requested project remains
+visible in `projectLedger` and coverage. `testProjectDetection="project_health_heuristic"` says
+that `isTestProject` is the project-health syntactic XML/package heuristic: `true` means a
+recognized test project, `false` means an unmarked project, and a missing project has `null`.
+Inherited or conditional MSBuild properties can evade the heuristic, and unreadable XML currently
+falls back to `false`. Use it to group evidence, then validate important classifications; neither
+value proves test or production execution, and a reference does not prove behavioral coverage.
+
+A linked physical source range counts once per project that compiled it and once in each applicable
+global category. Definitions and references de-duplicate independently, while `uniqueSites` is
+their physical-range union. If different project contexts classify the same linked range
+differently, `definitions + references` can therefore exceed `uniqueSites`; do not assume the two
+categories partition that union. Per-project totals can likewise sum above global `uniqueSites`.
+The response makes this explicit with `categoryCountsMayOverlap=true`. Every query owns its own
+deduplication sets: overlapping query rows are independent results, not pieces of a union.
+
+Inventory has no pagination in v1. It rejects `member`/`field`/position selectors,
+`includeSiteTypes=true`, `contextLines>0`, `cursor`, unsupported kinds, and
+`queries` with `countsOnly=false`. If the complete production-serialized response would exceed
+60,000 UTF-16 code units, `errorKind="find_inventory_response_budget"` advises splitting the query
+batch or narrowing `scope`/`projectPath`; `maxResults` cannot page it.
+
+`countsComplete=false` means all reported totals are lower bounds. A positive lower bound remains
+useful, but an incomplete zero has `outcome="indeterminate"` and `matched=null`; only a complete
+zero is `not_found`. On timeout, first inspect coverage and `phaseTimingsMs`, then narrow to a
+project such as `src/Core/Core.fsproj`, split the query list, warm the same request, or increase
+`timeoutMs`. Do not add incomplete rows together as if they were exhaustive.
+
+### Legacy site-search `scopeNote` (#193)
 
 Sweep breadth is unchanged by any `scope` value — `auto`/`workspace` always sweep every member
 project the resolved sweep target actually has, exactly as `file`/`project` always narrow to one.
-What's new is that **every response that completes a sweep carries a top-level `scopeNote`**
+For legacy site search, **every response that completes a sweep carries a top-level `scopeNote`**
 (`succeeded`, `partial`, and `unknown` all get one) reporting the real outcome (driven by
 `projectsSwept`/`projectsAnalyzed`, not by which `scope` string was requested) and the recipe to
 change it. Argument validation, ordinary `kind=position` resolution failures, and a missing
@@ -306,7 +404,7 @@ position, or any other identity input. Fixed metadata overflow uses
 | `auto` (default) | Union of `symbol` + `members` + `field` definitions/references/sites |
 | `symbol` | Grouped definitions + references |
 | `members` | Member-usage sites on a type; pair with `member` |
-| `field` | Record field sites — construction, copy-update, mutation, pattern, read; pair with `field` |
+| `field` | Record field use sites — `query="Card", field="Name"`, or exact `query="Card.Name"` without a selector |
 | `definition` | Definition sites only |
 | `position` | Exact-position resolution; needs `path` + `line` + `word`/`character` |
 
@@ -325,7 +423,8 @@ position, or any other identity input. Fixed metadata overflow uses
    member-usage sites.
 3. De-duplicates the union by `(file, range)` and groups by symbol identity.
 4. When FCS finds no sites, probes the project-bound FSAC `workspace/symbol` index without
-   treating a warming, disconnected, or mismatched FSAC session as a valid zero.
+   treating a warming, disconnected, or mismatched FSAC session as a valid zero. `kind=field`
+   skips this name-only fallback: an indexed declaration is not evidence of field use sites.
 5. Returns flat `sites` entries with `file`, `range`, `lineText`, plus scoped
    `projectDiagnostics` and explicit project-coverage counts.
 
@@ -333,8 +432,27 @@ position, or any other identity input. Fixed metadata overflow uses
 
 Changing a record field's type is a fan-out edit: every construction site, every copy-and-update,
 every mutation, every destructuring pattern, and every read may need a *different* change, and on a
-solution they are spread across projects. `find(kind='field', field='Name', includeSiteTypes=true)`
+solution they are spread across projects. `find(query='Card', kind='field', field='Name', includeSiteTypes=true)`
 is built for exactly that loop.
+
+**Query contract.** Use the declaring record type as `query`, with optional `field` to select
+one field. With `kind='field'`, `exact=true` (the default), and no `field` selector, `Card.Name`
+is shorthand for `query='Card', field='Name'`; module-qualified forms work too. Resolution
+uses actual record/field identities, not a blind last-dot split. If the entire query names a
+record type, that interpretation takes precedence, even if that type has no use sites.
+Short declaring-type names and dotted type suffixes retain legacy matching: all matching
+declaring types are included, not an arbitrary first record. Qualify the namespace/module
+when different records share the same type name.
+An explicit `field` selector always keeps `query` as the declaring type; `exact=false` retains
+declaring-type substring matching. Bare `query='Name'` is **not** a search across records sharing
+that field name. `auto` and other kinds retain their existing behavior.
+
+Field-only `matched=true` requires actual FCS use sites, never just a declaration or an FSAC
+index hit. A completed zero says no use sites were found in the selected scope, not that the
+declaration is absent. Zero-site hints explain the contract even without `includeSiteTypes`.
+Incomplete sweeps cannot exclude a later whole-type match, so provisional shorthand sites
+are withheld; read `coverage` and retry before inferring absence. Cursor continuations must
+repeat the original spelling and selector, even when another spelling would mean the same field.
 
 **Site kinds.** Field sites are classified from the parse tree into five kinds, each of which needs
 a different edit:
@@ -369,7 +487,7 @@ has **today** — the "before" half. `find` deliberately does **not** typecheck 
 record shape: knowing the "after" type requires compiling the modified code, which is what `check`
 does. The intended loop is therefore:
 
-1. `find(kind='field', field='Name', includeSiteTypes=true)` — enumerate every site with its kind,
+1. `find(query='Card', kind='field', field='Name', includeSiteTypes=true)` — enumerate every site with its kind,
    line text, and today's type;
 2. edit all of them;
 3. `check(scope='project')` — one verdict on the result.

@@ -199,10 +199,13 @@ type FcsFindSymbolArgs =
       cursor: string option }
 
 type FindArgs =
-    { /// Symbol, type, or member name to find. The ONLY required argument.
+    { /// Symbol, type, or member name to find. For kind=field, use the declaring record
+      /// type plus optional field=Name, or exact Type.Field with no field selector.
+      /// Bare field names are not resolved across records. The ONLY required argument.
       query: string
       /// Resolution mode: "auto" (default) | "symbol" | "members" | "field" | "definition" | "position".
       /// auto unions definitions + references + record-field sites + member-usage sites.
+      /// field finds use sites, not declarations: query=Card, field=Name or query=Card.Name.
       kind: string option
       /// Sweep breadth: "auto" (default) | "file" | "project" | "workspace".
       /// auto/workspace sweep every member project of the active solution; the response
@@ -215,6 +218,7 @@ type FindArgs =
       /// Restrict the member-usage union to this member name (used with kind=members).
       ``member``: string option
       /// Restrict the record-field union to this field name (used with kind=field).
+      /// When supplied, query remains the declaring type; dotted shorthand is disabled.
       field: string option
       /// File context: derives project options and anchors kind=position / scope=file.
       path: string option
@@ -258,6 +262,55 @@ type FindArgs =
       timeoutMs: int option
       /// Stateless v2 cursor from a prior Find call's nextCursor. It binds the canonical
       /// request and complete stream; omit for the first page. Legacy offset cursors are rejected.
+      cursor: string option }
+
+/// Public find input. Keep the single-query backend record stable for v2 cursors
+/// and internal consumers; inventory is an explicit alternative, not N calls.
+type FindToolArgs =
+    { /// Supply query for legacy site search, or queries for count-only inventory, never both.
+      /// kind=field takes the declaring type; exact Type.Field shorthand is supported when
+      /// field is omitted. Whole declaring-type matches take precedence over shorthand.
+      /// Bare field names are not resolved; qualify same-named declaring types to disambiguate.
+      query: string option
+      /// 1..50 distinct non-blank names. Defaults to countsOnly=true, kind=symbol.
+      queries: string list option
+      /// Inventory without snippets. Also supported with a single query. No inventory cursors.
+      countsOnly: bool option
+      /// auto (default), symbol, members, field, definition, position. Inventory: symbol/definition only.
+      kind: string option
+      /// auto/file/project/workspace. Narrow to one .fsproj with scope=project + projectPath.
+      scope: string option
+      /// Exact name match by default; false means case-insensitive substring, not a wildcard.
+      exact: bool option
+      ``member``: string option
+      /// kind=field selector within the query's declaring type; suppresses Type.Field shorthand.
+      /// Omit to find all fields on that type. Inventory does not support field selectors.
+      field: string option
+      /// File context for position resolution or scope=file; inventory can filter this file.
+      path: string option
+      /// 0-based line for kind=position; not supported by inventory.
+      line: int option
+      word: string option
+      occurrence: int option
+      /// 0-based column for kind=position; not supported by inventory.
+      character: int option
+      /// Site snippets: default 0, max 8 lines per side; inventory only supports 0.
+      contextLines: int option
+      /// Include definitions by default. kind=definition always returns definitions.
+      includeDeclaration: bool option
+      /// Include Info/Hint diagnostics. Default false.
+      includeInfo: bool option
+      /// Site search per-project match breakdown. Inventory always includes its shared project ledger.
+      includePerProject: bool option
+      /// Field site type resolution; not supported by inventory.
+      includeSiteTypes: bool option
+      /// .fsproj/.sln/.slnx/directory, falling back to active set_project.
+      projectPath: string option
+      /// Site page size (1..1000, default 80). Inventory counts all sites; no pagination.
+      maxResults: int option
+      /// One end-to-end budget including admission/options/FCS/response. Default 120000 ms; 0 is immediate timeout.
+      timeoutMs: int option
+      /// Stateless v2 site-search continuation. Inventory does not support cursors.
       cursor: string option }
 
 type FcsTestsForSymbolArgs =
