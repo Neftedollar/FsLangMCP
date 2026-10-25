@@ -104,7 +104,7 @@ jobs:
 
       - name: Upload release-bit test results
         if: always() && steps.release_bit_tests.outcome != 'skipped'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-bit-test-results
           path: '${{ github.workspace }}/TestResults/release-bits/release-bit-test-results.trx'
@@ -184,7 +184,7 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload the single verified release artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nuget-release-package
           path: |
@@ -203,7 +203,7 @@ jobs:
 
     steps:
       - name: Download the verified release artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nuget-release-package
           path: ./release-artifacts
@@ -233,7 +233,7 @@ jobs:
       # modified. A successful NuGet push is therefore the final irreversible
       # release action, and both destinations receive the same verified bytes.
       - name: Create or update GitHub Release with verified package
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           generate_release_notes: true
           files: |

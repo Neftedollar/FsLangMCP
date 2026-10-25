@@ -72,7 +72,7 @@ jobs:
 
       - name: Upload coverage test results
         if: always() && steps.coverage_tests.outcome != 'skipped'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-coverage-test-results
           path: '${{ github.workspace }}/TestResults/test-results.trx'
@@ -81,7 +81,7 @@ jobs:
 
       - name: Upload test hang diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-hang-diagnostics
           path: '**/TestResults/**'
@@ -110,7 +110,7 @@ jobs:
 
       - name: Upload coverage artifact
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-cobertura
           path: '**/coverage.cobertura.xml'
@@ -153,7 +153,7 @@ jobs:
 
       - name: Upload minimum SDK test results
         if: always() && steps.minimum_sdk_tests.outcome != 'skipped'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: minimum-sdk-test-results
           path: '${{ github.workspace }}/TestResults/minimum-sdk/minimum-sdk-test-results.trx'
