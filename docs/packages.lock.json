@@ -64,12 +64,12 @@
       },
       "Nacara.Plugin.Highlight.TreeSitter": {
         "type": "Direct",
-        "requested": "[1.0.0-beta.1, 1.0.0-beta.1]",
-        "resolved": "1.0.0-beta.1",
-        "contentHash": "K6M1orsk/LJBsRw7LVWMHYFBQ8aQJZsa6KhZ78jSNwJ9iWKhBAsB17Ou93EGW1mcotz+E02Pt8JZZW9rZHvjmA==",
+        "requested": "[1.0.0-beta.3, 1.0.0-beta.3]",
+        "resolved": "1.0.0-beta.3",
+        "contentHash": "Uy5qoH7aQLQ7BVpOX/gBodg9Y5zHlbO5b8xWM2wfo9GXhDjXamycyQjIKkE5qxc2/ZA4hnAvMiQ7Iz4W/gFq3w==",
         "dependencies": {
           "FSharp.Core": "10.1.300",
-          "Nacara.Core": "2.0.0-beta.1"
+          "Nacara.Core": "2.0.0-beta.6"
         }
       },
       "Nacara.Plugin.LinkValidator": {
@@ -84,23 +84,23 @@
       },
       "Nacara.Plugin.Markdown": {
         "type": "Direct",
-        "requested": "[1.0.0-beta.1, 1.0.0-beta.1]",
-        "resolved": "1.0.0-beta.1",
-        "contentHash": "re59LzZyJk6HuTHwveODOHqIMYSGnUmVEF5IeHAHJoXIrEMnmgL/2RDAx/hY1y6pBKmsUDixWUCJMS97x8KABQ==",
+        "requested": "[1.0.0-beta.2, 1.0.0-beta.2]",
+        "resolved": "1.0.0-beta.2",
+        "contentHash": "TkGArjH5hRQabgUUEgl9iOJLRzxwLoYrSGzfbHGT5A9QHmlp76yZSua53pPm0NzHVmO1kecTITZ3UuLf5CIFGg==",
         "dependencies": {
           "FSharp.Core": "10.1.300",
           "Markdig": "1.3.2",
-          "Nacara.Core": "2.0.0-beta.1"
+          "Nacara.Core": "2.0.0-beta.6"
         }
       },
       "Nacara.Plugin.Search": {
         "type": "Direct",
-        "requested": "[1.0.0-beta.1, 1.0.0-beta.1]",
-        "resolved": "1.0.0-beta.1",
-        "contentHash": "ZC8zPVWjr7L9cCXtlIMq/jgZVOFKZBHfcx+jEt8sHK5jNncA4X7icu6/Mgu/y6fF5ncgCmdyf5Oq12Sukss6sg==",
+        "requested": "[1.0.0-beta.2, 1.0.0-beta.2]",
+        "resolved": "1.0.0-beta.2",
+        "contentHash": "vuE3hO7sBIdulVKqrr1yWfnBR9xwDwq7ynqg8Yjw5W7DqZEihj2xDZm1szsHVMW4ib6s2cdOMMlQ+sROcRu/pg==",
         "dependencies": {
           "FSharp.Core": "10.1.300",
-          "Nacara.Core": "2.0.0-beta.1"
+          "Nacara.Core": "2.0.0-beta.6"
         }
       },
       "Nacara.Plugin.Sitemap": {

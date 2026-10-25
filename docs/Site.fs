@@ -33,9 +33,9 @@ let theme =
     Theme.defaults
     |> Theme.navbar
         [
-            NavbarSection("Get started", "guide", "getting-started.md")
-            NavbarSection("Tools", "tools", "tools-reference.md")
-            NavbarSection("Why semantic F#", "concepts", "why-agents-grep-fsharp.md")
+            NavbarSection("Get started", "guide", "/guide/getting-started/")
+            NavbarSection("Tools", "tools", "/tools/reference/")
+            NavbarSection("Why semantic F#", "concepts", "/concepts/why-semantic-fsharp/")
             NavbarLink("Troubleshooting", "/guide/troubleshooting/")
             NavbarLink("Release notes", "/changelog/releases/")
         ]
