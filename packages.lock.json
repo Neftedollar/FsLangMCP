@@ -10,11 +10,11 @@
       },
       "FSharp.Compiler.Service": {
         "type": "Direct",
-        "requested": "[43.12.400, 43.12.400]",
-        "resolved": "43.12.400",
-        "contentHash": "Ydo8HRHMewaGL6N1jFwFunI6aqyrv0Ndy1en3tT2jq3rGEDX53H2xqihD6mvbuIODB9TtLZi5hB2BZa2nVDnXg==",
+        "requested": "[43.12.403, 43.12.403]",
+        "resolved": "43.12.403",
+        "contentHash": "L8nTnxAsjXY6Fjnap5AVHVptbc7QqkNftmQiO0ylAnXpJHMCqO2u2XxmXo2pw4NfAAwClCwnjbF6BMOU3gibMA==",
         "dependencies": {
-          "FSharp.Core": "[10.1.400]"
+          "FSharp.Core": "[10.1.403]"
         }
       },
       "FSharp.Core": {
