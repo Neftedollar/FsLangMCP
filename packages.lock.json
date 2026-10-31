@@ -61,15 +61,15 @@
       },
       "G-Research.FSharp.Analyzers": {
         "type": "Direct",
-        "requested": "[0.23.0, 0.23.0]",
-        "resolved": "0.23.0",
-        "contentHash": "OySQ+6afD54e0P4bhGFS7DS7ijVP0tm4MgKw+Qn+JSyr0ObSktOoRGYO2mxUX7wzNuxr/67xO2JkXrkwBWwlnA=="
+        "requested": "[0.26.0, 0.26.0]",
+        "resolved": "0.26.0",
+        "contentHash": "UHl03E3O4qdgJJXBHBAP0ip+iYpZ7HRp58UX6/WdUiGYLp5DQCgk/OZOejO4EsAPYvwaJauWeTM8YRnl27pXJQ=="
       },
       "Ionide.Analyzers": {
         "type": "Direct",
-        "requested": "[0.16.0, 0.16.0]",
-        "resolved": "0.16.0",
-        "contentHash": "7yy9T/ffTaX6GJpfrItTWA/ogwpAt4/SKG58+mExZhkLi4xqLPjPKbPbuluEGcyknWGpjwPIC/ftLT+HU5mFMw=="
+        "requested": "[0.20.0, 0.20.0]",
+        "resolved": "0.20.0",
+        "contentHash": "40upZgbWL+Qsf5WHQfVShXAkCoUrFaygt2UlCAUMHQmvcQ4JWC4y1Dnxgem+lxkv3AJzkfpxngTy7aE/AActOQ=="
       },
       "Ionide.ProjInfo.FCS": {
         "type": "Direct",
