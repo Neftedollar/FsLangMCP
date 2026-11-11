@@ -12668,19 +12668,26 @@ type internal FcsBridge
                     if fcsLine < 1 || fcsLine > lines.Length || fcsCol < 0 || fcsCol > lt.Length then
                         None
                     else
-                        match checkResults.GetSymbolUseAtLocation(fcsLine, fcsCol, lt, []) with
-                        | None -> None
-                        | Some su ->
-                            let toolTip =
-                                checkResults.GetToolTip(
-                                    fcsLine,
-                                    fcsCol,
-                                    lt,
-                                    [],
-                                    FSharp.Compiler.Tokenization.FSharpTokenTag.IDENT
-                                )
-
-                            Some(su, toolTip)
+                        // FCS requires the identifier text even for position-based
+                        // lookup. An empty names list silently returns no symbol.
+                        // Share the same span extraction as the public SymbolAtWord path.
+                        wordSpans None lt
+                        |> Array.tryPick (fun (startColumn, endColumn, word) ->
+                            if fcsCol < startColumn || fcsCol > endColumn then
+                                None
+                            else
+                                match checkResults.GetSymbolUseAtLocation(fcsLine, endColumn, lt, [ word ]) with
+                                | None -> None
+                                | Some su ->
+                                    let toolTip =
+                                        checkResults.GetToolTip(
+                                            fcsLine,
+                                            endColumn,
+                                            lt,
+                                            [ word ],
+                                            FSharp.Compiler.Tokenization.FSharpTokenTag.IDENT
+                                        )
+                                    Some(su, toolTip))
 
                 let exactFcsLine = args.line + 1
                 let exactFcsCol = args.character

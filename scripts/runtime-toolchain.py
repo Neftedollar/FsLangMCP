@@ -573,7 +573,9 @@ def require_fsac_diagnostics(
 
     diagnostics = response.get("diagnostics")
     if not isinstance(diagnostics, list) or not any(
-        isinstance(diagnostic, dict) and diagnostic.get("severity") == 1
+        isinstance(diagnostic, dict)
+        and type(diagnostic.get("severity")) is int
+        and diagnostic.get("severity") == 1
         for diagnostic in diagnostics
     ):
         fail(f"FSAC publishDiagnostics did not surface the deliberate error: {response!r}")

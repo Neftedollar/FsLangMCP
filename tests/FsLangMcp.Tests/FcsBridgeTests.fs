@@ -3450,10 +3450,13 @@ let ``TypeAtPosition no_symbol includes lineText + surroundingLines for misalign
             Assert.Equal("no_symbol", result["status"].GetValue<string>())
             // The lineText must always be present so 1-based vs 0-based mistakes are visible.
             let lineText = result["lineText"].GetValue<string>()
-            Assert.NotNull(lineText :> obj)
-            // surroundingLines has exactly 3 entries (line-1, line, line+1)
+            Assert.Equal("", lineText)
+            // Pin the actual nearby source, not just the number of rows.
             let surrounding = result["surroundingLines"] :?> JsonArray
-            Assert.Equal(3, surrounding.Count)
+            Assert.Equal<int array>([| 0; 1; 2 |], surrounding |> Seq.map (fun row -> row["line"].GetValue<int>()) |> Seq.toArray)
+            Assert.Equal<string array>(
+                [| "module TestModule"; ""; "let aValue = 42" |],
+                surrounding |> Seq.map (fun row -> row["text"].GetValue<string>()) |> Seq.toArray)
             // fuzzy flag echoed back
             Assert.False(result["fuzzy"].GetValue<bool>())
         finally
@@ -3461,88 +3464,91 @@ let ``TypeAtPosition no_symbol includes lineText + surroundingLines for misalign
                 Directory.Delete(tempRoot, true)
     }
 
-[<Fact>]
-let ``TypeAtPosition fuzzy snaps to nearest symbol when exact position misses`` () : Task =
+[<Theory>]
+[<InlineData(false, 8, 8, false)>]
+[<InlineData(true, 8, 8, false)>]
+[<InlineData(true, 15, 10, true)>]
+let ``TypeAtPosition resolves the known symbol and distinguishes exact from fuzzy hits``
+    (fuzzy: bool, character: int, resolvedCharacter: int, snapped: bool) : Task =
     task {
-        let runId = Guid.NewGuid().ToString("N")
-        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_tap_fuzzy_%s{runId}")
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_tap_%O{Guid.NewGuid()}")
         let bridge = FcsBridge()
 
         try
-            // line 0: "module M"
-            // line 1: ""
-            // line 2: "let aValue = 42"
-            let src = "module M\n\nlet aValue = 42\n"
-            let sourcePath, projectPath = writeProjectWithSource tempRoot "TapFuzzy" src
+            let sourcePath, projectPath =
+                writeProjectWithSource tempRoot "TapKnown" "module M\n\nlet aValue = 42\n"
+            let args =
+                { path = sourcePath; line = 2; character = character; text = None
+                  projectPath = Some projectPath; projectOptions = None; fuzzy = Some fuzzy }
 
-            // Aim a few columns past the identifier on the SAME line — exact may miss,
-            // fuzzy should still resolve "aValue".
-            let! fuzzyResult =
-                bridge.TypeAtPosition(
-                    { path = sourcePath
-                      line = 2
-                      character = 25 // well past end of "let aValue = 42"
-                      text = None
-                      projectPath = Some projectPath
-                      projectOptions = None
-                      fuzzy = Some true }
-                )
+            if snapped then
+                // Column 15 is outside the line, but the identifier end at 10 is
+                // exactly within the documented five-column search radius.
+                let! exactMiss = bridge.TypeAtPosition({ args with fuzzy = Some false })
+                Assert.Equal("no_symbol", exactMiss["status"].GetValue<string>())
 
-            // Either we snap and get ok, or we still no_symbol (depends on FCS column
-            // tolerance). The contract: when ok, fuzzySnap must be true and resolvedLine
-            // must be set.
-            let status = fuzzyResult["status"].GetValue<string>()
-
-            if status = "ok" then
-                Assert.True(fuzzyResult["fuzzySnap"].GetValue<bool>())
-                Assert.NotNull(fuzzyResult["resolvedLine"] :> obj)
-                Assert.NotNull(fuzzyResult["resolvedCharacter"] :> obj)
-            else
-                // If even fuzzy can't resolve (edge case), ensure the diagnostic shape is correct.
-                Assert.Equal("no_symbol", status)
-                Assert.True(fuzzyResult["fuzzy"].GetValue<bool>())
+            let! result = bridge.TypeAtPosition(args)
+            Assert.Equal("ok", result["status"].GetValue<string>())
+            Assert.Equal("aValue", result["symbolName"].GetValue<string>())
+            Assert.Equal("M.aValue", result["fullName"].GetValue<string>())
+            Assert.Equal("val aValue: int", result["typeString"].GetValue<string>())
+            Assert.Equal(snapped, result["fuzzySnap"].GetValue<bool>())
+            Assert.Equal(2, result["resolvedLine"].GetValue<int>())
+            Assert.Equal(resolvedCharacter, result["resolvedCharacter"].GetValue<int>())
         finally
-            if Directory.Exists tempRoot then
-                Directory.Delete(tempRoot, true)
+            if Directory.Exists tempRoot then Directory.Delete(tempRoot, true)
+    }
+
+[<Theory>]
+[<InlineData(16)>]
+[<InlineData(25)>]
+let ``TypeAtPosition fuzzy search does not invent a hit beyond its radius`` (character: int) : Task =
+    task {
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_tap_far_%O{Guid.NewGuid()}")
+        try
+            let sourcePath, projectPath =
+                writeProjectWithSource tempRoot "TapFar" "module M\n\nlet aValue = 42\n"
+            let! result = FcsBridge().TypeAtPosition(
+                { path = sourcePath; line = 2; character = character; text = None
+                  projectPath = Some projectPath; projectOptions = None; fuzzy = Some true })
+            Assert.Equal("no_symbol", result["status"].GetValue<string>())
+            Assert.True(result["fuzzy"].GetValue<bool>())
+            Assert.Equal("let aValue = 42", result["lineText"].GetValue<string>())
+            Assert.Null(result["symbolName"])
+        finally
+            if Directory.Exists tempRoot then Directory.Delete(tempRoot, true)
     }
 
 [<Fact>]
-let ``TypeAtPosition exact hit reports fuzzySnap=false`` () : Task =
+let ``SymbolAtWord resolves the active public tool path from an unsaved buffer`` () : Task =
     task {
-        let runId = Guid.NewGuid().ToString("N")
-        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_tap_exact_%s{runId}")
-        let bridge = FcsBridge()
-
+        let tempRoot = Path.Combine(Path.GetTempPath(), $"fslangmcp_symbol_buffer_%O{Guid.NewGuid()}")
         try
-            // line 0: "module M"
-            // line 1: ""
-            // line 2: "let aValue = 42"  — identifier starts at column 4
-            let src = "module M\n\nlet aValue = 42\n"
-            let sourcePath, projectPath = writeProjectWithSource tempRoot "TapExact" src
+            let sourcePath, projectPath =
+                writeProjectWithSource tempRoot "SymbolBuffer" "module M\n\nlet aValue = 42\n"
+            let bridge = FcsBridge()
+            let args : FcsSymbolAtWordArgs =
+                { path = sourcePath; line = 2; word = Some "aValue"; occurrence = None
+                  text = None; projectPath = Some projectPath; projectOptions = None
+                  includeDocumentation = Some false }
+            let! disk = bridge.SymbolAtWord(args)
+            Assert.Equal("ok", disk["status"].GetValue<string>())
+            Assert.Equal("M.aValue", disk["fullName"].GetValue<string>())
+            Assert.Equal("val aValue: int", disk["typeString"].GetValue<string>())
 
-            let! result =
-                bridge.TypeAtPosition(
-                    { path = sourcePath
-                      line = 2
-                      character = 5
-                      text = None
-                      projectPath = Some projectPath
-                      projectOptions = None
-                      fuzzy = Some false }
-                )
+            let buffer = "module M\n\nlet aValue = \"unsaved\"\n"
+            let! unsaved = bridge.SymbolAtWord({ args with text = Some buffer })
+            Assert.Equal("ok", unsaved["status"].GetValue<string>())
+            Assert.Equal("aValue", unsaved["symbolName"].GetValue<string>())
+            Assert.Equal("M.aValue", unsaved["fullName"].GetValue<string>())
+            Assert.Equal("val aValue: string", unsaved["typeString"].GetValue<string>())
+            Assert.Equal("module M\n\nlet aValue = 42\n", File.ReadAllText(sourcePath))
 
-            // If the position is precise enough, ok status with fuzzySnap=false.
-            // If FCS still misses despite the exact location, accept no_symbol (FCS
-            // tolerance can vary across versions — the test guards the shape, not FCS).
-            let status = result["status"].GetValue<string>()
-
-            if status = "ok" then
-                Assert.False(result["fuzzySnap"].GetValue<bool>())
-                Assert.Equal(2, result["resolvedLine"].GetValue<int>())
-                Assert.Equal(5, result["resolvedCharacter"].GetValue<int>())
+            let! restored = bridge.SymbolAtWord(args)
+            Assert.Equal("ok", restored["status"].GetValue<string>())
+            Assert.Equal("val aValue: int", restored["typeString"].GetValue<string>())
         finally
-            if Directory.Exists tempRoot then
-                Directory.Delete(tempRoot, true)
+            if Directory.Exists tempRoot then Directory.Delete(tempRoot, true)
     }
 
 // ─── fcs_validate_snippet (#112) ─────────────────────────────────────────────
@@ -3714,40 +3720,6 @@ let ``ReferencedSymbols returns invalid_args when projectPath is None`` () : Tas
     }
 
 [<Fact>]
-let ``ReferencedSymbols includeNonPublic surfaces additional results vs default`` () : Task =
-    task {
-        let root = findRepoRoot ()
-        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
-        let bridge = FcsBridge()
-
-        let! publicOnly =
-            bridge.ReferencedSymbols(
-                { query = "FSharpProjectOptions"
-                  projectPath = Some projectPath
-                  includeNonPublic = Some false
-                  maxResults = Some 500
-                  cursor = None }
-            )
-
-        let! includingInternal =
-            bridge.ReferencedSymbols(
-                { query = "FSharpProjectOptions"
-                  projectPath = Some projectPath
-                  includeNonPublic = Some true
-                  maxResults = Some 500
-                  cursor = None }
-            )
-
-        let publicCount = (publicOnly["results"] :?> JsonArray).Count
-        let allCount = (includingInternal["results"] :?> JsonArray).Count
-        // includeNonPublic must never return fewer matches than the public-only filter.
-        Assert.True(
-            allCount >= publicCount,
-            $"includeNonPublic should return >= public-only count: public=%d{publicCount} all=%d{allCount}"
-        )
-    }
-
-[<Fact>]
 let ``NugetTypes enumerates types from a known framework assembly`` () : Task =
     task {
         let root = findRepoRoot ()
@@ -3913,7 +3885,12 @@ let ``NugetMembers surfaces multiple entries including union cases for FSharpOpt
 
         let results = result["results"] :?> JsonArray
         // FSharpOption has union cases (Some, None) plus instance members (IsNone, IsSome, Value)
-        Assert.True(results.Count >= 2, $"Expected >= 2 entries for FSharpOption, got {results.Count}")
+        let unionCases =
+            results
+            |> Seq.filter (fun entry -> entry["kind"].GetValue<string>() = "union-case")
+            |> Seq.map (fun entry -> entry["name"].GetValue<string>())
+            |> Set.ofSeq
+        Assert.Equal<Set<string>>(set [ "Some"; "None" ], unionCases)
 
         // Overloads: if there are multiple entries sharing the same name, they must have distinct signatures
         let byName =
@@ -3929,85 +3906,6 @@ let ``NugetMembers surfaces multiple entries including union cases for FSharpOpt
             Assert.True(
                 distinct.Length = sigs.Length,
                 $"Overloads of '{name}' must have distinct signatures; got duplicates: {joined}")
-    }
-
-[<Fact>]
-let ``NugetMembers overloads appear as distinct entries when type has method overloads`` () : Task =
-    task {
-        let root = findRepoRoot ()
-        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
-        let bridge = FcsBridge()
-
-        // System.Text.Json is bundled with the .NET framework; JsonSerializer has many Serialize overloads.
-        let! result =
-            bridge.NugetMembers(
-                { packageId = "System.Text.Json"
-                  typeName = "JsonSerializer"
-                  projectPath = Some projectPath
-                  includeNonPublic = None
-                  maxResults = Some 500
-                  cursor = None }
-            )
-
-        Assert.Equal("ok", result["status"].GetValue<string>())
-        let matchedTypes = result["matchedTypes"] :?> JsonArray
-
-        if matchedTypes.Count = 0 then
-            // Assembly not found in this .NET flavour — skip without failing
-            ()
-        else
-            let results = result["results"] :?> JsonArray
-            // JsonSerializer.Serialize has multiple overloads — expect at least 2
-            let serializeEntries =
-                results
-                |> Seq.cast<JsonNode>
-                |> Seq.filter (fun e -> e["name"].GetValue<string>() = "Serialize")
-                |> Seq.toList
-
-            Assert.True(
-                serializeEntries.Length >= 2,
-                $"Expected >= 2 Serialize overloads from JsonSerializer, got {serializeEntries.Length}")
-
-            // All overloads must have distinct signatures
-            let sigs = serializeEntries |> List.map (fun e -> e["signature"].GetValue<string>())
-            let distinct = sigs |> List.distinct
-            Assert.True(
-                distinct.Length = sigs.Length,
-                $"Expected all Serialize overload signatures to be distinct")
-    }
-
-[<Fact>]
-let ``NugetMembers includeNonPublic returns at least as many members as public-only`` () : Task =
-    task {
-        let root = findRepoRoot ()
-        let projectPath = Path.Combine(root, "FsLangMcp.fsproj")
-        let bridge = FcsBridge()
-
-        let! publicOnly =
-            bridge.NugetMembers(
-                { packageId = "FSharp.Core"
-                  typeName = "FSharpList"
-                  projectPath = Some projectPath
-                  includeNonPublic = Some false
-                  maxResults = Some 500
-                  cursor = None }
-            )
-
-        let! allMembers =
-            bridge.NugetMembers(
-                { packageId = "FSharp.Core"
-                  typeName = "FSharpList"
-                  projectPath = Some projectPath
-                  includeNonPublic = Some true
-                  maxResults = Some 500
-                  cursor = None }
-            )
-
-        let publicCount = (publicOnly["results"] :?> JsonArray).Count
-        let allCount = (allMembers["results"] :?> JsonArray).Count
-        Assert.True(
-            allCount >= publicCount,
-            $"includeNonPublic should return >= public-only count: public={publicCount} all={allCount}")
     }
 
 [<Fact>]

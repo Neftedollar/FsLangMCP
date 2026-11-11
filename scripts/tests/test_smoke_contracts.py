@@ -6,6 +6,7 @@ import re
 import tempfile
 import unittest
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -131,129 +132,286 @@ class RuntimeSmokeContractTests(unittest.TestCase):
             smoke_script,
         )
 
-    def test_diagnostics_rebase_requires_same_context_and_new_generation(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_name:
-            project = Path(temp_name) / "Smoke.fsproj"
-            response = {
-                "status": "succeeded",
-                "verdict": "unknown",
-                "scope": "workspace",
-                "speed": "fast",
-                "via": "fsac",
-                "fileGlob": "Version.fs",
-                "contextMatched": True,
-                "expectationComplete": True,
-                "requestedProjectPath": str(project),
-                "sessionGeneration": 8,
-            }
 
-            self.assertEqual(
-                8,
-                runtime_toolchain.require_fsac_rebase(
-                    response,
-                    expected_project=project,
-                    expected_glob="Version.fs",
-                    previous_generation=7,
-                ),
+class RuntimeSmokeValidatorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        self.project = root / "Smoke.fsproj"
+        self.source = root / "Version.fs"
+        self.contextual = {
+            "status": "ok",
+            "contextMatched": True,
+            "activeProjectPath": str(self.project),
+            "sessionGeneration": 7,
+        }
+        self.rebase = {
+            "status": "succeeded",
+            "verdict": "unknown",
+            "scope": "workspace",
+            "speed": "fast",
+            "via": "fsac",
+            "fileGlob": "Version.fs",
+            "contextMatched": True,
+            "expectationComplete": True,
+            "requestedProjectPath": str(self.project),
+            "sessionGeneration": 8,
+        }
+        self.diagnostics = self.rebase | {
+            "verdict": "errors",
+            "complete": True,
+            "analyzed": True,
+            "sessionGeneration": 11,
+            "expectedFileCount": 1,
+            "receivedFileCount": 1,
+            "missingFileCount": 0,
+            "staleFileCount": 0,
+            "analyzedFileCount": 1,
+            "expectedFiles": [str(self.source)],
+            "receivedFiles": [str(self.source)],
+            "missingFiles": [],
+            "staleFiles": [],
+            "mostRecentAnalyzedAt": "2026-08-14T12:00:00Z",
+            "diagnostics": [{"severity": 1, "message": "type mismatch"}],
+        }
+
+    def validate_contextual(self, response: object) -> int:
+        return runtime_toolchain.require_contextual_response(
+            response, self.project, "preload probe"
+        )
+
+    def validate_rebase(self, response: object) -> int:
+        return runtime_toolchain.require_fsac_rebase(
+            response,
+            expected_project=self.project,
+            expected_glob="Version.fs",
+            previous_generation=7,
+        )
+
+    def validate_diagnostics(self, response: object) -> None:
+        runtime_toolchain.require_fsac_diagnostics(
+            response,
+            expected_project=self.project,
+            expected_file=self.source,
+            expected_glob="Version.fs",
+            expected_generation=11,
+        )
+
+    def assert_field_rejected(
+        self,
+        validate: Callable[[object], object],
+        response: dict,
+        field: str,
+        invalid_values: tuple[object, ...],
+        message: str,
+    ) -> None:
+        # Change one field at a time so another guard cannot mask a regression.
+        for value in invalid_values:
+            with self.subTest(validator=validate.__name__, field=field, value=value):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    validate(response | {field: value})
+        missing = response.copy()
+        del missing[field]
+        with self.subTest(validator=validate.__name__, field=field, missing=True):
+            with self.assertRaisesRegex(RuntimeError, message):
+                validate(missing)
+
+    def test_accepts_valid_context_rebase_and_error_publication(self) -> None:
+        self.assertEqual(7, self.validate_contextual(self.contextual))
+        self.assertEqual(8, self.validate_rebase(self.rebase))
+        self.assertIsNone(self.validate_diagnostics(self.diagnostics))
+
+        # A rebase may advance more than once; it need not be previous + 1.
+        self.assertEqual(
+            12, self.validate_rebase(self.rebase | {"sessionGeneration": 12})
+        )
+        self.assertEqual(
+            1, self.validate_contextual(self.contextual | {"sessionGeneration": 1})
+        )
+
+    def test_rejects_non_object_payloads(self) -> None:
+        for validate in (
+            self.validate_contextual,
+            self.validate_rebase,
+            self.validate_diagnostics,
+        ):
+            for response in (None, [], "ok", 1, True):
+                with self.subTest(validator=validate.__name__, response=response):
+                    with self.assertRaises(RuntimeError):
+                        validate(response)
+
+    def test_contextual_response_requires_success_status(self) -> None:
+        self.assert_field_rejected(
+            self.validate_contextual, self.contextual, "status",
+            ("error", "succeeded", None, True), "did not succeed",
+        )
+
+    def test_context_flags_require_literal_true_independently(self) -> None:
+        for validate, response, field, message in (
+            (
+                self.validate_contextual, self.contextual,
+                "contextMatched", "confirm its FSAC context",
+            ),
+            (
+                self.validate_rebase, self.rebase,
+                "contextMatched", "escaped the requested context",
+            ),
+            (
+                self.validate_rebase, self.rebase,
+                "expectationComplete", "lacked evaluated SourceFiles",
+            ),
+            (
+                self.validate_diagnostics, self.diagnostics,
+                "contextMatched", "bound to the active FSAC context",
+            ),
+            (
+                self.validate_diagnostics, self.diagnostics,
+                "complete", "coverage is incomplete",
+            ),
+            (
+                self.validate_diagnostics, self.diagnostics,
+                "analyzed", "coverage is incomplete",
+            ),
+        ):
+            self.assert_field_rejected(
+                validate, response, field, (False, None, 0, 1, "true", [], {}), message,
             )
 
-            for invalid in (
-                response | {"contextMatched": False},
-                response | {"sessionGeneration": 7},
-                response | {"requestedProjectPath": str(project.parent / "Other.fsproj")},
-            ):
-                with self.subTest(response=invalid), self.assertRaises(RuntimeError):
-                    runtime_toolchain.require_fsac_rebase(
-                        invalid,
-                        expected_project=project,
-                        expected_glob="Version.fs",
-                        previous_generation=7,
+    def test_rebase_and_diagnostics_require_each_exact_contract_field(self) -> None:
+        invalid_fields = {
+            "status": "error",
+            "verdict": "clean",
+            "scope": "file",
+            "speed": "full",
+            "via": "fcs",
+            "fileGlob": "Other.fs",
+        }
+        for validate, response in (
+            (self.validate_rebase, self.rebase),
+            (self.validate_diagnostics, self.diagnostics),
+        ):
+            for field, wrong in invalid_fields.items():
+                with self.subTest(validator=validate.__name__):
+                    self.assert_field_rejected(
+                        validate, response, field, (wrong, None, True, []),
+                        "contract mismatch",
                     )
 
-    def test_cli_preload_requires_matching_context_and_generation(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_name:
-            project = Path(temp_name) / "Smoke.fsproj"
-            response = {
-                "status": "ok",
-                "contextMatched": True,
-                "activeProjectPath": str(project),
-                "sessionGeneration": 7,
-            }
+    def test_validators_require_matching_project_paths(self) -> None:
+        for validate, response, field, message in (
+            (
+                self.validate_contextual, self.contextual,
+                "activeProjectPath", "wrong active project",
+            ),
+            (
+                self.validate_rebase, self.rebase,
+                "requestedProjectPath", "wrong project",
+            ),
+            (
+                self.validate_diagnostics, self.diagnostics,
+                "requestedProjectPath", "wrong requested project",
+            ),
+        ):
+            self.assert_field_rejected(
+                validate, response, field,
+                (str(self.project.with_name("Other.fsproj")), None, "", 1, []), message,
+            )
 
-            self.assertEqual(
-                7,
-                runtime_toolchain.require_contextual_response(
-                    response, project, "preload probe"
+    def test_contextual_generation_must_be_a_positive_integer(self) -> None:
+        self.assert_field_rejected(
+            self.validate_contextual, self.contextual, "sessionGeneration",
+            (0, -1, None, True, False, 7.0, "7", []), "live FSAC session generation",
+        )
+
+    def test_rebase_generation_must_advance_and_be_an_integer(self) -> None:
+        self.assert_field_rejected(
+            self.validate_rebase, self.rebase, "sessionGeneration",
+            (7, 6, 0, -1, None, True, 8.0, "8", []), "did not rebase FSAC",
+        )
+
+    def test_diagnostics_generation_must_match_and_be_an_integer(self) -> None:
+        self.assert_field_rejected(
+            self.validate_diagnostics, self.diagnostics, "sessionGeneration",
+            (10, 12, 0, -1, None, True, 11.0, "11", []), "active FSAC generation",
+        )
+
+    def test_diagnostics_requires_each_coverage_count_independently(self) -> None:
+        for field in (
+            "expectedFileCount", "receivedFileCount", "missingFileCount",
+            "staleFileCount", "analyzedFileCount",
+        ):
+            expected = self.diagnostics[field]
+            self.assert_field_rejected(
+                self.validate_diagnostics, self.diagnostics, field,
+                (
+                    expected + 1, expected - 1, None,
+                    True, False, float(expected), str(expected),
                 ),
+                "coverage counts are invalid",
             )
 
-            wrong_context = response | {
-                "activeProjectPath": str(project.parent / "Other.fsproj")
-            }
-            with self.assertRaisesRegex(RuntimeError, "wrong active project"):
-                runtime_toolchain.require_contextual_response(
-                    wrong_context, project, "preload probe"
-                )
-
-    def test_fast_diagnostics_requires_fsac_context_glob_and_generation(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_name:
-            root = Path(temp_name)
-            project = root / "Smoke.fsproj"
-            source = root / "Version.fs"
-            response = {
-                "status": "succeeded",
-                "verdict": "errors",
-                "scope": "workspace",
-                "speed": "fast",
-                "via": "fsac",
-                "fileGlob": "Version.fs",
-                "contextMatched": True,
-                "complete": True,
-                "analyzed": True,
-                "requestedProjectPath": str(project),
-                "sessionGeneration": 11,
-                "expectedFileCount": 1,
-                "receivedFileCount": 1,
-                "missingFileCount": 0,
-                "staleFileCount": 0,
-                "analyzedFileCount": 1,
-                "expectedFiles": [str(source)],
-                "receivedFiles": [str(source)],
-                "missingFiles": [],
-                "staleFiles": [],
-                "mostRecentAnalyzedAt": "2026-08-14T12:00:00Z",
-                "diagnostics": [{"severity": 1, "message": "type mismatch"}],
-            }
-
-            runtime_toolchain.require_fsac_diagnostics(
-                response,
-                expected_project=project,
-                expected_file=source,
-                expected_glob="Version.fs",
-                expected_generation=11,
+    def test_diagnostics_requires_exactly_one_expected_and_received_file(self) -> None:
+        source = str(self.source)
+        for field in ("expectedFiles", "receivedFiles"):
+            self.assert_field_rejected(
+                self.validate_diagnostics, self.diagnostics, field,
+                (
+                    None, source, [], [source, source], [1],
+                    [str(self.source.with_name("Other.fs"))],
+                ),
+                "not exactly the expected source file",
             )
 
-            invalid_cases = {
-                "trusted FCS path": response | {"via": "fcs"},
-                "missing fileGlob binding": response | {"fileGlob": None},
-                "wrong generation": response | {"sessionGeneration": 12},
-                "stale publication": response
-                | {
-                    "complete": False,
-                    "analyzed": False,
-                    "staleFileCount": 1,
-                    "staleFiles": [str(source)],
-                },
+    def test_diagnostics_rejects_missing_and_stale_files_independently(self) -> None:
+        for field in ("missingFiles", "staleFiles"):
+            self.assert_field_rejected(
+                self.validate_diagnostics, self.diagnostics, field,
+                (None, {}, "", [str(self.source)]), "reported missing or stale files",
+            )
+
+    def test_diagnostics_requires_a_nonblank_publication_timestamp(self) -> None:
+        self.assert_field_rejected(
+            self.validate_diagnostics, self.diagnostics, "mostRecentAnalyzedAt",
+            (None, "", " \t\n", 1, True, []), "publication timestamp",
+        )
+
+    def test_diagnostics_requires_an_actual_error_diagnostic(self) -> None:
+        self.assert_field_rejected(
+            self.validate_diagnostics, self.diagnostics, "diagnostics",
+            (
+                None, {}, [], [None], ["type mismatch"], [{}],
+                [{"severity": 2, "message": "type mismatch"}],
+                [{"severity": 3}], [{"severity": 4}],
+                [{"severity": "1"}], [{"severity": None}],
+                [{"severity": True}], [{"severity": 1.0}],
+            ),
+            "did not surface the deliberate error",
+        )
+
+    def test_diagnostics_finds_an_error_among_nonerror_entries(self) -> None:
+        response = self.diagnostics | {
+            "diagnostics": [None, {}, {"severity": 2}, {"severity": 1}],
+        }
+        self.assertIsNone(self.validate_diagnostics(response))
+
+    def test_paths_are_compared_after_normalization(self) -> None:
+        project = str(self.project.parent / "nested" / ".." / self.project.name)
+        source = str(self.source.parent / "nested" / ".." / self.source.name)
+        self.assertEqual(
+            7,
+            self.validate_contextual(self.contextual | {"activeProjectPath": project}),
+        )
+        self.assertEqual(
+            8, self.validate_rebase(self.rebase | {"requestedProjectPath": project})
+        )
+        self.assertIsNone(self.validate_diagnostics(
+            self.diagnostics | {
+                "requestedProjectPath": project,
+                "expectedFiles": [source],
+                "receivedFiles": [source],
             }
-            for name, invalid in invalid_cases.items():
-                with self.subTest(name=name), self.assertRaises(RuntimeError):
-                    runtime_toolchain.require_fsac_diagnostics(
-                        invalid,
-                        expected_project=project,
-                        expected_file=source,
-                        expected_glob="Version.fs",
-                        expected_generation=11,
-                    )
+        ))
 
 
 class PackageVersionContractTests(unittest.TestCase):
