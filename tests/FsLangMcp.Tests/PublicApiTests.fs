@@ -12,6 +12,8 @@ module FsLangMcp.Tests.PublicApiTests
 ///   * entities + members are stably sorted (deterministic snapshot order)
 ///   * namespaceFilter narrows the surface by FullName substring
 ///   * cursor pagination round-trip over the entity list
+///   * module values, including function-valued bindings, are not zero-arg functions
+///   * mutable and generic value signatures retain mutability and constraints
 
 open System
 open System.IO
@@ -57,11 +59,34 @@ let private surfaceFs =
           "type Widget() ="
           "    member _.Visible () = 1"
           "    member internal _.HiddenMember () = 2"
+          "    member _.ReadOnly = 3"
+          "    member val ReadWrite = 4 with get, set"
+          "    static member StaticValue = 5"
+          "    member _.Transform = fun (x: int) -> x + 1"
           ""
           "module Calc ="
           "    let add (a: int) (b: int) = a + b"
           "    let internal helper (x: int) = x * 2"
           "    let private secret (x: int) = x - 1"
+          ""
+          "[<RequireQualifiedAccess>]"
+          "module Values ="
+          "    let mutable interval = 0.1f"
+          "    let dashCap = 400"
+          "    let empty: string option = None"
+          "    let unitValue = ()"
+          "    let mutable transform: int -> int = fun x -> x + 1"
+          "    let partiallyApplied = (+) 1"
+          "    let comparableValue<'T when 'T : comparison> : 'T option = None"
+          "    [<Literal>]"
+          "    let literalValue = 42"
+          "    let width (x: float32) = x * 2f"
+          "    let refresh () = interval"
+          "    let lambda = fun (x: int) -> x + 1"
+          "    let internal internalValue = 10"
+          "    let mutable internal internalMutable = 11"
+          "    let private privateValue = 12"
+          "    let mutable private privateMutable = 13"
           "" ]
 
 let private surfaceFsproj =
@@ -147,6 +172,71 @@ let private memberSignature (entity: JsonNode) (name: string) : string =
 
 type PublicApiTests(fx: SurfaceFixture) =
     interface IClassFixture<SurfaceFixture>
+
+    [<Fact>]
+    member _.``module values have value signatures and mutable values are marked`` () : Task =
+        task {
+            let! result = fx.Bridge.PublicApi(baseArgs fx.Project)
+            Assert.Equal("ok", result["status"].GetValue<string>())
+            let values = tryEntity result "Probe.Surface.Values" |> Option.get
+
+            for name, signature in
+                [ "interval", "interval: float32 (mutable)"
+                  "dashCap", "dashCap: int"
+                  "empty", "empty: string option"
+                  "unitValue", "unitValue: unit"
+                  "transform", "transform: int -> int (mutable)"
+                  "partiallyApplied", "partiallyApplied: int -> int"
+                  "comparableValue", "comparableValue: 'T option where T : comparison"
+                  "literalValue", "literalValue: int" ] do
+                Assert.Equal(signature, memberSignature values name)
+                Assert.Equal(Some "value", memberKind values name)
+
+            for name in [ "internalValue"; "internalMutable"; "privateValue"; "privateMutable" ] do
+                Assert.DoesNotContain(name, memberNames values)
+        }
+
+    [<Fact>]
+    member _.``internal module values use value signatures without exposing private values`` () : Task =
+        task {
+            let! result = fx.Bridge.PublicApi({ baseArgs fx.Project with includeInternal = Some true })
+            let values = tryEntity result "Probe.Surface.Values" |> Option.get
+
+            for name, signature in
+                [ "internalValue", "internalValue: int"
+                  "internalMutable", "internalMutable: int (mutable)" ] do
+                Assert.Equal(signature, memberSignature values name)
+                Assert.Equal(Some "value", memberKind values name)
+
+            Assert.DoesNotContain("privateValue", memberNames values)
+            Assert.DoesNotContain("privateMutable", memberNames values)
+        }
+
+    [<Fact>]
+    member _.``value formatting preserves real functions methods and properties`` () : Task =
+        task {
+            let! result = fx.Bridge.PublicApi(baseArgs fx.Project)
+            let values = tryEntity result "Probe.Surface.Values" |> Option.get
+
+            for name, signature in
+                [ "width", "width(x: float32) -> float32"
+                  "refresh", "refresh(_: unit) -> float32"
+                  "lambda", "lambda(x: int) -> int" ] do
+                Assert.Equal(signature, memberSignature values name)
+                Assert.Equal(Some "function", memberKind values name)
+
+            let widget = tryEntity result "Probe.Surface.Widget" |> Option.get
+            Assert.Equal("Visible() -> int", memberSignature widget "Visible")
+            Assert.Equal(Some "method", memberKind widget "Visible")
+
+            for name, signature in
+                [ "ReadOnly", "ReadOnly() -> int"
+                  "ReadWrite", "ReadWrite() -> int"
+                  "StaticValue", "StaticValue() -> int"
+                  "Transform", "Transform() -> int -> int" ] do
+                Assert.Equal(signature, memberSignature widget name)
+                Assert.Equal(Some "property", memberKind widget name)
+        }
 
     [<Fact>]
     member _.``default surface includes public type+member and excludes private and internal`` () : Task =

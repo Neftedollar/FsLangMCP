@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `check` accepts standalone `.fsx` paths and `scope="script"`, using script SDK references,
+  NuGet `#r` resolution and relative `#load` closure without evaluating the script. Script checks
+  ignore unrelated project contexts and retain worker admission across resolution timeouts (#320).
+- Optional compact diagnostic groups preserve full verdict/count evidence while exposing occurrence
+  counts and bounded additional locations. `maxDiagnostics` controls the row cap (default 50,
+  maximum 1000); individual diagnostics remain the default. A production-JSON budget also bounds
+  long messages and repeated location strings with explicit truncation evidence (#321).
+
+### Fixed
+
+- Trusted constructor-argument mismatch diagnostics can identify the actual fully qualified selected
+  type and constructor range using exact syntax and semantic symbol evidence. Ambiguous/nested
+  expression errors are left unannotated instead of guessing a nearby constructor (#322).
+- `fcs_public_api` represents module values as `kind="value"` with `name: type`, including mutable,
+  function-valued and partially applied bindings. Actual functions and members retain their
+  callable signatures (#323).
+
+### Tests
+
+- Rechecked the v0.16.0 reports against v0.19.0. Added a real FS3520 regression proving the existing
+  `infoCount` / `belowSeverityFloorCount` / `diagnosticsNote` contract and `severity="all"` recovery;
+  #324 already behaves correctly in v0.19.0, so no additional severity fields were introduced.
+
 ## [0.19.0] - 2026-10-08
 
 0.19.0 expands `find` without adding tools: the 35-tool surface remains unchanged.

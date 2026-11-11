@@ -633,6 +633,8 @@ let ``diagnostic snapshots fail fast instead of queueing behind an in-flight LSP
                       mode = None
                       speed = Some "fast"
                       severity = None
+                      compact = None
+                      maxDiagnostics = None
                       projectPath = None
                       timeoutMs = Some 5_000 },
                     fsacSnapshot = exactBusySnapshot

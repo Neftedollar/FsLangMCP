@@ -36,6 +36,9 @@
     <Compile Include="LspBridge.fs" />
     <Compile Include="MetadataAccessibility.fs" />
     <Compile Include="FindInventory.fs" />
+    <Compile Include="ConstructorDiagnostics.fs" />
+    <Compile Include="CheckDiagnostics.fs" />
+    <Compile Include="ScriptChecking.fs" />
     <Compile Include="FcsBridge.fs" />
     <Compile Include="Tools.fs" />
     <Compile Include="RuntimeStatus.fs" />

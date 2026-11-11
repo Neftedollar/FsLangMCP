@@ -586,17 +586,18 @@ the bare call already swept all of them.
 **Routing description:** One trustworthy verdict for the active F# context. Bare `check()`
 suffices: returns `verdict` (`clean`|`errors`|`unknown`) after a FRESH in-process type-check, so it
 never reports a stale-`{}` false-clean within the current FCS/check profile. Optional `scope`
-(`auto`|`file`|`project`|`workspace`|`snippet`), `path`, `snippet` (inline source), `speed` (trusted
+(`auto`|`file`|`project`|`workspace`|`snippet`|`script`), `path`, `snippet` (inline source), `speed` (trusted
 default | `fast` = cached FSAC snapshot), `snippetPosition` (`start`|`end`, default `end`), and
-`severity` shape the request.
+`severity`, `compact`, and `maxDiagnostics` shape the response.
 
 **Signature:** every argument is optional. `scope` (default `auto`) picks `snippet` when `snippet`
-is set, `file` when `path` is set, else the active project (or the whole solution when it spans
+is set, `script` when `path` ends in `.fsx`, `file` for other paths, else the active project (or the whole solution when it spans
 >1 `.fsproj`). `path` / `snippet` / `fileGlob` / `mode` (`fs`|`fsi`) target the unit to check;
 `snippetPosition` controls where a snippet sits in project compile order.
 `speed` (`trusted` default | `fast`), `severity` (`error` default | `warning` | `information` |
 `hint` | `all`), `projectPath` (falls back to active `set_project`), and `timeoutMs` (default 60000)
-round out the surface.
+round out the context. `compact` (default `false`) groups repeated diagnostics;
+`maxDiagnostics` (default `50`, range `1..1000`) caps returned rows after grouping.
 
 ### Bare-call default
 
@@ -615,7 +616,7 @@ project, collapsed to a single `verdict`. No path, no project, no flags needed f
 When `unknown` has a machine-actionable infrastructure cause, inspect `blockingReason` rather than
 parsing `reason`. An unavailable exact SDK pin reports `errorKind="sdk_not_found"` together with
 `requestedSdkVersion`, `installedSdks`, `dotnetHostPath`, configured `sdkRoots`, `globalJsonPath`,
-and `remedies`. Project/file checks place it at the top level; a trusted workspace check places it
+and `remedies`. Project/file/script checks place it at the top level; a trusted workspace check places it
 on the affected `perProject` row. Fast workspace expectation failures may expose multiple
 `blockingReasons`. Timeout, cancellation, admission pressure, generic project failures, and an
 untyped unavailable FSAC snapshot remain separately classified as `timeout`, `cancelled`,
@@ -625,6 +626,57 @@ untyped unavailable FSAC snapshot remain separately classified as `timeout`, `ca
 |---------|-----------|
 | `trusted` (default) | Runs a FRESH FCS check; the verdict reflects the current source on disk |
 | `fast` | Reads a project-bound FSAC snapshot; `clean` requires a current publication for every evaluated in-scope source file |
+
+### Standalone scripts (#320)
+
+`check(scope="script", path="scripts/example.fsx")` checks the script in its own FCS context.
+A `.fsx` path also selects script checking with `scope=auto` or `scope=file`, even when an unrelated
+project is active. `projectPath` does not supply references to a script. Inline `mode` remains
+`fs`/`fsi`; script checking takes an on-disk `.fsx` file, not an inline `mode="fsx"` snippet.
+
+The script context uses SDK references, resolves `#r "nuget: ..."`, and follows relative `#load`
+paths. The complete source closure is freshly checked but never evaluated. NuGet reference
+resolution can run package restore, so this is not a sandbox for untrusted package/build assets.
+`speed=fast` is rejected because project FSAC snapshots cannot certify this script context.
+
+The response includes `scope="script"`, `mode="fsx"`, `optionsSource="script"`, the absolute
+`scriptPath`, normalized `sourceFiles`, and `evaluated=false`. Compiler errors in a script,
+loaded file, or unresolved reference cannot yield `clean`. An unavailable exact SDK pin yields
+`unknown` with the same `sdk_not_found` blocker as project checks. Other SDK resolution failures
+reported by FCS use `script_sdk_unavailable`; host-SDK fallback is not certified as clean.
+The standard `fsi` auxiliary library is available. A timeout is `unknown`; if
+non-cancellable resolution is still running, another script check reports `fcs_worker_busy`
+until that worker finishes. The admission slot is not freed merely because the caller timed out.
+
+### Compact diagnostics and output limits (#321)
+
+`compact=true` groups diagnostics with the same error code, severity, message (normalizing only
+CRLF to LF), and optional `resolvedType`. Grouping happens **before** the row cap and may span
+files. Each row preserves the first diagnostic's complete message and range and adds:
+
+- `count`: all occurrences in this group, including the representative.
+- `locations`: up to 20 additional `file:line` locations, using one-based lines.
+- `locationsTruncated` and `omittedLocationCount`: whether/how many additional locations did not fit.
+
+`diagnosticsGrouped` echoes the effective mode. `diagnosticGroupCount` is the number of groups
+before the row cap (null in full mode); `surfacedDiagnosticCount` counts individual diagnostics
+passing the severity filter, before grouping/capping. `maxDiagnostics` echoes the effective cap.
+`diagnosticsTruncated` concerns omitted rows, independently of per-group location truncation.
+Counts and the verdict always describe the full check, not the abbreviated rows.
+
+Defaults retain the individual diagnostic array and its 50-row cap. To recover individual ranges,
+use `compact=false, maxDiagnostics=1000`; if the response is still truncated, narrow the check
+with `path`/`fileGlob` or check individual projects. There is no diagnostic pagination cursor.
+
+The complete response also has a 60,000 UTF-16-code-unit ceiling measured with the production
+JSON serializer, including indentation and escaping. `responseBudgetChars` states the limit.
+If needed, the response first drops additional group locations with accurate omitted counts,
+then returns a fitting prefix of diagnostic rows. `responseTruncatedByBudget` distinguishes any
+such reduction; `diagnosticsTruncatedByBudget` specifically marks removed diagnostic rows.
+`responseSizeHint` explains recovery. Individual representatives are not silently shortened.
+If coverage metadata alone cannot fit, the response is `status="aborted", verdict="unknown"`
+with `errorKind="check_response_metadata_exceeds_budget"`, retaining the original small diagnostic
+counts rather than pretending incomplete coverage is complete. Narrow the scope to recover it.
 
 ### Snippet placement
 
@@ -647,7 +699,8 @@ made available by `snippetPosition=end`.
 
 ### How it works internally
 
-1. Resolves `scope`: `snippet` when `snippet` is set, `file` when `path` is set, else `project`
+1. Resolves `scope`: `snippet` when `snippet` is set, `script` for a `.fsx` path, `file` for
+   other paths, else `project`
    (escalating to `workspace` when the solution spans more than one `.fsproj`).
 2. At `speed=trusted`, runs a fresh in-process FCS pass (`ParseAndCheckFileInProject` for a file,
    `ParseAndCheckProject` for a project/workspace) so the result reflects the current source — never
@@ -662,6 +715,22 @@ made available by `snippetPosition=end`.
 5. Returns `verdict` + `errorCount` + `warningCount` + a `diagnostics` array filtered to `severity`,
    plus `totalDiagnostics`/`infoCount`/`belowSeverityFloorCount` covering the full severity set (see
    below).
+
+### Constructor type context (#322)
+
+Trusted checks can attach `resolvedType` and `resolvedConstructorRange` to FS0001,
+FS0193, or FS0041 diagnostics when the checked syntax and FCS symbol identity agree
+on one constructor. `resolvedType` is the fully qualified declaring type definition
+name, including generic arity (for example, ``FSharp.Data.Adaptive.HashSet`1``).
+`resolvedConstructorRange` points to its source name using the same coordinate
+convention as the diagnostic range. The original message, code, and range are preserved.
+
+This exposes which `HashSet` the compiler selected after multiple `open` directives,
+without recommending an unverified alternative. Attribution requires an exact complete
+argument or constructor-call range, not a nearby type name. Nested-expression errors,
+unresolved/ambiguous targets, missing semantic evidence, and fast FSAC snapshots do
+not acquire guessed type context. Absence of these optional fields is not proof that
+a name collision did not occur.
 
 ### Project-scope coverage boundary (#222)
 
@@ -699,7 +768,7 @@ the rest of the scope is incomplete.
    larger than `errorCount + warningCount` alone and larger than the `diagnostics` array length.
    `infoCount` is a tally of the Info+Hidden diagnostics in that full set. `belowSeverityFloorCount`
    says how many of those full-set diagnostics were excluded from `diagnostics` by the `severity`
-   floor (never by the 50-item cap — that is `diagnosticsTruncated`'s job); when it is `> 0`,
+   floor (never by grouping or the row cap — that is `diagnosticsTruncated`'s job); when it is `> 0`,
    `diagnosticsNote` spells out the gap and points at `severity="all"`. At `scope='workspace'`,
    this identity holds per-project too: every successfully analyzed `perProject[]` entry carries
    its own `errorCount` / `warningCount` / `infoCount` (#205), the same genuine
@@ -999,6 +1068,19 @@ exact cursor column.
 public members with signatures — sorted stably by `fullName` then member name, so two version
 snapshots diff cleanly. Public-only by default (`includeInternal=true` adds `internal`; `private`
 is never emitted).
+
+### Values and callable members
+
+Module-level values have `kind: "value"` and a `name: type` signature. Mutable
+bindings append `(mutable)`, for example `interval: float32 (mutable)`; an
+immutable `let dashCap = 400` appears as `dashCap: int`. Neither signature implies
+a zero-argument call.
+
+Function-valued bindings without declared argument groups also retain their
+complete value type, for example `transform: int -> int (mutable)`. Real functions
+keep `kind: "function"` and callable signatures, such as
+`width(x: float32) -> float32`. Methods and properties keep their existing kinds
+and signature format. Generic value signatures retain their type constraints.
 
 ### Response budget and `truncatedByBudget` (#206)
 

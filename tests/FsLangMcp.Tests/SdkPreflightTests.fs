@@ -575,6 +575,8 @@ let ``set_project find and check preserve the same typed SDK blocking evidence``
                   mode = None
                   speed = Some "trusted"
                   severity = None
+                  compact = None
+                  maxDiagnostics = None
                   projectPath = Some projectPath
                   timeoutMs = Some 30_000 }
 

@@ -334,11 +334,12 @@ type FcsTestsForSymbolArgs =
       cursor: string option }
 
 type CheckArgs =
-    { /// What to check: "auto" (default) | "file" | "project" | "workspace" | "snippet".
-      /// auto picks snippet when `snippet` is set, file when `path` is set, else the
+    { /// What to check: "auto" (default) | "file" | "project" | "workspace" | "snippet" | "script".
+      /// auto picks snippet when `snippet` is set, script for .fsx paths, file for other paths, else the
       /// active project (or whole solution when it spans >1 .fsproj).
       scope: string option
-      /// Single F# file to check. Implies scope=file.
+      /// Single F# source file. A .fsx path selects script scope (also with scope=file),
+      /// resolving its own SDK references, #r "nuget:" and relative #load without execution.
       path: string option
       /// Inline F# source to type-check against the project's references. Implies
       /// scope=snippet. (Consistent rename of fcs_validate_snippet's `content`.)
@@ -358,6 +359,13 @@ type CheckArgs =
       /// Minimum severity surfaced in `diagnostics`: "error" (default) | "warning" |
       /// "information" | "hint" | "all". errorCount/warningCount are unaffected.
       severity: string option
+      /// Group repeated diagnostics by code, severity, message and resolved type.
+      /// Default false. Each representative includes count and up to 20 other locations.
+      compact: bool option
+      /// Maximum diagnostic rows (or groups in compact mode). Default 50, range 1–1000.
+      /// Counts always describe the complete set before filtering, grouping and this cap.
+      /// A separate 60,000-character production-JSON budget can reduce locations/rows further.
+      maxDiagnostics: int option
       /// .fsproj / .sln / .slnx context. Falls back to active set_project.
       projectPath: string option
       /// Timeout in milliseconds for the project/workspace type-check. Default 60000.
