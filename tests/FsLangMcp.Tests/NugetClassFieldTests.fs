@@ -38,6 +38,9 @@ let private widgetFs =
           "    member val Name : string = \"\" with get, set"
           "    member internal _.InternalOnly () = ()"
           "    member _.Compute () = initial + 1"
+          "    member _.Overload(value: int) : int = value"
+          "    member _.Overload(value: string) : string = value"
+          "type internal InternalProbe = { Value: int }"
           "" ]
 
 let private fieldProbeFsproj =
@@ -254,6 +257,7 @@ type NugetClassFieldTests(fx: FieldProbeFixture) =
             Assert.True((result["matchedTypes"] :?> JsonArray).Count > 0, "Widget must match")
 
             let publicNames = names result
+            Assert.DoesNotContain("InternalOnly", publicNames)
 
             // INCLUSION: the public class `val` field is now enumerated, as a field — the
             // old IsFSharpRecord||IsValueType guard dropped it.
@@ -286,6 +290,39 @@ type NugetClassFieldTests(fx: FieldProbeFixture) =
 
             let internalOnly = entryNamed all "InternalOnly"
             Assert.Equal("internal", internalOnly["accessibility"].GetValue<string>())
+        }
+
+    [<Fact>]
+    member _.``NugetMembers preserves both overloads from the controlled reference assembly``() : Task =
+        task {
+            Assert.True(fx.BuildExitCode = 0, fx.BuildLog)
+            let! result = FcsBridge().NugetMembers(nugetArgs fx.ConsumerFsproj false)
+            Assert.Equal("ok", result["status"].GetValue<string>())
+            Assert.Contains("FieldProbe.Widget", result["matchedTypes"].AsArray() |> Seq.map _.GetValue<string>())
+            let overloads = entries result |> List.filter (fun row -> row["name"].GetValue<string>() = "Overload")
+            Assert.Equal(2, overloads.Length)
+            let signatures = overloads |> List.map (fun row -> row["signature"].GetValue<string>()) |> Set.ofList
+            Assert.Equal<Set<string>>(set [ "Overload(value: Microsoft.FSharp.Core.int) -> Microsoft.FSharp.Core.int"; "Overload(value: Microsoft.FSharp.Core.string) -> Microsoft.FSharp.Core.string" ], signatures)
+        }
+
+    [<Fact>]
+    member _.``ReferencedSymbols includes the known internal type only when requested``() : Task =
+        task {
+            Assert.True(fx.BuildExitCode = 0, fx.BuildLog)
+            let bridge = FcsBridge()
+            let args : FcsReferencedSymbolsArgs =
+                { query = "FieldProbe"; projectPath = Some fx.ConsumerFsproj
+                  includeNonPublic = Some false; maxResults = Some 100; cursor = None }
+            let! publicOnly = bridge.ReferencedSymbols(args)
+            let! all = bridge.ReferencedSymbols({ args with includeNonPublic = Some true })
+            for response in [ publicOnly; all ] do
+                Assert.Equal("ok", response["status"].GetValue<string>())
+                Assert.Contains("Widget", displayNames response)
+            Assert.DoesNotContain("InternalProbe", displayNames publicOnly)
+            Assert.Contains("InternalProbe", displayNames all)
+            // Imported F# internal entities may be labelled private by FCS; the
+            // behavioral contract here is the explicit opt-in, not that label.
+            Assert.True((Set.ofList (displayNames publicOnly)).IsSubsetOf(Set.ofList (displayNames all)))
         }
 
     [<Fact>]
