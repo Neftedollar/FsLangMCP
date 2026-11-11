@@ -89,6 +89,17 @@ compiler options in its current FCS/check profile; configuration-specific diagno
 Release-only FS3511 can still appear under optimized compilation. Before merge or release, run
 `dotnet build -c Release --warnaserror`.
 
+### Notable response fields
+
+Trusted `check` diagnostics can include `resolvedType` and `resolvedConstructorRange`
+when a type mismatch points exactly to a constructor call or one of its arguments.
+`resolvedType` is the compiler-resolved fully qualified type definition name (including
+FCS generic arity, such as ``FSharp.Data.Adaptive.HashSet`1``).
+The range identifies the constructor name using the same coordinates as other diagnostic
+ranges. This helps expose collisions between opened namespaces without guessing which
+alternative the caller intended. Original compiler messages and ranges remain unchanged.
+The fields are absent when constructor identity or attribution is uncertain, and in fast mode.
+
 ### Navigate / understand
 
 | Tool | What it does |
@@ -125,7 +136,7 @@ Release-only FS3511 can still appear under optimized compilation. Before merge o
 |------|--------------|
 | `fcs_dead_code` | List likely-unused `private`/`internal` bindings as cleanup candidates. |
 | `fcs_review_scan` | Scan source for AST-level review candidates: match wildcards, `mutable`, blocking calls, casts, reflection. |
-| `fcs_public_api` | Emit the project's full public API surface in stable order — useful for API-diff snapshots. |
+| `fcs_public_api` | Emit the project's full public API surface in stable order — useful for API-diff snapshots. Module values use `name: type` signatures, with `(mutable)` for mutable bindings. |
 | `fcs_signature_status` | Report `.fsi`-vs-impl drift: members hidden from signature or stale in signature. |
 | `fcs_create_file_plan` | Plan where a new `.fs` file belongs in compile order; writes nothing. |
 
@@ -286,6 +297,24 @@ continuations return no sites with `retrySameCursor=true`. This also applies whe
 the final validation-error response exhausts the deadline: a well-formed continuation returns
 `cursor_validation_incomplete` and can be retried to obtain the actual validation result.
 Malformed cursors and invalid/missing-context requests keep their typed rejection routes.
+`check(path="script.fsx")` uses the script's own SDK, `#r`/NuGet and relative `#load`
+context, rather than an active project's references. It never evaluates the script:
+`scope="script"`, `mode="fsx"`, `optionsSource="script"`, `scriptPath`, `sourceFiles`,
+and `evaluated=false` describe that coverage. Package reference resolution can run restore.
+Missing exact SDK pins and timeouts yield `unknown` with a structured blocker.
+
+`check(compact=true)` groups repeated diagnostics before the default 50-row cap.
+`diagnosticsGrouped`, `diagnosticGroupCount`, `surfacedDiagnosticCount`, and `maxDiagnostics`
+describe the presentation; each group retains a full representative and adds `count`, up to
+20 additional `locations`, `locationsTruncated`, and `omittedLocationCount`.
+`diagnosticsTruncated` reports omitted rows, not hidden severity levels or grouped occurrences.
+Use `compact=false, maxDiagnostics=1000` (or a narrower scope) for individual ranges.
+The full counts, `belowSeverityFloorCount`, and verdict are unchanged by grouping or row limits.
+`responseBudgetChars` caps the complete production JSON at 60,000 UTF-16 code units.
+`responseTruncatedByBudget`, `diagnosticsTruncatedByBudget`, and `responseSizeHint` distinguish
+size-driven reductions from requested row limits. Oversized coverage metadata returns a bounded
+`unknown`/`check_response_metadata_exceeds_budget` response rather than partial coverage as clean.
+
 `check(speed="fast")`
 similarly exposes expected/received/missing/stale file coverage and never turns an
 incomplete empty snapshot into `clean`.

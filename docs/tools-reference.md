@@ -181,12 +181,14 @@ metadata, or before changing query, scope, project, path, or position.
 project-bound FSAC coverage before it can return `clean`.
 
 **Key args:**
-- `scope` — `auto` | `file` | `project` | `workspace` | `snippet` (default: `auto`)
-- `path` — file path when `scope=file`
+- `scope` — `auto` | `file` | `project` | `workspace` | `snippet` | `script` (default: `auto`)
+- `path` — source path; `.fsx` selects an independent script context even with `scope=file`
 - `snippet` — inline source when `scope=snippet`
 - `snippetPosition` — `start` | `end` (default: `end`); compile-order placement for a snippet
 - `speed` — `trusted` (default; fresh check) | `fast` (cached FSAC snapshot)
 - `severity` — filter results by severity level
+- `compact` — group repeated diagnostics with occurrence counts and additional locations (default: `false`)
+- `maxDiagnostics` — cap diagnostic rows after grouping (default: `50`, range: `1..1000`)
 
 **Use when:** "Did my edit compile?", "Are there errors in this file?", "Is the workspace clean?"
 
@@ -194,6 +196,20 @@ project-bound FSAC coverage before it can return `clean`.
 the current FCS/check profile. It does not prove every build configuration. Release-only
 diagnostics such as FS3511 can appear only under optimized compilation; before merge or release,
 run `dotnet build -c Release --warnaserror`.
+
+**Script scope:** checks an on-disk `.fsx` with SDK references, NuGet `#r`, and relative `#load`,
+without evaluating top-level code. It ignores the active project and requires `speed=trusted`.
+Package reference resolution can run restore. `sourceFiles` reports the closure and `evaluated`
+is false; missing SDK pins and timeouts return `unknown`, never false-clean.
+
+**Compact output:** preserves full diagnostic counts/verdicts while grouping rows by code,
+severity, message, and optional `resolvedType`. Each row retains a full representative plus
+`count`, up to 20 additional `locations`, `locationsTruncated`, and `omittedLocationCount`.
+`diagnosticsTruncated` reports omitted rows separately. Use `compact=false` and a larger
+`maxDiagnostics`, or narrow the scope, to recover individual diagnostic ranges.
+A separate 60,000-code-unit production-JSON limit may further reduce locations or rows;
+`responseTruncatedByBudget` and `diagnosticsTruncatedByBudget` disclose this. If coverage metadata
+alone cannot fit, a typed `unknown` response recommends narrowing the scope.
 
 **Snippet scope:** diagnostics describe the snippet's *content* only. Bare expression code
 without a `module` header is valid — the missing-module FS0222 and source-file-bookkeeping

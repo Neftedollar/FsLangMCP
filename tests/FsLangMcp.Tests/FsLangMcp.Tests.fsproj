@@ -48,6 +48,9 @@
     <Compile Include="TestsForSymbolTests.fs" />
     <Compile Include="CompileOrderTests.fs" />
     <Compile Include="CheckTests.fs" />
+    <Compile Include="CheckPresentationTests.fs" />
+    <Compile Include="ScriptCheckTests.fs" />
+    <Compile Include="ConstructorDiagnosticsTests.fs" />
     <Compile Include="NugetPackageMapTests.fs" />
     <Compile Include="NugetClassFieldTests.fs" />
     <Compile Include="ExplainDiagnosticTests.fs" />

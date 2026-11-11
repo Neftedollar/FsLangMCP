@@ -708,6 +708,7 @@ let private runAsyncWithOutputLimitCore
     (unixSessionWrapperPreference: UnixSessionWrapperPreference)
     (standardInputPolicy: StandardInputPolicy)
     (requiredContainmentTestHooks: RequiredContainmentTestHooks option)
+    (processContext: (string * (string * string) list) option)
     : Task<ProcessOutput> =
     task {
         if String.IsNullOrWhiteSpace(fileName) then
@@ -729,6 +730,13 @@ let private runAsyncWithOutputLimitCore
         psi.RedirectStandardOutput <- true
         psi.RedirectStandardError <- true
         psi.CreateNoWindow <- true
+
+        match processContext with
+        | Some(directory, environment) ->
+            psi.WorkingDirectory <- directory
+            for key, value in environment do
+                psi.Environment[key] <- value
+        | None -> ()
 
         let containmentRequirement =
             match standardInputPolicy with
@@ -874,6 +882,7 @@ let internal runAsyncWithOutputLimit
         UnixSessionWrapperPreference.Automatic
         NoInput
         None
+        None
 
 /// Starts a controlled helper behind required process containment, then sends
 /// exactly one UTF-8 authorization line terminated by a literal LF. On Unix the
@@ -899,6 +908,7 @@ let internal runAsyncWithOutputLimitAfterRequiredContainment
         UnixSessionWrapperPreference.ManagedProcessGroup
         (ReleaseAfterRequiredContainment startLine)
         None
+        None
 
 let internal runAsyncWithOutputLimitAfterRequiredContainmentForTest
     (fileName: string)
@@ -918,6 +928,7 @@ let internal runAsyncWithOutputLimitAfterRequiredContainmentForTest
         UnixSessionWrapperPreference.ManagedProcessGroup
         (ReleaseAfterRequiredContainment startLine)
         (Some testHooks)
+        None
 
 let internal runAsyncWithManagedUnixSessionWrapper
     (fileName: string)
@@ -934,6 +945,13 @@ let internal runAsyncWithManagedUnixSessionWrapper
         UnixSessionWrapperPreference.Managed
         NoInput
         None
+        None
+
+/// Context is scoped to this child, never the server's process-wide current directory.
+let internal runAsyncInDirectory fileName args directory environment timeout cancellationToken =
+    runAsyncWithOutputLimitCore
+        fileName args timeout cancellationToken (outputLimitFromEnvironment ())
+        UnixSessionWrapperPreference.Automatic NoInput None (Some(directory, environment))
 
 let private runUnixWrapper createIsolation isolationName (fileName: string) (args: string array) =
     if OperatingSystem.IsWindows() then

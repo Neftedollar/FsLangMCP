@@ -3033,6 +3033,8 @@ type internal FcsBridge
             keepAllBackgroundSymbolUses = keepAllBackgroundSymbolUses
         )
 
+    let scriptChecker = ScriptChecking.Runner(checker)
+
     // Bounded caches keyed by a string combining projectPath + projectOptions hash.
     // Keep the source label with the options so cache hits report the same
     // resolution path as the original miss.
@@ -3084,7 +3086,7 @@ type internal FcsBridge
         BoundedCheckWorkAdmission("project type-check", freshProjectCheckCapacity)
 
     let freshProjectChecksInFlight =
-        ConcurrentDictionary<string, Lazy<Task<FSharpDiagnostic array * string * string>>>()
+        ConcurrentDictionary<string, Lazy<Task<FSharpDiagnostic array * string * string * ConstructorDiagnostics.Enrichment>>>()
 
     let snapshotComputationAdmission =
         BoundedCheckWorkAdmission("project snapshot computation", 1)
@@ -10639,7 +10641,7 @@ type internal FcsBridge
     // the caller turns into verdict="unknown" rather than a confident clean.
     member private this.FreshProjectCheck
         (fsproj: string, remainingBudget: unit -> TimeSpan)
-        : Task<Result<FSharpDiagnostic array * string * string, CheckBlockingFailure>> =
+        : Task<Result<FSharpDiagnostic array * string * string * ConstructorDiagnostics.Enrichment, CheckBlockingFailure>> =
         task {
             try
                 let! options, optionsSource =
@@ -10669,7 +10671,7 @@ type internal FcsBridge
                             freshProjectChecksInFlight.GetOrAdd(
                                 workKey,
                                 fun _ ->
-                                    Lazy<Task<FSharpDiagnostic array * string * string>>(
+                                    Lazy<Task<FSharpDiagnostic array * string * string * ConstructorDiagnostics.Enrichment>>(
                                         (fun () ->
                                             task {
                                                 try
@@ -10728,16 +10730,28 @@ type internal FcsBridge
                                                                         Interlocked.Increment(&projectTypeCheckStartCount)
                                                                         |> ignore
 
-                                                                        let! diagnostics =
+                                                                        let! diagnostics, enrichment =
                                                                             match freshProjectCheckWorkerOverride with
-                                                                            | Some worker -> worker options
+                                                                            | Some worker ->
+                                                                                task {
+                                                                                    let! diagnostics = worker options
+                                                                                    return diagnostics, ConstructorDiagnostics.empty
+                                                                                }
                                                                             | None ->
                                                                                 task {
                                                                                     let! results =
                                                                                         checker.ParseAndCheckProject(options)
                                                                                         |> asTask
 
-                                                                                    return results.Diagnostics
+                                                                                    let! enrichment =
+                                                                                        ConstructorDiagnostics.fromProjectResults
+                                                                                            checker
+                                                                                            options
+                                                                                            results
+                                                                                            (fun () -> remainingBudget () > TimeSpan.Zero)
+                                                                                        |> asTask
+
+                                                                                    return results.Diagnostics, enrichment
                                                                                 }
 
                                                                         // A caller may have timed out while the
@@ -10775,7 +10789,8 @@ type internal FcsBridge
                                                                             return
                                                                                 diagnostics,
                                                                                 options.ProjectFileName,
-                                                                                optionsSource
+                                                                                optionsSource,
+                                                                                enrichment
                                                                 }
                                                         )
                                                 finally
@@ -11185,6 +11200,8 @@ type internal FcsBridge
             let severityFloor = (args.severity |> Option.defaultValue "error").Trim().ToLowerInvariant()
             let scopeRaw = (args.scope |> Option.defaultValue "auto").Trim().ToLowerInvariant()
             let timeoutMs = args.timeoutMs |> Option.defaultValue 60000
+            let compact = defaultArg args.compact false
+            let maxDiagnostics = defaultArg args.maxDiagnostics 50
             let checkBudget = TimeSpan.FromMilliseconds(float (max 0 timeoutMs))
             let checkElapsed = System.Diagnostics.Stopwatch.StartNew()
 
@@ -11222,10 +11239,12 @@ type internal FcsBridge
                 return invalid $"snippetPosition must be 'start' or 'end' (got '{snippetPosition}')"
             elif not (List.contains severityFloor severityNames) then
                 return invalid $"severity must be one of error|warning|information|hint|all (got '{severityFloor}')"
-            elif not (List.contains scopeRaw [ "auto"; "file"; "project"; "workspace"; "snippet" ]) then
-                return invalid $"scope must be one of auto|file|project|workspace|snippet (got '{scopeRaw}')"
+            elif not (List.contains scopeRaw [ "auto"; "file"; "project"; "workspace"; "snippet"; "script" ]) then
+                return invalid $"scope must be one of auto|file|project|workspace|snippet|script (got '{scopeRaw}')"
             elif timeoutMs < 0 then
                 return invalid $"timeoutMs must be non-negative (got {timeoutMs})"
+            elif maxDiagnostics < 1 || maxDiagnostics > 1000 then
+                return invalid "maxDiagnostics must be between 1 and 1000."
             else
 
             // Severity floor → rank (Error = 1, highest). A diagnostic is surfaced in the
@@ -11312,8 +11331,15 @@ type internal FcsBridge
                     | None -> Task.FromResult(None, None)
                 | None -> Task.FromResult(None, None)
 
+            let isScriptPath =
+                args.path
+                |> Option.exists (fun path ->
+                    String.Equals(Path.GetExtension(path), ".fsx", StringComparison.OrdinalIgnoreCase))
+
             let! resolvedScope, autoScopeDiscoveryFailure =
                 match scopeRaw with
+                | "script" -> Task.FromResult("script", None)
+                | "file" when isScriptPath -> Task.FromResult("script", None)
                 | "file" -> Task.FromResult("file", None)
                 | "project" -> Task.FromResult("project", None)
                 | "workspace" -> Task.FromResult("workspace", None)
@@ -11322,7 +11348,7 @@ type internal FcsBridge
                     if hasText args.snippet then
                         Task.FromResult("snippet", None)
                     elif hasText args.path then
-                        Task.FromResult("file", None)
+                        Task.FromResult((if isScriptPath then "script" else "file"), None)
                     else
                         match sweepTargetOpt with
                         | None -> Task.FromResult("project", None)
@@ -11488,13 +11514,17 @@ type internal FcsBridge
                 (reason: string option)
                 (extra: (string * JsonNode) list)
                 : JsonNode =
-                // Hard cap the surfaced `diagnostics` array so a genuinely-erroring large
-                // project (or an unrestored false-error wall that slips past the probe)
-                // can never overflow the MCP token ceiling. errorCount/warningCount/
-                // totalDiagnostics stay FULL-set accurate — only the array is truncated.
-                let diagnosticsCap = 50
-                let cappedDiagNodes = diagNodes |> Array.truncate diagnosticsCap
-                let diagnosticsTruncated = diagNodes.Length > diagnosticsCap
+                // The row cap controls presentation; the final production-JSON
+                // guard below also handles long paths, messages, and group locations.
+                // Counts stay FULL-set accurate when diagnostic rows are reduced.
+                let surfaced =
+                    diagNodes
+                    |> Array.filter (fun node ->
+                        let rank = CheckDiagnostics.severityRank node
+                        rank >= 1 && rank <= floorRank)
+                let rows = if compact then CheckDiagnostics.group surfaced else surfaced
+                let cappedDiagNodes = rows |> Array.truncate maxDiagnostics
+                let diagnosticsTruncated = rows.Length > maxDiagnostics
 
                 // #190: totalDiagnostics silently disagreed with errorCount+warningCount
                 // whenever the full set held Info/Hidden diagnostics — agents read the gap
@@ -11510,7 +11540,7 @@ type internal FcsBridge
                 // full set), not an independently-observable quantity, so there is nothing
                 // to tally it against — measured before the diagnosticsCap truncation above
                 // so the cap and the floor never overlap in what they explain.
-                let belowSeverityFloorCount = max 0 (totalDiagnostics - diagNodes.Length)
+                let belowSeverityFloorCount = max 0 (totalDiagnostics - surfaced.Length)
 
                 let diagnosticsNote =
                     if belowSeverityFloorCount > 0 then
@@ -11540,17 +11570,25 @@ type internal FcsBridge
                       "totalDiagnostics", jint totalDiagnostics
                       "infoCount", jint infoCount
                       "belowSeverityFloorCount", jint belowSeverityFloorCount
+                      "diagnosticsGrouped", jbool compact
+                      "diagnosticGroupCount", (if compact then jint rows.Length else null)
+                      "surfacedDiagnosticCount", jint surfaced.Length
+                      "maxDiagnostics", jint maxDiagnostics
                       "diagnosticsNote", diagnosticsNote
                       "reason", (match reason with Some r -> jstr r | None -> null) ]
                     @ narrowCoverageFields
                     @ extra
                 )
                 :> JsonNode
+                |> CheckDiagnostics.boundResponse
 
             // FCS-diagnostics surfacing shared by every trusted (FCS) scope.
-            let surfaceFcs (diags: FSharpDiagnostic array) =
+            let surfaceFcs enrichment (diags: FSharpDiagnostic array) =
                 let surfaced = diags |> Array.filter (fun d -> passesFloor d.Severity)
-                let nodes = surfaced |> Array.map diagnosticToJson
+                let nodes =
+                    diags
+                    |> Array.map (fun diagnostic ->
+                        diagnosticToJson diagnostic |> ConstructorDiagnostics.enrich enrichment diagnostic)
                 let files = surfaced |> Array.map (fun d -> normalizePath d.FileName) |> Array.distinct
                 nodes, files
 
@@ -11584,6 +11622,66 @@ type internal FcsBridge
                         [||]
                         (Some discoveryReason)
                         ([ ("projectsSwept", jint 0) ] @ blockingFields discoveryFailure)
+            // ── Standalone scripts: their own SDK, #r and #load closure, no project. ──
+            | "script" ->
+                match args.path with
+                | None -> return invalid "scope='script' requires a .fsx path."
+                | Some path when String.IsNullOrWhiteSpace(path) || not isScriptPath ->
+                    return invalid "scope='script' requires a .fsx path."
+                | Some _ when speed <> "trusted" ->
+                    return invalid "Standalone scripts require speed='trusted'; FSAC project snapshots do not cover scripts."
+                | Some path ->
+                    match validateSourcePath "check" None path with
+                    | Some err -> return err
+                    | None ->
+                        let fullPath = normalizePath path
+                        let! result = scriptChecker.Check(fullPath, remainingCheckBudget ())
+
+                        match result with
+                        | Ok checkedScript ->
+                            let diags = checkedScript.Diagnostics
+                            let errorCount, warningCount = countDiagnosticsBySeverity diags
+                            let nodes, files = surfaceFcs checkedScript.Enrichment diags
+                            return
+                                build
+                                    (if errorCount > 0 then "errors" else "clean")
+                                    true
+                                    "fcs"
+                                    None
+                                    errorCount
+                                    warningCount
+                                    (countInfoDiagnostics diags)
+                                    diags.Length
+                                    nodes
+                                    files
+                                    None
+                                    [ "mode", jstr "fsx"
+                                      "scriptPath", jstr fullPath
+                                      "optionsSource", jstr "script"
+                                      "sourceFiles", JsonArray(checkedScript.Options.SourceFiles |> Array.map normalizePath |> Array.distinct |> Array.map jstr) :> JsonNode
+                                      "evaluated", jbool false ]
+                        | Error failure ->
+                            let reason, blocker =
+                                match failure with
+                                | ScriptChecking.ScriptFailure.Timeout ->
+                                    overallTimeoutReason, genericBlockingReason "timeout" overallTimeoutReason true
+                                | ScriptChecking.ScriptFailure.Busy ->
+                                    let message = "A previous script check is still running; retry after it completes."
+                                    message, genericBlockingReason "fcs_worker_busy" message true
+                                | ScriptChecking.ScriptFailure.SdkNotFound failure ->
+                                    failure.Message, SdkPreflight.toBlockingReason failure.Pin failure.InstalledSdks
+                                | ScriptChecking.ScriptFailure.SdkUnavailable message ->
+                                    message, genericBlockingReason "script_sdk_unavailable" message false
+                                | ScriptChecking.ScriptFailure.Failed message ->
+                                    message, genericBlockingReason "script_failure" message false
+
+                            return
+                                build "unknown" false "fcs" None 0 0 0 0 [||] [||] (Some reason)
+                                    [ "mode", jstr "fsx"
+                                      "scriptPath", jstr fullPath
+                                      "evaluated", jbool false
+                                      "blockingReason", blocker ]
+
             // ── snippet: always FRESH (ignores speed); placement-aware validation ──
             | "snippet" ->
                 match args.snippet with
@@ -11663,7 +11761,13 @@ type internal FcsBridge
                                 else
                                     "clean", true, None
 
-                            let nodes, _ = surfaceFcs allDiags
+                            let enrichment =
+                                match checkAnswer with
+                                | FSharpCheckFileAnswer.Succeeded results ->
+                                    ConstructorDiagnostics.fromFileResults parseResults results
+                                | FSharpCheckFileAnswer.Aborted -> ConstructorDiagnostics.empty
+
+                            let nodes, _ = surfaceFcs enrichment allDiags
 
                             // Every surviving diagnostic points at the temp file; surface the
                             // logical name instead of leaking a /tmp path the caller never made.
@@ -11946,13 +12050,14 @@ type internal FcsBridge
                             match n with
                             | :? JsonObject as obj ->
                                 let code = severityCode obj
-                                if code >= 1 && code <= floorRank then Some(n.DeepClone()) else None
+                                if code >= 1 then Some(n.DeepClone()) else None
                             | _ -> None)
                         |> Seq.toArray
                     | _ -> [||]
 
                 let files =
                     nodes
+                    |> Array.filter (fun node -> CheckDiagnostics.severityRank node <= floorRank)
                     |> Array.choose (fun n ->
                         match n["file"] with
                         | :? JsonValue as v -> Some(v.GetValue<string>())
@@ -12091,7 +12196,12 @@ type internal FcsBridge
                                     | None when errorCount > 0 -> "errors", true, None
                                     | None -> "clean", true, None
 
-                                let nodes, files = surfaceFcs allDiags
+                                let enrichment =
+                                    checkedResults
+                                    |> Option.map (ConstructorDiagnostics.fromFileResults parseResults)
+                                    |> Option.defaultValue ConstructorDiagnostics.empty
+
+                                let nodes, files = surfaceFcs enrichment allDiags
 
                                 let responseFields =
                                     [ "projectFileName", jstr projectOptions.ProjectFileName
@@ -12344,11 +12454,11 @@ type internal FcsBridge
                                         [||]
                                         (Some $"Project could not be analyzed: {message}")
                                         ([ ("projectsSwept", jint 1) ] @ blockingFields failure)
-                            | Ok(diags, projFileName, optionsSource) ->
+                            | Ok(diags, projFileName, optionsSource, enrichment) ->
                                 let errorCount, warningCount = countDiagnosticsBySeverity diags
                                 let infoCount = countInfoDiagnostics diags
                                 let verdict = if errorCount > 0 then "errors" else "clean"
-                                let nodes, files = surfaceFcs diags
+                                let nodes, files = surfaceFcs enrichment diags
 
                                 return
                                     build
@@ -12446,6 +12556,7 @@ type internal FcsBridge
                         return invalid $"check could not resolve any .fsproj to check from: {target}"
                     else
                         let allDiags = ResizeArray<FSharpDiagnostic>()
+                        let enrichments = ResizeArray<ConstructorDiagnostics.Enrichment>()
                         let perProject = ResizeArray<JsonNode>()
                         let mutable failCount = 0
                         let mutable unrestoredCount = 0
@@ -12528,8 +12639,9 @@ type internal FcsBridge
                                     | Some(Error CheckTimedOut) ->
                                         deadlineExhausted <- true
                                         addTimedOutProject proj
-                                    | Some(Ok(diags, _, _)) ->
+                                    | Some(Ok(diags, _, _, enrichment)) ->
                                         allDiags.AddRange diags
+                                        enrichments.Add enrichment
                                         let e, w = countDiagnosticsBySeverity diags
                                         // #205: a genuine tally via countInfoDiagnostics on this
                                         // project's own diags — mirrors the top-level infoCount
@@ -12581,7 +12693,8 @@ type internal FcsBridge
                             else
                                 "clean", true, None
 
-                        let nodes, files = surfaceFcs diags
+                        let enrichment = ConstructorDiagnostics.combine enrichments
+                        let nodes, files = surfaceFcs enrichment diags
 
                         return
                             build
@@ -14686,6 +14799,26 @@ type internal FcsBridge
 
             // ── Per-member signature/accessibility helpers (reuse the shared kind/acc
             //    helpers; only the bare signature strings are built locally) ──────────
+            let valueSignature (m: FSharpMemberOrFunctionOrValue) =
+                try
+                    let mutableSuffix = if m.IsMutable then " (mutable)" else ""
+
+                    let constraintsSuffix =
+                        m.GenericParameters
+                        |> Seq.choose (fun parameter ->
+                            let constraints = genericParameterConstraintsWith publicApiTypeName parameter
+
+                            if constraints.Length = 0 then
+                                None
+                            else
+                                let renderedConstraints = String.concat ", " constraints
+                                Some $" where {genericParameterName parameter} : {renderedConstraints}")
+                        |> String.concat ""
+
+                    $"{m.DisplayName}: {publicApiTypeName m.FullType}{mutableSuffix}{constraintsSuffix}"
+                with _ ->
+                    try m.DisplayName with _ -> "<unknown>"
+
             let fieldSignature (f: FSharpField) =
                 try
                     $"{f.Name}: {publicApiTypeName f.FieldType}"
@@ -14757,10 +14890,19 @@ type internal FcsBridge
                             let acc = memberAccessibilityString m
 
                             if not isAccessor && not isCompilerGenerated && not isRecordFieldProperty && accPasses acc then
+                                // Module values can compile to CLR getters, but are not
+                                // zero-argument F# functions. IsValue/IsFunction describe
+                                // the type, so a function-valued binding needs the same
+                                // value treatment when it has no declared argument groups.
+                                let isValue =
+                                    try not m.IsMember && m.CurriedParameterGroups.Count = 0 with _ -> false
+
                                 Some
                                     {| name = (try m.DisplayName with _ -> "<unknown>")
-                                       kind = memberKindString m
-                                       signature = memberSignatureWith publicApiTypeName m
+                                       kind = if isValue then "value" else memberKindString m
+                                       signature =
+                                           if isValue then valueSignature m
+                                           else memberSignatureWith publicApiTypeName m
                                        accessibility = acc |}
                             else
                                 None)

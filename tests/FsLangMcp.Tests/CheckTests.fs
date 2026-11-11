@@ -216,6 +216,8 @@ let private bareCheck: CheckArgs =
       mode = None
       speed = None
       severity = None
+      compact = None
+      maxDiagnostics = None
       projectPath = None
       timeoutMs = None }
 
