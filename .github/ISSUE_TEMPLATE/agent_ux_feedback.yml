@@ -11,11 +11,22 @@ body:
   - type: input
     id: version
     attributes:
-      label: FsLangMCP version
-      description: From the `fslangmcp_version` tool. (In-session MCP = the **installed** tool, not your local build.)
-      placeholder: "0.12.1"
+      label: Running FsLangMCP version
+      description: |
+        Call `fslangmcp_version` in the MCP session that reproduced the issue and paste the version.
+        Updating the installed tool does not update an already-running server. After updating, reconnect and check again.
+        If the server cannot start, say so and report `fslangmcp --version` instead. For a local build, include the commit SHA.
+      placeholder: "Version from the affected MCP session"
     validations:
       required: true
+  - type: input
+    id: installed-version
+    attributes:
+      label: Installed FsLangMCP version (if different)
+      description: |
+        Run `fslangmcp --version` using the executable configured in your MCP client.
+        This reports the on-disk version, which can differ from the version in a running session.
+      placeholder: "Leave blank if it matches the running version"
   - type: textarea
     id: context
     attributes:
