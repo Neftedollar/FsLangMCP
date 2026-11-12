@@ -532,9 +532,28 @@ type private BlockedCheckRequests(release: unit -> unit, reset: unit -> unit) =
                 try
                     do! Task.WhenAll(pending)
                 finally
-                    verifyDrained ()
-                    reset ()
+                    try
+                        verifyDrained ()
+                    finally
+                        reset ()
             })
+
+[<Fact>]
+let ``blocked check requests reset the fixture when drain verification fails`` () : Task =
+    task {
+        let mutable released = false
+        let mutable reset = false
+        let requests = new BlockedCheckRequests((fun () -> released <- true), (fun () -> reset <- true))
+        requests.VerifyBeforeReset(fun () -> invalidOp "controlled verification failure")
+
+        let! failure =
+            Assert.ThrowsAsync<InvalidOperationException>(fun () ->
+                (requests :> IAsyncDisposable).DisposeAsync().AsTask())
+
+        Assert.Equal("controlled verification failure", failure.Message)
+        Assert.True(released, "The blocked producer must be released even when verification fails.")
+        Assert.True(reset, "A failed verification must not skip fixture cleanup.")
+    }
 
 [<Fact>]
 let ``fast project check returns unknown when expectation evaluation exhausts the overall timeout`` () : Task =
@@ -677,6 +696,7 @@ let ``trusted workspace overall timeout skips later project loaders`` () : Task 
                 if String.Equals(Path.GetFullPath(path), Path.GetFullPath(projectA), StringComparison.Ordinal) then
                     aStarted.TrySetResult(()) |> ignore
                     do! releaseA.Task
+                    Assert.True(File.Exists(projectA), "The fixture must outlive the retained A producer.")
                     return raise (InvalidOperationException("controlled A completion"))
                 else
                     bStarted.TrySetResult(()) |> ignore
@@ -686,31 +706,50 @@ let ``trusted workspace overall timeout skips later project loaders`` () : Task 
 
         let bridge = FcsBridge(projectEvaluationBeforeLoadOverride = controlledLoad)
 
-        try
-            let checkTask =
-                bridge.Check(
-                    { bareCheck with
-                        scope = Some "workspace"
-                        speed = Some "trusted"
-                        projectPath = Some root
-                        timeoutMs = Some 300 }
-                )
+        use requests =
+            new BlockedCheckRequests(
+                (fun () -> releaseA.TrySetResult(()) |> ignore),
+                (fun () ->
+                    if Directory.Exists root then
+                        Directory.Delete(root, true))
+            )
 
-            do! aStarted.Task.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(1.0)))
-            let! result = checkTask.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
+        // Establish the blocked producer before starting the caller's 300ms budget.
+        // The seed owns its completion, including when an assertion fails.
+        let seed = bridge.GetEvaluatedProjectSnapshot(projectA) |> requests.Track
+        do! aStarted.Task.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(1.0)))
 
-            Assert.Equal("unknown", gs result "verdict")
-            Assert.False(gb result "analyzed")
-            Assert.Equal(2, gi result "timedOutCount")
-            Assert.False(bStarted.Task.IsCompleted, "The next workspace project must be skipped after deadline expiry.")
-            Assert.Equal(1L, bridge.ProjectEvaluationStartedCount)
-            Assert.Equal(0L, bridge.ProjectTypeCheckStartCount)
-            Assert.Contains("overall", (gs result "reason").ToLowerInvariant())
-        finally
-            releaseA.TrySetResult(()) |> ignore
+        requests.VerifyBeforeReset(fun () ->
+            Assert.Equal(Error "controlled A completion", seed.Result)
+            Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
+            Assert.Equal(0, bridge.ProjectOptionsInFlightCount))
 
-            if Directory.Exists root then
-                Directory.Delete(root, true)
+        let checkTask =
+            bridge.Check(
+                { bareCheck with
+                    scope = Some "workspace"
+                    speed = Some "trusted"
+                    projectPath = Some root
+                    timeoutMs = Some 300 }
+            )
+            |> requests.Track
+
+        let! result = checkTask.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
+
+        Assert.Equal("unknown", gs result "verdict")
+        Assert.False(gb result "analyzed")
+        Assert.Equal(2, gi result "timedOutCount")
+        Assert.False(bStarted.Task.IsCompleted, "The next workspace project must be skipped after deadline expiry.")
+        Assert.Equal(1L, bridge.ProjectEvaluationStartedCount)
+        Assert.Equal(0L, bridge.ProjectTypeCheckStartCount)
+        Assert.Contains("overall", (gs result "reason").ToLowerInvariant())
+
+        releaseA.TrySetResult(()) |> ignore
+        let! seededResult = seed.WaitAsync(TestTiming.watchdog (TimeSpan.FromSeconds(2.0)))
+        Assert.Equal(Error "controlled A completion", seededResult)
+        Assert.Equal(0, bridge.ProjectEvaluationActiveCount)
+        Assert.Equal(0, bridge.ProjectOptionsInFlightCount)
+        Assert.False(bStarted.Task.IsCompleted, "Draining A must not start the expired caller's next project.")
     }
 
 // ─────────────────────────────────────────────────────────────────────────────────
