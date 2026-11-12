@@ -20,10 +20,45 @@ open System.Diagnostics
 open System.Text.Json.Nodes
 open System.Threading.Tasks
 open Xunit
+open FSharp.Compiler.Diagnostics
+open FSharp.Compiler.Text
 open FsLangMcp.Types
 open FsLangMcp.FcsBridge
 open FsLangMcp.LspBridge
 open FsLangMcp.Dispatcher
+
+// #209: pin the actual FCS counters without depending on which informational
+// diagnostics a compiler version emits. Repeated entries must count separately.
+[<Theory>]
+[<InlineData(0, 0, 0, 0)>]
+[<InlineData(1, 0, 0, 0)>]
+[<InlineData(0, 1, 0, 0)>]
+[<InlineData(0, 0, 1, 0)>]
+[<InlineData(0, 0, 0, 1)>]
+[<InlineData(2, 3, 5, 7)>]
+let ``FCS severity counts partition every diagnostic including Hidden``
+    (errorCount: int)
+    (warningCount: int)
+    (infoCount: int)
+    (hiddenCount: int)
+    =
+    let copies severity count =
+        let range = Range.mkRange "Synthetic.fs" (Position.mkPos 1 0) (Position.mkPos 1 1)
+        let diagnostic = FSharpDiagnostic.Create(severity, "Synthetic diagnostic", 1, range)
+        Array.create count diagnostic
+
+    let diagnostics =
+        [| copies FSharpDiagnosticSeverity.Error errorCount
+           copies FSharpDiagnosticSeverity.Warning warningCount
+           copies FSharpDiagnosticSeverity.Info infoCount
+           copies FSharpDiagnosticSeverity.Hidden hiddenCount |]
+        |> Array.concat
+
+    let errors, warnings, infos = FcsBridge().CountDiagnosticsForTest diagnostics
+    Assert.Equal(errorCount, errors)
+    Assert.Equal(warningCount, warnings)
+    Assert.Equal(infoCount + hiddenCount, infos)
+    Assert.Equal(diagnostics.Length, errors + warnings + infos)
 
 // ── Fixture sources ────────────────────────────────────────────────────────────
 
