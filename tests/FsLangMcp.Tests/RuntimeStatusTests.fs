@@ -169,10 +169,39 @@ let ``buildSnapshot exposes non-negative thread diagnostics`` () =
     let proc = node result "process"
     let threads = node proc "threads"
 
-    Assert.True(getIntAt threads "process" >= 0)
+    // Restricted hosts may deny OS process-thread inspection. The key must still exist.
+    Assert.True(threads.AsObject().ContainsKey("process"))
+
+    if not (isNull threads["process"]) then
+        Assert.True(getIntAt threads "process" >= 0)
     Assert.True(getIntAt threads "threadPool" >= 0)
     Assert.True(threads["pendingWorkItems"].GetValue<int64>() >= 0L)
     Assert.True(threads["completedWorkItems"].GetValue<int64>() >= 0L)
+
+let private assertThreadPoolCounters (threads: JsonNode) =
+    Assert.True(getIntAt threads "threadPool" >= 0)
+    Assert.True(getInt64At threads "pendingWorkItems" >= 0L)
+    Assert.True(getInt64At threads "completedWorkItems" >= 0L)
+
+[<Fact>]
+let ``unavailable process threads serialize as explicit null without losing thread pool counters`` () =
+    let telemetry = { LoadAttempts = 0L; StaleReloads = 0L; CacheValidations = 0L; InFlight = 0 }
+    let threads = threadInfoJsonWithProcessCount None telemetry
+    Assert.True(threads.AsObject().ContainsKey("process"))
+    Assert.Null(threads["process"])
+    Assert.Equal("unknown", getStr threads["health"] "status")
+    assertThreadPoolCounters threads
+
+[<Theory>]
+[<InlineData(0)>]
+[<InlineData(17)>]
+[<InlineData(128)>]
+let ``available process thread counts retain their exact value`` (count: int) =
+    let telemetry = { LoadAttempts = 0L; StaleReloads = 0L; CacheValidations = 0L; InFlight = 0 }
+    let threads = threadInfoJsonWithProcessCount (Some count) telemetry
+    Assert.Equal(count, getIntAt threads "process")
+    Assert.Equal((if count >= 128 then "warning" else "ok"), getStr threads["health"] "status")
+    assertThreadPoolCounters threads
 
 [<Fact>]
 let ``thread health warns at the conservative threshold without claiming proof of cause`` () =
