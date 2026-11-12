@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-12
+
+0.20.0 ships the changes for the recent v0.16.0 reports #320–324, checked against
+v0.19.0 before implementation. It remains a pre-1.0 release, not the 1.0 contract freeze.
+
 ### Added
 
 - `check` accepts standalone `.fsx` paths and `scope="script"`, using script SDK references,
@@ -32,6 +37,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rechecked the v0.16.0 reports against v0.19.0. Added a real FS3520 regression proving the existing
   `infoCount` / `belowSeverityFloorCount` / `diagnosticsNote` contract and `severity="all"` recovery;
   #324 already behaves correctly in v0.19.0, so no additional severity fields were introduced.
+
+- Bound forced cursor-response expiry to its intended test request so an incidental early
+  timeout cannot defer the injected fault onto the retry. Production timeout and strict retry
+  behavior are unchanged.
+
+### Maintenance
+
+- Strengthened behavioral and mutation-sensitive tests, fixed legacy type-at-position lookup
+  and Python smoke severity type validation (#326), and stabilized deadline/pagination test
+  harness assertions (#316).
+- Issue forms now distinguish the running MCP server version from an installed package
+  version (#325).
+- Updated the reviewed runtime dependency pins, test tooling and documentation stack
+  (#315, #309, #313, #293), plus CI action patch/minor updates.
 
 ## [0.19.0] - 2026-10-08
 
@@ -1249,7 +1268,8 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
   above), so it has no link definition either — 0.15.0 compares from the
   last version that actually was tagged, 0.13.2.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.0...v0.17.1

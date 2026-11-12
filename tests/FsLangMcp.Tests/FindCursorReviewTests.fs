@@ -598,7 +598,6 @@ type FindCursorReviewTests(fixture: FindCursorFixture, output: ITestOutputHelper
             Assert.Equal(4, expected.Length)
             let mutable expired = false
             let mutable expireThisRequest = false
-            let mutable signal = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let requests = ResizeArray<FindArgs>()
             let ledger = ResizeArray<string>()
             let mutable failedRequest: (FindArgs * string array) option = None
@@ -609,16 +608,20 @@ type FindCursorReviewTests(fixture: FindCursorFixture, output: ITestOutputHelper
             let bridge =
                 FcsBridge(
                     findResponseDeadlineSignalOverride = (fun () ->
-                        signal <- TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
-                        signal.Task :> Task),
-                    findResponseConstructionBeforeStepOverride = (fun phase _ ->
-                        if expireThisRequest && not expired && phase = "response-planning" then
+                        // Bind the forced response expiry to this request before it
+                        // starts. A late planner hook could be preempted by a real
+                        // response timeout and then inject a second expiry on retry.
+                        // This signal affects only response construction; semantic
+                        // analysis still runs normally. Late expiry has separate tests.
+                        let signal = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+                        if expireThisRequest && not expired then
                             Assert.True(armedForcedRequest.IsSome, "Forced deadline fired without an armed request.")
                             Assert.True(forcedRequest.IsNone, "Forced deadline fired more than once.")
                             forcedRequest <- armedForcedRequest
                             forcedTriggerCount <- forcedTriggerCount + 1
                             expired <- true
-                            signal.TrySetResult(()) |> ignore))
+                            signal.TrySetResult(()) |> ignore
+                        signal.Task :> Task))
             try
                 File.WriteAllText(fixture.AProject, originalProject.Replace("</PropertyGroup>", "<OtherFlags>--maxerrors:500</OtherFlags></PropertyGroup>", StringComparison.Ordinal))
                 File.WriteAllText(fixture.ASource, originalSource + "\n" + String.concat "\n" [ for index in 0 .. 204 -> $"let diagnostic{index:D3} = missing{index:D3}" ])
