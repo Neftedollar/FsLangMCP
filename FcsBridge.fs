@@ -15523,6 +15523,12 @@ type internal FcsBridge
 
     member _.FindTargetDiscoveryComputeCount = Volatile.Read(&findTargetDiscoveryComputeCount)
 
+    /// Exercise the production counters with synthetic severities, including Hidden
+    /// diagnostics that do not have a stable compiler-emitted regression fixture.
+    member internal _.CountDiagnosticsForTest(diagnostics: FSharpDiagnostic array) =
+        let errors, warnings = countDiagnosticsBySeverity diagnostics
+        errors, warnings, countInfoDiagnostics diagnostics
+
     /// Pure deterministic seam for verifying collision-free discovery key framing.
     member _.CheckDiscoveryKeyForTest(scope: string, target: string, path: string option) =
         checkDiscoveryKey scope target path
