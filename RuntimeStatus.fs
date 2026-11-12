@@ -200,8 +200,11 @@ let private tryProcessThreadCount (proc: Process) =
     with _ ->
         None
 
-let private threadInfoJson (proc: Process) (projectOptions: ProjectOptionsTelemetry) : JsonNode =
-    let processThreadCount = tryProcessThreadCount proc
+/// Serialize optional OS thread telemetry without conflating unavailable with zero.
+let internal threadInfoJsonWithProcessCount
+    (processThreadCount: int option)
+    (projectOptions: ProjectOptionsTelemetry)
+    : JsonNode =
 
     let processThreads: JsonNode =
         match processThreadCount with
@@ -215,6 +218,9 @@ let private threadInfoJson (proc: Process) (projectOptions: ProjectOptionsTeleme
           "completedWorkItems", jint64 ThreadPool.CompletedWorkItemCount
           "health", threadHealthJson processThreadCount projectOptions ]
     :> JsonNode
+
+let private threadInfoJson (proc: Process) (projectOptions: ProjectOptionsTelemetry) : JsonNode =
+    threadInfoJsonWithProcessCount (tryProcessThreadCount proc) projectOptions
 
 let currentThreadWarning (projectOptions: ProjectOptionsTelemetry) : JsonNode option =
     use proc = Process.GetCurrentProcess()
