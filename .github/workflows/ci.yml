@@ -49,6 +49,11 @@ jobs:
           FSLANGMCP_SERVER_DLL: bin/Release/net10.0/FsLangMcp.dll
         run: python -m unittest -v scripts.tests.test_sdk_pin_preflight_e2e
 
+      - name: Test symbol coordinate contract end to end
+        env:
+          FSLANGMCP_SERVER_DLL: bin/Release/net10.0/FsLangMcp.dll
+        run: python -m unittest -v scripts.tests.test_symbol_coordinates_e2e
+
       - name: Test (with coverage)
         id: coverage_tests
         # coverlet.msbuild instruments FsLangMcp.dll via the ProjectReference graph (ADR-0001).

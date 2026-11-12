@@ -378,7 +378,7 @@ type FcsSymbolAtWordArgs =
       line: int
       /// Identifier to locate on the line; when omitted, falls back to column-based scan.
       word: string option
-      /// 0-based index among multiple occurrences of `word` on the line. Default -1 (first match).
+      /// 0-based candidate index. Omitted/negative requires exactly one candidate; otherwise ambiguous_word.
       occurrence: int option
       /// Unsaved buffer content; when omitted, file is read from disk.
       text: string option
