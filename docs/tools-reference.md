@@ -8,7 +8,7 @@ toc:
 
 FsLangMCP exposes 35 tools over MCP stdio, grouped below by intent. Start with `find` and `check` — they cover the two most common agent questions ("where is X?" and "did my edit compile?"). The other 33 tools provide deeper access to specific compiler, LSP, and project capabilities.
 
-All positions (`line`, `character`) are **0-based**. `projectPath` is optional on most tools after `set_project` — it falls back to the active project.
+Input positions (`line`, `character`) are **0-based**. FCS output ranges may use 1-based lines; see each tool's response contract. `projectPath` is optional on most tools after `set_project` — it falls back to the active project.
 
 Arguments are **strictly typed JSON** (since v0.15.0): string-encoded scalars such as `"42"` or `"true"` are not coerced into numeric or boolean fields and fail with a structured invalid-arguments error. Send `42` and `true`, not their quoted forms.
 
@@ -360,7 +360,10 @@ The response includes `evaluation.status`, `evaluation.source`, `evaluation.impo
 - `path` (required) — absolute path to `.fs` file
 - `line` (required) — 0-based line number
 - `word` (required) — the word/identifier to look up
-- `occurrence` — which occurrence on the line (1-based, default 1)
+- `occurrence` — 0-based candidate index (0 selects the first match, 1 the second). Omitted or negative requires a unique candidate; multiple matches return `ambiguous_word`.
+
+**Response coordinates:** `line` and `candidate`/`candidates` line/columns are 0-based.
+`definitionRange` uses 1-based lines and 0-based columns. End columns are exclusive.
 
 **Use when:** Inspecting what a specific identifier means without knowing its exact column.
 

@@ -1053,7 +1053,8 @@ exact cursor column.
 1. **Project context required** — without `set_project` (or an explicit project path), types are often
    reported as unresolved or `obj`. Always set the project first.
 2. **File must exist on disk** — this tool reads the file by path.
-3. **Line is 0-based; occurrence is 1-based** — use `occurrence` to select repeated words on one line.
+3. **Input line and occurrence are 0-based** — use `occurrence=0` for the first candidate and `1` for the second. Omitted or negative occurrence requires a unique candidate; multiple matches return `ambiguous_word` with 0-based candidate indices.
+4. **Output coordinates differ by field** — `line` and `candidate`/`candidates` line/columns remain 0-based. `definitionRange` uses 1-based lines and 0-based columns. End columns are exclusive.
 
 ### Related tools
 

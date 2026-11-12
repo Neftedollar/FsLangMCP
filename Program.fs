@@ -1020,7 +1020,7 @@ let private mainCore argv =
                 tool (
                     TypedTool.define<FcsSymbolAtWordArgs>
                         "fcs_symbol_at_word"
-                        "Tolerant FCS symbol lookup for agent workflows. Accepts a line plus word/occurrence, finds the candidate span, and returns symbol identity, kind, type string, definition range, and optional documentation. Prefer over exact-position hover/type queries."
+                        "Tolerant FCS symbol lookup; prefer over exact-position hover/type queries. Input line and occurrence are 0-based; omitted/negative occurrence requires a unique candidate. Returns identity, kind, type and optional documentation. Output candidate line/columns are 0-based; definitionRange lines are 1-based, columns 0-based. End columns are exclusive. Supports unsaved text and explicit project context."
                         (fun args (ct: CancellationToken) ->
                             toolResult (fun () -> runLimited fcsGate ct (fun () -> fcsBridge.SymbolAtWord args)))
                     |> unwrapResult
