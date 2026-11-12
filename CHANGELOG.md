@@ -38,6 +38,10 @@ v0.19.0 before implementation. It remains a pre-1.0 release, not the 1.0 contrac
   `infoCount` / `belowSeverityFloorCount` / `diagnosticsNote` contract and `severity="all"` recovery;
   #324 already behaves correctly in v0.19.0, so no additional severity fields were introduced.
 
+- Bound forced cursor-response expiry to its intended test request so an incidental early
+  timeout cannot defer the injected fault onto the retry. Production timeout and strict retry
+  behavior are unchanged.
+
 ### Maintenance
 
 - Strengthened behavioral and mutation-sensitive tests, fixed legacy type-at-position lookup
