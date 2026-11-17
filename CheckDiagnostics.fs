@@ -91,7 +91,7 @@ let boundResponse (response: JsonNode) : JsonNode =
     if overBudget () then
         response["responseTruncatedByBudget"] <- jbool true
         response["responseSizeHint"] <-
-            jstr "Response details were reduced to fit the JSON budget. Narrow path/fileGlob/project scope for individual diagnostics; inspect compiler output if one diagnostic alone is too large."
+            jstr "Response details were reduced to fit the JSON budget. Narrow the file/project scope for individual diagnostics; inspect compiler output if one diagnostic alone is too large."
         let diagnostics = response["diagnostics"].AsArray()
 
         for diagnostic in diagnostics do
@@ -134,7 +134,7 @@ let boundResponse (response: JsonNode) : JsonNode =
                "infoCount", response["infoCount"].DeepClone()
                "totalDiagnostics", response["totalDiagnostics"].DeepClone()
                "errorKind", jstr "check_response_metadata_exceeds_budget"
-               "reason", jstr "Check coverage metadata exceeds the response budget even without diagnostics. Retry with a narrower path, fileGlob, or project scope."
+               "reason", jstr "Check coverage metadata exceeds the response budget even without diagnostics. Retry with a narrower file/project scope."
                "diagnostics", JsonArray() :> JsonNode
                "diagnosticsTruncated", jbool true
                "diagnosticsTruncatedByBudget", jbool true

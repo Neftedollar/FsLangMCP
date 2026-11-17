@@ -11225,6 +11225,9 @@ type internal FcsBridge
             let invalid msg =
                 jobj [ "status", jstr "invalid_args"; "message", jstr msg ] :> JsonNode
 
+            let unsupportedFileGlobMessage =
+                "fileGlob is supported only with scope=\"workspace\" and speed=\"fast\" (cached diagnostics). Remove fileGlob and set speed=\"trusted\" for a fresh full-context check, or remove fileGlob and use scope=\"file\", speed=\"trusted\", and path for a fresh single-file check."
+
             let hasText (o: string option) =
                 o |> Option.exists (String.IsNullOrWhiteSpace >> not)
 
@@ -11245,6 +11248,9 @@ type internal FcsBridge
                 return invalid $"timeoutMs must be non-negative (got {timeoutMs})"
             elif maxDiagnostics < 1 || maxDiagnostics > 1000 then
                 return invalid "maxDiagnostics must be between 1 and 1000."
+            elif args.fileGlob.IsSome && (speed <> "fast" || (scopeRaw <> "auto" && scopeRaw <> "workspace")) then
+                // Reject explicit unsupported combinations before project discovery.
+                return invalid unsupportedFileGlobMessage
             else
 
             // Severity floor → rank (Error = 1, highest). A diagnostic is surfaced in the
@@ -11622,6 +11628,10 @@ type internal FcsBridge
                         [||]
                         (Some discoveryReason)
                         ([ ("projectsSwept", jint 0) ] @ blockingFields discoveryFailure)
+            | _ when args.fileGlob.IsSome && resolvedScope <> "workspace" ->
+                // Auto can resolve to file/script/snippet/project. Failed discovery
+                // stays unknown above; never reinterpret it as a supported selection.
+                return invalid unsupportedFileGlobMessage
             // ── Standalone scripts: their own SDK, #r and #load closure, no project. ──
             | "script" ->
                 match args.path with
