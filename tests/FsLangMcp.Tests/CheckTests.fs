@@ -256,6 +256,67 @@ let private bareCheck: CheckArgs =
       projectPath = None
       timeoutMs = None }
 
+// #339: unsupported filters must never look like a filtered clean/errors result.
+[<Theory>]
+[<InlineData("project", "trusted")>]
+[<InlineData("project", "fast")>]
+[<InlineData("workspace", "trusted")>]
+[<InlineData("auto", "trusted")>]
+[<InlineData("auto", "fast")>]
+[<InlineData("file", "fast")>]
+[<InlineData("script", "trusted")>]
+[<InlineData("snippet", "fast")>]
+let ``unsupported fileGlob fails without returning misleading diagnostic evidence`` scope speed : Task =
+    task {
+        let mutable snapshotCalled = false
+        let snapshot expectation =
+            snapshotCalled <- true
+            Task.FromResult(CheckFsacSnapshot.unavailable expectation "must not be called")
+        let! result =
+            FcsBridge().Check(
+                { bareCheck with scope = Some scope; speed = Some speed; fileGlob = Some "**/Series*.fs" },
+                fsacSnapshot = snapshot)
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("fileGlob", result["message"].GetValue<string>())
+        Assert.Contains("scope=\"workspace\"", result["message"].GetValue<string>())
+        Assert.Contains("speed=\"fast\"", result["message"].GetValue<string>())
+        Assert.Null(result["verdict"])
+        Assert.Null(result["warningCount"])
+        Assert.Null(result["diagnostics"])
+        Assert.False(snapshotCalled)
+    }
+
+[<Theory>]
+[<InlineData("default")>]
+[<InlineData("file")>]
+[<InlineData("script")>]
+[<InlineData("snippet")>]
+let ``auto fileGlob rejects default trusted speed and nonworkspace targets`` target : Task =
+    task {
+        let request =
+            match target with
+            | "file" -> { bareCheck with speed = Some "fast"; path = Some "Missing.fs" }
+            | "script" -> { bareCheck with speed = Some "fast"; path = Some "Missing.fsx" }
+            | "snippet" -> { bareCheck with speed = Some "fast"; snippet = Some "let value = 1" }
+            | _ -> bareCheck
+        let! result = FcsBridge().Check({ request with fileGlob = Some "**/*.fs" })
+        Assert.Equal("invalid_args", result["status"].GetValue<string>())
+        Assert.Contains("fileGlob", result["message"].GetValue<string>())
+        Assert.Null(result["verdict"])
+    }
+
+[<Fact>]
+let ``auto fileGlob discovery timeout remains unknown`` () : Task =
+    task {
+        let! result =
+            FcsBridge().Check(
+                { bareCheck with speed = Some "fast"; fileGlob = Some "**/*.fs"
+                                 projectPath = Some(Path.Combine(Path.GetTempPath(), "not-discovered.fsproj"))
+                                 timeoutMs = Some 0 })
+        Assert.Equal("unknown", result["verdict"].GetValue<string>())
+        Assert.False(result["analyzed"].GetValue<bool>())
+    }
+
 let private waitForDiscoveryState description predicate =
     task {
         let deadline = Stopwatch.StartNew()
@@ -2633,6 +2694,38 @@ type CheckTests(fx: CheckFixture) =
             Assert.Equal(0, gi result "missingFileCount")
             Assert.Equal(1, gi result "staleFileCount")
             Assert.Contains("stale", (gs result "reason").ToLowerInvariant())
+        }
+
+    [<Fact>]
+    member _.``project fileGlob cannot disguise unrelated real warnings as selected diagnostics``() : Task =
+        task {
+            Assert.True(fx.BetaBuildExitCode = 0, fx.BetaBuildLog)
+            let bridge = FcsBridge()
+            let request =
+                { bareCheck with scope = Some "project"; projectPath = Some fx.BetaFsproj
+                                 severity = Some "warning" }
+            let! unfiltered = bridge.Check(request)
+            Assert.Equal("clean", gs unfiltered "verdict")
+            Assert.True(gi unfiltered "warningCount" > 0)
+            Assert.True(gi unfiltered "totalDiagnostics" > 0)
+            Assert.True(gi unfiltered "diagnosticsFileCount" > 0)
+            Assert.NotEmpty(unfiltered["diagnostics"].AsArray())
+            let! filtered = bridge.Check({ request with fileGlob = Some "**/Series*.fs" })
+            Assert.Equal("invalid_args", gs filtered "status")
+            for field in ["verdict"; "warningCount"; "totalDiagnostics"; "diagnosticsFileCount"; "files"; "diagnostics"] do
+                Assert.Null(filtered[field])
+        }
+
+    [<Fact>]
+    member _.``auto fileGlob rejects a project but preserves a fast workspace filter``() : Task =
+        task {
+            let bridge = FcsBridge()
+            let request = { bareCheck with speed = Some "fast"; fileGlob = Some "**/Main.fs" }
+            let! project = bridge.Check({ request with projectPath = Some fx.ProbeFsproj })
+            Assert.Equal("invalid_args", gs project "status")
+            let! expectation = captureFastExpectation bridge { request with projectPath = Some fx.Root }
+            Assert.Equal("workspace", expectation.Scope)
+            Assert.Equal(Some "**/Main.fs", expectation.FileGlob)
         }
 
     [<Fact>]

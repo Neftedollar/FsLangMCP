@@ -592,12 +592,19 @@ default | `fast` = cached FSAC snapshot), `snippetPosition` (`start`|`end`, defa
 
 **Signature:** every argument is optional. `scope` (default `auto`) picks `snippet` when `snippet`
 is set, `script` when `path` ends in `.fsx`, `file` for other paths, else the active project (or the whole solution when it spans
->1 `.fsproj`). `path` / `snippet` / `fileGlob` / `mode` (`fs`|`fsi`) target the unit to check;
+>1 `.fsproj`). `path` / `snippet` / `mode` (`fs`|`fsi`) target the unit to check;
 `snippetPosition` controls where a snippet sits in project compile order.
 `speed` (`trusted` default | `fast`), `severity` (`error` default | `warning` | `information` |
 `hint` | `all`), `projectPath` (falls back to active `set_project`), and `timeoutMs` (default 60000)
 round out the context. `compact` (default `false`) groups repeated diagnostics;
 `maxDiagnostics` (default `50`, range `1..1000`) caps returned rows after grouping.
+
+`fileGlob` is supported only with resolved `scope="workspace"` and `speed="fast"`.
+It selects workspace-relative evaluated source paths (absolute paths and file-URI globs
+are also accepted). Other scope/speed combinations return `invalid_args` instead of
+silently returning unfiltered diagnostics. This includes the default trusted speed.
+Remove `fileGlob` and set `speed="trusted"` for a fresh full-project/workspace check. For a fresh single-file
+check, remove `fileGlob` and set `scope="file"`, `speed="trusted"`, and `path`. Fast mode reads cached FSAC diagnostics; it is not a fresh check.
 
 ### Bare-call default
 
@@ -666,7 +673,7 @@ Counts and the verdict always describe the full check, not the abbreviated rows.
 
 Defaults retain the individual diagnostic array and its 50-row cap. To recover individual ranges,
 use `compact=false, maxDiagnostics=1000`; if the response is still truncated, narrow the check
-with `path`/`fileGlob` or check individual projects. There is no diagnostic pagination cursor.
+with `path` or check individual projects (`fileGlob` is available only for fast workspace checks). There is no diagnostic pagination cursor.
 
 The complete response also has a 60,000 UTF-16-code-unit ceiling measured with the production
 JSON serializer, including indentation and escaping. `responseBudgetChars` states the limit.

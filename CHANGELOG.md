@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `check` rejects unsupported `fileGlob` scope/speed combinations instead of silently
+  reporting unfiltered diagnostics. The filter remains supported for cached
+  `scope="workspace", speed="fast"` checks, including auto-resolved workspaces (#339).
+
 ## [0.20.0] - 2026-11-12
 
 0.20.0 ships the changes for the recent v0.16.0 reports #320–324, checked against
