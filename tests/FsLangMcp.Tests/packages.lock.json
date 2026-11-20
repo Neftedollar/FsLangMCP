@@ -593,8 +593,8 @@
       },
       "Nerdbank.MessagePack": {
         "type": "Transitive",
-        "resolved": "1.3.88",
-        "contentHash": "gUsiRGa3ENHt/AR78Z1EbUhRf3jpz+pHd8m9/T+0Fb3mN0eLApShos0I0bTwYofLAsBSKIUI7QU74eXgqSuUzQ==",
+        "resolved": "1.4.104",
+        "contentHash": "+cRgY8dL0AY0jJPTDfDE9EWBiqDFPd3kCSOSxYv0n/6JB6vj2T95c9c+4OcDFaPiGSCSAHsSpa0KZ28mlip/DQ==",
         "dependencies": {
           "Microsoft.VisualStudio.Validation": "17.13.22",
           "PolyType": "1.4.1"
@@ -703,7 +703,7 @@
           "Ionide.ProjInfo.FCS": "[0.75.3, 0.75.3]",
           "Microsoft.NET.StringTools": "[18.9.6, 18.9.6]",
           "Microsoft.VisualStudio.Threading.Only": "[18.7.23, 18.7.23]",
-          "Nerdbank.MessagePack": "[1.3.88, 1.3.88]",
+          "Nerdbank.MessagePack": "[1.4.104, 1.4.104]",
           "StreamJsonRpc": "[2.26.150, 2.26.150]"
         }
       }
