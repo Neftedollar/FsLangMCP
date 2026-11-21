@@ -10,9 +10,9 @@
       },
       "Nacara.Core": {
         "type": "Direct",
-        "requested": "[2.0.0-beta.6, 2.0.0-beta.6]",
-        "resolved": "2.0.0-beta.6",
-        "contentHash": "IvAtbADun05y/u7sX3U6to/+tyXUq0VC7y31eWtNKa96nPI1XZRqUeR/T2RpNr2OvASd0gznVJfcldWcZrKVMA==",
+        "requested": "[2.0.0-beta.7, 2.0.0-beta.7]",
+        "resolved": "2.0.0-beta.7",
+        "contentHash": "XMpBy00Wf/v04M6KBlEK4JGtghayj4/GuyiwwRZVQHsU7yTRZcjq/aqK31gx1+Ego8vIl9cJGq/oHf29Q8mKAg==",
         "dependencies": {
           "FSharp.Core": "10.1.300",
           "Feliz.ViewEngine": "1.0.3",
