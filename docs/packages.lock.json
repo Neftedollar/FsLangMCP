@@ -10,9 +10,9 @@
       },
       "Nacara.Core": {
         "type": "Direct",
-        "requested": "[2.0.0-beta.6, 2.0.0-beta.6]",
-        "resolved": "2.0.0-beta.6",
-        "contentHash": "IvAtbADun05y/u7sX3U6to/+tyXUq0VC7y31eWtNKa96nPI1XZRqUeR/T2RpNr2OvASd0gznVJfcldWcZrKVMA==",
+        "requested": "[2.0.0-beta.7, 2.0.0-beta.7]",
+        "resolved": "2.0.0-beta.7",
+        "contentHash": "XMpBy00Wf/v04M6KBlEK4JGtghayj4/GuyiwwRZVQHsU7yTRZcjq/aqK31gx1+Ego8vIl9cJGq/oHf29Q8mKAg==",
         "dependencies": {
           "FSharp.Core": "10.1.300",
           "Feliz.ViewEngine": "1.0.3",
@@ -115,12 +115,14 @@
       },
       "Nacara.Theme.Default": {
         "type": "Direct",
-        "requested": "[1.0.0-beta.14, 1.0.0-beta.14]",
-        "resolved": "1.0.0-beta.14",
-        "contentHash": "sSKpbRlHr9TdabdwFra1BryfxifVIdYy/vqO/GWP1tA12IMNrmeD4OKIECydiSKwd8MMgnfdbrcbGkP1CxDHbw==",
+        "requested": "[1.0.0-beta.15, 1.0.0-beta.15]",
+        "resolved": "1.0.0-beta.15",
+        "contentHash": "sRCbs0FVUTJNBFKdy7ZwlzS7IfzmKcLg+ll9rQl85UWQtGYEE29z4tpD9ESZCpPMFfGvwnA4PxtWk8XsrwARww==",
         "dependencies": {
           "FSharp.Core": "10.1.300",
-          "Nacara.Core": "2.0.0-beta.6"
+          "Nacara.Core": "2.0.0-beta.7",
+          "Nacara.Theme.Core": "1.0.0-beta.1",
+          "Nacara.Theme.Docs": "1.0.0-beta.1"
         }
       },
       "Feliz.ViewEngine": {
@@ -148,6 +150,25 @@
         "type": "Transitive",
         "resolved": "10.0.11",
         "contentHash": "2i6rtW/B5rCnWCnhdmWWEmaM9O0HD0zsPY9eRqa++y4tclI3Uw8zvGbBvhY/LjAdtf8gUHhUPcAWj3DRlWMXmQ=="
+      },
+      "Nacara.Theme.Core": {
+        "type": "Transitive",
+        "resolved": "1.0.0-beta.1",
+        "contentHash": "tWvgrkAw0MvAB4bPxQPfRenmH4C7XkDL7vG4HPSejrMumyJ9mWU+wmFYpoRZM89d5/iCGWZtkU8XVk/do8COog==",
+        "dependencies": {
+          "FSharp.Core": "10.1.300",
+          "Nacara.Core": "2.0.0-beta.7"
+        }
+      },
+      "Nacara.Theme.Docs": {
+        "type": "Transitive",
+        "resolved": "1.0.0-beta.1",
+        "contentHash": "XR0kQAhO2tAoJJh7ikSp0eO2grti5ph7kHnskzKBBMcZoKR5kDmZRfYJ4lcUFqkJKz3ZLgEYZbYh/Lnc4llP/g==",
+        "dependencies": {
+          "FSharp.Core": "10.1.300",
+          "Nacara.Core": "2.0.0-beta.7",
+          "Nacara.Theme.Core": "1.0.0-beta.1"
+        }
       },
       "NUglify": {
         "type": "Transitive",
