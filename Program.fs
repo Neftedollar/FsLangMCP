@@ -682,7 +682,7 @@ let private mainCore argv =
         let setProjectAndRefresh (args: SetProjectArgs) : Task<JsonNode> =
             task {
                 InstallationHealth.ensureCurrent ()
-                let! result = bridge.SetProject args
+                let! result = bridge.SetProjectWithAnalysisInvalidation(args, fcsBridge.ClearAnalysisCaches)
 
                 let succeeded =
                     match result["status"] with
@@ -694,10 +694,6 @@ let private mainCore argv =
                     | _ -> false
 
                 if succeeded then
-                    // A rejected restartLsp=false transition must not invalidate the
-                    // still-active context. Only accepted transitions clear analysis.
-                    fcsBridge.ClearAnalysisCaches()
-
                     // Enrich readiness.projectOptions by probing the first evaluated
                     // project. CLI preload and the MCP tool share this exact coordinator.
                     match result["result"] with

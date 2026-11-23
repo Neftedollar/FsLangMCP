@@ -1948,7 +1948,7 @@ type internal FsAutoCompleteBridge
 
         response
 
-    member private this.SetProjectCore(args: SetProjectArgs) : Task<JsonNode> =
+    member private this.SetProjectCore(args: SetProjectArgs, invalidateAnalysis: unit -> unit) : Task<JsonNode> =
         let invalidWorkspace =
             args.workspacePath
             |> Option.map Path.GetFullPath
@@ -2065,11 +2065,17 @@ type internal FsAutoCompleteBridge
                         try
                             lspWasRunning <- isLiveSession ()
 
-                            let sameLiveContext =
+                            let sameContext =
                                 runtimeProjectPath |> Option.exists (pathsEqual projectPath)
                                 && runtimeWorkspaceRoot |> Option.exists (pathsEqual resolvedWorkspace)
 
-                            if not restartLsp && lspWasRunning && not sameLiveContext then
+                            let retainAnalysis =
+                                args.restartLsp = Some false
+                                && sameContext
+                                && runtimeLoadedProjects.Length = loadedProjects.Length
+                                && Array.forall2 pathsEqual runtimeLoadedProjects loadedProjects
+
+                            if not restartLsp && lspWasRunning && not sameContext then
                                 // Do not create split-brain state: the advertised target and
                                 // live FSAC must always identify the same workspace.
                                 restartRequired <- true
@@ -2100,6 +2106,13 @@ type internal FsAutoCompleteBridge
                                 if restartLsp then
                                     let! _ = this.StartLspUnsafe()
                                     ()
+
+                                // Decide and apply together under the transition gate.
+                                // Rejected switches and failed starts never invalidate.
+                                // Retained FCS entries still validate source, options and
+                                // dependency fingerprints normally on the next request.
+                                if not retainAnalysis then
+                                    invalidateAnalysis ()
                         finally
                             gate.Release() |> ignore
 
@@ -2192,15 +2205,19 @@ type internal FsAutoCompleteBridge
                                 :> JsonNode
         }
 
-    member this.SetProject(args: SetProjectArgs) : Task<JsonNode> =
+    member internal this.SetProjectWithAnalysisInvalidation
+        (args: SetProjectArgs, invalidateAnalysis: unit -> unit) : Task<JsonNode> =
         task {
             do! projectSwitchGate.WaitAsync()
 
             try
-                return! this.SetProjectCore(args)
+                return! this.SetProjectCore(args, invalidateAnalysis)
             finally
                 projectSwitchGate.Release() |> ignore
         }
+
+    member this.SetProject(args: SetProjectArgs) : Task<JsonNode> =
+        this.SetProjectWithAnalysisInvalidation(args, ignore)
 
     // StartLspUnsafe: assumes gate is already held by caller
     member private this.StartLspUnsafe() : Task<JsonRpc> =
