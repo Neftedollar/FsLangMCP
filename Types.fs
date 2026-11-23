@@ -348,8 +348,9 @@ type CheckArgs =
       /// project source file; "end" (default) checks after all project source files.
       /// The effective normalized placement is echoed as snippetPosition.
       snippetPosition: string option
-      /// scope=workspace fast-mode glob over workspace-relative evaluated source paths
-      /// (e.g. "src/Adapters/*.fs"); absolute paths and file-URI globs are also accepted.
+      /// Supported only for scope=workspace with speed=fast (cached diagnostics).
+      /// Glob over workspace-relative evaluated source paths (e.g. "src/Adapters/*.fs");
+      /// absolute paths and file-URI globs are also accepted. Other combinations return invalid_args.
       fileGlob: string option
       /// Snippet parse mode: "fs" (default) | "fsi". Pick "fsi" for a signature sketch.
       mode: string option
