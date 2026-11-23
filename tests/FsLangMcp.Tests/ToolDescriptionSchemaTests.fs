@@ -55,7 +55,7 @@ let private programFsPath () =
 
 let private toolPattern =
     Regex(
-        "TypedTool\\.define<[^>]+>\\s*\\n\\s*\"([^\"]+)\"\\s*\\n\\s*\"((?:[^\"\\\\]|\\\\.)*)\"",
+        "TypedToolDiagnostics\\.define<[^>]+>\\s*\\n\\s*\"([^\"]+)\"\\s*\\n\\s*\"((?:[^\"\\\\]|\\\\.)*)\"",
         RegexOptions.Singleline
     )
 

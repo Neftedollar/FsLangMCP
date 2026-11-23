@@ -230,12 +230,21 @@ let ``public find wire contract advertises inventory and rejects unsafe shapes b
             let! nullName = callFind server 12 """{"queries":[null]}"""
             assertInvalidInventoryArgs (parseBody nullName)
 
-            for id, malformed in
-                [ 7, """{"queries":"A"}"""
-                  8, """{"queries":["A",1]}""" ] do
+            for id, malformed, topLevelMismatch in
+                [ 7, """{"queries":"not-an-array-value"}""", true
+                  8, """{"queries":["not-an-array-value",1]}""", false ] do
                 let! rejected = callFind server id malformed
                 Assert.True(rejected.IsError, rejected.Text)
-                Assert.Equal("Invalid tool arguments.", rejected.Text)
+                Assert.StartsWith("Invalid tool arguments. ", rejected.Text)
+                Assert.Contains("Allowed fields: ", rejected.Text)
+                Assert.Contains("See tools/list for the complete input schema.", rejected.Text)
+                Assert.DoesNotContain("not-an-array-value", rejected.Text)
+                Assert.True(rejected.Text.Length < 1024, "Tool binding error text must be bounded.")
+                if topLevelMismatch then
+                    Assert.Contains("Fields with incompatible JSON types: queries.", rejected.Text)
+                else
+                    // The array itself matches the schema; the binder rejects an item.
+                    Assert.DoesNotContain("Fields with incompatible JSON types:", rejected.Text)
 
             let! invalidTimeout =
                 callFind

@@ -5,7 +5,6 @@ open System.Threading
 open System.Threading.Tasks
 open Xunit
 open FsMcp.Core
-open FsMcp.Server
 open FsLangMcp.Types
 open FsLangMcp.FindInput
 
@@ -82,7 +81,7 @@ let ``inventory rejects every unsupported selector instead of silently ignoring 
         rejected args
 
 let private definition handler =
-    match TypedTool.define<FindToolArgs> "find" "Count inventory binding regression." handler with
+    match FsLangMcp.TypedToolDiagnostics.define<FindToolArgs> "find" "Count inventory binding regression." handler with
     | Ok tool -> tool
     | Error error -> failwith $"Cannot construct find input tool: {error}"
 
@@ -131,10 +130,15 @@ let ``typed tool binds array inventory and legacy query while rejecting malforme
         Assert.Equal(Some "A", received.Value.query)
         Assert.Equal(Some "token", received.Value.cursor)
 
-        for json in [ """{"queries":"A"}"""; """{"queries":["A",1]}""" ] do
+        for json, topLevelMismatch in [ """{"queries":"A"}""", true; """{"queries":["A",1]}""", false ] do
             received <- None
-            let! _ = Assert.ThrowsAsync<ModelContextProtocol.McpProtocolException>(fun () ->
+            let! error = Assert.ThrowsAsync<ModelContextProtocol.McpProtocolException>(fun () ->
                 tool.Handler (arguments json) CancellationToken.None :> Task)
+            Assert.Equal(ModelContextProtocol.McpErrorCode.InvalidParams, error.ErrorCode)
+            if topLevelMismatch then
+                Assert.Contains("Fields with incompatible JSON types: queries.", error.Message)
+            else
+                Assert.DoesNotContain("Fields with incompatible JSON types:", error.Message)
             Assert.True(received.IsNone, "Invalid arrays must not enter the public handler.")
 
         // The SDK can bind a null string element. Domain validation must reject
