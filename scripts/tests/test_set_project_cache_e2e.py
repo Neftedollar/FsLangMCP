@@ -17,7 +17,8 @@ class SetProjectCacheEndToEnd(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="fslangmcp_set_project_cache_")
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        # Keep MSBuild's cwd and reference paths canonical on macOS (/var is an alias).
+        self.root = Path(temp.name).resolve()
 
         def write(path, text):
             file = self.root / path
