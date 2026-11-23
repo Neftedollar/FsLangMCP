@@ -110,7 +110,11 @@ write as a read. `fieldRead` counts in `breakdown` drop accordingly; the new
 `fieldSetMutation` / `fieldPattern` counters make up the difference.
 
 **Absence contract:** inspect `outcome` and `coverage.complete`. A complete miss returns
-`outcome="not_found"` and `resolution.matched=false`. A failed/timed-out/busy project makes absence
+`outcome="not_found"` and `resolution.matched=false`. An exact definition lookup with zero
+source sites can instead return the additive `outcome="external_definition"` and
+`resolution.matched=true` when FCS observed one unambiguous referenced non-F# type. Read
+`resolution.externalDefinition` for identity and the referenced-API route.
+A failed/timed-out/busy project makes absence
 indeterminate (`status="unknown"`, `outcome="indeterminate"`, `matched=null`); positive results
 from an incomplete sweep return `status="partial"`. A busy `perProject` entry carries
 `errorKind="fcs_worker_busy"` and `retryable=true`; `projectsBusy` keeps it separate from failures.
