@@ -144,6 +144,7 @@ let private testEvaluatedSnapshot referencesExisting referencesTotal projectPath
               Files = compileFiles fullPath doc
               PackageReferences = packages
               ProjectReferences = projectReferences
+              CSharpProjectReferenceAssemblies = [||]
               ImportedProjects = []
               OtherOptions = [||]
               ReferencesExisting = referencesExisting

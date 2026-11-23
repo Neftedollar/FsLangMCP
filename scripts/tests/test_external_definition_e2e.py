@@ -16,7 +16,9 @@ class ExternalDefinitionEndToEnd(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="fslangmcp_external_def_")
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        # macOS exposes its temp directory through /var -> /private/var.
+        # Use one canonical spelling for every build input and server cwd.
+        self.root = Path(temp.name).resolve()
 
         def write(path, contents):
             path = self.root / path
@@ -37,7 +39,16 @@ class ExternalDefinitionEndToEnd(unittest.TestCase):
         ))
         write("Consumer/Consumer.fs", "module Consumer\nlet read (x: External.IFunctionalGrainTarget) = x\n"
               "type OnlyLocal = { Value: int }\n"
-              "let ambiguous (x: External.AmbiguousExternal) (y: Other.AmbiguousExternal) = x, y\n")
+              "let ambiguous (x: External.AmbiguousExternal) (y: Other.AmbiguousExternal) = x, y\n"
+              "let useFrameworkType (value: System.Uri) = value\n")
+        self.binary_consumer = write("BinaryConsumer/BinaryConsumer.fsproj", project(
+            '<Compile Include="BinaryConsumer.fs" />'
+            '<ProjectReference Include="../Contracts/Contracts.csproj" ReferenceOutputAssembly="false" />'
+            '<Reference Include="Contracts"><HintPath>../Contracts/obj/Debug/net10.0/ref/Contracts.dll</HintPath></Reference>'
+        ))
+        write("BinaryConsumer/BinaryConsumer.fs",
+              "module BinaryConsumer\nlet read (x: External.IFunctionalGrainTarget) = x\n")
+        self.source_project = self.root / "Contracts/Contracts.csproj"
         projects = ["Contracts/Contracts.csproj", "Consumer/Consumer.fsproj"]
         for index in range(1, 8):
             name = f"Leaf{index}"
@@ -93,12 +104,34 @@ class ExternalDefinitionEndToEnd(unittest.TestCase):
         suggested = resolution["externalDefinition"]
         self.assertEqual("fcs_referenced_symbols", suggested["suggestedTool"])
         self.assertEqual(self.consumer.resolve(), Path(suggested["projectPath"]).resolve())
+        self.assertEqual("csharp", suggested["sourceProjectLanguage"])
+        self.assertEqual(self.source_project.resolve(), Path(suggested["sourceProjectPath"]).resolve())
         referenced, _ = self.call(suggested["suggestedTool"], {
             "projectPath": suggested["projectPath"], "query": suggested["fullName"],
         })
         self.assertTrue(any(item["fullName"] == suggested["fullName"] and
                             item["assembly"] == suggested["assembly"]
                             for item in referenced["results"]), referenced)
+
+    def test_binary_and_framework_metadata_do_not_claim_csharp_project(self):
+        restored = subprocess.run(["dotnet", "restore", str(self.binary_consumer), "-m:1",
+                                   "-nr:false", "-p:NuGetAudit=false"],
+                                  capture_output=True, text=True, timeout=120)
+        self.assertEqual(0, restored.returncode, restored.stdout + restored.stderr)
+        binary, _ = self.find("IFunctionalGrainTarget", projectPath=str(self.binary_consumer), scope="project")
+        self.assertEqual("external_definition", binary["resolution"]["outcome"])
+        identity = binary["resolution"]["externalDefinition"]
+        self.assertEqual("External.IFunctionalGrainTarget", identity["fullName"])
+        self.assertEqual("Contracts", identity["assembly"])
+        self.assertNotIn("sourceProjectLanguage", identity)
+        self.assertNotIn("sourceProjectPath", identity)
+
+        framework, _ = self.find("System.Uri", projectPath=str(self.consumer), scope="project")
+        self.assertEqual("external_definition", framework["resolution"]["outcome"])
+        identity = framework["resolution"]["externalDefinition"]
+        self.assertEqual("System.Uri", identity["fullName"])
+        self.assertNotIn("sourceProjectLanguage", identity)
+        self.assertNotIn("sourceProjectPath", identity)
 
     def test_local_shadow_and_true_miss_keep_normal_behavior(self):
         self.shadow.write_text("module Leaf7\ntype IFunctionalGrainTarget = { Local: int }\n", encoding="utf-8")

@@ -132,6 +132,10 @@ fully analyzed without FCS errors. The response has zero F# sites, but
 `resolution.externalDefinition` supplies its `fullName`, assembly simple name,
 F# consumer `projectPath` and `suggestedTool="fcs_referenced_symbols"`. Pass the
 provided full name as `query` and the same project path to inspect that API.
+When the resolved assembly path also has unambiguous evaluated C# ProjectReference
+provenance, the response adds `sourceProjectLanguage="csharp"` and
+`sourceProjectPath`. The existing `projectPath` is still the F# consumer.
+Binary, package, framework, and unproven origins leave the two fields absent.
 This bypasses the fallback symbol index, not the sweep needed to rule out local
 definitions. No matching use, competing identities or incomplete coverage
 preserve normal lookup behavior.

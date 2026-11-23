@@ -596,11 +596,15 @@ module private FindExternalDefinition =
           Assembly: string
           AssemblyIdentity: string
           AssemblyPath: string
-          ProjectPath: string }
+          ProjectPath: string
+          SourceProjectPath: string option }
+
+    let private pathComparer =
+        if OperatingSystem.IsWindows() then StringComparer.OrdinalIgnoreCase else StringComparer.Ordinal
 
     // Only a resolved CLR type at a genuine FCS reference site is evidence.
     // Assembly simple names alone cannot disambiguate copies or identities.
-    let tryEvidence projectPath (symbol: FSharpSymbol) =
+    let tryEvidence projectPath (evaluated: EvaluatedProjectSnapshot option) (symbol: FSharpSymbol) =
         try
             match symbol with
             | :? FSharpEntity as entity when
@@ -614,12 +618,20 @@ module private FindExternalDefinition =
                     let identity = assembly.QualifiedName
                     let usable limit (value: string) = not (String.IsNullOrWhiteSpace value) && value.Length <= limit
                     if usable 512 fullName && usable 256 simpleName && usable 1024 identity then
+                        let assemblyPath = normalizePath assemblyPath
+                        let sourceProject =
+                            evaluated
+                            |> Option.bind (fun snapshot ->
+                                snapshot.CSharpProjectReferenceAssemblies
+                                |> Array.tryPick (fun (output, source) ->
+                                    if pathComparer.Equals(output, assemblyPath) then Some source else None))
                         Some
                             { FullName = fullName
                               Assembly = simpleName
                               AssemblyIdentity = identity
-                              AssemblyPath = normalizePath assemblyPath
-                              ProjectPath = projectPath }
+                              AssemblyPath = assemblyPath
+                              ProjectPath = projectPath
+                              SourceProjectPath = sourceProject }
                     else None
                 | _ -> None
             | _ -> None
@@ -631,12 +643,22 @@ module private FindExternalDefinition =
         && String.Equals(first.AssemblyIdentity, next.AssemblyIdentity, StringComparison.Ordinal)
         && String.Equals(first.AssemblyPath, next.AssemblyPath, pathComparison)
 
+    let mergeProvenance (first: Evidence) (next: Evidence) =
+        match first.SourceProjectPath, next.SourceProjectPath with
+        | Some firstPath, Some nextPath when pathComparer.Equals(firstPath, nextPath) -> first
+        | _ -> { first with SourceProjectPath = None }
+
     let toJson (evidence: Evidence) =
         jobj
             [ "fullName", jstr evidence.FullName
               "assembly", jstr evidence.Assembly
               "projectPath", jstr evidence.ProjectPath
-              "suggestedTool", jstr "fcs_referenced_symbols" ]
+              "suggestedTool", jstr "fcs_referenced_symbols"
+              match evidence.SourceProjectPath with
+              | Some path ->
+                  "sourceProjectLanguage", jstr "csharp"
+                  "sourceProjectPath", jstr path
+              | None -> () ]
         :> JsonNode
 
 exception private FindProjectNotStartedException
@@ -2319,6 +2341,47 @@ module private EvaluatedProjectModel =
         orderedItems
         |> projectFilesFromEvaluatedItems
 
+    let private csharpProjectReferenceAssemblies
+        projectDirectory
+        (project: Ionide.ProjInfo.Types.ProjectOptions)
+        (edges: EvaluatedProjectReference list) =
+        let pathComparer =
+            if OperatingSystem.IsWindows() then StringComparer.OrdinalIgnoreCase else StringComparer.Ordinal
+        let paths = System.Collections.Generic.Dictionary<string, string option>(pathComparer)
+        let declared = System.Collections.Generic.HashSet<string>(edges |> Seq.map _.ProjectPath, pathComparer)
+        let isValue expected name metadata =
+            tryMapValueIgnoreCase name metadata
+            |> Option.exists (fun value -> String.Equals(value, expected, StringComparison.OrdinalIgnoreCase))
+
+        // The compiler-facing resolved item includes the actual ref assembly,
+        // while ReferencePath can still identify the implementation DLL.
+        match Map.tryFind "ReferencePathWithRefAssemblies" project.AllItems with
+        | None -> [||]
+        | Some references ->
+            for includePath, metadata in references do
+                let path = normalizeFrom projectDirectory includePath
+                let origin =
+                    if isValue "ProjectReference" "ReferenceSourceTarget" metadata
+                       && isValue "true" "ReferenceOutputAssembly" metadata then
+                        tryMapValueIgnoreCase "MSBuildSourceProjectFile" metadata
+                        |> Option.map (normalizeFrom projectDirectory)
+                        |> Option.filter (fun source -> declared.Contains source)
+                    else None
+
+                match paths.TryGetValue path with
+                | false, _ -> paths.Add(path, origin)
+                | true, Some prior ->
+                    if not (origin |> Option.exists (fun current -> pathComparer.Equals(current, prior))) then
+                        paths[path] <- None
+                | true, None -> ()
+
+            paths
+            |> Seq.choose (fun (KeyValue(output, origin)) ->
+                origin
+                |> Option.filter (fun source -> source.Length <= 4096 && source.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+                |> Option.map (fun source -> output, source))
+            |> Seq.toArray
+
     let private packageReferences (project: Ionide.ProjInfo.Types.ProjectOptions) =
         let explicitByName =
             project.PackageReferences
@@ -2432,6 +2495,8 @@ module private EvaluatedProjectModel =
           Files = compileFiles project
           PackageReferences = packageReferences project
           ProjectReferences = projectReferences
+          CSharpProjectReferenceAssemblies =
+              csharpProjectReferenceAssemblies projectDirectory project projectReferences
           ImportedProjects = importedProjects
           OtherOptions = Array.copy fcsOptions.OtherOptions
           ReferencesExisting = existingReferences
@@ -8377,9 +8442,10 @@ type internal FcsBridge
                                         | None -> true
 
                                     if inScope then
-                                        match externalEvidence, FindExternalDefinition.tryEvidence fsproj u.Symbol with
+                                        match externalEvidence, FindExternalDefinition.tryEvidence fsproj optionsEntry.EvaluatedSnapshot u.Symbol with
                                         | None, Some next -> externalEvidence <- Some next
-                                        | Some first, Some next when FindExternalDefinition.sameIdentity first next -> ()
+                                        | Some first, Some next when FindExternalDefinition.sameIdentity first next ->
+                                            externalEvidence <- Some(FindExternalDefinition.mergeProvenance first next)
                                         | _ -> externalEvidenceAmbiguous <- true
 
                             nameIndex <- nameIndex + 1
