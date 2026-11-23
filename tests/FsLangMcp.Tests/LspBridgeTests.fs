@@ -716,9 +716,11 @@ let ``Repeated SetProject restarts fully drain prior LSP lifecycle`` () : Task =
         let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_lsp_restart_%s{id}")
         let projectPath = Path.Combine(root, "App.fsproj")
         let scriptPath = Path.Combine(root, "fake-fsac.fsx")
+        let otherProjectPath = Path.Combine(root, "Other.fsproj")
 
         Directory.CreateDirectory(root) |> ignore
         File.WriteAllText(projectPath, "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>")
+        File.Copy(projectPath, otherProjectPath)
 
         File.WriteAllText(scriptPath, fakeFsacScript)
 
@@ -729,13 +731,18 @@ let ``Repeated SetProject restarts fully drain prior LSP lifecycle`` () : Task =
                 fsacArgsOverride = [ "fsi"; "--exec"; scriptPath ]
             )
 
+        let mutable invalidations = 0
+        let select target restart =
+            bridge.SetProjectWithAnalysisInvalidation(
+                { projectPath = target
+                  workspacePath = None
+                  restartLsp = restart },
+                (fun () -> invalidations <- invalidations + 1)
+            )
+
         try
-            let! first =
-                bridge.SetProject(
-                    { projectPath = projectPath
-                      workspacePath = None
-                      restartLsp = Some true }
-                )
+            let! first = select projectPath None
+            Assert.Equal(1, invalidations)
 
             let firstResult = first["result"]
             let readiness = firstResult["readiness"]
@@ -747,13 +754,16 @@ let ``Repeated SetProject restarts fully drain prior LSP lifecycle`` () : Task =
             Assert.False(String.IsNullOrWhiteSpace((readiness["symbolIndexHint"]).GetValue<string>()))
             Assert.Equal(0, bridge.PendingLspCleanupCount)
 
-            for _ in 1..6 do
-                let! restarted =
-                    bridge.SetProject(
-                        { projectPath = projectPath
-                          workspacePath = None
-                          restartLsp = Some true }
-                    )
+            let! retained = select projectPath (Some false)
+            Assert.Equal("ok", retained["status"].GetValue<string>())
+            Assert.Equal(1, invalidations)
+            let! rejected = select otherProjectPath (Some false)
+            Assert.Equal("restart_required", rejected["status"].GetValue<string>())
+            Assert.Equal(1, invalidations)
+
+            for index in 1..6 do
+                let! restarted = select projectPath (Some true)
+                Assert.Equal(1 + index, invalidations)
 
                 let restartedResult = restarted["result"]
                 Assert.True((restartedResult["lspRestarted"]).GetValue<bool>())

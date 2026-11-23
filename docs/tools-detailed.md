@@ -178,8 +178,9 @@ general speed claim from one run. Legacy site search continues to omit successfu
 projects from `perProject`; their work remains visible through these phase and cache ledgers.
 Inventory instead keeps every requested project in `projectLedger`.
 
-Expect the first sweep after `set_project` to be substantially more expensive than repeated
-searches over unchanged projects. One [0.18.0 dogfood report](https://github.com/Neftedollar/FsLangMCP/issues/227#issuecomment-6023560318)
+Expect the first sweep in a new selection or after an accepted restart to be substantially
+more expensive than repeated searches over unchanged projects. An explicitly non-restarting
+`set_project` for the same effective selection can retain those warm entries. One [0.18.0 dogfood report](https://github.com/Neftedollar/FsLangMCP/issues/227#issuecomment-6023560318)
 on an eight-project solution measured 101.3 seconds for the first workspace search, then
 0.3–5.6 seconds for subsequent searches in the same session. This is an observed cold/warm gap,
 not a promised speedup or baseline: project size, builds running concurrently, filesystem work,
