@@ -155,8 +155,8 @@ are outside this contract. Sampling precedes the last production size-check seri
 transport, so these are diagnostics rather than latency guarantees. `cacheState.projectOptions`
 and `cacheState.projectUses` each expose request-observed `hits`, `misses`, `incomplete`, and
 `state`; they do not describe FCS-internal caches. A warm hit can skip base compiler work, while
-kind narrowing alone cannot remove a cold FCS check. The first sweep after `set_project` can be
-much slower than subsequent searches over unchanged projects; FSAC readiness/index warmth does
+kind narrowing alone cannot remove a cold FCS check. The first sweep in a new selection or after
+a restart can be much slower than subsequent searches over unchanged projects; FSAC readiness/index warmth does
 not establish FCS project-use cache warmth. See the measured example and caveats in
 [Cost and cache evidence](tools-detailed.md#cost-and-cache-evidence). Later projects receive only
 the remaining shared timeout budget.
@@ -262,6 +262,12 @@ unrestored, or errored entry carries no counts at all.
 **Key args:**
 - `projectPath` (required) — `.fsproj`, `.sln`, `.slnx`, or directory path; a directory recursively selects one candidate and reports ambiguity for multiple candidates
 - `restartLsp` — request an FSAC restart (default `true`)
+
+Re-selecting the same effective project/solution and workspace root with explicit
+`restartLsp=false` retains the FCS analysis cache when the selected project list
+also matches. Changes to the selected context or member list and accepted restarts
+still invalidate analysis. Retained entries continue to revalidate source, project,
+and dependency content; this is not a stale-cache mode or a faster initial sweep.
 
 **Response includes:** `loadedProjects`, `readiness` (`lsp` / `projectOptions` / `symbolIndex` flags plus `symbolIndexState` / `symbolIndexHint`), `lspLifecycleState`, `sessionGeneration`, `lspRestartRequested`, legacy `lspRestarted`, `lspReplacedExistingProcess`, and `fslangmcpVersion`. `lspRestarted` keeps mirroring the request for compatibility; `lspReplacedExistingProcess=true` means a pre-existing FSAC process was actually replaced, so first launch reports `false` there. Switching to a different context with `restartLsp=false` while FSAC is live returns `status="restart_required"` and leaves the active context unchanged.
 
