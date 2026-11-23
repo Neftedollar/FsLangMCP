@@ -589,6 +589,78 @@ type internal FindRequestDeadline
     member this.SemanticExpired = this.RemainingSemanticBudget() <= TimeSpan.Zero
     member this.ResponseExpired = this.RemainingResponseBudget() <= TimeSpan.Zero
 
+[<RequireQualifiedAccess>]
+module private FindExternalDefinition =
+    type Evidence =
+        { FullName: string
+          Assembly: string
+          AssemblyIdentity: string
+          AssemblyPath: string
+          ProjectPath: string
+          SourceProjectPath: string option }
+
+    let private pathComparer =
+        if OperatingSystem.IsWindows() then StringComparer.OrdinalIgnoreCase else StringComparer.Ordinal
+
+    // Only a resolved CLR type at a genuine FCS reference site is evidence.
+    // Assembly simple names alone cannot disambiguate copies or identities.
+    let tryEvidence projectPath (evaluated: EvaluatedProjectSnapshot option) (symbol: FSharpSymbol) =
+        try
+            match symbol with
+            | :? FSharpEntity as entity when
+                not entity.IsUnresolved && not entity.IsFSharp && not entity.IsProvided
+                && not entity.IsNamespace && not entity.Assembly.IsProviderGenerated ->
+                let assembly = entity.Assembly
+                match assembly.FileName with
+                | Some assemblyPath when not (String.IsNullOrWhiteSpace assemblyPath) ->
+                    let fullName = entity.FullName
+                    let simpleName = assembly.SimpleName
+                    let identity = assembly.QualifiedName
+                    let usable limit (value: string) = not (String.IsNullOrWhiteSpace value) && value.Length <= limit
+                    if usable 512 fullName && usable 256 simpleName && usable 1024 identity then
+                        let assemblyPath = normalizePath assemblyPath
+                        let sourceProject =
+                            evaluated
+                            |> Option.bind (fun snapshot ->
+                                snapshot.CSharpProjectReferenceAssemblies
+                                |> Array.tryPick (fun (output, source) ->
+                                    if pathComparer.Equals(output, assemblyPath) then Some source else None))
+                        Some
+                            { FullName = fullName
+                              Assembly = simpleName
+                              AssemblyIdentity = identity
+                              AssemblyPath = assemblyPath
+                              ProjectPath = projectPath
+                              SourceProjectPath = sourceProject }
+                    else None
+                | _ -> None
+            | _ -> None
+        with _ -> None // FCS symbols can become unavailable in an erroneous project.
+
+    let sameIdentity (first: Evidence) (next: Evidence) =
+        let pathComparison = if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
+        String.Equals(first.FullName, next.FullName, StringComparison.Ordinal)
+        && String.Equals(first.AssemblyIdentity, next.AssemblyIdentity, StringComparison.Ordinal)
+        && String.Equals(first.AssemblyPath, next.AssemblyPath, pathComparison)
+
+    let mergeProvenance (first: Evidence) (next: Evidence) =
+        match first.SourceProjectPath, next.SourceProjectPath with
+        | Some firstPath, Some nextPath when pathComparer.Equals(firstPath, nextPath) -> first
+        | _ -> { first with SourceProjectPath = None }
+
+    let toJson (evidence: Evidence) =
+        jobj
+            [ "fullName", jstr evidence.FullName
+              "assembly", jstr evidence.Assembly
+              "projectPath", jstr evidence.ProjectPath
+              "suggestedTool", jstr "fcs_referenced_symbols"
+              match evidence.SourceProjectPath with
+              | Some path ->
+                  "sourceProjectLanguage", jstr "csharp"
+                  "sourceProjectPath", jstr path
+              | None -> () ]
+        :> JsonNode
+
 exception private FindProjectNotStartedException
 
 [<RequireQualifiedAccess; NoEquality; NoComparison>]
@@ -2269,6 +2341,47 @@ module private EvaluatedProjectModel =
         orderedItems
         |> projectFilesFromEvaluatedItems
 
+    let private csharpProjectReferenceAssemblies
+        projectDirectory
+        (project: Ionide.ProjInfo.Types.ProjectOptions)
+        (edges: EvaluatedProjectReference list) =
+        let pathComparer =
+            if OperatingSystem.IsWindows() then StringComparer.OrdinalIgnoreCase else StringComparer.Ordinal
+        let paths = System.Collections.Generic.Dictionary<string, string option>(pathComparer)
+        let declared = System.Collections.Generic.HashSet<string>(edges |> Seq.map _.ProjectPath, pathComparer)
+        let isValue expected name metadata =
+            tryMapValueIgnoreCase name metadata
+            |> Option.exists (fun value -> String.Equals(value, expected, StringComparison.OrdinalIgnoreCase))
+
+        // The compiler-facing resolved item includes the actual ref assembly,
+        // while ReferencePath can still identify the implementation DLL.
+        match Map.tryFind "ReferencePathWithRefAssemblies" project.AllItems with
+        | None -> [||]
+        | Some references ->
+            for includePath, metadata in references do
+                let path = normalizeFrom projectDirectory includePath
+                let origin =
+                    if isValue "ProjectReference" "ReferenceSourceTarget" metadata
+                       && isValue "true" "ReferenceOutputAssembly" metadata then
+                        tryMapValueIgnoreCase "MSBuildSourceProjectFile" metadata
+                        |> Option.map (normalizeFrom projectDirectory)
+                        |> Option.filter (fun source -> declared.Contains source)
+                    else None
+
+                match paths.TryGetValue path with
+                | false, _ -> paths.Add(path, origin)
+                | true, Some prior ->
+                    if not (origin |> Option.exists (fun current -> pathComparer.Equals(current, prior))) then
+                        paths[path] <- None
+                | true, None -> ()
+
+            paths
+            |> Seq.choose (fun (KeyValue(output, origin)) ->
+                origin
+                |> Option.filter (fun source -> source.Length <= 4096 && source.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+                |> Option.map (fun source -> output, source))
+            |> Seq.toArray
+
     let private packageReferences (project: Ionide.ProjInfo.Types.ProjectOptions) =
         let explicitByName =
             project.PackageReferences
@@ -2382,6 +2495,8 @@ module private EvaluatedProjectModel =
           Files = compileFiles project
           PackageReferences = packageReferences project
           ProjectReferences = projectReferences
+          CSharpProjectReferenceAssemblies =
+              csharpProjectReferenceAssemblies projectDirectory project projectReferences
           ImportedProjects = importedProjects
           OtherOptions = Array.copy fcsOptions.OtherOptions
           ReferencesExisting = existingReferences
@@ -7930,6 +8045,10 @@ type internal FcsBridge
                 && (kindResolved = "auto" || kindResolved = "symbol" || kindResolved = "definition")
 
             let wantDefsOnly = kindResolved = "definition"
+            let inspectExternalDefinition = wantDefsOnly && exact && cursorPayload.IsNone
+            let mutable externalEvidence = None
+            let mutable externalEvidenceAmbiguous = false
+            let mutable externalEvidenceHasErrors = false
             let wantField = inventoryQueries.IsNone && (kindResolved = "auto" || kindResolved = "field")
             let wantMember = inventoryQueries.IsNone && (kindResolved = "auto" || kindResolved = "members")
             let inventoryCollector =
@@ -8110,6 +8229,8 @@ type internal FcsBridge
                     deadline.Telemetry.SetPhase("classification")
                     for diagnostic in projDiagnostics do
                         aggregatedDiagnostics.Add(normalizePath fsproj, diagnostic)
+                        if inspectExternalDefinition && diagnostic.Severity = FSharpDiagnosticSeverity.Error then
+                            externalEvidenceHasErrors <- true
 
                     // Per-file record-field form classifier (literal vs with-update).
                     let parsingOptions, _ = checker.GetParsingOptionsFromProjectOptions(options)
@@ -8312,6 +8433,20 @@ type internal FcsBridge
                                     nameCount <- nameCount + 1
                                     let k = if u.IsFromDefinition then "definition" else "reference"
                                     add false u k false null null
+                                elif inspectExternalDefinition && not externalEvidenceAmbiguous then
+                                    let inScope =
+                                        match fileScopePath with
+                                        | Some path ->
+                                            let range = u.Range
+                                            String.Equals(normalizePath range.FileName, path, sourcePathComparison)
+                                        | None -> true
+
+                                    if inScope then
+                                        match externalEvidence, FindExternalDefinition.tryEvidence fsproj optionsEntry.EvaluatedSnapshot u.Symbol with
+                                        | None, Some next -> externalEvidence <- Some next
+                                        | Some first, Some next when FindExternalDefinition.sameIdentity first next ->
+                                            externalEvidence <- Some(FindExternalDefinition.mergeProvenance first next)
+                                        | _ -> externalEvidenceAmbiguous <- true
 
                             nameIndex <- nameIndex + 1
 
@@ -8595,13 +8730,21 @@ type internal FcsBridge
             // allowed to hide before that boundary.
             let totalSites = siteByKey.Count
             let fcsMatched = totalSites > 0
+            // Preserve workspace semantics: an earlier external use cannot rule
+            // out a same-named F# declaration in a later or unexamined project.
+            let externalDefinition =
+                if fcsMatched || not coverageComplete || deadline.SemanticExpired
+                    || externalEvidenceAmbiguous || externalEvidenceHasErrors then None
+                else externalEvidence
+
+            let haveConclusiveFcsEvidence = fcsMatched || externalDefinition.IsSome
 
             let mutable fsacFallbackTimedOut = false
             let mutable fsacFallbackNotStarted = false
 
             let! fsacProbeResult =
                 task {
-                    if fcsMatched || kindResolved = "field" then
+                    if haveConclusiveFcsEvidence || kindResolved = "field" then
                         // A workspace-symbol count is not evidence of a field USE.
                         // Even a real unused declaration must not turn zero sites into
                         // matched=true. Field-only results rely exclusively on FCS sites.
@@ -8715,7 +8858,7 @@ type internal FcsBridge
                 | FindFsacProbeResult.Unavailable reason -> 0, "unavailable", Some reason
 
             let matched: bool option =
-                if fcsMatched || fsacHits > 0 then
+                if haveConclusiveFcsEvidence || fsacHits > 0 then
                     Some true
                 elif coverageComplete && not fsacFallbackTimedOut then
                     Some false
@@ -8723,10 +8866,11 @@ type internal FcsBridge
                     None
 
             let outcome =
-                match matched with
-                | Some true -> "matched"
-                | Some false -> "not_found"
-                | None -> "indeterminate"
+                match externalDefinition, matched with
+                | Some _, _ -> "external_definition"
+                | None, Some true -> "matched"
+                | None, Some false -> "not_found"
+                | None, None -> "indeterminate"
 
             let responseStatus =
                 if coverageComplete && not fsacFallbackTimedOut then
@@ -8738,6 +8882,7 @@ type internal FcsBridge
 
             let via =
                 if fcsMatched then "fcs-multiproject-sweep"
+                elif externalDefinition.IsSome then "fcs-referenced-assembly"
                 elif fsacHits > 0 then "fsac-symbol-index"
                 elif targetDiscoveryMaterializationTimedOut then "incomplete-target-discovery"
                 elif fsacFallbackTimedOut then "incomplete-fsac-fallback"
@@ -9199,7 +9344,7 @@ type internal FcsBridge
                         "partial"
 
                 let fsacFallbackPhaseStatus =
-                    if fcsMatched || kindResolved = "field" then
+                    if haveConclusiveFcsEvidence || kindResolved = "field" then
                         "not_needed"
                     elif fsacFallbackNotStarted then
                         "not_started"
@@ -9274,6 +9419,9 @@ type internal FcsBridge
                       "fsacFallbackReason",
                       (fsacFallbackReason |> Option.map jstr |> Option.defaultValue null) ]
                 :> JsonNode
+
+            externalDefinition
+            |> Option.iter (fun evidence -> resolution["externalDefinition"] <- FindExternalDefinition.toJson evidence)
 
             let breakdown =
                 jobj

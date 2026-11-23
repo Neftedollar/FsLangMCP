@@ -87,6 +87,7 @@ type internal EvaluatedProjectSnapshot =
       Files: ProjectFile list
       PackageReferences: EvaluatedPackageReference list
       ProjectReferences: EvaluatedProjectReference list
+      CSharpProjectReferenceAssemblies: (string * string) array
       ImportedProjects: string list
       OtherOptions: string array
       ReferencesExisting: int

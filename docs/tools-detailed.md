@@ -125,6 +125,21 @@ solution has no invented member count. `coverage.phases` names the affected phas
 `projectsNotStarted`, `projectsTimedOut`, `projectsBusy`, `projectsMissing`, and `projectsFailed`
 remain distinct. An incomplete zero-result answer stays indeterminate.
 
+An exact, non-continuation `kind="definition"` query with no source definitions
+can return `resolution.outcome="external_definition"` if FCS resolves matching
+use sites to one unambiguous non-F# referenced type and the requested scope is
+fully analyzed without FCS errors. The response has zero F# sites, but
+`resolution.externalDefinition` supplies its `fullName`, assembly simple name,
+F# consumer `projectPath` and `suggestedTool="fcs_referenced_symbols"`. Pass the
+provided full name as `query` and the same project path to inspect that API.
+When the resolved assembly path also has unambiguous evaluated C# ProjectReference
+provenance, the response adds `sourceProjectLanguage="csharp"` and
+`sourceProjectPath`. The existing `projectPath` is still the F# consumer.
+Binary, package, framework, and unproven origins leave the two fields absent.
+This bypasses the fallback symbol index, not the sweep needed to rule out local
+definitions. No matching use, competing identities or incomplete coverage
+preserve normal lookup behavior.
+
 If response construction expires after the sweep, `errorKind="find_response_timeout"` preserves
 the available semantic evidence but sets `resultSetComplete=false`,
 `paginationRestartRequired=true`, and `nextCursor=null` for an initial request. Restart without a
