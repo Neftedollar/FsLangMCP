@@ -51,7 +51,7 @@ PREFER_PATTERNS = re.compile(
 
 def parse_descriptions(source: str) -> list[tuple[str, str]]:
     pat = re.compile(
-        r'TypedTool\.define<[^>]+>\s*\n\s*"([^"]+)"\s*\n\s*"((?:[^"\\]|\\.)*)"',
+        r'TypedToolDiagnostics\.define<[^>]+>\s*\n\s*"([^"]+)"\s*\n\s*"((?:[^"\\]|\\.)*)"',
         re.S,
     )
     rows: list[tuple[str, str]] = []

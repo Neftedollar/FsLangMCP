@@ -122,7 +122,7 @@ The contract is documented in README's "Response Shape" section.
 
 | Adding... | Goes in... |
 |-----------|------------|
-| A new MCP tool | New args record in `Types.fs`, new method on `FcsBridge` or `FsAutoCompleteBridge`, new `TypedTool.define` in `Program.fs`. Walkthrough in [`CONTRIBUTING.md`](../CONTRIBUTING.md). |
+| A new MCP tool | New args record in `Types.fs`, new method on `FcsBridge` or `FsAutoCompleteBridge`, new `TypedToolDiagnostics.define` in `Program.fs`. Walkthrough in [`CONTRIBUTING.md`](../CONTRIBUTING.md). |
 | A new response field on an existing tool | Add to README's "Notable response fields", update the response record's `///` docs, bump the CHANGELOG entry. |
 | A new FCS-driven diagnostic check | New `member` on `FcsBridge`, registered in `Program.fs` under `fcsGate`. Add to `docs/tools-detailed.md` if the description needs implementation depth. |
 | A new project-inspection capability | `ProjectInspection.fs` (structural — compile order, references) or `ProjectHealth.fs` (health-shaped — readiness, test detection, build artifacts) depending on shape. |

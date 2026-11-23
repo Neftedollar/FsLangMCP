@@ -13,6 +13,22 @@ https://github.com/Neftedollar/FsLangMCP/issues with the output of
 
 ---
 
+## Typed tool arguments are rejected
+
+Supplying `filePath` instead of `path` to `fcs_file_outline` names the
+unknown field and the missing required field. The tool error text lists a
+bounded subset of schema fields and may flag incompatible top-level JSON
+types. Use `tools/list` for the complete input schema.
+
+Binding stays with FsMcp.Server. Extra fields that binding already accepts
+are still accepted; the hints are added only on rejection. Argument values
+and long or unsafe field names are not echoed. The binder raises
+`InvalidParams` internally, but the MCP SDK presents this as a tool result
+with `isError: true` and text content in the JSON-RPC response. This
+boundary does not expose structured `error.data` or nested serializer
+diagnostics, and faults rejected earlier by the MCP host may retain its
+own message.
+
 ## `{"status": "not_ready", "message": "..."}` after `set_project`
 
 The LSP layer (fsautocomplete) hasn't finished its initial workspace scan yet. For

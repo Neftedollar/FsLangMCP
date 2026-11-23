@@ -65,7 +65,7 @@ The v0.19.0 surface ships 35 tools that all follow the same registration shape. 
 
    ```fsharp
    tool (
-       TypedTool.define<MyToolArgs>
+       TypedToolDiagnostics.define<MyToolArgs>
            "tool_name"
            "Short routing description …"
            (fun args -> toolResult (runLimited fcsGate (fun () -> fcsBridge.MyTool args)))
