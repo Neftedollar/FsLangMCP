@@ -535,6 +535,8 @@ dependencies before it can resolve those test references.
 
 **Use when:** Identifying dead code before a cleanup pass. Always verify candidates with `find` before removing.
 
+**Coverage:** `succeeded` and `complete: true` mean all discovered F# projects were scanned. `partial` means some were scanned; candidates are provisional because unscanned projects may contain uses. `unknown` means none were scanned. Check `projectsRequested`, `projectsScanned`, and `projectFailures` (project path, error kind, and message). An empty candidate list is not a clean result unless coverage is complete.
+
 ---
 
 ### `fcs_review_scan`

@@ -1277,7 +1277,7 @@ let private mainCore argv =
                 tool (
                     TypedToolDiagnostics.define<FcsDeadCodeArgs>
                         "fcs_dead_code"
-                        "List likely-unused F# symbols as cleanup candidates — a conservative cleanup pass (candidates, not deletions); use `find` to verify each candidate's real usage before removing. Sweeps the project (GetAllUsesOfAllSymbols) and flags private/internal value & function bindings whose only use is their own definition. Public is excluded (includePublic=true adds it); skips compiler-generated, [<EntryPoint>], overrides/interface impls, ctors. Always emits caveats. projectPath falls back to set_project."
+                        "List likely-unused F# bindings as cleanup candidates, not deletions. Use `find` to verify usage before removing. Scans private/internal values and functions; includePublic=true adds public ones. Skips compiler-generated symbols, entry points, overrides, interface implementations and constructors. Check complete and projectFailures: partial/unknown scans cannot rule out usage. projectPath falls back to set_project."
                         (fun args (ct: CancellationToken) ->
                             let args =
                                 { args with projectPath = args.projectPath |> Option.orElse bridge.CurrentProjectPath }
