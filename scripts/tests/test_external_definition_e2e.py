@@ -1,5 +1,6 @@
 """#225: a real C# project reference behind an F# find request."""
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -87,6 +88,55 @@ class ExternalDefinitionEndToEnd(unittest.TestCase):
     def find(self, query, **extra):
         return self.call("find", {"query": query, "kind": "definition",
                          "projectPath": str(self.solution), "scope": "workspace", **extra})
+
+    def test_warm_consumer_refreshes_after_same_stat_fsharp_dependency_edit(self):
+        # Warm only Leaf1: checking the dependency or a second consumer first can
+        # inadvertently refresh the stale builder and hide the regression.
+        consumer = self.root / "Leaf1" / "Leaf1.fsproj"
+        consumer.write_text(consumer.read_text().replace(
+            "</ItemGroup>", '<ProjectReference Include="../Consumer/Consumer.fsproj" /></ItemGroup>'
+        ))
+        (consumer.parent / "Leaf1.fs").write_text(
+            "module Leaf1\nlet useIt (value: Consumer.OnlyLocal) = value\n"
+        )
+        built = subprocess.run(
+            ["dotnet", "build", str(consumer), "-m:1", "-nr:false",
+             "-p:NuGetAudit=false", "-p:UseSharedCompilation=false"],
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(0, built.returncode, built.stdout + built.stderr)
+        args = {"query": "useIt", "kind": "definition", "projectPath": str(consumer), "scope": "project"}
+        client = StdioClient(locate_server_dll(), self.root)
+        try:
+            client.request("initialize", {
+                "protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": "fsharp-dependency-freshness", "version": "1"},
+            })
+            client.notify("notifications/initialized", {})
+            before, is_error = client.call_tool("find", args)
+            self.assertFalse(is_error, before)
+            self.assertTrue(before["coverage"]["complete"], before)
+            self.assertEqual(0, before["projectDiagnosticsTotalCount"], before)
+
+            dependency = self.root / "Consumer" / "Consumer.fs"
+            stamp = dependency.stat()
+            source = dependency.read_text()
+            self.assertIn("OnlyLocal", source)
+            dependency.write_text(source.replace("OnlyLocal", "OtherHere"))
+            os.utime(dependency, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            self.assertEqual((stamp.st_size, stamp.st_mtime_ns),
+                             (dependency.stat().st_size, dependency.stat().st_mtime_ns))
+
+            warm, is_error = client.call_tool("find", args)
+            self.assertFalse(is_error, warm)
+            fresh, _ = self.call("find", args)
+            self.assertTrue(warm["coverage"]["complete"], warm)
+            self.assertTrue(fresh["coverage"]["complete"], fresh)
+            self.assertEqual(1, fresh["projectDiagnosticsTotalCount"], fresh)
+            self.assertEqual(fresh["projectDiagnosticsTotalCount"], warm["projectDiagnosticsTotalCount"], warm)
+            self.assertEqual(fresh["sites"], warm["sites"])
+        finally:
+            client.close()
 
     def test_external_project_reference_has_no_fake_source_site(self):
         result, elapsed = self.find("IFunctionalGrainTarget")

@@ -662,6 +662,7 @@ module private FindExternalDefinition =
         :> JsonNode
 
 exception private FindProjectNotStartedException
+exception private ProjectSweepSnapshotChangedException of string
 
 [<RequireQualifiedAccess; NoEquality; NoComparison>]
 type private FindTargetDiscoveryResult =
@@ -2085,11 +2086,14 @@ module internal AnalysisSnapshotKey =
 
         capture 1
 
-    let create (projectOptions: FSharpProjectOptions) =
+    let createWithDependencyKey (projectOptions: FSharpProjectOptions) =
         use aggregate =
             System.Security.Cryptography.IncrementalHash.CreateHash(
                 System.Security.Cryptography.HashAlgorithmName.SHA256
             )
+
+        use dependencyAggregate = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256)
+        let mutable inDependency = false
 
         let append (value: string) =
             let bytes = System.Text.Encoding.UTF8.GetBytes(if isNull value then "" else value)
@@ -2101,6 +2105,9 @@ module internal AnalysisSnapshotKey =
 
             aggregate.AppendData(header)
             aggregate.AppendData(bytes)
+            if inDependency then
+                dependencyAggregate.AppendData(header)
+                dependencyAggregate.AppendData(bytes)
 
         let appendInt (value: int) =
             append (value.ToString(System.Globalization.CultureInfo.InvariantCulture))
@@ -2167,6 +2174,8 @@ module internal AnalysisSnapshotKey =
 
                 match referencedProject with
                 | FSharpReferencedProject.FSharpReference(outputFile, referencedOptions) ->
+                    let previousInDependency = inDependency
+                    inDependency <- true
                     let referencedProjectPath =
                         normalizeFrom projectDirectory referencedOptions.ProjectFileName
 
@@ -2178,6 +2187,7 @@ module internal AnalysisSnapshotKey =
                         appendProject "referenced" projectDirectory referencedOptions
                     else
                         append "already-visited"
+                    inDependency <- previousInDependency
                 | _ ->
                     // PE/IL references have no source options. Their evaluated -r:
                     // inputs and file contents are already included above.
@@ -2186,7 +2196,10 @@ module internal AnalysisSnapshotKey =
         append "fslangmcp-analysis-snapshot-v1"
         visitedProjects.Add(normalizeFrom "" projectOptions.ProjectFileName) |> ignore
         appendProject "root" "" projectOptions
-        aggregate.GetHashAndReset() |> Convert.ToHexString
+        (aggregate.GetHashAndReset() |> Convert.ToHexString),
+        (dependencyAggregate.GetHashAndReset() |> Convert.ToHexString)
+
+    let create options = createWithDependencyKey options |> fst
 
 /// Single construction path for user-supplied project-outline filters. Tests
 /// assert these engine guarantees directly instead of treating host speed as a
@@ -4572,8 +4585,12 @@ type internal FcsBridge
 
         $"%s{pp}::%s{po}"
 
+    let dependencyKeys = BoundedCache<string, string>(128)
+    let previousDependencyKeys = BoundedCache<string, string>(128)
+
     let computeAnalysisSnapshotKey (projectOptions: FSharpProjectOptions) =
-        let key = AnalysisSnapshotKey.create projectOptions
+        let key, dependencyKey = AnalysisSnapshotKey.createWithDependencyKey projectOptions
+        dependencyKeys.Set(key, dependencyKey)
         Interlocked.Increment(&analysisSnapshotComputeCount) |> ignore
         key
 
@@ -4725,12 +4742,28 @@ type internal FcsBridge
         =
         acquireAnalysisSnapshotKey projectOptions (Some remainingBudget)
 
+    let invalidateFSharpProjectClosure (root: FSharpProjectOptions) =
+        let visited = System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
+
+        let rec invalidate (options: FSharpProjectOptions) =
+            if visited.Add(analysisProjectIdentity options) then
+                for reference in options.ReferencedProjects do
+                    match reference with
+                    | FSharpReferencedProject.FSharpReference(_, dependencyOptions) -> invalidate dependencyOptions
+                    | _ -> ()
+
+                checker.InvalidateConfiguration(options)
+
+        invalidate root
+
     let commitAnalysisSnapshotKey (projectOptions: FSharpProjectOptions) (key: string) =
         let projectIdentity = analysisProjectIdentity projectOptions
 
         Interlocked.Increment(&analysisSnapshotCommitCount) |> ignore
 
         lock analysisSnapshotGate (fun () ->
+            let priorDependencyKey = previousDependencyKeys.TryGet projectIdentity
+            let currentDependencyKey = dependencyKeys.TryGet key
             let invalidate =
                 match lastAnalysisSnapshotByProject.TryGetValue(projectIdentity) with
                 | true, previous when previous <> key ->
@@ -4750,7 +4783,12 @@ type internal FcsBridge
                 // Keep invalidation inside the gate: a concurrent caller observing the
                 // just-recorded key must not proceed before the FCS cache is actually
                 // invalidated.
-                checker.InvalidateConfiguration(projectOptions))
+                if priorDependencyKey.IsNone || currentDependencyKey.IsNone || priorDependencyKey <> currentDependencyKey then
+                    invalidateFSharpProjectClosure projectOptions
+                else checker.InvalidateConfiguration(projectOptions)
+                match currentDependencyKey with
+                | Some dependencyKey -> previousDependencyKeys.Set(projectIdentity, dependencyKey)
+                | None -> previousDependencyKeys.TryRemove projectIdentity |> ignore)
 
     let analysisSnapshotKey (projectOptions: FSharpProjectOptions) =
         let key = computeAnalysisSnapshotKey projectOptions
@@ -7197,12 +7235,27 @@ type internal FcsBridge
                                                                         return uses, results.Diagnostics
                                                                     }
 
-                                                            // set_project may clear caches while this
-                                                            // uncancellable FCS walk is still running. Do
-                                                            // not repopulate a new generation with the old
-                                                            // workspace's result.
-                                                            if Volatile.Read(&projectUsesCacheGeneration) = generation then
-                                                                projectUsesCache.Set(usesKey, value)
+                                                            // FCS consumes live files, not the captured key's bytes. If
+                                                            // input drift is visible after this sweep, don't return or
+                                                            // publish under the wrong key. Also force rechecking if
+                                                            // the caller restores the old bytes before retrying.
+                                                            let stable = computeAnalysisSnapshotKey options = usesKey
+
+                                                            lock analysisSnapshotGate (fun () ->
+                                                                // Cache clear and publication are serialized, so an old
+                                                                // workspace worker cannot mutate the new generation.
+                                                                if Volatile.Read(&projectUsesCacheGeneration) = generation then
+                                                                    if stable then
+                                                                        projectUsesCache.Set(usesKey, value)
+                                                                    else
+                                                                        let identity = analysisProjectIdentity options
+                                                                        lastAnalysisSnapshotByProject.Remove(identity) |> ignore
+                                                                        previousDependencyKeys.TryRemove(identity) |> ignore
+                                                                        invalidateFSharpProjectClosure options)
+
+                                                            if not stable then
+                                                                raise (ProjectSweepSnapshotChangedException
+                                                                    "Project inputs changed during semantic analysis. Retry once edits have settled.")
 
                                                             return value
                                                         }
@@ -8543,9 +8596,10 @@ type internal FcsBridge
                                   else
                                       match ex with
                                       | SdkPreflight.SdkPinUnsatisfiable _ -> "sdk_not_found"
+                                      | ProjectSweepSnapshotChangedException _ -> "project_inputs_changed"
                                       | _ -> "project_failure"
                               )
-                              "retryable", jbool (timedOut || busy)
+                              "retryable", jbool (timedOut || busy || (match ex with ProjectSweepSnapshotChangedException _ -> true | _ -> false))
                               "error", jstr ex.Message
                               "elapsedMs", jint (int projSw.ElapsedMilliseconds) ]
                             @ typedFailureFields
@@ -15580,18 +15634,19 @@ type internal FcsBridge
         }
 
     member _.ClearAnalysisCaches() =
-        Interlocked.Increment(&projectUsesCacheGeneration) |> ignore
         Interlocked.Increment(&freshProjectCheckGeneration) |> ignore
         projectResultsCache.Clear()
         // issue #131: a new set_project (or any explicit cache clear) must drop the
         // memoized find sweeps too, so a project switch never serves stale symbol uses.
         // Project options intentionally survive: every fsproj entry is validated against
         // its complete ProjInfo input fingerprint before reuse (issue #150).
-        projectUsesCache.Clear()
+        lock analysisSnapshotGate (fun () ->
+            Interlocked.Increment(&projectUsesCacheGeneration) |> ignore
+            projectUsesCache.Clear()
 
-        // The next project-level analysis must establish a new FCS freshness
-        // boundary as well as repopulating the application caches above.
-        lock analysisSnapshotGate lastAnalysisSnapshotByProject.Clear
+            // Next project-level analysis establishes a fresh FCS boundary.
+            lastAnalysisSnapshotByProject.Clear()
+            previousDependencyKeys.Clear())
 
     /// Returns configuration flags captured at checker creation time, for use by RuntimeStatus.
     member _.CheckerConfig: FcsCheckerConfig =
