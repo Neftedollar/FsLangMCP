@@ -8,7 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-11-25
+
+### Changed
+
+- Warm the shared `find` semantic cache during project selection, including startup
+  with a selected project. This shifts work out of the first query; an explicit
+  cold query without prior selection still follows the ordinary path (#225).
+
 ### Fixed
+
+- `find` identifies proven external C# types by full name and assembly without
+  inventing a site. It refuses to publish mismatched snapshots if inputs change
+  during a sweep (#225).
+- `fcs_dead_code` reports `partial` or `unknown` with project failure details
+  when a scan cannot cover the requested projects. Incomplete candidates are
+  provisional, not evidence that a symbol is unused (#353).
 
 - `check` rejects unsupported `fileGlob` scope/speed combinations instead of silently
   reporting unfiltered diagnostics. The filter remains supported for cached

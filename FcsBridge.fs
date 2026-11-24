@@ -17714,7 +17714,7 @@ type internal FcsBridge
                     :> JsonNode
             | Some sweepTarget ->
 
-            let projects = SolutionParsing.listProjects sweepTarget
+            let projects = SolutionParsing.discoverProjects sweepTarget
 
             if projects.Length = 0 then
                 return
@@ -17826,20 +17826,35 @@ type internal FcsBridge
                        Project: string |}
                  >()
 
-            // #100 review: count only projects whose sweep actually succeeded. Reporting
-            // projects.Length while the catch below swallows load failures would tell an
-            // agent "N scanned, 0 dead" when 0 projects were analyzed (unrestored solution).
             let mutable scannedOk = 0
+            let failures = ResizeArray<JsonNode>()
 
-            for fsproj in projects do
+            let recordFailure projectPath kind message =
+                failures.Add(
+                    jobj [ "projectPath", jstr projectPath; "errorKind", jstr kind; "message", jstr message ]
+                    :> JsonNode
+                )
+
+            for project in projects do
+                let fsproj = project.ProjectPath
+                let mutable stage = "project_options_failed"
+
                 try
+                    if project.Status = SolutionParsing.ProjectDiscoveryStatus.Missing then
+                        stage <- "project_missing"
+                        raise (FileNotFoundException("The declared F# project file is missing.", fsproj))
+
                     let projDisplay = Path.GetFileNameWithoutExtension fsproj
                     let! options, _ = this.ResolveFsprojOptions(fsproj)
-
+                    stage <- "sweep_failed"
                     let usesKey = analysisSnapshotKey options
+                    let! allUses, diagnostics = this.ProjectSweepUses(usesKey, options, 120000)
 
-                    let! allUses, _ = this.ProjectSweepUses(usesKey, options, 120000)
-                    scannedOk <- scannedOk + 1
+                    match diagnostics |> Array.tryFind (fun d -> d.Severity = FSharpDiagnosticSeverity.Error) with
+                    | Some diagnostic ->
+                        stage <- "compiler_error"
+                        raise (InvalidOperationException(diagnostic.Message))
+                    | None -> ()
 
                     for u in allUses do
                         let sym = u.Symbol
@@ -17876,10 +17891,17 @@ type internal FcsBridge
                             match fullNameOf sym with
                             | Some fn -> nonDefFullNames.Add fn |> ignore
                             | None -> ()
-                with _ ->
-                    // A project that fails to resolve/check is skipped — the candidate scan
-                    // is best-effort, never a hard failure for one bad project.
-                    ()
+                    scannedOk <- scannedOk + 1
+                with
+                | :? OperationCanceledException as ex -> raise ex
+                | InstallationHealth.StaleToolProcessException _ as ex -> raise ex
+                | ex -> recordFailure fsproj stage ex.Message
+
+            let complete = scannedOk = projects.Length
+            let status =
+                if complete then "succeeded"
+                elif scannedOk > 0 then "partial"
+                else "unknown"
 
             let candidatesAll =
                 defByKey
@@ -17892,6 +17914,7 @@ type internal FcsBridge
                 |> Seq.sortBy (fun v -> v.File, v.StartLine, v.StartCol, v.Name)
                 |> Seq.toArray
 
+            let candidatesAll = if scannedOk = 0 then [||] else candidatesAll
             let total = candidatesAll.Length
             let page = candidatesAll |> Array.truncate maxResults
             let truncated = total > page.Length
@@ -17939,6 +17962,10 @@ type internal FcsBridge
                    else
                        "public symbols are excluded by default (presumed reachable by external callers); pass includePublic=true to include them")
                   "union cases, record fields, and type definitions are NOT analyzed (FCS may under-attribute their pattern/usage sites)" ]
+                @ (if complete then
+                       []
+                   else
+                       [ "Scan incomplete: unscanned projects may contain uses, so all returned candidates are provisional; do not treat an empty list as a clean scan." ])
                 @ (if truncated then
                        [ $"results capped at {maxResults}; {total - page.Length} more candidate(s) not shown — raise maxResults" ]
                    else
@@ -17946,19 +17973,23 @@ type internal FcsBridge
 
             return
                 jobj
-                    [ "status", jstr "succeeded"
-                      // projectsScanned = projects actually analyzed; projectsRequested =
-                      // total in scope. A gap means some projects failed to load (e.g.
-                      // unrestored) and their symbols were NOT considered — do not read
-                      // an empty candidate list as "nothing is dead" when scanned < requested.
+                    [ "status", jstr status
+                      "complete", jbool complete
                       "projectsScanned", jint scannedOk
                       "projectsRequested", jint projects.Length
+                      "projectFailures", JsonArray(failures.ToArray()) :> JsonNode
                       "candidates", JsonArray(page |> Array.map candidateToJson) :> JsonNode
                       "candidateCount", jint total
                       "truncated", jbool truncated
                       "verificationHint",
-                      jstr
-                          "Each candidate has no non-definition use across the swept project(s); verify it with `find` before removing."
+                      jstr (
+                          if complete then
+                              "Each candidate has no non-definition use across the swept project(s); verify it with `find` before removing."
+                          elif scannedOk = 0 then
+                              "No F# project was analyzed. Check projectFailures and retry; no conclusion about unused code is possible."
+                          else
+                              "Candidates are provisional. Fix or include the unscanned projects, then rerun and verify usage with `find` before removing."
+                      )
                       "caveats", JsonArray(caveats |> List.map jstr |> List.toArray) :> JsonNode ]
                 :> JsonNode
         }

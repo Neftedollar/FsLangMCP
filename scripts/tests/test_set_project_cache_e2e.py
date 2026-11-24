@@ -1,4 +1,4 @@
-"""Unchanged set_project selections may retain fresh FCS analysis, over real MCP stdio."""
+"""FCS cache retention and truthful sweep coverage over real MCP stdio."""
 
 import os
 import shutil
@@ -105,6 +105,63 @@ class SetProjectCacheEndToEnd(unittest.TestCase):
         os.utime(path, ns=(initial.st_atime_ns, initial.st_mtime_ns))
         after = path.stat()
         self.assertEqual((initial.st_size, initial.st_mtime_ns), (after.st_size, after.st_mtime_ns))
+
+    def test_dead_code_complete_and_empty_is_a_clean_scan(self):
+        payload, _ = self.call("fcs_dead_code", {"projectPath": str(self.app)})
+        self.assertTrue(payload["complete"])
+        self.assertEqual(1, payload["projectsRequested"])
+        self.assertEqual(1, payload["projectsScanned"])
+        self.assertEqual([], payload["projectFailures"])
+        self.assertEqual([], payload["candidates"])
+
+    def test_dead_code_unloadable_project_is_unknown_not_clean(self):
+        broken = self.root / "Broken.fsproj"
+        # The path is discovered, but MSBuild cannot evaluate malformed XML.
+        broken.write_text("<Project><ItemGroup>", encoding="utf-8")
+        payload, _ = self.call("fcs_dead_code", {
+            "projectPath": str(broken), "includePublic": True,
+        }, expected="unknown")
+        self.assertFalse(payload["complete"])
+        self.assertEqual(1, payload["projectsRequested"])
+        self.assertEqual(0, payload["projectsScanned"])
+        self.assertEqual([], payload["candidates"])
+        self.assertIn("No F# project was analyzed", payload["verificationHint"])
+        failure, = payload["projectFailures"]
+        self.assertEqual(broken, Path(failure["projectPath"]))
+        self.assertEqual("project_options_failed", failure["errorKind"])
+        self.assertIn("Unable to load F# project options", failure["message"])
+
+    def test_dead_code_partial_scan_preserves_provisional_candidates(self):
+        missing = self.root / "MissingConsumer.fsproj"
+        solution = self.root / "Partial.slnx"
+        solution.write_text(
+            '<Solution><Project Path="Dep/Dep.fsproj" />'
+            '<Project Path="MissingConsumer.fsproj" /></Solution>', encoding="utf-8",
+        )
+        args = {"projectPath": str(solution), "includePublic": True}
+        payload, _ = self.call("fcs_dead_code", args, expected="partial")
+        self.assertFalse(payload["complete"])
+        self.assertEqual(2, payload["projectsRequested"])
+        self.assertEqual(1, payload["projectsScanned"])
+        self.assertIn("OldName", [c["name"] for c in payload["candidates"]])
+        self.assertIn("provisional", payload["verificationHint"])
+        failure, = payload["projectFailures"]
+        self.assertEqual(missing, Path(failure["projectPath"]))
+        self.assertEqual("project_missing", failure["errorKind"])
+
+        # Even an empty partial page cannot be treated as a clean scan.
+        payload, _ = self.call("fcs_dead_code", {**args, "includePublic": False}, expected="partial")
+        self.assertFalse(payload["complete"])
+        self.assertEqual([], payload["candidates"])
+
+    def test_dead_code_compiler_errors_do_not_establish_clean_coverage(self):
+        self.a_source.write_text("module App\nlet bad = NoSuchValue\n", encoding="utf-8")
+        payload, _ = self.call("fcs_dead_code", {"projectPath": str(self.app)}, expected="unknown")
+        self.assertFalse(payload["complete"])
+        self.assertEqual(0, payload["projectsScanned"])
+        failure, = payload["projectFailures"]
+        self.assertEqual("compiler_error", failure["errorKind"])
+        self.assertIn("NoSuchValue", failure["message"])
 
     def test_default_selection_warms_first_find_and_edits_invalidate_without_reselecting(self):
         self.client.close()
