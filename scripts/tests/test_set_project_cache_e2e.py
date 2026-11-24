@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.tests.test_sdk_pin_preflight_e2e import StdioClient, locate_server_dll
 
@@ -54,7 +55,17 @@ class SetProjectCacheEndToEnd(unittest.TestCase):
             capture_output=True, text=True, timeout=120,
         )
         self.assertEqual(0, restored.returncode, restored.stdout + restored.stderr)
-        self.client = StdioClient(locate_server_dll(), self.root)
+        self.start_client(warmup=False)
+
+    def start_client(self, *, warmup):
+        # These existing retention tests still assert cold misses. The dedicated
+        # warm-up test below exercises the default independently.
+        with patch.dict(os.environ):
+            if warmup:
+                os.environ.pop("FSLANGMCP_SEMANTIC_WARMUP", None)
+            else:
+                os.environ["FSLANGMCP_SEMANTIC_WARMUP"] = "0"
+            self.client = StdioClient(locate_server_dll(), self.root)
         self.addCleanup(self.client.close)
         self.client.request("initialize", {
             "protocolVersion": "2024-11-05", "capabilities": {},
@@ -94,6 +105,27 @@ class SetProjectCacheEndToEnd(unittest.TestCase):
         os.utime(path, ns=(initial.st_atime_ns, initial.st_mtime_ns))
         after = path.stat()
         self.assertEqual((initial.st_size, initial.st_mtime_ns), (after.st_size, after.st_mtime_ns))
+
+    def test_default_selection_warms_first_find_and_edits_invalidate_without_reselecting(self):
+        self.client.close()
+        self.start_client(warmup=True)
+        selected, _ = self.select(self.solution, self.root)
+        self.assertEqual({"selected": 2, "warmed": 2, "complete": True},
+                         selected["result"].get("semanticWarmup"))
+        first, _ = self.find("Original")
+        self.assert_uses(first, hits=2)
+        self.assertEqual(1, first["returnedSiteCount"])
+
+        self.replace_same_stat(self.a_source, "Original", "Replaced")
+        edited, _ = self.find("Replaced")
+        self.assert_uses(edited, hits=1, misses=1)
+        self.assertEqual(1, edited["returnedSiteCount"])
+
+        self.replace_same_stat(self.dep_source, "OldName", "NewName")
+        changed, _ = self.find("Replaced", self.app)
+        self.assert_uses(changed, misses=1)
+        self.assertEqual(1, changed["returnedSiteCount"])
+        self.assertGreater(changed["projectDiagnosticsTotalCount"], 0)
 
     def test_same_effective_selection_keeps_hits_but_never_stale_source_or_project(self):
         _, setup_ms = self.select(self.app, self.root)

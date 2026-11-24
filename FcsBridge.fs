@@ -7198,7 +7198,7 @@ type internal FcsBridge
     // the real worker; legacy callers use the timeout wrapper below. In both cases
     // projectUsesInFlight deduplicates retries.
     member private _.ProjectSweepUsesActual
-        (usesKey: string, options: FSharpProjectOptions, ?observeCache: bool -> unit)
+        (usesKey: string, options: FSharpProjectOptions, ?observeCache: bool -> unit, ?canPublish: FSharpDiagnostic array -> bool)
         : Task<FSharpSymbolUse array * FSharpDiagnostic array> =
         task {
             match projectUsesCache.TryGet(usesKey) with
@@ -7246,7 +7246,8 @@ type internal FcsBridge
                                                                 // workspace worker cannot mutate the new generation.
                                                                 if Volatile.Read(&projectUsesCacheGeneration) = generation then
                                                                     if stable then
-                                                                        projectUsesCache.Set(usesKey, value)
+                                                                        if canPublish |> Option.forall (fun allow -> allow (snd value)) then
+                                                                            projectUsesCache.Set(usesKey, value)
                                                                     else
                                                                         let identity = analysisProjectIdentity options
                                                                         lastAnalysisSnapshotByProject.Remove(identity) |> ignore
@@ -7270,6 +7271,45 @@ type internal FcsBridge
                 let work = pending.Value
                 observeFault work
                 return! work
+        }
+
+    // Share Find's content-addressed cache and worker admission. The budget bounds
+    // selection's wait, not synchronous compiler work already admitted by FCS.
+    member internal this.WarmSelectedUses(paths: string array, ct: CancellationToken) =
+        task {
+            let budget = TimeSpan.FromSeconds(20.0)
+            let elapsed = System.Diagnostics.Stopwatch.StartNew()
+            use deadline = CancellationTokenSource.CreateLinkedTokenSource(ct)
+            deadline.CancelAfter(budget)
+            let token = deadline.Token
+            let generation = Volatile.Read(&projectUsesCacheGeneration)
+            let remaining () = budget - elapsed.Elapsed
+            let live () = not token.IsCancellationRequested && Volatile.Read(&projectUsesCacheGeneration) = generation
+            let noErrors = Array.forall (fun (d: FSharpDiagnostic) -> d.Severity <> FSharpDiagnosticSeverity.Error)
+            let mutable warmed = 0
+
+            for path in paths |> Array.truncate 8 do
+                if live () then
+                    try
+                        use optionsWaiter = this.AcquireFsprojEntryWithinBudget(path, Some remaining, callerIsNeeded = live)
+                        let! entry, _ = optionsWaiter.Operation.WaitAsync(token)
+                        if live () then
+                            let options = entry.Options
+                            use snapshot = acquireAnalysisSnapshotKeyActual options remaining
+                            let! key = snapshot.Operation.WaitAsync(token)
+                            if live () then
+                                commitAnalysisSnapshotKey options key
+                                let actual =
+                                    this.ProjectSweepUsesActual(
+                                        key, options, canPublish = fun diagnostics -> live () && noErrors diagnostics)
+                                let! _, diagnostics = actual.WaitAsync(token)
+                                if live () && noErrors diagnostics && projectUsesCache.TryGet(key).IsSome then
+                                    warmed <- warmed + 1
+                    with
+                    | :? OperationCanceledException when token.IsCancellationRequested -> ()
+                    | ex -> eprintfn "Selection-time semantic warm-up skipped a project (%s)." (ex.GetType().Name)
+
+            return warmed
         }
 
     member private this.ProjectSweepUses

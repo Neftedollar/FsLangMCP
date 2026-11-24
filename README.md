@@ -257,6 +257,7 @@ Pass `projectPath` explicitly on every FCS tool call — FCS tools cache project
 Concurrency limits:
 
 - `FSLANGMCP_MAX_CONCURRENT_FCS=2`
+- `FSLANGMCP_SEMANTIC_WARMUP=0` disables upfront semantic warm-up. By default, project selection (including `--project` / `FSA_PROJECT_PATH`) warms the shared `find` cache for up to eight loaded F# projects, waiting up to 20 seconds. `set_project` reports `semanticWarmup.selected`, `warmed` and `complete` separately from readiness. Searches still analyze uncovered or changed projects on demand; a start without a selected project does no warm-up.
 - LSP tools are always serialized. FSAC owns one mutable workspace, so LSP concurrency is intentionally not configurable.
 
 Process and RPC timeouts (milliseconds):
