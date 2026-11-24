@@ -597,6 +597,59 @@ let ``find cancellation retains an admitted project-options evaluation`` () : Ta
     }
 
 [<Fact>]
+let ``find rejects visible mid-sweep input drift and does not cache the failed sweep`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_sweep_drift_{Guid.NewGuid():N}")
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable starts = 0
+
+        let sweep (_: string) : Task<FSharpSymbolUse array * FSharpDiagnostic array> =
+            task {
+                if Interlocked.Increment(&starts) = 1 then
+                    entered.TrySetResult(()) |> ignore
+                    do! release.Task
+
+                return [||], [||]
+            }
+
+        let bridge = FcsBridge(projectSweepWorkerOverride = sweep)
+
+        try
+            let source, project = writeSimpleProject root "DriftingSweep" "value"
+            let original = File.ReadAllText(source)
+            let stamp = File.GetLastWriteTimeUtc(source)
+            let args = admissionFindArgs project 20_000
+            let firstRequest = bridge.Find(args)
+            do! entered.Task.WaitAsync(TimeSpan.FromSeconds(10.0))
+            File.WriteAllText(source, original.Replace("value", "other"))
+            File.SetLastWriteTimeUtc(source, stamp)
+            Assert.Equal(stamp, File.GetLastWriteTimeUtc(source))
+            release.TrySetResult(()) |> ignore
+            let! first = firstRequest
+            Assert.Equal("indeterminate", first.["resolution"].["outcome"].GetValue<string>())
+            Assert.False(first.["coverage"].["complete"].GetValue<bool>())
+            Assert.Equal(0, jsonArrayLength first["sites"])
+            let failure = first["perProject"][0]
+            Assert.Equal("project_inputs_changed", failure["errorKind"].GetValue<string>())
+            Assert.True(failure["retryable"].GetValue<bool>())
+
+            File.WriteAllText(source, original)
+            File.SetLastWriteTimeUtc(source, stamp)
+            let! retry = bridge.Find(args)
+            Assert.True(retry.["coverage"].["complete"].GetValue<bool>())
+            Assert.Equal(2, Volatile.Read(&starts))
+            let! cached = bridge.Find(args)
+            Assert.True(cached.["coverage"].["complete"].GetValue<bool>())
+            Assert.Equal(2, Volatile.Read(&starts))
+        finally
+            release.TrySetResult(()) |> ignore
+
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
 let ``timed out project-use sweep retains actual-worker admission across distinct keys`` () : Task =
     task {
         use outerGate = new SemaphoreSlim(2, 2)
