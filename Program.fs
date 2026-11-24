@@ -679,7 +679,7 @@ let private mainCore argv =
         // also serializes internally because some FCS orchestrators call LSP directly.
         use lspGate = new SemaphoreSlim(1, 1)
 
-        let setProjectAndRefresh (args: SetProjectArgs) : Task<JsonNode> =
+        let setProjectAndRefresh (args: SetProjectArgs) (ct: CancellationToken) : Task<JsonNode> =
             task {
                 InstallationHealth.ensureCurrent ()
                 let! result = bridge.SetProjectWithAnalysisInvalidation(args, fcsBridge.ClearAnalysisCaches)
@@ -734,6 +734,17 @@ let private mainCore argv =
                             | _ -> ()
                         | None -> ()
 
+                        match resultObj["loadedProjects"] with
+                        | :? JsonArray as projects when projects.Count > 0 && Environment.GetEnvironmentVariable("FSLANGMCP_SEMANTIC_WARMUP") <> "0" ->
+                            let paths = projects |> Seq.map (fun p -> p.GetValue<string>()) |> Seq.toArray
+                            let! warmed = fcsBridge.WarmSelectedUses(paths, ct)
+                            let summary = JsonObject()
+                            summary["selected"] <- JsonValue.Create(paths.Length)
+                            summary["warmed"] <- JsonValue.Create(warmed)
+                            summary["complete"] <- jbool (warmed = paths.Length)
+                            resultObj["semanticWarmup"] <- summary
+                        | _ -> ()
+
                         match currentThreadWarning (projectOptionsTelemetry ()) with
                         | Some warning -> resultObj["runtimeWarning"] <- warning
                         | None -> ()
@@ -749,6 +760,7 @@ let private mainCore argv =
                     { projectPath = projectPath
                       workspacePath = None
                       restartLsp = Some true }
+                    CancellationToken.None
                 |> fun operation -> operation.GetAwaiter().GetResult()
 
             let ready =
@@ -814,10 +826,10 @@ let private mainCore argv =
                 tool (
                     TypedToolDiagnostics.define<SetProjectArgs>
                         "set_project"
-                        "Initialize or switch the FSAC/LSP project context. Required before raw LSP proxies. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load and clears stale FCS analysis while retaining validated MSBuild project options. Response includes loadedProjects, readiness, restart intent, and whether a running FSAC process was actually replaced."
+                        "Initialize or switch the FSAC/LSP project context. Required before raw LSP proxies. Accepts .fsproj, .sln, .slnx, or directory. Waits up to 30s for workspace load and clears stale FCS analysis while retaining validated MSBuild project options. Best-effort semantic warm-up waits up to 20s for at most eight F# projects. Response includes loadedProjects, readiness, semantic warm-up coverage, restart intent, and whether a running FSAC process was actually replaced."
                         (fun args (ct: CancellationToken) ->
                             toolResult (fun () ->
-                                runLimited lspGate ct (fun () -> setProjectAndRefresh args)))
+                                runLimited lspGate ct (fun () -> setProjectAndRefresh args ct)))
                     |> unwrapResult
                 )
 
