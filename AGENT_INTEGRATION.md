@@ -33,8 +33,11 @@ Drop this into your project's `CLAUDE.md` (Claude Code), your `.cursorrules` (Cu
     `fcs_find_symbol`, `fcs_project_symbol_uses`, `fcs_find_member_usages`,
     `fcs_record_field_audit`, `textDocument_references`, and
     `textDocument_definition` were removed in v0.11.0; use `find` instead.
-    For exhaustive refactor counts, require both `coverage.complete=true` and
-    `resolution.complete=true`; follow `nextCursor` while `truncated=true`.
+    For exhaustive refactor counts, require complete project coverage. A whole
+    response has `resolution.complete=true`; for paged results, collect rows
+    from page zero, following each non-null `nextCursor`, and reconcile with
+    `totalEstimate.sites`. Later pages can have `resolution.complete=false`
+    even when the collected result is complete.
   - **"Did my edit compile?"** → `mcp__fslangmcp__check` (one
     `clean` / `errors` / `unknown` verdict from a FRESH in-process
     type-check for the current FCS/check profile — no stale-`{}` false-clean).
@@ -119,10 +122,20 @@ A minimal F# subagent brief skeleton. Embed your task-specific content where ind
   as needed. The removed `workspace_diagnostics`, `workspace_symbol`, and
   `textDocument_references` aliases are not available; use `find` / `check`.
 - `rg` is OK for non-F# files (.fsproj, .md, .json, .yml).
-- Before treating a `find` result as an exhaustive refactor plan, inspect both
-  `coverage.complete` (all requested projects analyzed) and `resolution.complete`
-  (the response contains the whole site set). Follow `nextCursor` while
-  `truncated=true`; a final cursor page still omits earlier pages by itself.
+- For exhaustive `find` results, require `coverage.complete=true` (all requested
+  projects analyzed). An unpaged response is complete when
+  `resolution.complete=true`. For ordinary pagination, accumulate from page
+  zero, follow each non-null `nextCursor`, and reconcile the collected rows
+  with `totalEstimate.sites`. A final nonzero page has
+  `resolution.complete=false` because it omits the earlier rows.
+- On `cursor_stale` or `cursor_query_mismatch`, discard the old traversal
+  and restart without a cursor. On `cursor_validation_incomplete`, retry
+  the same cursor with a larger `timeoutMs`.
+- A partial first result can contain useful sites without proving absence
+  or an exhaustive count. If `truncated=true` but `nextCursor=null`, there
+  is no next page to request. Follow the response's recovery hint: for a
+  deadline-partial result, restart from page zero with more time or a
+  narrower scope.
 - Treat `check(clean)` as evidence for the current FCS/check profile, not every
   build configuration. Before merge or release, run
   `dotnet build -c Release --warnaserror` to catch Release-only diagnostics such
