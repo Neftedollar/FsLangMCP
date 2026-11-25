@@ -1,3 +1,5 @@
+#nowarn "57" // FsLangMCP pins FCS; DocumentSource.Custom is exercised end to end.
+
 module FsLangMcp.FcsBridge
 
 open System
@@ -606,8 +608,17 @@ module private FindExternalDefinition =
     // Assembly simple names alone cannot disambiguate copies or identities.
     let tryEvidence projectPath (evaluated: EvaluatedProjectSnapshot option) (symbol: FSharpSymbol) =
         try
-            match symbol with
-            | :? FSharpEntity as entity when
+            let declaringType =
+                match symbol with
+                | :? FSharpEntity as entity -> Some entity
+                // A resolved CLR constructor is evidence for its declaring type,
+                // not a competing symbol identity. Other members remain ambiguous.
+                | :? FSharpMemberOrFunctionOrValue as memberOrValue when memberOrValue.IsConstructor ->
+                    memberOrValue.DeclaringEntity
+                | _ -> None
+
+            match declaringType with
+            | Some entity when
                 not entity.IsUnresolved && not entity.IsFSharp && not entity.IsProvided
                 && not entity.IsNamespace && not entity.Assembly.IsProviderGenerated ->
                 let assembly = entity.Assembly
@@ -663,6 +674,7 @@ module private FindExternalDefinition =
 
 exception private FindProjectNotStartedException
 exception private ProjectSweepSnapshotChangedException of string
+exception private ProjectSweepSnapshotUnavailableException of string
 
 [<RequireQualifiedAccess; NoEquality; NoComparison>]
 type private FindTargetDiscoveryResult =
@@ -2028,15 +2040,109 @@ module internal AnalysisSnapshotKey =
         else
             normalized
 
-    let private tryReferencePath baseDirectory (optionText: string) =
-        if optionText.StartsWith("-r:", StringComparison.Ordinal) then
-            Some(normalizeFrom baseDirectory (optionText.Substring 3))
-        elif optionText.StartsWith("--reference:", StringComparison.Ordinal) then
-            Some(normalizeFrom baseDirectory (optionText.Substring 12))
+    let private tryFlagArgument prefixes (optionText: string) =
+        // As in FCS, a slash-style argument containing another slash is a
+        // rooted Unix file, not a slash-style compiler switch.
+        let couldBeOption =
+            not (optionText.StartsWith("/", StringComparison.Ordinal))
+            || optionText.IndexOf('/', 1) < 0
+            || (optionText.Length >= 3 && optionText[2] = ':')
+        if not couldBeOption then None
         else
-            None
+            prefixes
+            |> List.tryPick (fun (prefix: string) ->
+                if optionText.StartsWith(prefix, StringComparison.Ordinal) then
+                    Some(optionText.Substring(prefix.Length).Trim().Trim('"'))
+                else None)
 
-    let private captureFile (path: string) =
+    let private compilerFlags (options: FSharpProjectOptions) =
+        let original = options.OtherOptions
+        let rec loop index =
+            seq {
+                if index < original.Length then
+                    let argument = original[index]
+                    if index + 1 < original.Length &&
+                       (argument = "-r" || argument = "/r" || argument = "-I" || argument = "/I") then
+                        yield argument + ":" + original[index + 1]
+                        yield! loop (index + 2)
+                    else
+                        yield argument
+                        yield! loop (index + 1)
+            }
+        loop 0 |> Seq.toArray
+
+    let private referencePaths (arguments: string array) projectDirectory =
+        let referenceFlags = [ "-r:"; "--reference:"; "/r:"; "/reference:" ]
+        let evaluatedAbsoluteReferences =
+            arguments
+            |> Array.choose (tryFlagArgument referenceFlags)
+            |> Array.filter Path.IsPathFullyQualified
+            |> Array.map (normalizeFrom projectDirectory)
+            |> Array.distinct
+        let searchDirectories =
+            arguments
+            |> Array.choose (tryFlagArgument [ "-I:"; "--lib:"; "/I:"; "/lib:" ])
+            |> Array.collect (fun text -> text.Split([| ','; ';' |], StringSplitOptions.TrimEntries ||| StringSplitOptions.RemoveEmptyEntries))
+            |> Array.map (normalizeFrom projectDirectory)
+
+        let resolve (reference: string) =
+            // FCS probes these extensions in order when the name does not
+            // already have one of them; dotted assembly names are not extensions.
+            let recognizedExtensions = [| ".dll"; ".exe"; ".netmodule" |]
+            let names =
+                if recognizedExtensions |> Array.exists (fun suffix -> reference.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) then
+                    [| reference |]
+                else
+                    recognizedExtensions |> Array.map (fun suffix -> reference + suffix)
+            let candidatesFor (path: string) =
+                if Path.IsPathFullyQualified(path) then [| normalizeFrom projectDirectory path |]
+                else
+                    let explicitDirectories =
+                        Array.append searchDirectories [| projectDirectory |]
+                        |> Array.map (fun directory -> normalizeFrom directory path)
+                    // ProjInfo usually already resolved the framework reference
+                    // (e.g. System.Net.Http.dll) alongside its extra bare alias.
+                    let evaluated =
+                        if Path.GetFileName(path) = path then
+                            evaluatedAbsoluteReferences
+                            |> Array.filter (fun fullPath -> pathComparer.Equals(Path.GetFileName(fullPath), path))
+                        else [||]
+                    Array.append explicitDirectories evaluated
+            let fallback = normalizeFrom projectDirectory names[0]
+            let candidates =
+                names
+                |> Array.tryPick (fun path ->
+                    let found = candidatesFor path |> Array.filter File.Exists |> Array.distinct
+                    if found.Length = 0 then None else Some found)
+                |> Option.defaultValue [||]
+            // Do not guess between distinct physical assemblies.
+            if candidates.Length = 1 then candidates[0], false
+            else fallback, candidates.Length > 1
+
+        arguments
+        |> Array.map (fun argument ->
+            tryFlagArgument referenceFlags argument
+            |> Option.map resolve)
+
+    // Every captured source and explicit CLR reference used by a sweep comes
+    // from the same read as its content key. Non-pinning key walks still stream.
+    let private maxPinnedInputBytes = 256L * 1024L * 1024L
+    let maxWarmupInputBytes = 64L * 1024L * 1024L
+
+    [<NoComparison; NoEquality>]
+    type private PinnedInputs =
+        { Sources: System.Collections.Generic.Dictionary<string, byte array * string>
+          References: System.Collections.Generic.Dictionary<string, DelayedILModuleReader * DateTime>
+          ReferencePaths: System.Collections.Generic.Dictionary<FSharpProjectOptions, string option array>
+          TryGetReader: string -> string -> (DelayedILModuleReader * DateTime) option
+          GetReader: string -> string -> byte array -> DelayedILModuleReader * DateTime }
+
+    let private captureFile
+        (path: string)
+        (pinInput: (byte array -> string -> DateTime -> unit) option)
+        (reuseInput: (string -> (int64 -> DateTime -> unit) option) option)
+        (remainingCapacity: int64)
+        =
         let unavailable state =
             { State = state
               LastWriteTimeUtcTicks = -1L
@@ -2062,8 +2168,38 @@ module internal AnalysisSnapshotKey =
                             FileShare.ReadWrite ||| FileShare.Delete
                         )
 
-                    use sha = System.Security.Cryptography.SHA256.Create()
-                    let contentHash = sha.ComputeHash(stream) |> Convert.ToHexString
+                    let hashStream () =
+                        use sha = System.Security.Cryptography.SHA256.Create()
+                        sha.ComputeHash(stream) |> Convert.ToHexString
+
+                    let readPinnedBytes () =
+                        if beforeLength > remainingCapacity then
+                            raise (ProjectSweepSnapshotUnavailableException
+                                "The project input closure exceeds the 256 MiB semantic snapshot limit.")
+
+                        let bytes = Array.zeroCreate<byte> (int beforeLength)
+                        stream.ReadExactly(bytes)
+                        if stream.ReadByte() <> -1 then
+                            raise (IOException("Input size changed while reading the semantic snapshot."))
+
+                        bytes, (System.Security.Cryptography.SHA256.HashData(bytes) |> Convert.ToHexString)
+
+                    let bytes, contentHash, reused =
+                        match pinInput, reuseInput with
+                        | None, _ -> None, hashStream (), None
+                        | Some _, Some tryReuse ->
+                            let observedHash = hashStream ()
+                            match tryReuse observedHash with
+                            | Some save -> None, observedHash, Some save
+                            | None ->
+                                stream.Position <- 0L
+                                let data, capturedHash = readPinnedBytes ()
+                                if capturedHash <> observedHash then
+                                    raise (IOException("The binary reference changed while capturing its semantic snapshot."))
+                                Some data, capturedHash, None
+                        | Some _, None ->
+                            let data, capturedHash = readPinnedBytes ()
+                            Some data, capturedHash, None
                     let after = FileInfo(path)
                     after.Refresh()
 
@@ -2073,20 +2209,30 @@ module internal AnalysisSnapshotKey =
                     then
                         capture (attemptsRemaining - 1)
                     else
-                        { State =
-                            if after.LastWriteTimeUtc.Ticks = beforeTicks && after.Length = beforeLength then
-                                "present"
-                            else
-                                "changed-during-read"
+                        let stable =
+                            after.Exists && after.LastWriteTimeUtc.Ticks = beforeTicks && after.Length = beforeLength
+                        match stable, reused, pinInput, bytes with
+                        | true, Some save, _, _ -> save after.Length after.LastWriteTimeUtc
+                        | true, _, Some save, Some data -> save data contentHash after.LastWriteTimeUtc
+                        | _ -> ()
+
+                        { State = if stable then "present" else "changed-during-read"
                           LastWriteTimeUtcTicks = after.LastWriteTimeUtc.Ticks
                           Length = after.Length
                           ContentHash = contentHash }
-            with _ ->
-                unavailable "unreadable"
+            with
+            | ProjectSweepSnapshotUnavailableException _ -> reraise ()
+            | _ -> unavailable "unreadable"
 
         capture 1
 
-    let createWithDependencyKey (projectOptions: FSharpProjectOptions) =
+    let private collect
+        (projectOptions: FSharpProjectOptions)
+        (pinnedInputs: PinnedInputs option)
+        =
+        let mutable totalPinnedBytes = 0L
+        let mutable inputFootprint = 0L
+        let footprintPaths = System.Collections.Generic.HashSet<string>(pathComparer)
         use aggregate =
             System.Security.Cryptography.IncrementalHash.CreateHash(
                 System.Security.Cryptography.HashAlgorithmName.SHA256
@@ -2115,19 +2261,59 @@ module internal AnalysisSnapshotKey =
         let appendInt64 (value: int64) =
             append (value.ToString(System.Globalization.CultureInfo.InvariantCulture))
 
-        let fileSnapshots = System.Collections.Generic.Dictionary<string, FileSnapshot>(pathComparer)
+        let fileSnapshots =
+            System.Collections.Generic.Dictionary<string, FileSnapshot>(pathComparer)
 
-        let appendFile role index path =
+        let appendFile role index path allowPin =
             let normalized = normalizeFrom "" path
 
+            let consumeBudget length =
+                totalPinnedBytes <- totalPinnedBytes + length
+                if totalPinnedBytes > maxPinnedInputBytes then
+                    raise (ProjectSweepSnapshotUnavailableException
+                        "The project input closure exceeds the 256 MiB semantic snapshot limit.")
+
+            let pin =
+                pinnedInputs
+                |> Option.bind (fun inputs ->
+                    if not allowPin then None
+                    elif role = "source" && not (inputs.Sources.ContainsKey(normalized)) then
+                        Some(fun (data: byte array) hash _ ->
+                            consumeBudget (int64 data.Length)
+                            inputs.Sources.Add(normalized, (data, hash)))
+                    elif role = "assembly-reference" && not (inputs.References.ContainsKey(normalized)) then
+                        Some(fun (data: byte array) hash _ ->
+                            consumeBudget (int64 data.Length)
+                            inputs.References.Add(normalized, inputs.GetReader normalized hash data))
+                    else None)
+
+            let reuse =
+                pinnedInputs
+                |> Option.bind (fun inputs ->
+                    if pin.IsSome && role = "assembly-reference" then
+                        Some(fun hash ->
+                            inputs.TryGetReader normalized hash
+                            |> Option.map (fun captured length _ ->
+                                consumeBudget length
+                                inputs.References.Add(normalized, captured)))
+                    else None)
+
             let snapshot =
-                match fileSnapshots.TryGetValue(normalized) with
-                | true, existing -> existing
-                | false, _ ->
-                    let captured = captureFile normalized
+                match fileSnapshots.TryGetValue(normalized), pin with
+                | (true, existing), None -> existing
+                | _, _ ->
+                    let captured = captureFile normalized pin reuse (maxPinnedInputBytes - totalPinnedBytes)
+                    if pin.IsSome && captured.State <> "present" then
+                        if captured.State = "missing" then
+                            raise (ProjectSweepSnapshotUnavailableException
+                                $"A compiler input does not resolve to a file: {normalized}")
+                        raise (ProjectSweepSnapshotChangedException
+                            "An input file could not be captured for semantic analysis. Retry once edits have settled.")
                     fileSnapshots[normalized] <- captured
                     captured
 
+            if allowPin && footprintPaths.Add(normalized) then
+                inputFootprint <- inputFootprint + max 0L snapshot.Length
             append role
             appendInt index
             append normalized
@@ -2136,11 +2322,21 @@ module internal AnalysisSnapshotKey =
             appendInt64 snapshot.Length
             append snapshot.ContentHash
 
-        let visitedProjects = System.Collections.Generic.HashSet<string>(pathComparer)
+        let visitedProjects = System.Collections.Generic.Dictionary<FSharpProjectOptions, int>(HashIdentity.Reference)
 
         let rec appendProject relation parentDirectory (options: FSharpProjectOptions) =
             let projectPath = normalizeFrom parentDirectory options.ProjectFileName
             let projectDirectory = Path.GetDirectoryName(projectPath)
+            let flags = compilerFlags options
+            if pinnedInputs.IsSome && (flags |> Array.exists (fun flag -> flag.StartsWith("@", StringComparison.Ordinal))) then
+                raise (ProjectSweepSnapshotUnavailableException
+                    "Compiler response-file arguments cannot be captured as a verified semantic snapshot.")
+            let referenceSelections = referencePaths flags projectDirectory
+            if pinnedInputs.IsSome && (referenceSelections |> Array.exists (Option.exists snd)) then
+                raise (ProjectSweepSnapshotUnavailableException
+                    "More than one file matches a relative assembly reference. Specify its absolute path for semantic analysis.")
+            let resolvedReferences = referenceSelections |> Array.map (Option.map fst)
+            pinnedInputs |> Option.iter (fun inputs -> inputs.ReferencePaths.Add(options, resolvedReferences))
 
             append "project"
             append relation
@@ -2149,22 +2345,30 @@ module internal AnalysisSnapshotKey =
             append (if options.UseScriptResolutionRules then "script" else "project")
             append (if options.IsIncompleteTypeCheckEnvironment then "incomplete" else "complete")
 
-            append "compiler-options"
-            appendInt options.OtherOptions.Length
+            let fsharpOutputs =
+                System.Collections.Generic.HashSet<string>(
+                    (options.ReferencedProjects
+                     |> Seq.choose (function
+                         | FSharpReferencedProject.FSharpReference(output, _) -> Some(normalizeFrom projectDirectory output)
+                         | _ -> None)), pathComparer)
 
-            for index, optionText in options.OtherOptions |> Array.indexed do
+            append "compiler-options"
+            appendInt flags.Length
+
+            for index, optionText in flags |> Array.indexed do
                 appendInt index
                 append optionText
 
-                match tryReferencePath projectDirectory optionText with
-                | Some referencePath -> appendFile "assembly-reference" index referencePath
+                match resolvedReferences[index] with
+                | Some referencePath ->
+                    appendFile "assembly-reference" index referencePath (not (fsharpOutputs.Contains(referencePath)))
                 | None -> ()
 
             append "ordered-sources"
             appendInt options.SourceFiles.Length
 
             for index, sourcePath in options.SourceFiles |> Array.indexed do
-                appendFile "source" index (normalizeFrom projectDirectory sourcePath)
+                appendFile "source" index (normalizeFrom projectDirectory sourcePath) true
 
             append "referenced-projects"
             appendInt options.ReferencedProjects.Length
@@ -2180,26 +2384,146 @@ module internal AnalysisSnapshotKey =
                         normalizeFrom projectDirectory referencedOptions.ProjectFileName
 
                     append "fsharp-project-reference"
-                    appendFile "project-output" index (normalizeFrom projectDirectory outputFile)
+                    appendFile "project-output" index (normalizeFrom projectDirectory outputFile) false
                     append referencedProjectPath
 
-                    if visitedProjects.Add(referencedProjectPath) then
-                        appendProject "referenced" projectDirectory referencedOptions
-                    else
+                    match visitedProjects.TryGetValue(referencedOptions) with
+                    | true, ordinal ->
                         append "already-visited"
+                        appendInt ordinal
+                    | false, _ ->
+                        visitedProjects.Add(referencedOptions, visitedProjects.Count)
+                        appendProject "referenced" projectDirectory referencedOptions
                     inDependency <- previousInDependency
-                | _ ->
-                    // PE/IL references have no source options. Their evaluated -r:
-                    // inputs and file contents are already included above.
+                | binary ->
                     append "binary-project-reference"
+                    // MSBuild's PE project reference path can differ from its
+                    // compile-line -r path (e.g. output vs reference assembly).
+                    appendFile "assembly-reference" index (normalizeFrom projectDirectory binary.OutputFile) true
 
-        append "fslangmcp-analysis-snapshot-v1"
-        visitedProjects.Add(normalizeFrom "" projectOptions.ProjectFileName) |> ignore
+        append "fslangmcp-analysis-snapshot-v3"
+        visitedProjects.Add(projectOptions, 0)
         appendProject "root" "" projectOptions
         (aggregate.GetHashAndReset() |> Convert.ToHexString),
-        (dependencyAggregate.GetHashAndReset() |> Convert.ToHexString)
+        (dependencyAggregate.GetHashAndReset() |> Convert.ToHexString), inputFootprint
+
+    let createWithFootprint options = collect options None
+
+    let createWithDependencyKey options =
+        let key, dependencyKey, _ = createWithFootprint options
+        key, dependencyKey
 
     let create options = createWithDependencyKey options |> fst
+
+    let pinProjectClosure tryGetReader getReader virtualProjectOutput (options: FSharpProjectOptions) =
+        let sources = System.Collections.Generic.Dictionary<string, byte array * string>(pathComparer)
+        let references = System.Collections.Generic.Dictionary<string, DelayedILModuleReader * DateTime>(pathComparer)
+        let resolvedReferences =
+            System.Collections.Generic.Dictionary<FSharpProjectOptions, string option array>(HashIdentity.Reference)
+        let key, _, _ =
+            collect options (Some {
+                Sources = sources
+                References = references
+                ReferencePaths = resolvedReferences
+                TryGetReader = tryGetReader
+                GetReader = getReader
+            })
+        let sourceEncoding (opts: FSharpProjectOptions) =
+            opts.OtherOptions
+            |> Array.choose (tryFlagArgument [ "--codepage:"; "/codepage:" ])
+            |> Array.tryLast
+            |> Option.map (fun codePage ->
+                match Int32.TryParse(codePage) with
+                | true, codePage ->
+                    System.Text.Encoding.GetEncoding(codePage)
+                | _ ->
+                    raise (ProjectSweepSnapshotChangedException
+                        "FCS has an invalid source encoding option."))
+            |> Option.defaultValue System.Text.Encoding.UTF8
+
+        let fileSnapshot (opts: FSharpProjectOptions) path =
+            async {
+                let encoding = sourceEncoding opts
+                let directory = Path.GetDirectoryName(opts.ProjectFileName)
+                match sources.TryGetValue(normalizeFrom directory path) with
+                | true, (data, hash) ->
+                    use content = new MemoryStream(data, false)
+                    use reader = new StreamReader(content, encoding, true)
+                    let text = SourceTextNew.ofString(reader.ReadToEnd())
+                    let version = $"{hash}:{encoding.CodePage}"
+                    return ProjectSnapshot.FSharpFileSnapshot.Create(path, version, fun () -> Task.FromResult(text))
+                | false, _ ->
+                    return raise (ProjectSweepSnapshotChangedException
+                        "FCS requested source outside the captured semantic snapshot.")
+            }
+        let rewritten = System.Collections.Generic.Dictionary<FSharpProjectOptions, FSharpProjectOptions>(HashIdentity.Reference)
+        let inProgress = System.Collections.Generic.HashSet<FSharpProjectOptions>(HashIdentity.Reference)
+
+        let rec apply (opts: FSharpProjectOptions) =
+            match rewritten.TryGetValue(opts) with
+            | true, previous -> previous
+            | false, _ ->
+                if not (inProgress.Add(opts)) then
+                    raise (ProjectSweepSnapshotChangedException
+                        "A cyclic F# project reference is outside the captured semantic snapshot.")
+                try
+                    let updated = rewrite opts
+                    rewritten.Add(opts, updated)
+                    updated
+                finally
+                    inProgress.Remove(opts) |> ignore
+
+        and rewrite (opts: FSharpProjectOptions) =
+            let directory = Path.GetDirectoryName(opts.ProjectFileName)
+            let assigned = System.Collections.Generic.HashSet<string>(pathComparer)
+            let fromPinnedStream path =
+                match references.TryGetValue(path) with
+                | true, (reader, stamp) ->
+                    FSharpReferencedProject.PEReference((fun () -> stamp), reader)
+                | _ ->
+                    raise (ProjectSweepSnapshotChangedException
+                        "A binary reference is outside the captured semantic snapshot.")
+
+            let virtualOutputs = System.Collections.Generic.Dictionary<string, string>(pathComparer)
+            let existing =
+                opts.ReferencedProjects
+                |> Array.map (function
+                    | FSharpReferencedProject.FSharpReference(output, dependency) ->
+                        let original = normalizeFrom directory output
+                        assigned.Add(original) |> ignore
+                        if String.Equals(Path.GetFileNameWithoutExtension(original), "FSharp.Core", StringComparison.OrdinalIgnoreCase) then
+                            raise (ProjectSweepSnapshotUnavailableException
+                                "FCS requires a physical FSharp.Core assembly for a source project reference.")
+                        // The pinned FCS version prefers an existing built DLL when
+                        // its mtime is newer than source. Use an unpublished identity
+                        // so this edge can only come from the captured source project.
+                        let virtualOutput = virtualProjectOutput original
+                        virtualOutputs[original] <- virtualOutput
+                        FSharpReferencedProject.FSharpReference(virtualOutput, apply dependency)
+                    | binary ->
+                        let path = normalizeFrom directory binary.OutputFile
+                        assigned.Add(path) |> ignore
+                        fromPinnedStream path)
+            let paths = resolvedReferences[opts]
+            let pinned =
+                paths
+                |> Array.choose (function
+                    | Some path when assigned.Add(path) -> Some(fromPinnedStream path)
+                    | _ -> None)
+            let compilerOptions =
+                compilerFlags opts
+                |> Array.mapi (fun i argument ->
+                    paths[i]
+                    |> Option.map (fun path ->
+                        match virtualOutputs.TryGetValue(path) with
+                        | true, virtualOutput -> "-r:" + virtualOutput
+                        | false, _ -> "-r:" + path)
+                    |> Option.defaultValue argument)
+            { opts with
+                OtherOptions = compilerOptions
+                ReferencedProjects = Array.append existing pinned
+            }
+        key, fileSnapshot, apply options
 
 /// Single construction path for user-supplied project-outline filters. Tests
 /// assert these engine guarantees directly instead of treating host speed as a
@@ -3094,6 +3418,7 @@ type internal FcsBridge
         ?freshProjectCheckBeforeAdmissionOverride: (unit -> Task),
         ?freshProjectCheckBeforeFcsStartOverride: (unit -> Task),
         ?projectSweepWorkerOverride: (string -> Task<FSharpSymbolUse array * FSharpDiagnostic array>),
+        ?projectSweepPinnedInputsLeaseOverride: (string -> IDisposable),
         ?testsForSymbolSiteScanBeforeUseOverride: (unit -> unit),
         ?testsForSymbolFailureDeadlineExpiredOverride: (unit -> bool),
         ?testsForSymbolProjectSweepWaitMsOverride: (int -> int),
@@ -3159,6 +3484,60 @@ type internal FcsBridge
             keepAssemblyContents = keepAssemblyContents,
             keepAllBackgroundResolutions = keepAllBackgroundResolutions,
             keepAllBackgroundSymbolUses = keepAllBackgroundSymbolUses
+        )
+
+    // Share only the immutable, exact-version PE reader, never a checker's
+    // mutable source context. Weak entries do not own the bytes or IL lifetime.
+    let pinnedPeReaders = BoundedCache<string * string, WeakReference<DelayedILModuleReader> * DateTime>(512)
+    let pinnedPeGate = obj ()
+    let mutable pinnedPeVersion = DateTime.UtcNow.Ticks
+
+    let tryGetPinnedPeReader path hash =
+        pinnedPeReaders.TryGet((path, hash))
+        |> Option.bind (fun (weak, version) ->
+            match weak.TryGetTarget() with
+            | true, reader -> Some(reader, version)
+            | false, _ -> None)
+
+    let getPinnedPeReader path hash (bytes: byte array) =
+        lock pinnedPeGate (fun () ->
+            match tryGetPinnedPeReader path hash with
+            | Some reader -> reader
+            | None ->
+                let reader =
+                    DelayedILModuleReader(path, fun ct ->
+                        ct.ThrowIfCancellationRequested()
+                        Some(new MemoryStream(bytes, false) :> Stream))
+
+                // FCS uses the reference stamp as a semantic version (not just
+                // filesystem metadata). Never reuse it for different bytes at one path,
+                // even if on-disk mtime was restored after a rebuild.
+                pinnedPeVersion <- pinnedPeVersion + 1L
+                let version = DateTime(pinnedPeVersion, DateTimeKind.Utc)
+                pinnedPeReaders.Set((path, hash), (WeakReference<DelayedILModuleReader>(reader), version))
+                reader, version)
+
+    // Use the snapshot-aware backend only for pinned project sweeps. It can
+    // share bounded incremental analysis across projects without a mutable
+    // DocumentSource attached to the global checker used by other tools.
+    let virtualProjectRoot =
+        Path.Combine(Path.GetTempPath(), $"fslangmcp-virtual-projects-{Guid.NewGuid():N}")
+
+    let virtualProjectOutput (original: string) =
+        let name = Path.GetFileName(original)
+        let identity =
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(original))
+            |> Convert.ToHexString
+        Path.Combine(virtualProjectRoot, identity, name)
+
+    let sweepChecker =
+        FSharpChecker.Create(
+            projectCacheSize = defaultProjectCacheSize,
+            keepAssemblyContents = keepAssemblyContents,
+            keepAllBackgroundResolutions = keepAllBackgroundResolutions,
+            keepAllBackgroundSymbolUses = keepAllBackgroundSymbolUses,
+            useTransparentCompiler = true,
+            transparentCompilerCacheSizes = TransparentCompiler.CacheSizes.Create 8
         )
 
     let scriptChecker = ScriptChecking.Runner(checker)
@@ -4586,11 +4965,13 @@ type internal FcsBridge
         $"%s{pp}::%s{po}"
 
     let dependencyKeys = BoundedCache<string, string>(128)
+    let snapshotFootprints = BoundedCache<string, int64>(128)
     let previousDependencyKeys = BoundedCache<string, string>(128)
 
     let computeAnalysisSnapshotKey (projectOptions: FSharpProjectOptions) =
-        let key, dependencyKey = AnalysisSnapshotKey.createWithDependencyKey projectOptions
+        let key, dependencyKey, footprint = AnalysisSnapshotKey.createWithFootprint projectOptions
         dependencyKeys.Set(key, dependencyKey)
+        snapshotFootprints.Set(key, footprint)
         Interlocked.Increment(&analysisSnapshotComputeCount) |> ignore
         key
 
@@ -4602,6 +4983,9 @@ type internal FcsBridge
     // Cheap, in-memory identity for sharing the expensive content snapshot walk.
     // The final AnalysisSnapshotKey still hashes every source/reference byte; this
     // structural prefix only decides which concurrent callers may share that walk.
+    let snapshotOptionsIdentity =
+        System.Runtime.CompilerServices.ConditionalWeakTable<FSharpProjectOptions, string>()
+
     let snapshotComputationKey (projectOptions: FSharpProjectOptions) =
         use aggregate =
             System.Security.Cryptography.IncrementalHash.CreateHash(
@@ -4614,6 +4998,9 @@ type internal FcsBridge
             aggregate.AppendData([| 0uy |])
 
         append (analysisProjectIdentity projectOptions)
+        // The same path and local flags can have different resolved reference
+        // graphs. Only share the in-flight fingerprint for the same option node.
+        append (snapshotOptionsIdentity.GetValue(projectOptions, fun _ -> Guid.NewGuid().ToString("N")))
 
         for sourceFile in projectOptions.SourceFiles do
             append sourceFile
@@ -7227,18 +7614,37 @@ type internal FcsBridge
                                                                 | Some worker -> worker options.ProjectFileName
                                                                 | None ->
                                                                     task {
+                                                                        let pinnedKey, fileSnapshot, pinnedOptions =
+                                                                            AnalysisSnapshotKey.pinProjectClosure tryGetPinnedPeReader getPinnedPeReader virtualProjectOutput options
+
+                                                                        if pinnedKey <> usesKey then
+                                                                            raise (ProjectSweepSnapshotChangedException
+                                                                                "Project inputs changed before semantic analysis. Retry once edits have settled.")
+
+                                                                        // Deterministic test seam around actual FCS consumption.
+                                                                        use _testLease =
+                                                                            projectSweepPinnedInputsLeaseOverride
+                                                                            |> Option.map (fun acquire -> acquire options.ProjectFileName)
+                                                                            |> Option.defaultValue null
+
+                                                                        let accumulator =
+                                                                            System.Collections.Generic.Dictionary<FSharpProjectOptions, ProjectSnapshot.FSharpProjectSnapshot>(
+                                                                                HashIdentity.Reference)
+                                                                        let! snapshot =
+                                                                            ProjectSnapshot.FSharpProjectSnapshot.FromOptions(pinnedOptions, fileSnapshot, accumulator)
+                                                                            |> asTask
                                                                         let! results =
-                                                                            checker.ParseAndCheckProject(options)
+                                                                            sweepChecker.ParseAndCheckProject(snapshot)
                                                                             |> asTask
 
                                                                         let uses = results.GetAllUsesOfAllSymbols()
                                                                         return uses, results.Diagnostics
                                                                     }
 
-                                                            // FCS consumes live files, not the captured key's bytes. If
-                                                            // input drift is visible after this sweep, don't return or
-                                                            // publish under the wrong key. Also force rechecking if
-                                                            // the caller restores the old bytes before retrying.
+                                                            // The sweep consumed captured sources and explicit PE inputs;
+                                                            // don't return or publish that result if the visible project
+                                                            // inputs are now different. Clear the legacy checker state too
+                                                            // in case another operation read live files during the change.
                                                             let stable = computeAnalysisSnapshotKey options = usesKey
 
                                                             lock analysisSnapshotGate (fun () ->
@@ -7297,7 +7703,10 @@ type internal FcsBridge
                             let options = entry.Options
                             use snapshot = acquireAnalysisSnapshotKeyActual options remaining
                             let! key = snapshot.Operation.WaitAsync(token)
-                            if live () then
+                            let affordable =
+                                snapshotFootprints.TryGet(key)
+                                |> Option.exists (fun bytes -> bytes <= AnalysisSnapshotKey.maxWarmupInputBytes)
+                            if live () && affordable then
                                 commitAnalysisSnapshotKey options key
                                 let actual =
                                     this.ProjectSweepUsesActual(
@@ -8637,6 +9046,7 @@ type internal FcsBridge
                                       match ex with
                                       | SdkPreflight.SdkPinUnsatisfiable _ -> "sdk_not_found"
                                       | ProjectSweepSnapshotChangedException _ -> "project_inputs_changed"
+                                      | ProjectSweepSnapshotUnavailableException _ -> "project_snapshot_unavailable"
                                       | _ -> "project_failure"
                               )
                               "retryable", jbool (timedOut || busy || (match ex with ProjectSweepSnapshotChangedException _ -> true | _ -> false))

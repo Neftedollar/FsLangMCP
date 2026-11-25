@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 from scripts.tests.test_sdk_pin_preflight_e2e import StdioClient, locate_server_dll
 
@@ -33,7 +34,7 @@ class ExternalDefinitionEndToEnd(unittest.TestCase):
 
         write("Contracts/Contracts.csproj", project())
         write("Contracts/Contract.cs", "namespace External { public interface IFunctionalGrainTarget {}"
-              " public interface AmbiguousExternal {} }"
+              " public interface AmbiguousExternal {} public class Widget {} }"
               " namespace Other { public interface AmbiguousExternal {} }")
         self.consumer = write("Consumer/Consumer.fsproj", project(
             '<Compile Include="Consumer.fs" /><ProjectReference Include="../Contracts/Contracts.csproj" />'
@@ -41,7 +42,10 @@ class ExternalDefinitionEndToEnd(unittest.TestCase):
         write("Consumer/Consumer.fs", "module Consumer\nlet read (x: External.IFunctionalGrainTarget) = x\n"
               "type OnlyLocal = { Value: int }\n"
               "let ambiguous (x: External.AmbiguousExternal) (y: Other.AmbiguousExternal) = x, y\n"
-              "let useFrameworkType (value: System.Uri) = value\n")
+              "let useFrameworkType (value: System.Uri) = value\n"
+              "let constructFrameworkType () = System.Uri(\"https://example.com\")\n"
+              "let useWidget (value: External.Widget) = value\n"
+              "let constructWidget () = External.Widget()\n")
         self.binary_consumer = write("BinaryConsumer/BinaryConsumer.fsproj", project(
             '<Compile Include="BinaryConsumer.fs" />'
             '<ProjectReference Include="../Contracts/Contracts.csproj" ReferenceOutputAssembly="false" />'
@@ -180,8 +184,64 @@ class ExternalDefinitionEndToEnd(unittest.TestCase):
         self.assertEqual("external_definition", framework["resolution"]["outcome"])
         identity = framework["resolution"]["externalDefinition"]
         self.assertEqual("System.Uri", identity["fullName"])
+        self.assertEqual([], framework["sites"])
         self.assertNotIn("sourceProjectLanguage", identity)
         self.assertNotIn("sourceProjectPath", identity)
+
+    def test_search_path_reference_with_non_utf8_source_matches_compiler(self):
+        folder = self.root / "SearchPathConsumer"
+        folder.mkdir()
+        library = self.root / "Contracts/obj/Debug/net10.0/ref"
+        self.assertTrue((library / "Contracts.dll").is_file())
+        project = folder / "SearchPathConsumer.fsproj"
+        (folder / "SearchPathConsumer.fs").write_bytes(
+            "module SearchPathConsumer\nlet café (value: External.IFunctionalGrainTarget) = value\n".encode("latin-1")
+        )
+        for raw_flags in (
+            f'--codepage:28591 -I:"{library}" -r:Contracts',
+            f'/codepage:28591 -I:"{library}" /reference:Contracts.dll -r:System.Net.Http',
+        ):
+            with self.subTest(flags=raw_flags):
+                flags = escape(raw_flags)
+                project.write_text(
+                    '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework>'
+                    f'<OtherFlags>{flags}</OtherFlags></PropertyGroup><ItemGroup>'
+                    '<Compile Include="SearchPathConsumer.fs" /></ItemGroup></Project>', encoding="utf-8",
+                )
+                built = subprocess.run(
+                    ["dotnet", "build", str(project), "-m:1", "-nr:false", "-p:NuGetAudit=false",
+                     "-p:UseSharedCompilation=false"], capture_output=True, text=True, timeout=120,
+                )
+                self.assertEqual(0, built.returncode, built.stdout + built.stderr)
+                result, _ = self.find("café", projectPath=str(project), scope="project")
+                self.assertTrue(result["coverage"]["complete"], result)
+                self.assertEqual("matched", result["outcome"], result)
+                self.assertEqual(0, result["projectDiagnosticsTotalCount"], result)
+                external, _ = self.find("IFunctionalGrainTarget", projectPath=str(project), scope="project")
+                self.assertEqual("external_definition", external["outcome"], external)
+                self.assertEqual("Contracts", external["resolution"]["externalDefinition"]["assembly"])
+                self.assertEqual([], external["sites"])
+
+    def test_csharp_constructor_resolves_declaring_type_with_no_fake_site(self):
+        def check():
+            result, _ = self.find("External.Widget", projectPath=str(self.consumer), scope="project")
+            self.assertEqual([], result["sites"])
+            self.assertTrue(result["coverage"]["complete"], result)
+            resolution = result["resolution"]
+            self.assertEqual("external_definition", resolution["outcome"], result)
+            identity = resolution["externalDefinition"]
+            self.assertEqual("External.Widget", identity["fullName"])
+            self.assertEqual("Contracts", identity["assembly"])
+            self.assertEqual("csharp", identity["sourceProjectLanguage"])
+            self.assertEqual(self.source_project, Path(identity["sourceProjectPath"]).resolve())
+
+        check()  # Both the annotation and the constructor are observed.
+        source = self.consumer.parent / "Consumer.fs"
+        text = source.read_text(encoding="utf-8")
+        without_annotation = text.replace("let useWidget (value: External.Widget) = value\n", "")
+        self.assertNotEqual(text, without_annotation)
+        source.write_text(without_annotation, encoding="utf-8")
+        check()  # The constructor is the only observed use of the type.
 
     def test_local_shadow_and_true_miss_keep_normal_behavior(self):
         self.shadow.write_text("module Leaf7\ntype IFunctionalGrainTarget = { Local: int }\n", encoding="utf-8")
