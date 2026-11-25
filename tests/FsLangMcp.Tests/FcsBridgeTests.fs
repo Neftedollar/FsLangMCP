@@ -650,6 +650,155 @@ let ``find rejects visible mid-sweep input drift and does not cache the failed s
     }
 
 [<Fact>]
+let ``find compiles pinned source even when disk goes A to B to A during the sweep`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_sweep_aba_{Guid.NewGuid():N}")
+
+        try
+            let source, project = writeSimpleProject root "PinnedSweep" "value"
+            let original = File.ReadAllText(source)
+            let alternate = original.Replace("value", "other")
+            let stamp = File.GetLastWriteTimeUtc(source)
+            let mutable transitions = 0
+
+            let write (text: string) =
+                File.WriteAllText(source, text)
+                File.SetLastWriteTimeUtc(source, stamp)
+
+            let bridge =
+                FcsBridge(projectSweepPinnedInputsLeaseOverride = fun _ ->
+                    write alternate
+                    Interlocked.Increment(&transitions) |> ignore
+                    { new IDisposable with
+                        member _.Dispose() =
+                            write original
+                            Interlocked.Increment(&transitions) |> ignore })
+
+            let args = { admissionFindArgs project 20_000 with kind = Some "definition" }
+            let! inFlight = bridge.Find(args)
+            Assert.Equal(2, Volatile.Read(&transitions))
+            Assert.Equal(original, File.ReadAllText(source))
+            Assert.True(inFlight.["coverage"].["complete"].GetValue<bool>(), inFlight.ToJsonString())
+            Assert.Equal(1, jsonArrayLength inFlight["sites"])
+
+            let! absent = bridge.Find({ args with query = "other" })
+            Assert.True(absent.["coverage"].["complete"].GetValue<bool>(), absent.ToJsonString())
+            Assert.Equal("not_found", absent.["outcome"].GetValue<string>())
+            Assert.Equal(0, jsonArrayLength absent["sites"])
+            Assert.Equal(2, Volatile.Read(&transitions)) // Probe the published cache, not another compile.
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
+let ``find compiles pinned CLR metadata even when disk goes A to B to A during the sweep`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_sweep_clr_aba_{Guid.NewGuid():N}")
+        let projectXml items =
+            $"""<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup><ItemGroup>{items}</ItemGroup></Project>"""
+
+        let build (path: string) =
+            task {
+                let psi = System.Diagnostics.ProcessStartInfo("dotnet")
+                psi.UseShellExecute <- false
+                psi.RedirectStandardOutput <- true
+                psi.RedirectStandardError <- true
+                for arg in [ "build"; path; "-m:1"; "-nologo"; "--disable-build-servers"; "-nodeReuse:false"
+                             "-p:UseSharedCompilation=false"; "-p:NuGetAudit=false" ] do
+                    psi.ArgumentList.Add(arg)
+                use child = System.Diagnostics.Process.Start(psi)
+                let stdout = child.StandardOutput.ReadToEndAsync()
+                let stderr = child.StandardError.ReadToEndAsync()
+                use timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60.0))
+                try
+                    do! child.WaitForExitAsync(timeout.Token)
+                with :? OperationCanceledException ->
+                    if not child.HasExited then child.Kill(true)
+                    raise (TimeoutException("Fixture build timed out."))
+                let! output = stdout
+                let! errors = stderr
+                Assert.True(child.ExitCode = 0, output + errors)
+            }
+
+        let makeVariant (name: string) =
+            task {
+                let dir = Path.Combine(root, name)
+                Directory.CreateDirectory(dir) |> ignore
+                let project = Path.Combine(dir, "Contracts.csproj")
+                File.WriteAllText(project, projectXml "")
+                File.WriteAllText(Path.Combine(dir, "Widget.cs"),
+                    $"namespace Contracts {{ public static class Widget {{ public static int {name} => 42; }} }}")
+                do! build project
+                return File.ReadAllBytes(Path.Combine(dir, "bin", "Debug", "net10.0", "Contracts.dll"))
+            }
+
+        try
+            let! original = makeVariant "OldValue"
+            let! alternate = makeVariant "NewValue"
+            let consumer = Path.Combine(root, "Consumer")
+            Directory.CreateDirectory(consumer) |> ignore
+            let reference = Path.Combine(consumer, "Contracts.dll")
+            File.WriteAllBytes(reference, original)
+            let stamp = File.GetLastWriteTimeUtc(reference)
+            let project = Path.Combine(consumer, "Consumer.fsproj")
+            // Keep the alternative spelling in this real compile-and-cache
+            // regression, so omitting slash options from the key cannot pass.
+            let flags = System.Security.SecurityElement.Escape($"-I:\"{consumer}\" /reference:Contracts.dll")
+            let xml = (projectXml """<Compile Include="Main.fs" />""").Replace("</PropertyGroup>", $"<OtherFlags>{flags}</OtherFlags></PropertyGroup>")
+            File.WriteAllText(project, xml)
+            File.WriteAllText(Path.Combine(consumer, "Main.fs"), "module Consumer\nlet value = Contracts.Widget.OldValue\n")
+            do! build project
+            let mutable transitions = 0
+            let mutable leaseCalls = 0
+
+            let write (bytes: byte array) =
+                File.WriteAllBytes(reference, bytes)
+                File.SetLastWriteTimeUtc(reference, stamp)
+                Interlocked.Increment(&transitions) |> ignore
+
+            let bridge =
+                FcsBridge(projectSweepPinnedInputsLeaseOverride = fun _ ->
+                    if Interlocked.Increment(&leaseCalls) = 1 then
+                        write alternate
+                        { new IDisposable with
+                            member _.Dispose() = write original }
+                    else
+                        { new IDisposable with member _.Dispose() = () })
+
+            let args = { admissionFindArgs project 20_000 with kind = Some "definition" }
+            let! during = bridge.Find(args)
+            Assert.True(during.["coverage"].["complete"].GetValue<bool>(), during.ToJsonString())
+            Assert.Equal(0, during.["projectDiagnosticsTotalCount"].GetValue<int>())
+            Assert.Equal(2, Volatile.Read(&transitions))
+            let! again = bridge.Find(args)
+            let! fresh = FcsBridge().Find(args)
+            Assert.Equal(0, fresh.["projectDiagnosticsTotalCount"].GetValue<int>())
+            Assert.Equal(fresh.["projectDiagnosticsTotalCount"].GetValue<int>(), again.["projectDiagnosticsTotalCount"].GetValue<int>())
+            Assert.Equal(2, Volatile.Read(&transitions)) // Still the cached result.
+
+            // A persistent rebuild at the same path/mtime must also invalidate
+            // the shared FCS snapshot; an app-cache miss alone is not enough.
+            write alternate
+            Assert.Equal(stamp, File.GetLastWriteTimeUtc(reference))
+            let! changed = bridge.Find(args)
+            let! freshChanged = FcsBridge().Find(args)
+            Assert.True(changed.["coverage"].["complete"].GetValue<bool>(), changed.ToJsonString())
+            Assert.Equal(1, freshChanged.["projectDiagnosticsTotalCount"].GetValue<int>())
+            Assert.Equal(1, changed.["projectDiagnosticsTotalCount"].GetValue<int>())
+            Assert.Contains("FS0039", changed.["projectDiagnostics"].ToJsonString())
+            Assert.Equal(2, Volatile.Read(&leaseCalls))
+
+            write original
+            let! restored = bridge.Find(args)
+            Assert.Equal(0, restored.["projectDiagnosticsTotalCount"].GetValue<int>())
+            Assert.Equal(2, Volatile.Read(&leaseCalls)) // The original fingerprint is unchanged.
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
+    }
+
+[<Fact>]
 let ``timed out project-use sweep retains actual-worker admission across distinct keys`` () : Task =
     task {
         use outerGate = new SemaphoreSlim(2, 2)
@@ -2497,6 +2646,49 @@ let ``analysis snapshot key distinguishes compile order and normalized source pa
         finally
             if Directory.Exists(tempRoot) then
                 Directory.Delete(tempRoot, true)
+    }
+
+[<Fact>]
+let ``analysis snapshot key includes each resolved variant of the same referenced project`` () : Task =
+    task {
+        let root = Path.Combine(Path.GetTempPath(), $"fslangmcp_snapshot_variant_{Guid.NewGuid():N}")
+        Directory.CreateDirectory(root) |> ignore
+
+        try
+            let sourceA = Path.Combine(root, "A.fs")
+            let sourceB = Path.Combine(root, "B.fs")
+            let sourceRoot = Path.Combine(root, "Root.fs")
+            for source in [ sourceA; sourceB; sourceRoot ] do
+                File.WriteAllText(source, "module Shared\nlet value = 0\n")
+
+            let! baseOptions, _ =
+                checker.GetProjectOptionsFromScript(sourceRoot, SourceText.ofString(File.ReadAllText(sourceRoot)))
+                |> asTask
+
+            let variant output (source: string) =
+                let options =
+                    { baseOptions with
+                        ProjectFileName = Path.Combine(root, "Shared.fsproj")
+                        ProjectId = Some output
+                        SourceFiles = [| source |]
+                        ReferencedProjects = [||] }
+                FSharpReferencedProject.FSharpReference(Path.Combine(root, output + ".dll"), options)
+
+            let rootOptions =
+                { baseOptions with
+                    ProjectFileName = Path.Combine(root, "Root.fsproj")
+                    ProjectId = Some "Root"
+                    SourceFiles = [| sourceRoot |]
+                    ReferencedProjects = [| variant "A" sourceA; variant "B" sourceB |] }
+
+            let before = AnalysisSnapshotKey.create rootOptions
+            let stamp = File.GetLastWriteTimeUtc(sourceB)
+            File.WriteAllText(sourceB, "module Shared\nlet value = 1\n")
+            File.SetLastWriteTimeUtc(sourceB, stamp)
+            Assert.NotEqual<string>(before, AnalysisSnapshotKey.create rootOptions)
+        finally
+            if Directory.Exists root then
+                Directory.Delete(root, true)
     }
 
 [<Fact>]

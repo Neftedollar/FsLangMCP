@@ -8,26 +8,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.20.1] - 2026-11-25
+## [0.21.0] - 2026-11-25
+
+This pre-1.0 minor release changes some MCP responses. Clients that match
+exhaustively on outcomes should account for the new cases below.
 
 ### Changed
 
 - Warm the shared `find` semantic cache during project selection, including startup
-  with a selected project. This shifts work out of the first query; an explicit
-  cold query without prior selection still follows the ordinary path (#225).
+  with a selected project. Warm-up moves work into selection rather than speeding up
+  an explicit cold query without prior selection. Set `FSLANGMCP_SEMANTIC_WARMUP=0`
+  to opt out; `set_project` reports attempted warm-up in `semanticWarmup`. Selection
+  skips project closures over 64 MiB of source and explicit assembly inputs (#225, #356).
+- Keep FCS analysis across unchanged project selections that do not restart the
+  language server (#351).
+- Invalid typed tool arguments include hints about missing, unknown or incompatible
+  fields where available, preserving the JSON-RPC error code (#268, #350).
 
 ### Fixed
 
-- `find` identifies proven external C# types by full name and assembly without
-  inventing a site. It refuses to publish mismatched snapshots if inputs change
-  during a sweep (#225).
+- `find` can return `outcome="external_definition"` with the full type name and
+  assembly for an external C# type when semantic evidence exists, without inventing
+  a source location, including when the only use is a constructor call.
+  Semantic sweeps use the captured F# sources and explicit CLR assembly references
+  associated with their cache key, and decline results if the visible inputs have
+  changed by the end of the sweep (#225, #352, #355). On-demand sweeps can capture up
+  to 256 MiB per project closure; an oversized closure or ambiguous relative assembly
+  reference reports incomplete coverage with `project_snapshot_unavailable`.
 - `fcs_dead_code` reports `partial` or `unknown` with project failure details
   when a scan cannot cover the requested projects. Incomplete candidates are
-  provisional, not evidence that a symbol is unused (#353).
-
+  provisional, not evidence that a symbol is unused (#353, #357).
 - `check` rejects unsupported `fileGlob` scope/speed combinations instead of silently
   reporting unfiltered diagnostics. The filter remains supported for cached
-  `scope="workspace", speed="fast"` checks, including auto-resolved workspaces (#339).
+  `scope="workspace", speed="fast"` checks, including auto-resolved workspaces (#339, #340).
+
+### Tests and documentation
+
+- Pin existing Hidden diagnostic counting and the unavailable-thread-telemetry
+  response; clarify and test zero-based symbol lookup coordinates (#209, #166, #247).
+- Keep asynchronous check fixtures alive until their blocked producer drains (#199, #333).
 
 ## [0.20.0] - 2026-11-12
 
@@ -1289,7 +1308,8 @@ Three LSP-readiness issues closed (#102, #103, #104); all response shapes additi
   above), so it has no link definition either — 0.15.0 compares from the
   last version that actually was tagged, 0.13.2.
 -->
-[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/Neftedollar/FsLangMCP/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/Neftedollar/FsLangMCP/compare/v0.17.1...v0.18.0
