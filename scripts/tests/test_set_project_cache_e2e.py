@@ -106,6 +106,92 @@ class SetProjectCacheEndToEnd(unittest.TestCase):
         after = path.stat()
         self.assertEqual((initial.st_size, initial.st_mtime_ns), (after.st_size, after.st_mtime_ns))
 
+    def partial_solution(self):
+        solution = self.root / "Partial.slnx"
+        solution.write_text(
+            '<Solution><Project Path="Dep/Dep.fsproj" />'
+            '<Project Path="MissingConsumer.fsproj" /></Solution>', encoding="utf-8",
+        )
+        return solution
+
+    def test_find_pages_match_complete_result_and_edit_requires_restart(self):
+        original = self.dep_source.read_text(encoding="utf-8")
+        self.dep_source.write_text(
+            original + "let first = OldName + 1\nlet second = OldName + 2\n",
+            encoding="utf-8",
+        )
+        args = {
+            "projectPath": str(self.dep), "scope": "project", "query": "OldName",
+            "kind": "symbol", "exact": True, "includeDeclaration": True,
+            "contextLines": 0,
+        }
+
+        complete, _ = self.call("find", {**args, "maxResults": 20})
+        self.assertIs(complete["coverage"]["complete"], True)
+        self.assertIs(complete["resolution"]["complete"], True)
+        self.assertIs(complete["resultSetComplete"], True)
+        self.assertIs(complete["truncated"], False)
+        self.assertIsNone(complete["nextCursor"])
+        self.assertEqual(3, complete["totalEstimate"]["sites"])
+        self.assertEqual(3, len(complete["sites"]))
+        self.assertTrue(all(Path(row["file"]) == self.dep_source for row in complete["sites"]))
+
+        paged = {**args, "maxResults": 1}
+        cursor = None
+        first_cursor = None
+        rows = []
+        # Fixed fixture size bounds the traversal: an extra or cyclic cursor fails.
+        for offset in range(3):
+            request = {**paged, "cursor": cursor} if cursor is not None else paged
+            page, _ = self.call("find", request)
+            self.assertIs(page["coverage"]["complete"], True)
+            self.assertIs(page["resolution"]["complete"], False)
+            self.assertIs(page["resultSetComplete"], False)
+            self.assertEqual(offset, page["pageOffset"])
+            self.assertEqual(3, page["totalEstimate"]["sites"])
+            self.assertEqual(1, len(page["sites"]))
+            rows.extend(page["sites"])
+            cursor = page["nextCursor"]
+            self.assertIs(page["truncated"], offset < 2)
+            if offset < 2:
+                self.assertIsInstance(cursor, str)
+                self.assertTrue(cursor)
+                if offset == 0:
+                    first_cursor = cursor
+            else:
+                self.assertIsNone(cursor)
+        self.assertEqual(complete["sites"], rows)
+
+        with self.dep_source.open("a", encoding="utf-8") as source:
+            source.write("let third = OldName + 3\n")
+        stale, _ = self.call("find", {**paged, "cursor": first_cursor}, expected="invalid_cursor")
+        self.assertEqual("cursor_stale", stale["errorKind"])
+        self.assertIs(stale["paginationRestartRequired"], True)
+        self.assertIs(stale["retrySameCursor"], False)
+        self.assertIsNone(stale["nextCursor"])
+        self.assertEqual([], stale["sites"])
+
+        restarted, _ = self.call("find", paged)
+        self.assertEqual(0, restarted["pageOffset"])
+        self.assertEqual(4, restarted["totalEstimate"]["sites"])
+        self.assertEqual(1, len(restarted["sites"]))
+        self.assertTrue(restarted["nextCursor"])
+
+    def test_find_partial_preserves_known_site_without_claiming_completeness(self):
+        result, _ = self.call("find", {
+            "projectPath": str(self.partial_solution()), "scope": "workspace",
+            "query": "OldName", "kind": "definition", "exact": True,
+        }, expected="partial")
+        self.assertIs(result["coverage"]["complete"], False)
+        self.assertIs(result["resolution"]["complete"], False)
+        self.assertIs(result["resultSetComplete"], False)
+        self.assertEqual(2, result["projectsRequested"])
+        self.assertEqual(1, result["projectsAnalyzed"])
+        self.assertEqual(1, result["projectsMissing"])
+        site, = result["sites"]
+        self.assertEqual(self.dep_source, Path(site["file"]))
+        self.assertEqual("definition", site["kind"])
+
     def test_dead_code_complete_and_empty_is_a_clean_scan(self):
         payload, _ = self.call("fcs_dead_code", {"projectPath": str(self.app)})
         self.assertTrue(payload["complete"])
@@ -133,12 +219,7 @@ class SetProjectCacheEndToEnd(unittest.TestCase):
 
     def test_dead_code_partial_scan_preserves_provisional_candidates(self):
         missing = self.root / "MissingConsumer.fsproj"
-        solution = self.root / "Partial.slnx"
-        solution.write_text(
-            '<Solution><Project Path="Dep/Dep.fsproj" />'
-            '<Project Path="MissingConsumer.fsproj" /></Solution>', encoding="utf-8",
-        )
-        args = {"projectPath": str(solution), "includePublic": True}
+        args = {"projectPath": str(self.partial_solution()), "includePublic": True}
         payload, _ = self.call("fcs_dead_code", args, expected="partial")
         self.assertFalse(payload["complete"])
         self.assertEqual(2, payload["projectsRequested"])
