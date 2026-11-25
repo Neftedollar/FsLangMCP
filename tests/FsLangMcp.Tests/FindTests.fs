@@ -2409,7 +2409,22 @@ type FindLinkedSourceTests(fx: LinkedSourceFixture) =
                     cursor = cursor }
 
             let! largePage = largeBridge.Find(request 1000 None)
-            Assert.Equal("succeeded", gs largePage "status")
+            let status = gs largePage "status"
+
+            if status <> "succeeded" then
+                let diagnostic (key: string) =
+                    match largePage[key] with
+                    | null -> "<missing or null>"
+                    | value ->
+                        let json = value.ToJsonString()
+                        if json.Length > 4096 then json.Substring(0, 4096) + "..." else json
+
+                let details =
+                    [ "outcome"; "coverage"; "scopeNote"; "error"; "resolution"; "perProject" ]
+                    |> List.map (fun key -> $"{key}={diagnostic key}")
+                    |> String.concat "\n"
+
+                Assert.Fail($"Initial unpaginated find: expected succeeded, got {status}.\n{details}")
 
             let targetFromLargePage =
                 (largePage["sites"] :?> JsonArray)
